@@ -1,19 +1,15 @@
 warmup:
-  # GVRs derived from the krateoplatformops-blueprints/portal chart (v1.1.0).
-  # Every resource kind rendered by the portal blueprint is listed here so that
-  # snowplow's cache is fully warm before the first request is served.
+  # GVRs derived from the krateoplatformops-blueprints/portal chart (v1.1.0)
+  # plus CompositionDefinitions across all 20 bench namespaces.
   gvrs:
 
-    # ── RESTActions (templates.krateo.io/v1) ─────────────────────────────────
-    # All API calls wired into pages/panels go through RESTActions.
+    # ── RESTActions ───────────────────────────────────────────────────────────
     - group: templates.krateo.io
       version: v1
       resource: restactions
       ttl: 6h
 
-    # ── Widgets (widgets.templates.krateo.io/v1beta1) ─────────────────────────
-    # Every widget kind used by the portal blueprint.
-
+    # ── Widgets ───────────────────────────────────────────────────────────────
     - group: widgets.templates.krateo.io
       version: v1beta1
       resource: pages
@@ -70,18 +66,14 @@ warmup:
       version: v1beta1
       resource: tables
 
-    # ── Core Krateo types ─────────────────────────────────────────────────────
+    # ── Core Krateo types ────────────────────────────────────────────────────
+    # Warmed cluster-wide (all namespaces including the 20 bench namespaces).
     - group: core.krateo.io
       version: v1alpha1
       resource: compositiondefinitions
       ttl: 24h
 
-    - group: core.krateo.io
-      version: v1alpha1
-      resource: schemadefinitions
-      ttl: 24h
-
-    # ── Kubernetes core resources ─────────────────────────────────────────────
+    # ── Kubernetes core ───────────────────────────────────────────────────────
     - group: ""
       version: v1
       resource: namespaces

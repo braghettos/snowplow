@@ -198,6 +198,10 @@ func main() {
 }
 
 // startBackgroundServices sets up the four-phase cache startup sequence.
+// ctx is the signal context used for long-running watchers (cancelled on SIGTERM).
+// Warmup and informer sync use a separate background context so that a SIGTERM
+// received during startup (e.g. from a failing liveness probe) does not abort
+// the warmup — the server will start with a fully warm cache regardless.
 func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.RedisCache, authnNS, warmupConfigPath string) {
 	rc, err := rest.InClusterConfig()
 	if err != nil {
@@ -205,7 +209,7 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 		return
 	}
 
-	// Phase 1: Start watchers.
+	// Phase 1: Start long-running watchers bound to the process lifetime (signal ctx).
 	resourceWatcher, err := cache.NewResourceWatcher(c, rc)
 	if err != nil {
 		log.Error("failed to create resource watcher", slog.Any("err", err))
@@ -230,6 +234,10 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 	}
 
 	// Phase 2: Load warmup config and pre-register GVRs (triggers informer startup).
+	// Uses a background context so a signal during startup does not abort registration.
+	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer warmupCancel()
+
 	warmer := cache.NewWarmer(c, rc)
 	warmupCfg, err := cache.LoadWarmupConfig(warmupConfigPath)
 	if err != nil {
@@ -237,20 +245,20 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 			slog.String("path", warmupConfigPath), slog.Any("err", err))
 	} else {
 		warmer.SetWarmupConfig(warmupCfg)
-		warmer.PreRegisterGVRs(ctx)
+		warmer.PreRegisterGVRs(warmupCtx)
 	}
 
 	// Phase 3: Wait for informers to complete their initial list-and-watch sync.
 	log.Info("waiting for informer caches to sync...")
-	syncCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
+	syncCtx, syncCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer syncCancel()
 	if resourceWatcher.WaitForSync(syncCtx) {
 		log.Info("informer caches synced")
 	} else {
 		log.Warn("informer caches did not sync within timeout; proceeding with warmup anyway")
 	}
 
-	// Phase 4: Run warmup.
+	// Phase 4: Run warmup using the background context.
 	log.Info("starting cache warmup")
-	warmer.Run(ctx)
+	warmer.Run(warmupCtx)
 }

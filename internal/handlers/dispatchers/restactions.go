@@ -11,6 +11,7 @@ import (
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/snowplow/apis"
 	v1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -32,7 +33,6 @@ var _ http.Handler = (*restActionHandler)(nil)
 
 func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	log := xcontext.Logger(req.Context())
-
 	start := time.Now()
 
 	extras, err := util.ParseExtras(req)
@@ -40,6 +40,37 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		response.BadRequest(wri, err)
 		return
 	}
+
+	// ── Resolved-output cache ─────────────────────────────────────────────────
+	// Cache the fully-resolved RESTAction JSON keyed per user + resource.
+	// This eliminates both the HTTP fan-out AND all JQ evaluations on repeated
+	// requests. Only unpaginated requests are cached (extras excluded for now).
+	perPage, page := paginationInfo(log, req)
+	c := cache.FromContext(req.Context())
+
+	var resolvedKey string
+	if c != nil && len(extras) == 0 {
+		gvr, gerr := util.ParseGVR(req)
+		nsn, nerr := util.ParseNamespacedName(req)
+		if gerr == nil && nerr == nil {
+			user, uerr := xcontext.UserInfo(req.Context())
+			if uerr == nil {
+				resolvedKey = cache.ResolvedKey(user.Username, gvr, nsn.Namespace, nsn.Name, page, perPage)
+				if raw, hit, _ := c.GetRaw(req.Context(), resolvedKey); hit {
+					cache.GlobalMetrics.RawHits.Add(1)
+					log.Info("RESTAction resolved from cache",
+						slog.String("key", resolvedKey),
+						slog.String("duration", util.ETA(start)))
+					wri.Header().Set("Content-Type", "application/json")
+					wri.WriteHeader(http.StatusOK)
+					_, _ = wri.Write(raw)
+					return
+				}
+				cache.GlobalMetrics.RawMisses.Add(1)
+			}
+		}
+	}
+	// ── End resolved-output cache ─────────────────────────────────────────────
 
 	got := fetchObject(req)
 	if got.Err != nil {
@@ -66,8 +97,6 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		return
 	}
 
-	perPage, page := paginationInfo(log, req)
-
 	ctx := xcontext.BuildContext(req.Context())
 	res, err := restactions.Resolve(ctx, restactions.ResolveOptions{
 		In:      &cr,
@@ -91,9 +120,18 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		slog.String("duration", util.ETA(start)),
 	)
 
+	raw, merr := json.MarshalIndent(res, "", "  ")
+	if merr != nil {
+		response.InternalError(wri, merr)
+		return
+	}
+
+	// Populate the resolved cache for future requests.
+	if c != nil && resolvedKey != "" {
+		_ = c.SetRaw(req.Context(), resolvedKey, raw)
+	}
+
 	wri.Header().Set("Content-Type", "application/json")
 	wri.WriteHeader(http.StatusOK)
-	enc := json.NewEncoder(wri)
-	enc.SetIndent("", "  ")
-	enc.Encode(res)
+	_, _ = wri.Write(raw)
 }

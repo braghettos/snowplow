@@ -235,6 +235,16 @@ func (c *RedisCache) ScanKeys(ctx context.Context, pattern string) ([]string, er
 	return keys, iter.Err()
 }
 
+// DeletePattern deletes all keys matching the given glob pattern using SCAN+DEL.
+// Safe on a nil receiver (no-op).
+func (c *RedisCache) DeletePattern(ctx context.Context, pattern string) error {
+	keys, err := c.ScanKeys(ctx, pattern)
+	if err != nil || len(keys) == 0 {
+		return err
+	}
+	return c.Delete(ctx, keys...)
+}
+
 func (c *RedisCache) SAddGVR(ctx context.Context, gvr schema.GroupVersionResource) error {
 	if c == nil {
 		return nil

@@ -157,6 +157,16 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 			rw.patchListCache(ctx, gvr, clusterListKey, uns, eventType)
 		}
 	}
+
+	// Dispatcher-level resolved outputs (snowplow:resolved:*) are derived from
+	// the resources watched here. Any change to a watched resource potentially
+	// affects the resolved output of widgets or RESTActions that fetch it, so
+	// we bulk-invalidate all resolved keys. They will be re-populated lazily on
+	// the next request.
+	if err := rw.cache.DeletePattern(ctx, AllResolvedPattern); err != nil {
+		slog.Warn("resource-watcher: failed to invalidate resolved cache",
+			slog.String("gvr", gvr.String()), slog.Any("err", err))
+	}
 }
 
 // patchListCache atomically patches the cached list in-place using WATCH/MULTI/EXEC.

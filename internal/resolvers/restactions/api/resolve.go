@@ -1,9 +1,14 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"strings"
+	"sync"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	httpcall "github.com/krateoplatformops/plumbing/http/request"
@@ -11,6 +16,7 @@ import (
 	"github.com/krateoplatformops/plumbing/maps"
 	"github.com/krateoplatformops/plumbing/ptr"
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"k8s.io/client-go/rest"
 )
 
@@ -50,6 +56,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		log.Error("unable to fetch user info from context", slog.Any("err", err))
 		return map[string]any{}
 	}
+
+	// Extract Redis cache from context (nil-safe: all cache ops are no-ops on nil).
+	c := cache.FromContext(ctx)
 
 	// Sort API by Depends
 	names, err := topologicalSort(opts.Items)
@@ -129,16 +138,82 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			continue
 		}
 
-		for _, call := range tmp {
+		// ── Parallel execution of iterator calls ──────────────────────────────
+		// When a single API entry fans out into N calls via an iterator (e.g.
+		// one call per namespace), run them concurrently. A mutex serialises
+		// all writes to the shared dict so that JQ handlers can safely append.
+		//
+		// For single-call entries (the common case) we skip goroutine overhead.
+		runOne := func(call httpcall.RequestOptions, mu *sync.Mutex) (continueOnErr bool) {
 			call.Endpoint = &ep
-			call.ResponseHandler = jsonHandler(ctx, jsonHandlerOptions{
-				key: id, out: dict, filter: apiCall.Filter,
-			})
+			verb := strings.ToUpper(ptr.Deref(call.Verb, http.MethodGet))
+
+			// ── HTTP response cache ────────────────────────────────────────────
+			if c != nil && verb == http.MethodGet {
+				httpKey := cache.HTTPUserKey(user.Username, verb, call.Path)
+
+				if raw, hit, _ := c.GetRaw(ctx, httpKey); hit {
+					handler := jsonHandler(ctx, jsonHandlerOptions{
+						key: id, out: dict, filter: apiCall.Filter,
+					})
+					cache.GlobalMetrics.RawHits.Add(1)
+					log.Debug("api: cache hit", slog.String("name", id), slog.String("path", call.Path))
+					if mu != nil {
+						mu.Lock()
+					}
+					herr := handler(io.NopCloser(bytes.NewReader(raw)))
+					if mu != nil {
+						mu.Unlock()
+					}
+					if herr != nil {
+						log.Warn("api: cached response handler error",
+							slog.String("key", httpKey), slog.Any("err", herr))
+					}
+					return true
+				}
+
+				baseHandler := jsonHandler(ctx, jsonHandlerOptions{
+					key: id, out: dict, filter: apiCall.Filter,
+				})
+				capturedKey := httpKey
+				call.ResponseHandler = func(r io.ReadCloser) error {
+					data, rerr := io.ReadAll(r)
+					if rerr != nil {
+						return rerr
+					}
+					_ = c.SetRaw(ctx, capturedKey, data)
+					cache.GlobalMetrics.RawMisses.Add(1)
+					if mu != nil {
+						mu.Lock()
+					}
+					werr := baseHandler(io.NopCloser(bytes.NewReader(data)))
+					if mu != nil {
+						mu.Unlock()
+					}
+					return werr
+				}
+			} else {
+				plain := jsonHandler(ctx, jsonHandlerOptions{
+					key: id, out: dict, filter: apiCall.Filter,
+				})
+				if mu != nil {
+					call.ResponseHandler = func(r io.ReadCloser) error {
+						data, rerr := io.ReadAll(r)
+						if rerr != nil {
+							return rerr
+						}
+						mu.Lock()
+						defer mu.Unlock()
+						return plain(io.NopCloser(bytes.NewReader(data)))
+					}
+				} else {
+					call.ResponseHandler = plain
+				}
+			}
+			// ── End HTTP response cache ────────────────────────────────────────
 
 			log.Debug("calling api", slog.String("name", id),
-				slog.String("host", call.Endpoint.ServerURL), slog.String("path", call.Path),
-				slog.Any("out", dict),
-			)
+				slog.String("host", call.Endpoint.ServerURL), slog.String("path", call.Path))
 
 			res := httpcall.Do(ctx, call)
 			if res.Status == response.StatusFailure {
@@ -146,20 +221,19 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					slog.String("host", call.Endpoint.ServerURL), slog.String("path", call.Path),
 					slog.String("error", res.Message))
 
-				tmp, err := response.AsMap(res)
-				if err != nil {
-					log.Warn("unable to encode status as dict", slog.Any("err", err))
+				errMap, merr := response.AsMap(res)
+				if mu != nil {
+					mu.Lock()
 				}
-
-				if len(tmp) > 0 {
-					dict[call.ErrorKey] = tmp
+				if merr == nil && len(errMap) > 0 {
+					dict[call.ErrorKey] = errMap
 				} else {
 					dict[call.ErrorKey] = res.Message
 				}
-
-				if !call.ContinueOnError {
-					return dict
+				if mu != nil {
+					mu.Unlock()
 				}
+				return call.ContinueOnError
 			}
 
 			log.Info("api successfully resolved",
@@ -167,7 +241,28 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				slog.String("host", call.Endpoint.ServerURL), slog.String("path", call.Path),
 				slog.Any("depth", mapDepth(dict)),
 			)
+			return true
 		}
+
+		if len(tmp) == 1 {
+			// Single call: run inline to avoid goroutine overhead.
+			if !runOne(tmp[0], nil) {
+				return dict
+			}
+		} else {
+			// Iterator: N independent calls — run concurrently.
+			var mu sync.Mutex
+			var wg sync.WaitGroup
+			for _, call := range tmp {
+				wg.Add(1)
+				go func(c httpcall.RequestOptions) {
+					defer wg.Done()
+					runOne(c, &mu)
+				}(call)
+			}
+			wg.Wait()
+		}
+		// ── End parallel execution ─────────────────────────────────────────────
 	}
 
 	removeManagedFields(dict)

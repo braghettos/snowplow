@@ -70,11 +70,39 @@ func RBACKeyPattern(username string) string {
 	return fmt.Sprintf("snowplow:rbac:%s:*", username)
 }
 
-// HTTPKey builds the shared cache key for a raw HTTP GET call to the K8s API.
+// HTTPKey builds the shared (user-agnostic) cache key for a raw HTTP GET call.
 func HTTPKey(method, path string) string {
 	h := sha256.Sum256([]byte(path))
 	return fmt.Sprintf("snowplow:http:%s:%x", strings.ToUpper(method), h[:8])
 }
+
+// HTTPUserKey builds a per-user cache key for HTTP GET calls made inside the
+// RESTAction/widget resolution pipeline. These calls use the user's JWT, so
+// responses may differ per user (RBAC-filtered namespace lists, widget lists,
+// etc.). The path hash includes query parameters to avoid collisions.
+func HTTPUserKey(username, method, path string) string {
+	h := sha256.Sum256([]byte(path))
+	return fmt.Sprintf("snowplow:http:%s:%s:%x", username, strings.ToUpper(method), h[:8])
+}
+
+// ResolvedKey builds the per-user cache key for a fully-resolved dispatcher
+// output (widget or RESTAction). Caching at this level eliminates both the
+// HTTP fan-out AND all JQ evaluations for repeated requests.
+//
+// Pagination is included in the key so paginated requests get isolated entries.
+// Pass page=0 and perPage=0 for unpaginated resources (the common case).
+func ResolvedKey(username string, gvr schema.GroupVersionResource, namespace, name string, page, perPage int) string {
+	base := fmt.Sprintf("snowplow:resolved:%s:%s:%s:%s", username, GVRToKey(gvr), namespace, name)
+	if page > 0 || perPage > 0 {
+		return fmt.Sprintf("%s:p%d-pp%d", base, page, perPage)
+	}
+	return base
+}
+
+// AllResolvedPattern matches every dispatcher-level resolved cache entry.
+// Used by the resource watcher to bulk-invalidate stale resolved outputs
+// when any watched Kubernetes resource changes.
+const AllResolvedPattern = "snowplow:resolved:*"
 
 // IsNotFoundRaw returns true if raw is the negative-cache sentinel.
 func IsNotFoundRaw(raw []byte) bool {

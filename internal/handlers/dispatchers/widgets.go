@@ -12,6 +12,7 @@ import (
 	"github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/maps"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -33,6 +34,7 @@ var _ http.Handler = (*widgetsHandler)(nil)
 
 func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	start := time.Now()
+	log := xcontext.Logger(req.Context())
 
 	extras, err := util.ParseExtras(req)
 	if err != nil {
@@ -40,23 +42,51 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// ── Resolved-output cache ─────────────────────────────────────────────────
+	// Cache the fully-resolved widget JSON keyed per user + resource.
+	// This eliminates both the HTTP fan-out AND all JQ evaluations on repeated
+	// requests. Only unpaginated requests without extras are cached.
+	perPage, page := paginationInfo(log, req)
+	c := cache.FromContext(req.Context())
+
+	var resolvedKey string
+	if c != nil && len(extras) == 0 {
+		gvr, gerr := util.ParseGVR(req)
+		nsn, nerr := util.ParseNamespacedName(req)
+		if gerr == nil && nerr == nil {
+			user, uerr := xcontext.UserInfo(req.Context())
+			if uerr == nil {
+				resolvedKey = cache.ResolvedKey(user.Username, gvr, nsn.Namespace, nsn.Name, page, perPage)
+				if raw, hit, _ := c.GetRaw(req.Context(), resolvedKey); hit {
+					cache.GlobalMetrics.RawHits.Add(1)
+					log.Info("Widget resolved from cache",
+						slog.String("key", resolvedKey),
+						slog.String("duration", util.ETA(start)))
+					wri.Header().Set("Content-Type", "application/json")
+					wri.WriteHeader(http.StatusOK)
+					_, _ = wri.Write(raw)
+					return
+				}
+				cache.GlobalMetrics.RawMisses.Add(1)
+			}
+		}
+	}
+	// ── End resolved-output cache ─────────────────────────────────────────────
+
 	got := fetchObject(req)
 	if got.Err != nil {
 		response.Encode(wri, got.Err)
 		return
 	}
 
-	log := xcontext.Logger(req.Context()).
-		With(
-			slog.Group("widget",
-				slog.String("name", widgets.GetName(got.Unstructured.Object)),
-				slog.String("namespace", widgets.GetNamespace(got.Unstructured.Object)),
-				slog.String("apiVersion", widgets.GetAPIVersion(got.Unstructured.Object)),
-				slog.String("kind", widgets.GetKind(got.Unstructured.Object)),
-			),
-		)
-
-	perPage, page := paginationInfo(log, req)
+	log = log.With(
+		slog.Group("widget",
+			slog.String("name", widgets.GetName(got.Unstructured.Object)),
+			slog.String("namespace", widgets.GetNamespace(got.Unstructured.Object)),
+			slog.String("apiVersion", widgets.GetAPIVersion(got.Unstructured.Object)),
+			slog.String("kind", widgets.GetKind(got.Unstructured.Object)),
+		),
+	)
 
 	ctx := xcontext.BuildContext(req.Context())
 
@@ -82,9 +112,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 
 	traceId := xcontext.TraceId(ctx, false)
 	if traceId != "" {
-		err := maps.SetNestedField(res.Object, traceId, "status", "traceId")
-		if err != nil {
-			log.Warn("unable to set traceId in status", slog.Any("err", err))
+		if terr := maps.SetNestedField(res.Object, traceId, "status", "traceId"); terr != nil {
+			log.Warn("unable to set traceId in status", slog.Any("err", terr))
 		}
 	}
 
@@ -92,9 +121,18 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		slog.String("duration", util.ETA(start)),
 	)
 
+	raw, merr := json.MarshalIndent(res, "", "  ")
+	if merr != nil {
+		response.InternalError(wri, merr)
+		return
+	}
+
+	// Populate the resolved cache for future requests.
+	if c != nil && resolvedKey != "" {
+		_ = c.SetRaw(req.Context(), resolvedKey, raw)
+	}
+
 	wri.Header().Set("Content-Type", "application/json")
 	wri.WriteHeader(http.StatusOK)
-	enc := json.NewEncoder(wri)
-	enc.SetIndent("", "  ")
-	enc.Encode(res)
+	_, _ = wri.Write(raw)
 }
