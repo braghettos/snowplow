@@ -9,6 +9,7 @@ import (
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/kubeconfig"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/dynamic"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -43,6 +44,31 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 		return
 	}
 
+	c := cache.FromContext(ctx)
+	cacheKey := cache.GetKey(res.GVR, ref.Namespace, ref.Name)
+
+	// Negative cache check.
+	if c != nil && c.GetNotFound(ctx, cacheKey) {
+		cache.GlobalMetrics.NegativeHits.Add(1)
+		log.Debug("object not-found cache hit", slog.String("key", cacheKey))
+		res.Err = response.New(http.StatusNotFound, apierrors.NewNotFound(schema.GroupResource{
+			Group: res.GVR.Group, Resource: res.GVR.Resource,
+		}, ref.Name))
+		return
+	}
+
+	// Positive cache check.
+	if c != nil {
+		var cached unstructured.Unstructured
+		if hit, rerr := c.Get(ctx, cacheKey, &cached); hit && rerr == nil {
+			cache.GlobalMetrics.GetHits.Add(1)
+			log.Debug("object cache hit", slog.String("key", cacheKey))
+			res.Unstructured = &cached
+			return
+		}
+		cache.GlobalMetrics.GetMisses.Add(1)
+	}
+
 	rc, err := kubeconfig.NewClientConfig(ctx, ep)
 	if err != nil {
 		log.Error("unable to create kubernetes client config", slog.Any("err", err))
@@ -71,6 +97,9 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 			res.Err = response.New(http.StatusForbidden, err)
 		} else if apierrors.IsNotFound(err) {
 			res.Err = response.New(http.StatusNotFound, err)
+			if c != nil {
+				_ = c.SetNotFound(ctx, cacheKey)
+			}
 		}
 
 		return
@@ -82,6 +111,10 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 		uns.SetAnnotations(annotations)
 	}
 	uns.SetManagedFields(nil)
+
+	if c != nil {
+		_ = c.SetForGVR(ctx, res.GVR, cacheKey, uns)
+	}
 
 	res.Unstructured = uns
 	res.Err = nil

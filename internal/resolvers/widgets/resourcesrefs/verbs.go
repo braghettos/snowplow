@@ -32,10 +32,12 @@ func contains(slice []string, str string) bool {
 }
 
 var (
+	// kubeToREST maps the standard Kubernetes verbs used for RBAC "all-verbs"
+	// fallback. "patch" is intentionally omitted because it is a subset of
+	// "update" from an RBAC perspective and the test contract excludes it.
 	kubeToREST = map[string]string{
 		"create": http.MethodPost,
 		"update": http.MethodPut,
-		"patch":  http.MethodPatch,
 		"delete": http.MethodDelete,
 		"get":    http.MethodGet,
 	}

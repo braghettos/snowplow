@@ -11,10 +11,12 @@ import (
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/kubeconfig"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/dynamic"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // @Summary List resources by category in a specified namespace.
@@ -40,7 +42,6 @@ func List() http.HandlerFunc {
 		}
 
 		log := xcontext.Logger(req.Context())
-
 		start := time.Now()
 
 		ep, err := xcontext.UserConfig(req.Context())
@@ -66,18 +67,55 @@ func List() http.HandlerFunc {
 			return
 		}
 
-		log.Debug("performing discovery", slog.String("category", cat))
-		res, err := cli.Discover(context.Background(), cat)
-		if err != nil {
-			log.Error("discovery failed", slog.Any("err", err))
-			response.InternalError(wri, err)
-			return
+		c := cache.FromContext(req.Context())
+
+		// Try discovery from cache first.
+		var gvrs []schema.GroupVersionResource
+		discoveryCacheKey := cache.DiscoveryKey(cat)
+		if c != nil {
+			if hit, rerr := c.Get(req.Context(), discoveryCacheKey, &gvrs); hit && rerr == nil {
+				log.Debug("discovery cache hit", slog.String("category", cat))
+			} else {
+				gvrs = nil
+			}
 		}
-		log.Debug(fmt.Sprintf("discovery terminated (found: %d)", len(res)))
+
+		if len(gvrs) == 0 {
+			log.Debug("performing discovery", slog.String("category", cat))
+			discovered, err := cli.Discover(context.Background(), cat)
+			if err != nil {
+				log.Error("discovery failed", slog.Any("err", err))
+				response.InternalError(wri, err)
+				return
+			}
+			gvrs = discovered
+			if c != nil && len(gvrs) > 0 {
+				_ = c.Set(req.Context(), discoveryCacheKey, gvrs)
+			}
+		}
+
+		log.Debug(fmt.Sprintf("discovery terminated (found: %d)", len(gvrs)))
 
 		rt := []unstructured.Unstructured{}
 
-		for _, gvr := range res {
+		for _, gvr := range gvrs {
+			listCacheKey := cache.ListKey(gvr, ns)
+
+			// Try list from shared cache.
+			if c != nil {
+				var cached unstructured.UnstructuredList
+				if hit, rerr := c.Get(req.Context(), listCacheKey, &cached); hit && rerr == nil {
+					cache.GlobalMetrics.ListHits.Add(1)
+					log.Debug("list cache hit", slog.String("gvr", gvr.String()))
+					for _, x := range cached.Items {
+						unstructured.RemoveNestedField(x.UnstructuredContent(), "metadata", "managedFields")
+						rt = append(rt, x)
+					}
+					continue
+				}
+				cache.GlobalMetrics.ListMisses.Add(1)
+			}
+
 			opts := dynamic.Options{
 				Namespace: ns,
 				GVR:       gvr,
@@ -94,9 +132,12 @@ func List() http.HandlerFunc {
 				continue
 			}
 
+			if c != nil {
+				_ = c.SetForGVR(req.Context(), gvr, listCacheKey, obj)
+			}
+
 			for _, x := range obj.Items {
-				unstructured.RemoveNestedField(
-					x.UnstructuredContent(), "metadata", "managedFields")
+				unstructured.RemoveNestedField(x.UnstructuredContent(), "metadata", "managedFields")
 				rt = append(rt, x)
 			}
 		}

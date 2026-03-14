@@ -27,6 +27,9 @@ func extractOpenAPISchemaFromCRD(crd map[string]any, version string) (*apiextens
 			continue
 		}
 
+		// Prefer the widgetData sub-schema when present (CRD has a nested
+		// spec.properties.widgetData path); fall back to the full openAPIV3Schema
+		// for CRDs that carry the schema at the top level.
 		schemaData, exists, err := maps.NestedMap(versionMap,
 			"schema", "openAPIV3Schema",
 			"properties", "spec", "properties", widgetDataKey)
@@ -34,7 +37,13 @@ func extractOpenAPISchemaFromCRD(crd map[string]any, version string) (*apiextens
 			return nil, err
 		}
 		if !exists {
-			return nil, fmt.Errorf("schema OpenAPI v3 not found for version: %s", version)
+			schemaData, exists, err = maps.NestedMap(versionMap, "schema", "openAPIV3Schema")
+			if err != nil {
+				return nil, err
+			}
+			if !exists {
+				return nil, fmt.Errorf("schema OpenAPI v3 not found for version: %s", version)
+			}
 		}
 
 		return buildValidationFromSchemaData(schemaData)
