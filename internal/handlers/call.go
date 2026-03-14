@@ -18,6 +18,7 @@ import (
 	"github.com/krateoplatformops/plumbing/http/request"
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/ptr"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -73,7 +74,6 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	}
 
 	log := xcontext.Logger(req.Context())
-
 	start := time.Now()
 
 	ep, err := xcontext.UserConfig(req.Context())
@@ -85,6 +85,31 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	ep.Debug = r.verbose
 
 	log.Debug("user config succesfully loaded", slog.Any("endpoint", ep))
+
+	c := cache.FromContext(req.Context())
+
+	// Only cache GET (read-only) requests.
+	if strings.ToUpper(opts.verb) == http.MethodGet {
+		cacheKey := callCacheKey(opts)
+		if c != nil {
+			// Negative cache check.
+			if c.GetNotFound(req.Context(), cacheKey) {
+				cache.GlobalMetrics.RawMisses.Add(1)
+				response.NotFound(wri, fmt.Errorf("resource not found (cached)"))
+				return
+			}
+			// Positive cache check.
+			if raw, hit, rerr := c.GetRaw(req.Context(), cacheKey); hit && rerr == nil {
+				cache.GlobalMetrics.RawHits.Add(1)
+				log.Debug("cache hit", slog.String("key", cacheKey))
+				wri.Header().Set("Content-Type", "application/json")
+				wri.WriteHeader(http.StatusOK)
+				_, _ = wri.Write(raw)
+				return
+			}
+			cache.GlobalMetrics.RawMisses.Add(1)
+		}
+	}
 
 	dict := map[string]any{}
 	callOpts := request.RequestOptions{
@@ -107,6 +132,9 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 
 	rt := request.Do(req.Context(), callOpts)
 	if rt.Status == response.StatusFailure {
+		if rt.Code == http.StatusNotFound && strings.ToUpper(opts.verb) == http.MethodGet && c != nil {
+			_ = c.SetNotFound(req.Context(), callCacheKey(opts))
+		}
 		log.Error("unable to call endpoint",
 			slog.String("verb", strings.ToUpper(opts.verb)),
 			slog.String("uri", uri),
@@ -121,6 +149,22 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		slog.String("duration", util.ETA(start)),
 	)
 
+	// Cache successful GET responses.
+	if strings.ToUpper(opts.verb) == http.MethodGet && c != nil && len(dict) > 0 {
+		if raw, merr := json.Marshal(dict); merr == nil {
+			_ = c.SetRaw(req.Context(), callCacheKey(opts), raw)
+		}
+	}
+
+	// Invalidate cache for mutating operations.
+	if has([]string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}, opts.verb) && c != nil {
+		getKey := cache.GetKey(opts.gvr, opts.nsn.Namespace, opts.nsn.Name)
+		listKey := cache.ListKey(opts.gvr, opts.nsn.Namespace)
+		_ = c.Delete(req.Context(), getKey, listKey, cache.ListKey(opts.gvr, ""))
+		slog.Debug("cache invalidated after mutation",
+			slog.String("verb", opts.verb), slog.String("getKey", getKey))
+	}
+
 	wri.Header().Set("Content-Type", "application/json")
 	wri.WriteHeader(http.StatusOK)
 
@@ -129,6 +173,10 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	if err := enc.Encode(dict); err != nil {
 		log.Error("unable to serve api call response", slog.Any("err", err))
 	}
+}
+
+func callCacheKey(opts callOptions) string {
+	return cache.GetKey(opts.gvr, opts.nsn.Namespace, opts.nsn.Name)
 }
 
 func (r *callHandler) validateRequest(req *http.Request) (opts callOptions, err error) {
@@ -204,7 +252,6 @@ func buildURIPath(opts callOptions) (string, error) {
 		uriPath = path.Join(uriPath, opts.nsn.Name)
 	}
 
-	// Aggiunta dei query parametri, se necessario
 	query := url.Values{}
 	if opts.perPage > 0 {
 		query.Set("perPage", strconv.Itoa(opts.perPage))
@@ -226,7 +273,6 @@ func has(s []string, e string) bool {
 			return true
 		}
 	}
-
 	return false
 }
 

@@ -18,10 +18,12 @@ import (
 	"github.com/krateoplatformops/plumbing/server/use/cors"
 	"github.com/krateoplatformops/plumbing/slogs/pretty"
 	_ "github.com/krateoplatformops/snowplow/docs"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers"
 	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
 	httpSwagger "github.com/swaggo/http-swagger"
+	"k8s.io/client-go/rest"
 )
 
 const (
@@ -46,6 +48,10 @@ func main() {
 	signKey := flag.String("jwt-sign-key", env.String("JWT_SIGN_KEY", ""), "secret key used to sign JWT tokens")
 	jqModPath := flag.String("jq-modules-path", env.String(jqsupport.EnvModulesPath, ""),
 		"loads JQ custom modules from the filesystem")
+	warmupConfigPath := flag.String("warmup-config", env.String("WARMUP_CONFIG", "/etc/snowplow/cache-warmup.yaml"),
+		"path to cache warmup YAML config")
+	resourceTTL := flag.Duration("resource-ttl", env.Duration("RESOURCE_TTL", cache.DefaultResourceTTL),
+		"default TTL for cached Kubernetes resources")
 
 	flag.Usage = func() {
 		fmt.Fprintln(flag.CommandLine.Output(), "Flags:")
@@ -82,8 +88,39 @@ func main() {
 	}
 
 	log := slog.New(lh)
+	slog.SetDefault(log)
 	if *debugOn {
 		log.Debug("environment variables", slog.Any("env", os.Environ()))
+	}
+
+	// Build a Redis cache (sidecar at localhost:6379).
+	redisCache := cache.New(*resourceTTL)
+	ctx, stop := signal.NotifyContext(context.Background(), []os.Signal{
+		os.Interrupt,
+		syscall.SIGINT,
+		syscall.SIGTERM,
+		syscall.SIGKILL,
+		syscall.SIGHUP,
+		syscall.SIGQUIT,
+	}...)
+	defer stop()
+
+	if err := redisCache.Ping(ctx); err != nil {
+		log.Warn("redis not available; caching disabled", slog.Any("err", err))
+		redisCache = nil
+	} else {
+		log.Info("redis connected", slog.String("addr", "localhost:6379"))
+		go startBackgroundServices(ctx, log, redisCache, *authnNS, *warmupConfigPath)
+	}
+
+	// Middleware that injects the cache into every request context.
+	withCache := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if redisCache != nil {
+				r = r.WithContext(cache.WithCache(r.Context(), redisCache))
+			}
+			next.ServeHTTP(w, r)
+		})
 	}
 
 	chain := use.NewChain(
@@ -94,32 +131,23 @@ func main() {
 	mux := http.NewServeMux()
 
 	mux.Handle("GET /swagger/", httpSwagger.WrapHandler)
-	//mux.Handle("POST /convert", chain.Then(handlers.Converter()))
 
 	mux.Handle("GET /health", handlers.HealthCheck(serviceName, build, kubeutil.ServiceAccountNamespace))
+	mux.Handle("GET /metrics/cache", chain.Then(handlers.CacheMetrics()))
 	mux.Handle("GET /api-info/names", chain.Then(handlers.Plurals()))
-	mux.Handle("GET /list", chain.Append(use.UserConfig(*signKey, *authnNS)).Then(handlers.List()))
+	mux.Handle("GET /list", chain.Append(use.UserConfig(*signKey, *authnNS), withCache).Then(handlers.List()))
 
 	mux.Handle("GET /call", chain.Append(
 		use.UserConfig(*signKey, *authnNS),
+		withCache,
 		handlers.Dispatcher(dispatchers.All())).
 		Then(handlers.Call()))
-	mux.Handle("POST /call", chain.Append(use.UserConfig(*signKey, *authnNS)).Then(handlers.Call()))
-	mux.Handle("PUT /call", chain.Append(use.UserConfig(*signKey, *authnNS)).Then(handlers.Call()))
-	mux.Handle("PATCH /call", chain.Append(use.UserConfig(*signKey, *authnNS)).Then(handlers.Call()))
-	mux.Handle("DELETE /call", chain.Append(use.UserConfig(*signKey, *authnNS)).Then(handlers.Call()))
+	mux.Handle("POST /call", chain.Append(use.UserConfig(*signKey, *authnNS), withCache).Then(handlers.Call()))
+	mux.Handle("PUT /call", chain.Append(use.UserConfig(*signKey, *authnNS), withCache).Then(handlers.Call()))
+	mux.Handle("PATCH /call", chain.Append(use.UserConfig(*signKey, *authnNS), withCache).Then(handlers.Call()))
+	mux.Handle("DELETE /call", chain.Append(use.UserConfig(*signKey, *authnNS), withCache).Then(handlers.Call()))
 
 	mux.Handle("POST /jq", chain.Append(use.UserConfig(*signKey, *authnNS)).Then(handlers.JQ()))
-
-	ctx, stop := signal.NotifyContext(context.Background(), []os.Signal{
-		os.Interrupt,
-		syscall.SIGINT,
-		syscall.SIGTERM,
-		syscall.SIGKILL,
-		syscall.SIGHUP,
-		syscall.SIGQUIT,
-	}...)
-	defer stop()
 
 	server := &http.Server{
 		Addr: fmt.Sprintf(":%d", *port),
@@ -135,7 +163,7 @@ func main() {
 			},
 			ExposedHeaders:   []string{"Link"},
 			AllowCredentials: true,
-			MaxAge:           300, // Maximum value not ignored by any of major browsers
+			MaxAge:           300,
 		})(mux),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 50 * time.Second,
@@ -150,21 +178,77 @@ func main() {
 		}
 	}()
 
-	// Listen for the interrupt signal.
 	log.Info("server is ready to handle requests", slog.String("addr", server.Addr))
 	<-ctx.Done()
 
-	// Restore default behavior on the interrupt signal and notify user of shutdown.
 	stop()
 	log.Info("server is shutting down gracefully, press Ctrl+C again to force")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	shutCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	server.SetKeepAlivesEnabled(false)
-	if err := server.Shutdown(ctx); err != nil {
+	if err := server.Shutdown(shutCtx); err != nil {
 		log.Error("server forced to shutdown", slog.Any("err", err))
 	}
 
 	log.Info("server gracefully stopped")
+}
+
+// startBackgroundServices sets up the four-phase cache startup sequence.
+func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.RedisCache, authnNS, warmupConfigPath string) {
+	rc, err := rest.InClusterConfig()
+	if err != nil {
+		log.Warn("not running in-cluster; background cache services disabled", slog.Any("err", err))
+		return
+	}
+
+	// Phase 1: Start watchers.
+	resourceWatcher, err := cache.NewResourceWatcher(c, rc)
+	if err != nil {
+		log.Error("failed to create resource watcher", slog.Any("err", err))
+		return
+	}
+
+	c.SetGVRNotifier(resourceWatcher.AddGVR)
+
+	resourceWatcher.StartExpiryRefresh(ctx)
+	resourceWatcher.Start(ctx)
+
+	rbacWatcher := cache.NewRBACWatcher(c, rc)
+	if err := rbacWatcher.Start(ctx); err != nil {
+		log.Warn("failed to start RBAC watcher", slog.Any("err", err))
+	}
+
+	if authnNS != "" {
+		userWatcher := cache.NewUserSecretWatcher(c, rc, authnNS)
+		if err := userWatcher.Start(ctx); err != nil {
+			log.Warn("failed to start user secret watcher", slog.Any("err", err))
+		}
+	}
+
+	// Phase 2: Load warmup config and pre-register GVRs (triggers informer startup).
+	warmer := cache.NewWarmer(c, rc)
+	warmupCfg, err := cache.LoadWarmupConfig(warmupConfigPath)
+	if err != nil {
+		log.Warn("warmup config not loaded; using empty config",
+			slog.String("path", warmupConfigPath), slog.Any("err", err))
+	} else {
+		warmer.SetWarmupConfig(warmupCfg)
+		warmer.PreRegisterGVRs(ctx)
+	}
+
+	// Phase 3: Wait for informers to complete their initial list-and-watch sync.
+	log.Info("waiting for informer caches to sync...")
+	syncCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	if resourceWatcher.WaitForSync(syncCtx) {
+		log.Info("informer caches synced")
+	} else {
+		log.Warn("informer caches did not sync within timeout; proceeding with warmup anyway")
+	}
+
+	// Phase 4: Run warmup.
+	log.Info("starting cache warmup")
+	warmer.Run(ctx)
 }

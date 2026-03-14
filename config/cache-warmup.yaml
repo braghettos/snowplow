@@ -1,0 +1,39 @@
+warmup:
+  # GVRs to pre-populate in the shared cache at startup.
+  # All List calls are cluster-wide; per-namespace lists are derived automatically.
+  # Optional per-GVR TTL overrides (default: 1h).
+  gvrs:
+    - group: krateo.io
+      version: v1alpha1
+      resource: compositions
+    - group: krateo.io
+      version: v1alpha1
+      resource: compositiondefinitions
+    - group: templates.krateo.io
+      version: v1alpha1
+      resource: restactions
+    - group: templates.krateo.io
+      version: v1alpha1
+      resource: widgets
+    - group: ""
+      version: v1
+      resource: configmaps
+      ttl: 6h
+    - group: ""
+      version: v1
+      resource: secrets
+      ttl: 30m
+    - group: ""
+      version: v1
+      resource: namespaces
+      ttl: 24h
+    - group: apps
+      version: v1
+      resource: deployments
+    - group: ""
+      version: v1
+      resource: pods
+
+  # API server discovery categories to cache at startup.
+  categories:
+    - krateoplatformops
