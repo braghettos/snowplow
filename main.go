@@ -110,7 +110,9 @@ func main() {
 		redisCache = nil
 	} else {
 		log.Info("redis connected", slog.String("addr", "localhost:6379"))
-		go startBackgroundServices(ctx, log, redisCache, *authnNS, *warmupConfigPath)
+		// Run synchronously: the HTTP server does not start until warmup completes,
+		// guaranteeing a fully warm cache before the first request is served.
+		startBackgroundServices(ctx, log, redisCache, *authnNS, *warmupConfigPath)
 	}
 
 	// Middleware that injects the cache into every request context.

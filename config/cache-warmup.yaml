@@ -1,39 +1,99 @@
 warmup:
-  # GVRs to pre-populate in the shared cache at startup.
-  # All List calls are cluster-wide; per-namespace lists are derived automatically.
-  # Optional per-GVR TTL overrides (default: 1h).
+  # GVRs derived from the krateoplatformops-blueprints/portal chart (v1.1.0).
+  # Every resource kind rendered by the portal blueprint is listed here so that
+  # snowplow's cache is fully warm before the first request is served.
   gvrs:
-    - group: krateo.io
-      version: v1alpha1
-      resource: compositions
-    - group: krateo.io
+
+    # ── RESTActions (templates.krateo.io/v1) ─────────────────────────────────
+    # All API calls wired into pages/panels go through RESTActions.
+    - group: templates.krateo.io
+      version: v1
+      resource: restactions
+      ttl: 6h
+
+    # ── Widgets (widgets.templates.krateo.io/v1beta1) ─────────────────────────
+    # Every widget kind used by the portal blueprint.
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: pages
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: panels
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: rows
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: columns
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: buttons
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: buttongroups
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: datagrids
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: filters
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: navmenus
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: navmenuitems
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: piecharts
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: routes
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: routesloaders
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: tables
+
+    # ── Core Krateo types ─────────────────────────────────────────────────────
+    - group: core.krateo.io
       version: v1alpha1
       resource: compositiondefinitions
-    - group: templates.krateo.io
+      ttl: 24h
+
+    - group: core.krateo.io
       version: v1alpha1
-      resource: restactions
-    - group: templates.krateo.io
-      version: v1alpha1
-      resource: widgets
-    - group: ""
-      version: v1
-      resource: configmaps
-      ttl: 6h
-    - group: ""
-      version: v1
-      resource: secrets
-      ttl: 30m
+      resource: schemadefinitions
+      ttl: 24h
+
+    # ── Kubernetes core resources ─────────────────────────────────────────────
     - group: ""
       version: v1
       resource: namespaces
       ttl: 24h
-    - group: apps
-      version: v1
-      resource: deployments
+
     - group: ""
       version: v1
-      resource: pods
+      resource: configmaps
+      ttl: 6h
 
-  # API server discovery categories to cache at startup.
+  # Discovery categories to pre-cache for the /list endpoint.
   categories:
     - krateoplatformops
+    - krateo
+    - widgets
