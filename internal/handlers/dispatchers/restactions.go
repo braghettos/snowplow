@@ -66,7 +66,8 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 					_, _ = wri.Write(raw)
 					return
 				}
-				cache.GlobalMetrics.RawMisses.Add(1)
+			cache.GlobalMetrics.RawMisses.Add(1)
+				log.Info("restaction: L1 miss", slog.String("key", resolvedKey))
 			}
 		}
 	}

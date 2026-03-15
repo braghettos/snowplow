@@ -248,17 +248,18 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				if tracker := cache.TrackerFromContext(ctx); tracker != nil {
 					tracker.AddL2Key(capturedKey)
 				}
-				cache.GlobalMetrics.RawMisses.Add(1)
-				if mu != nil {
-					mu.Lock()
-				}
-				werr := baseHandler(io.NopCloser(bytes.NewReader(data)))
-				if mu != nil {
-					mu.Unlock()
-				}
-				return werr
+			cache.GlobalMetrics.RawMisses.Add(1)
+			log.Info("api: L2+L3 miss (live HTTP)", slog.String("name", id), slog.String("path", call.Path), slog.String("key", capturedKey))
+			if mu != nil {
+				mu.Lock()
 			}
-			} else {
+			werr := baseHandler(io.NopCloser(bytes.NewReader(data)))
+			if mu != nil {
+				mu.Unlock()
+			}
+			return werr
+		}
+		} else {
 				plain := jsonHandler(ctx, jsonHandlerOptions{
 					key: id, out: dict, filter: apiCall.Filter,
 				})
