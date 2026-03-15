@@ -177,6 +177,21 @@ def widget_url(resource, name, namespace="krateo-system"):
             "&resource=" + resource + "&name=" + name + "&namespace=" + namespace)
 
 
+def pod_url(name, namespace="krateo-system"):
+    return "/call?apiVersion=v1&resource=pods&name=" + name + "&namespace=" + namespace
+
+
+def get_pod_names(namespace="krateo-system", count=3):
+    """Return up to `count` running pod names from the given namespace."""
+    rc, out, _ = kubectl("get", "pods", "-n", namespace,
+                         "--field-selector=status.phase=Running",
+                         "-o", "jsonpath={.items[*].metadata.name}")
+    if rc != 0 or not out.strip():
+        return []
+    names = out.strip().split()
+    return names[:count]
+
+
 def kubectl(*args, **kwargs):
     input_data = kwargs.get("input_data")
     proc = subprocess.run(
@@ -404,19 +419,103 @@ def test_with_cache(token):
                code == 200 and (raw_delta >= 1 or ms < 150), ms, code,
                "raw_hits+%d" % raw_delta)
 
+    # -------------------------------------------------------------------------
+    section("S10 -- Cache ON: GET pods (core K8s resource caching)")
+    # -------------------------------------------------------------------------
+    pod_names = get_pod_names("krateo-system", 3)
+    if not pod_names:
+        record("GET pods: no running pods found", False, 0, 0, "skip")
+    else:
+        info("Found %d pods: %s" % (len(pod_names), ", ".join(pod_names)))
+
+        # Warmup pass: first GET populates the cache for each pod.
+        for pn in pod_names:
+            http_get(pod_url(pn), token)
+
+        # Second pass: each GET should be a cache hit.
+        for pn in pod_names:
+            m0 = cache_metrics(token)
+            ms, code, body = http_get(pod_url(pn), token)
+            m1 = cache_metrics(token)
+            hits_delta = m_total_hits(m1) - m_total_hits(m0)
+            kind_ok = isinstance(body, dict) and body.get("kind") == "Pod"
+            record("GET pod %s (cache hit)" % pn[:30],
+                   code == 200 and (hits_delta >= 1 or ms < 150) and kind_ok,
+                   ms, code,
+                   "hits+%d kind=%s" % (hits_delta, "Pod" if kind_ok else body.get("kind", "?") if body else "?"))
+
+        # Verify the pods GVR was auto-registered for informer watching
+        # by checking that a third GET is still a hit (informer didn't evict).
+        time.sleep(1)
+        pn = pod_names[0]
+        m0 = cache_metrics(token)
+        ms, code, _ = http_get(pod_url(pn), token)
+        m1 = cache_metrics(token)
+        hits_delta = m_total_hits(m1) - m_total_hits(m0)
+        record("GET pod %s 3rd request (still cached)" % pn[:25],
+               code == 200 and (hits_delta >= 1 or ms < 150), ms, code,
+               "hits+%d" % hits_delta)
+
+    # -------------------------------------------------------------------------
+    section("S11 -- Cache ON: key expiry (negative cache TTL = 30s)")
+    # -------------------------------------------------------------------------
+    # The negative-cache sentinel has a 30s TTL in Redis. We verify:
+    # 1) First request for non-existent resource -> 404 from K8s API (slow)
+    # 2) Immediate second request -> 404 from negative cache (fast)
+    # 3) Wait 35s for the sentinel to expire
+    # 4) Third request -> 404 from K8s API again (slow, sentinel gone)
+    EXPIRY_FAKE = "expiry-test-resource-xyz"
+    info("Step 1: first request (K8s API miss, stores 30s sentinel)...")
+    ms1, code1, _ = http_get(call_url(TEST_NS, EXPIRY_FAKE), token)
+    record("TTL S1: 1st request (K8s API, stores sentinel)",
+           code1 in (404, 500), ms1, code1, "expected 404")
+
+    time.sleep(0.5)
+    info("Step 2: immediate re-request (negative cache hit)...")
+    m0 = cache_metrics(token)
+    ms2, code2, _ = http_get(call_url(TEST_NS, EXPIRY_FAKE), token)
+    m1 = cache_metrics(token)
+    neg_delta = m_neg_hits(m1) - m_neg_hits(m0)
+    record("TTL S2: 2nd request (negative cache, fast)",
+           code2 in (404, 500) and ms2 < ms1, ms2, code2,
+           "negative_hits+%d saved=%dms" % (neg_delta, ms1 - ms2))
+
+    info("Step 3: waiting 35s for sentinel TTL to expire...")
+    time.sleep(35)
+
+    info("Step 4: post-expiry request (K8s API again, sentinel gone)...")
+    m0 = cache_metrics(token)
+    ms3, code3, _ = http_get(call_url(TEST_NS, EXPIRY_FAKE), token)
+    m1 = cache_metrics(token)
+    neg_delta_after = m_neg_hits(m1) - m_neg_hits(m0)
+    # After expiry the sentinel is gone, so this should NOT be a negative hit.
+    # It goes to K8s API again and is slower than the cached request (ms2).
+    record("TTL S3: 3rd request post-expiry (K8s API, not cached)",
+           code3 in (404, 500) and neg_delta_after == 0,
+           ms3, code3,
+           "negative_hits+%d (expect 0)" % neg_delta_after)
+    record("TTL: post-expiry is slower than cached",
+           ms3 > ms2, 0, 0,
+           "cached=%dms expired=%dms" % (ms2, ms3))
+
 
 def test_without_cache(token):
     """Run core operations with cache disabled -- all must succeed via K8s API."""
     # -------------------------------------------------------------------------
     section("S8 -- Cache OFF: all K8s API calls must succeed")
     # -------------------------------------------------------------------------
+    pod_names = get_pod_names("krateo-system", 1)
+    pod_case = []
+    if pod_names:
+        pod_case = [("GET pod %s (no cache)" % pod_names[0][:20],
+                     pod_url(pod_names[0]), False)]
     cases = [
         ("GET warmed resource (no cache)",   call_url(TEST_NS, TEST_NAME_WARM), False),
         ("GET non-existent (no cache)",      call_url(TEST_NS, "does-not-exist-xyz"), True),
         ("Widget pages (no cache)",          widget_url("pages",    "dashboard-page"), False),
         ("Widget nav-menu (no cache)",       widget_url("navmenus", "sidebar-nav-menu"), False),
         ("Widget table-comps (no cache)",    widget_url("tables",   "dashboard-compositions-panel-row-table"), False),
-    ]
+    ] + pod_case
     nocache_times = {}
     for label, path, expect_404 in cases:
         ms, code, body = http_get(path, token, timeout=60)

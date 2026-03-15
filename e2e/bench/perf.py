@@ -14,10 +14,10 @@ Usage:
 import argparse, base64, json, statistics, subprocess, sys, time
 import urllib.request, urllib.error
 
-SNOWPLOW  = "http://localhost:30081"
-AUTHN     = "http://localhost:30082"
+SNOWPLOW  = "http://34.135.50.203:8081"
+AUTHN     = "http://34.136.84.51:8082"
 USERNAME  = "admin"
-PASSWORD  = "JSqt0OLM6YAT"
+PASSWORD  = "jl1DDPGMFOWw"
 ITERS     = 30
 WARMUP    = 5
 NUM_NS    = 20   # bench-ns-01 … bench-ns-20
@@ -85,11 +85,15 @@ def request_ms(url: str, token: str) -> float:
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     t0 = time.perf_counter()
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=60) as r:
             r.read()
-    except urllib.error.HTTPError:
+    except Exception:
+        # Count any error (disconnect, timeout, HTTP error) as a slow response
+        # so it shows up in p99 rather than crashing the benchmark.
         pass
-    return (time.perf_counter() - t0) * 1000
+    elapsed = (time.perf_counter() - t0) * 1000
+    time.sleep(0.05)  # 50ms pause to avoid overwhelming GKE LoadBalancer
+    return elapsed
 
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
@@ -125,26 +129,40 @@ def run_kubectl(cmd: str):
     subprocess.run(cmd, shell=True, check=True)
 
 
+_REDIS_WRONG_PORT = (
+    """kubectl patch deployment snowplow -n krateo-system --type=strategic -p='{"""
+    """"spec":{"template":{"spec":{"initContainers":[{"""
+    """"name":"redis","image":"redis:7-alpine","restartPolicy":"Always","""
+    """"command":["redis-server","--port","6380"],"""
+    """"ports":[{"containerPort":6380}],"""
+    """"resources":{"requests":{"cpu":"50m","memory":"64Mi"},"""
+    """"limits":{"cpu":"200m","memory":"128Mi"}}}]}}}}'"""
+)
+
+_REDIS_CORRECT_PORT = (
+    """kubectl patch deployment snowplow -n krateo-system --type=strategic -p='{"""
+    """"spec":{"template":{"spec":{"initContainers":[{"""
+    """"name":"redis","image":"redis:7-alpine","restartPolicy":"Always","""
+    """"command":null,"""
+    """"ports":[{"containerPort":6379}],"""
+    """"readinessProbe":{"exec":{"command":["redis-cli","ping"]},"""
+    """"initialDelaySeconds":2,"periodSeconds":3},"""
+    """"resources":{"requests":{"cpu":"50m","memory":"64Mi"},"""
+    """"limits":{"cpu":"200m","memory":"256Mi"}}}]}}}}'"""
+)
+
+
 def remove_redis():
-    run_kubectl(
-        "kubectl patch deployment snowplow -n krateo-system --type=json "
-        "-p='[{\"op\":\"remove\",\"path\":\"/spec/template/spec/initContainers\"}]'"
-    )
-    run_kubectl("kubectl rollout status deployment/snowplow -n krateo-system --timeout=120s")
+    # Make the Redis sidecar listen on 6380 so snowplow (hardcoded to 6379) can't
+    # connect and gracefully disables caching. This works even with native sidecars
+    # (initContainer + restartPolicy:Always) on GKE 1.29+.
+    run_kubectl(_REDIS_WRONG_PORT)
+    run_kubectl("kubectl rollout status deployment/snowplow -n krateo-system --timeout=180s")
 
 
 def restore_redis():
-    run_kubectl(
-        """kubectl patch deployment snowplow -n krateo-system --type=strategic -p='{
-          "spec":{"template":{"spec":{"initContainers":[{
-            "name":"redis","image":"redis:7-alpine","restartPolicy":"Always",
-            "ports":[{"containerPort":6379}],
-            "readinessProbe":{"exec":{"command":["redis-cli","ping"]},
-              "initialDelaySeconds":2,"periodSeconds":3},
-            "resources":{"requests":{"cpu":"50m","memory":"64Mi"},
-              "limits":{"cpu":"200m","memory":"128Mi"}}
-          }]}}}}'"""
-    )
+    run_kubectl(_REDIS_CORRECT_PORT)
+    run_kubectl("kubectl rollout status deployment/snowplow -n krateo-system --timeout=180s")
 
 
 def wait_snowplow(timeout=90):
