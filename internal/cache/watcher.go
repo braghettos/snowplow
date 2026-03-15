@@ -188,14 +188,15 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	}
 
 	// Targeted L1+L2 invalidation: only delete resolved/http entries that
-	// depend on the GVR that just changed. The reverse indexes
-	// (snowplow:l1gvr:<gvr> and snowplow:l2gvr:<gvr>) are populated by the
-	// resolution pipeline when it writes L1/L2 entries.
+	// depend on the GVR that just changed. After deleting the cache entries,
+	// also delete the reverse-index SET so it doesn't accumulate stale
+	// members across invalidation cycles. The next resolution pass will
+	// re-populate a clean SET via SAddWithTTL.
 	gvrKey := GVRToKey(gvr)
 	for _, prefix := range []string{"snowplow:l1gvr:", "snowplow:l2gvr:"} {
 		idxKey := prefix + gvrKey
 		if keys, serr := rw.cache.SMembers(ctx, idxKey); serr == nil && len(keys) > 0 {
-			_ = rw.cache.Delete(ctx, keys...)
+			_ = rw.cache.Delete(ctx, append(keys, idxKey)...)
 			slog.Debug("resource-watcher: targeted invalidation",
 				slog.String("index", idxKey),
 				slog.Int("count", len(keys)))

@@ -105,6 +105,13 @@ func main() {
 	}...)
 	defer stop()
 
+	// In-cluster config used by the CachedUserConfig middleware and background
+	// services. Created once to avoid re-reading service account files per request.
+	sarc, sarcErr := rest.InClusterConfig()
+	if sarcErr != nil {
+		log.Warn("not running in-cluster; some features disabled", slog.Any("err", sarcErr))
+	}
+
 	if err := redisCache.Ping(ctx); err != nil {
 		log.Warn("redis not available; caching disabled", slog.Any("err", err))
 		redisCache = nil
@@ -137,19 +144,21 @@ func main() {
 	mux.Handle("GET /health", handlers.HealthCheck(serviceName, build, kubeutil.ServiceAccountNamespace))
 	mux.Handle("GET /metrics/cache", chain.Then(handlers.CacheMetrics()))
 	mux.Handle("GET /api-info/names", chain.Then(handlers.Plurals()))
-	mux.Handle("GET /list", chain.Append(use.UserConfig(*signKey, *authnNS), withCache).Then(handlers.List()))
+	userCfg := handlers.CachedUserConfig(*signKey, *authnNS, sarc, redisCache)
+
+	mux.Handle("GET /list", chain.Append(userCfg, withCache).Then(handlers.List()))
 
 	mux.Handle("GET /call", chain.Append(
-		use.UserConfig(*signKey, *authnNS),
+		userCfg,
 		withCache,
 		handlers.Dispatcher(dispatchers.All())).
 		Then(handlers.Call()))
-	mux.Handle("POST /call", chain.Append(use.UserConfig(*signKey, *authnNS), withCache).Then(handlers.Call()))
-	mux.Handle("PUT /call", chain.Append(use.UserConfig(*signKey, *authnNS), withCache).Then(handlers.Call()))
-	mux.Handle("PATCH /call", chain.Append(use.UserConfig(*signKey, *authnNS), withCache).Then(handlers.Call()))
-	mux.Handle("DELETE /call", chain.Append(use.UserConfig(*signKey, *authnNS), withCache).Then(handlers.Call()))
+	mux.Handle("POST /call", chain.Append(userCfg, withCache).Then(handlers.Call()))
+	mux.Handle("PUT /call", chain.Append(userCfg, withCache).Then(handlers.Call()))
+	mux.Handle("PATCH /call", chain.Append(userCfg, withCache).Then(handlers.Call()))
+	mux.Handle("DELETE /call", chain.Append(userCfg, withCache).Then(handlers.Call()))
 
-	mux.Handle("POST /jq", chain.Append(use.UserConfig(*signKey, *authnNS)).Then(handlers.JQ()))
+	mux.Handle("POST /jq", chain.Append(userCfg).Then(handlers.JQ()))
 
 	server := &http.Server{
 		Addr: fmt.Sprintf(":%d", *port),

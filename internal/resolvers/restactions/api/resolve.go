@@ -159,55 +159,94 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			if c != nil && verb == http.MethodGet {
 				httpKey := cache.HTTPUserKey(user.Username, verb, call.Path)
 
-				if raw, hit, _ := c.GetRaw(ctx, httpKey); hit {
-					handler := jsonHandler(ctx, jsonHandlerOptions{
-						key: id, out: dict, filter: apiCall.Filter,
-					})
+			if raw, hit, _ := c.GetRaw(ctx, httpKey); hit {
+				handler := jsonHandler(ctx, jsonHandlerOptions{
+					key: id, out: dict, filter: apiCall.Filter,
+				})
+				if tracker := cache.TrackerFromContext(ctx); tracker != nil {
+					tracker.AddL2Key(httpKey)
+				}
+				cache.GlobalMetrics.RawHits.Add(1)
+				log.Debug("api: L2 hit", slog.String("name", id), slog.String("path", call.Path))
+				if mu != nil {
+					mu.Lock()
+				}
+				herr := handler(io.NopCloser(bytes.NewReader(raw)))
+				if mu != nil {
+					mu.Unlock()
+				}
+				if herr != nil {
+					log.Warn("api: cached response handler error",
+						slog.String("key", httpKey), slog.Any("err", herr))
+				}
+				return true
+			}
+
+			// L2 miss → try L3 promotion: if the path maps to a K8s
+			// resource that the warmup or informer already cached in L3,
+			// serve from L3 and populate L2 — no API call needed.
+			if pathGVR, pathNS, pathName := cache.ParseK8sAPIPath(call.Path); pathGVR.Resource != "" {
+				var l3Key string
+				if pathName != "" {
+					l3Key = cache.GetKey(pathGVR, pathNS, pathName)
+				} else {
+					l3Key = cache.ListKey(pathGVR, pathNS)
+				}
+				if l3Raw, l3Hit, _ := c.GetRaw(ctx, l3Key); l3Hit && !cache.IsNotFoundRaw(l3Raw) {
+					_ = c.SetHTTPRaw(ctx, httpKey, l3Raw)
+					gvrKey := cache.GVRToKey(pathGVR)
+					_ = c.SAddWithTTL(ctx, cache.L2GVRKey(gvrKey), httpKey, cache.DefaultResourceTTL)
 					if tracker := cache.TrackerFromContext(ctx); tracker != nil {
 						tracker.AddL2Key(httpKey)
 					}
 					cache.GlobalMetrics.RawHits.Add(1)
-					log.Debug("api: cache hit", slog.String("name", id), slog.String("path", call.Path))
+					cache.GlobalMetrics.L3Promotions.Add(1)
+					log.Debug("api: L3→L2 promotion", slog.String("name", id), slog.String("l3", l3Key))
+					handler := jsonHandler(ctx, jsonHandlerOptions{
+						key: id, out: dict, filter: apiCall.Filter,
+					})
 					if mu != nil {
 						mu.Lock()
 					}
-					herr := handler(io.NopCloser(bytes.NewReader(raw)))
+					herr := handler(io.NopCloser(bytes.NewReader(l3Raw)))
 					if mu != nil {
 						mu.Unlock()
 					}
 					if herr != nil {
-						log.Warn("api: cached response handler error",
+						log.Warn("api: L3 promoted response handler error",
 							slog.String("key", httpKey), slog.Any("err", herr))
 					}
 					return true
 				}
+			}
 
-				baseHandler := jsonHandler(ctx, jsonHandlerOptions{
-					key: id, out: dict, filter: apiCall.Filter,
-				})
-				capturedKey := httpKey
-				call.ResponseHandler = func(r io.ReadCloser) error {
-					data, rerr := io.ReadAll(r)
-					if rerr != nil {
-						return rerr
-					}
-					_ = c.SetHTTPRaw(ctx, capturedKey, data)
-					if pathGVR, _, _ := cache.ParseK8sAPIPath(call.Path); pathGVR.Resource != "" {
-						_ = c.SAddWithTTL(ctx, cache.L2GVRKey(cache.GVRToKey(pathGVR)), capturedKey, cache.DefaultResourceTTL)
-					}
-					if tracker := cache.TrackerFromContext(ctx); tracker != nil {
-						tracker.AddL2Key(capturedKey)
-					}
-					cache.GlobalMetrics.RawMisses.Add(1)
-					if mu != nil {
-						mu.Lock()
-					}
-					werr := baseHandler(io.NopCloser(bytes.NewReader(data)))
-					if mu != nil {
-						mu.Unlock()
-					}
-					return werr
+			// True L2+L3 miss → HTTP call.
+			baseHandler := jsonHandler(ctx, jsonHandlerOptions{
+				key: id, out: dict, filter: apiCall.Filter,
+			})
+			capturedKey := httpKey
+			call.ResponseHandler = func(r io.ReadCloser) error {
+				data, rerr := io.ReadAll(r)
+				if rerr != nil {
+					return rerr
 				}
+				_ = c.SetHTTPRaw(ctx, capturedKey, data)
+				if pathGVR, _, _ := cache.ParseK8sAPIPath(call.Path); pathGVR.Resource != "" {
+					_ = c.SAddWithTTL(ctx, cache.L2GVRKey(cache.GVRToKey(pathGVR)), capturedKey, cache.DefaultResourceTTL)
+				}
+				if tracker := cache.TrackerFromContext(ctx); tracker != nil {
+					tracker.AddL2Key(capturedKey)
+				}
+				cache.GlobalMetrics.RawMisses.Add(1)
+				if mu != nil {
+					mu.Lock()
+				}
+				werr := baseHandler(io.NopCloser(bytes.NewReader(data)))
+				if mu != nil {
+					mu.Unlock()
+				}
+				return werr
+			}
 			} else {
 				plain := jsonHandler(ctx, jsonHandlerOptions{
 					key: id, out: dict, filter: apiCall.Filter,

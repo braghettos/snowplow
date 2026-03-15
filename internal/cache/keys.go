@@ -122,6 +122,13 @@ func L2GVRKey(gvrKey string) string {
 	return "snowplow:l2gvr:" + gvrKey
 }
 
+// UserConfigKey builds the per-user cache key for the Endpoint fetched from
+// the user's -clientconfig Secret. Invalidated by UserSecretWatcher when the
+// Secret changes.
+func UserConfigKey(username string) string {
+	return "snowplow:userconfig:" + username
+}
+
 // IsNotFoundRaw returns true if raw is the negative-cache sentinel.
 func IsNotFoundRaw(raw []byte) bool {
 	return string(raw) == notFoundSentinel

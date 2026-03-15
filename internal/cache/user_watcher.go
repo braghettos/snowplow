@@ -67,14 +67,11 @@ func (uw *UserSecretWatcher) onUpdate(ctx context.Context, secret *corev1.Secret
 	if !isClientConfig(secret) {
 		return
 	}
-	// Re-authentication issues a new JWT but does NOT change Kubernetes RBAC
-	// bindings, so cached SelfSubjectAccessReview results remain valid.
-	// We only refresh the user's membership in ActiveUsersKey so that the
-	// RBACWatcher can target this user when actual role changes occur.
 	username := usernameFromSecret(secret)
-	slog.Info("user-watcher: user re-authenticated, refreshing active-user registration",
+	slog.Info("user-watcher: user secret updated, invalidating cached config",
 		slog.String("username", username))
 	_ = uw.cache.SAddUser(ctx, username)
+	_ = uw.cache.Delete(ctx, UserConfigKey(username))
 }
 
 func (uw *UserSecretWatcher) onDelete(ctx context.Context, secret *corev1.Secret) {
@@ -82,9 +79,10 @@ func (uw *UserSecretWatcher) onDelete(ctx context.Context, secret *corev1.Secret
 		return
 	}
 	username := usernameFromSecret(secret)
-	slog.Info("user-watcher: user secret deleted, purging RBAC cache",
+	slog.Info("user-watcher: user secret deleted, purging caches",
 		slog.String("username", username))
 	_ = uw.cache.SRemUser(ctx, username)
+	_ = uw.cache.Delete(ctx, UserConfigKey(username))
 	uw.purgeRBACKeys(ctx, username)
 }
 
