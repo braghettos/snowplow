@@ -154,6 +154,9 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// The ResourceWatcher may have populated (or freshly updated) the key while
 	// we were waiting for the K8s API response, so we must not overwrite it with
 	// potentially stale bytes fetched before the mutation was visible.
+	// Additionally, auto-register every accessed GVR for dynamic informer
+	// watching so that no GVR needs to be manually listed in cache-warmup.yaml
+	// just to benefit from cache invalidation on mutations.
 	if strings.ToUpper(opts.verb) == http.MethodGet && c != nil && len(dict) > 0 {
 		ckey := callCacheKey(opts)
 		if !c.Exists(req.Context(), ckey) {
@@ -161,6 +164,9 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 				_ = c.SetRaw(req.Context(), ckey, raw)
 			}
 		}
+		// SAddGVR is a no-op if the GVR is already registered; the onNewGVR
+		// callback starts a dynamic informer only on first registration.
+		_ = c.SAddGVR(req.Context(), opts.gvr)
 	}
 
 	// Invalidate cache for mutating operations.

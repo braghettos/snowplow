@@ -114,6 +114,10 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 
 	if c != nil {
 		_ = c.SetForGVR(ctx, res.GVR, cacheKey, uns)
+		// Auto-register this GVR for dynamic informer watching so that any
+		// future mutations are reflected in the cache without requiring a
+		// manual entry in cache-warmup.yaml.
+		_ = c.SAddGVR(ctx, res.GVR)
 	}
 
 	res.Unstructured = uns

@@ -1,6 +1,8 @@
 warmup:
-  # GVRs derived from the krateoplatformops-blueprints/portal chart (v1.1.0)
-  # plus CompositionDefinitions across all 20 bench namespaces.
+  # GVRs to pre-populate at startup for zero cold miss on first user request.
+  # Only list "infrastructure" GVRs here (widgets, RESTActions, core Krateo
+  # types). All other GVRs are cached automatically on first access and then
+  # kept fresh by dynamically-started informers -- no manual entries needed.
   gvrs:
 
     # ── RESTActions ───────────────────────────────────────────────────────────
@@ -67,7 +69,6 @@ warmup:
       resource: tables
 
     # ── Core Krateo types ────────────────────────────────────────────────────
-    # Warmed cluster-wide (all namespaces including the 20 bench namespaces).
     - group: core.krateo.io
       version: v1alpha1
       resource: compositiondefinitions
