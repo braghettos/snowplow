@@ -37,6 +37,10 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 	}
 	res.GVR = gv.WithResource(ref.Resource)
 
+	if tracker := cache.TrackerFromContext(ctx); tracker != nil {
+		tracker.AddGVR(res.GVR)
+	}
+
 	ep, err := xcontext.UserConfig(ctx)
 	if err != nil {
 		log.Error("unable to get user endpoint", slog.Any("err", err))

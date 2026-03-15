@@ -88,7 +88,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		),
 	)
 
-	ctx := xcontext.BuildContext(req.Context())
+	tracker := cache.NewDependencyTracker()
+	ctx := cache.WithDependencyTracker(xcontext.BuildContext(req.Context()), tracker)
 
 	res, err := widgets.Resolve(ctx, widgets.ResolveOptions{
 		In:      got.Unstructured,
@@ -127,9 +128,13 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Populate the resolved cache for future requests.
+	// Populate the resolved cache and register GVR reverse indexes so that
+	// informer events can do targeted invalidation instead of bulk deletes.
 	if c != nil && resolvedKey != "" {
-		_ = c.SetRaw(req.Context(), resolvedKey, raw)
+		_ = c.SetResolvedRaw(req.Context(), resolvedKey, raw)
+		for _, gvrKey := range tracker.GVRKeys() {
+			_ = c.SAddWithTTL(req.Context(), cache.L1GVRKey(gvrKey), resolvedKey, cache.DefaultResourceTTL)
+		}
 	}
 
 	wri.Header().Set("Content-Type", "application/json")

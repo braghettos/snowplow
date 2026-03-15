@@ -26,7 +26,6 @@ type ResourceWatcher struct {
 	mu        sync.Mutex
 	watched   map[string]bool
 	appCtx    context.Context // long-lived process context; set by Start()
-	debouncer *derivedCacheDebouncer
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -39,7 +38,6 @@ func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error
 		dynClient: dynClient,
 		factory:   dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 0),
 		watched:   make(map[string]bool),
-		debouncer: newDerivedCacheDebouncer(c),
 	}, nil
 }
 
@@ -189,13 +187,19 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		}
 	}
 
-	// Only trigger derived-cache invalidation for events from informers that
-	// have completed their initial sync. Events during initial list or re-lists
-	// after watch failures (e.g. RBAC-forbidden GVRs like namespaces/configmaps)
-	// are not real changes and must not wipe resolved/http caches.
-	informer := rw.factory.ForResource(gvr).Informer()
-	if informer.HasSynced() {
-		rw.debouncer.schedule(ctx)
+	// Targeted L1+L2 invalidation: only delete resolved/http entries that
+	// depend on the GVR that just changed. The reverse indexes
+	// (snowplow:l1gvr:<gvr> and snowplow:l2gvr:<gvr>) are populated by the
+	// resolution pipeline when it writes L1/L2 entries.
+	gvrKey := GVRToKey(gvr)
+	for _, prefix := range []string{"snowplow:l1gvr:", "snowplow:l2gvr:"} {
+		idxKey := prefix + gvrKey
+		if keys, serr := rw.cache.SMembers(ctx, idxKey); serr == nil && len(keys) > 0 {
+			_ = rw.cache.Delete(ctx, keys...)
+			slog.Debug("resource-watcher: targeted invalidation",
+				slog.String("index", idxKey),
+				slog.Int("count", len(keys)))
+		}
 	}
 }
 
@@ -328,85 +332,3 @@ func toUnstructured(obj any) (*unstructured.Unstructured, bool) {
 	return nil, false
 }
 
-// ── Derived-cache debouncer ───────────────────────────────────────────────────
-//
-// Informer events can fire at very high rates (initial list, bulk operations,
-// status reconciliation across many GVRs). Invalidating resolved:* and http:*
-// on every single event prevents those caches from ever accumulating entries.
-//
-// The debouncer has three mechanisms:
-//  1. Quiet period: waits for a pause in events before flushing.
-//  2. Max delay cap: forces a flush under continuous event pressure.
-//  3. Cooldown: after a flush (which empties the caches), events are ignored
-//     for a cooldown window. Re-flushing empty caches is pointless, and this
-//     gives the caches time to populate and serve hits.
-
-const (
-	debouncerQuietPeriod = 2 * time.Second
-	debouncerMaxDelay    = 10 * time.Second
-	debouncerCooldown    = 30 * time.Second
-)
-
-type derivedCacheDebouncer struct {
-	mu         sync.Mutex
-	pending    bool
-	quietTimer *time.Timer
-	maxTimer   *time.Timer
-	lastFlush  time.Time
-	cache      *RedisCache
-}
-
-func newDerivedCacheDebouncer(c *RedisCache) *derivedCacheDebouncer {
-	return &derivedCacheDebouncer{cache: c}
-}
-
-func (d *derivedCacheDebouncer) schedule(ctx context.Context) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if !d.lastFlush.IsZero() && time.Since(d.lastFlush) < debouncerCooldown {
-		return
-	}
-
-	if d.quietTimer != nil {
-		d.quietTimer.Stop()
-	}
-	d.quietTimer = time.AfterFunc(debouncerQuietPeriod, func() {
-		d.flush(ctx)
-	})
-
-	if !d.pending {
-		d.pending = true
-		d.maxTimer = time.AfterFunc(debouncerMaxDelay, func() {
-			d.flush(ctx)
-		})
-	}
-}
-
-func (d *derivedCacheDebouncer) flush(ctx context.Context) {
-	d.mu.Lock()
-	if !d.pending {
-		d.mu.Unlock()
-		return
-	}
-	d.pending = false
-	d.lastFlush = time.Now()
-	if d.quietTimer != nil {
-		d.quietTimer.Stop()
-		d.quietTimer = nil
-	}
-	if d.maxTimer != nil {
-		d.maxTimer.Stop()
-		d.maxTimer = nil
-	}
-	d.mu.Unlock()
-
-	for _, pattern := range []string{AllResolvedPattern, AllHTTPPattern} {
-		if err := d.cache.DeletePattern(ctx, pattern); err != nil {
-			slog.Warn("resource-watcher: debounced invalidation failed",
-				slog.String("pattern", pattern), slog.Any("err", err))
-		}
-	}
-	GlobalMetrics.DebouncedInvalidations.Add(1)
-	slog.Info("resource-watcher: debounced derived-cache invalidation complete")
-}

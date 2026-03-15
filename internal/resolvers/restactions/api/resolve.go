@@ -148,6 +148,13 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			call.Endpoint = &ep
 			verb := strings.ToUpper(ptr.Deref(call.Verb, http.MethodGet))
 
+			// Record the GVR dependency for targeted invalidation.
+			if pathGVR, _, _ := cache.ParseK8sAPIPath(call.Path); pathGVR.Resource != "" {
+				if tracker := cache.TrackerFromContext(ctx); tracker != nil {
+					tracker.AddGVR(pathGVR)
+				}
+			}
+
 			// ── HTTP response cache ────────────────────────────────────────────
 			if c != nil && verb == http.MethodGet {
 				httpKey := cache.HTTPUserKey(user.Username, verb, call.Path)
@@ -156,6 +163,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					handler := jsonHandler(ctx, jsonHandlerOptions{
 						key: id, out: dict, filter: apiCall.Filter,
 					})
+					if tracker := cache.TrackerFromContext(ctx); tracker != nil {
+						tracker.AddL2Key(httpKey)
+					}
 					cache.GlobalMetrics.RawHits.Add(1)
 					log.Debug("api: cache hit", slog.String("name", id), slog.String("path", call.Path))
 					if mu != nil {
@@ -182,6 +192,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						return rerr
 					}
 					_ = c.SetHTTPRaw(ctx, capturedKey, data)
+					if pathGVR, _, _ := cache.ParseK8sAPIPath(call.Path); pathGVR.Resource != "" {
+						_ = c.SAddWithTTL(ctx, cache.L2GVRKey(cache.GVRToKey(pathGVR)), capturedKey, cache.DefaultResourceTTL)
+					}
+					if tracker := cache.TrackerFromContext(ctx); tracker != nil {
+						tracker.AddL2Key(capturedKey)
+					}
 					cache.GlobalMetrics.RawMisses.Add(1)
 					if mu != nil {
 						mu.Lock()

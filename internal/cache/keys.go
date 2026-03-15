@@ -110,6 +110,18 @@ const AllResolvedPattern = "snowplow:resolved:*"
 // contain raw Kubernetes API data that feeds into the resolution pipeline.
 const AllHTTPPattern = "snowplow:http:*"
 
+// L1GVRKey returns the Redis SET key that maps a GVR to all L1 (resolved)
+// cache entries that depend on it. Used for targeted invalidation.
+func L1GVRKey(gvrKey string) string {
+	return "snowplow:l1gvr:" + gvrKey
+}
+
+// L2GVRKey returns the Redis SET key that maps a GVR to all L2 (http)
+// cache entries that depend on it. Used for targeted invalidation.
+func L2GVRKey(gvrKey string) string {
+	return "snowplow:l2gvr:" + gvrKey
+}
+
 // IsNotFoundRaw returns true if raw is the negative-cache sentinel.
 func IsNotFoundRaw(raw []byte) bool {
 	return string(raw) == notFoundSentinel

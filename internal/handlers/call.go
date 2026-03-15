@@ -170,15 +170,22 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	// Invalidate cache for mutating operations.
+	// Invalidate cache for mutating operations using targeted GVR-based
+	// invalidation instead of bulk-wiping all resolved/http entries.
 	if has([]string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}, opts.verb) && c != nil {
 		getKey := cache.GetKey(opts.gvr, opts.nsn.Namespace, opts.nsn.Name)
 		listKey := cache.ListKey(opts.gvr, opts.nsn.Namespace)
 		_ = c.Delete(req.Context(), getKey, listKey, cache.ListKey(opts.gvr, ""))
-		_ = c.DeletePattern(req.Context(), cache.AllResolvedPattern)
-		_ = c.DeletePattern(req.Context(), cache.AllHTTPPattern)
+
+		gvrKey := cache.GVRToKey(opts.gvr)
+		for _, prefix := range []string{"snowplow:l1gvr:", "snowplow:l2gvr:"} {
+			idxKey := prefix + gvrKey
+			if keys, serr := c.SMembers(req.Context(), idxKey); serr == nil && len(keys) > 0 {
+				_ = c.Delete(req.Context(), keys...)
+			}
+		}
 		slog.Debug("cache invalidated after mutation",
-			slog.String("verb", opts.verb), slog.String("getKey", getKey))
+			slog.String("verb", opts.verb), slog.String("gvr", gvrKey))
 	}
 
 	wri.Header().Set("Content-Type", "application/json")

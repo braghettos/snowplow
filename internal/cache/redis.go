@@ -14,7 +14,8 @@ import (
 
 const (
 	DefaultResourceTTL = time.Hour
-	HTTPCacheTTL       = 5 * time.Minute
+	ResolvedCacheTTL   = time.Hour
+	HTTPCacheTTL       = time.Hour
 	notFoundTTL        = 30 * time.Second
 )
 
@@ -173,10 +174,20 @@ func (c *RedisCache) SetRaw(ctx context.Context, key string, val []byte) error {
 	return c.client.Set(ctx, key, val, c.ResourceTTL).Err()
 }
 
-// SetHTTPRaw stores a raw HTTP response with a shorter TTL than regular
-// resources. HTTP cache entries are intermediate results from the resolution
-// pipeline that are rebuilt frequently, so a shorter TTL reduces staleness
-// while still absorbing bursts of identical requests.
+// SetResolvedRaw stores a fully-resolved widget/restaction output with
+// ResolvedCacheTTL. Freshness is guaranteed by the GVR reverse index
+// (targeted invalidation from informer events); TTL is only for memory
+// management.
+func (c *RedisCache) SetResolvedRaw(ctx context.Context, key string, val []byte) error {
+	if c == nil {
+		return nil
+	}
+	return c.client.Set(ctx, key, val, ResolvedCacheTTL).Err()
+}
+
+// SetHTTPRaw stores a raw HTTP response. Freshness is guaranteed by the GVR
+// reverse index (targeted invalidation from informer events); TTL is only for
+// memory management.
 func (c *RedisCache) SetHTTPRaw(ctx context.Context, key string, val []byte) error {
 	if c == nil {
 		return nil
@@ -265,6 +276,20 @@ func (c *RedisCache) DeletePattern(ctx context.Context, pattern string) error {
 		return err
 	}
 	return c.Delete(ctx, keys...)
+}
+
+// SAddWithTTL adds member to a Redis set and refreshes the set's TTL.
+// Used for reverse-index sets (l1gvr, l2gvr) that should expire when the
+// associated cache entries expire.
+func (c *RedisCache) SAddWithTTL(ctx context.Context, key, member string, ttl time.Duration) error {
+	if c == nil {
+		return nil
+	}
+	pipe := c.client.Pipeline()
+	pipe.SAdd(ctx, key, member)
+	pipe.Expire(ctx, key, ttl)
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
 func (c *RedisCache) SAddGVR(ctx context.Context, gvr schema.GroupVersionResource) error {
