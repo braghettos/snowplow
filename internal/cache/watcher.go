@@ -211,8 +211,10 @@ func (rw *ResourceWatcher) patchListCache(ctx context.Context, gvr schema.GroupV
 
 	err := rw.cache.AtomicUpdateJSON(ctx, listKey, func(raw []byte) ([]byte, error) {
 		var list unstructured.UnstructuredList
-		if err := json.Unmarshal(raw, &list); err != nil {
-			return nil, err
+		if raw != nil {
+			if err := json.Unmarshal(raw, &list); err != nil {
+				return nil, err
+			}
 		}
 		idx := -1
 		for i := range list.Items {
@@ -235,6 +237,9 @@ func (rw *ResourceWatcher) patchListCache(ctx context.Context, gvr schema.GroupV
 				list.Items = append(list.Items, *uns)
 			}
 		case "delete":
+			if raw == nil {
+				return nil, nil
+			}
 			if idx >= 0 {
 				filtered := make([]unstructured.Unstructured, 0, len(list.Items)-1)
 				for i := range list.Items {

@@ -233,6 +233,8 @@ func (c *RedisCache) Delete(ctx context.Context, keys ...string) error {
 
 // AtomicUpdateJSON performs an optimistic-locking read-modify-write using
 // Redis WATCH/MULTI/EXEC. Retries up to 3 times on transaction conflict.
+// When the key does not exist, fn is called with nil so the caller can
+// choose to create the entry from scratch.
 func (c *RedisCache) AtomicUpdateJSON(ctx context.Context, key string, fn func([]byte) ([]byte, error), ttl time.Duration) error {
 	if c == nil {
 		return nil
@@ -242,13 +244,11 @@ func (c *RedisCache) AtomicUpdateJSON(ctx context.Context, key string, fn func([
 		err := c.client.Watch(ctx, func(tx *redis.Tx) error {
 			val, err := tx.Get(ctx, key).Bytes()
 			if errors.Is(err, redis.Nil) {
-				return nil
-			}
-			if err != nil {
+				val = nil
+			} else if err != nil {
 				return err
-			}
-			if bytes.Equal(val, []byte(notFoundSentinel)) {
-				return nil
+			} else if bytes.Equal(val, []byte(notFoundSentinel)) {
+				val = nil
 			}
 			newVal, ferr := fn(val)
 			if ferr != nil || newVal == nil {

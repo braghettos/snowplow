@@ -198,16 +198,6 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				}
 				l3Raw, l3Hit, _ := c.GetRaw(ctx, l3Key)
 
-				// For per-namespace lists: if the per-NS key is missing but the
-				// cluster-wide key exists, the GVR was warmed and this namespace
-				// simply has no items → synthesize an empty list.
-				if !l3Hit && pathName == "" && pathNS != "" {
-					if c.Exists(ctx, cache.ListKey(pathGVR, "")) {
-						l3Raw = []byte(`{"metadata":{},"items":[]}`)
-						l3Hit = true
-					}
-				}
-
 				if l3Hit && !cache.IsNotFoundRaw(l3Raw) {
 					_ = c.SetHTTPRaw(ctx, httpKey, l3Raw)
 					gvrKey := cache.GVRToKey(pathGVR)
