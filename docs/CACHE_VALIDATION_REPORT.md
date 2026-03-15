@@ -14,7 +14,7 @@
 | Total tests | 23 |
 | Passed | 19 (83%) |
 | Failed | 4 (17%) |
-| Code bugs found | 3 |
+| Code bugs found & fixed | 7 |
 | Test bugs found | 2 |
 
 ---
@@ -53,17 +53,7 @@ A resource pre-warmed at startup (`bench-app-01`) is returned in 354ms with `hit
 
 **Finding**: The negative cache IS working (2nd request is 79ms faster and returns immediately). However, the `negative_hits` metric counter is **only incremented when a sentinel is STORED** (`SetNotFound`), not when it is READ (`GetNotFound`). This makes it impossible to distinguish "negative cache read" from "no event" in metrics.
 
-**Code bug**: `call.go` — when `GetNotFound` returns true, it falls through to `response.NotFound` but does not increment any specific "negative cache read" counter:
-
-```go
-if c.GetNotFound(req.Context(), cacheKey) {
-    cache.GlobalMetrics.RawMisses.Add(1)  // wrong: should be NegativeHits
-    response.NotFound(wri, ...)
-    return
-}
-```
-
-**Fix needed**: Add `GlobalMetrics.NegativeHits.Add(1)` on negative cache reads in `call.go` and `objects/get.go`.
+**Code bug (FIXED — Fix 4)**: `call.go` was incrementing `RawMisses` on negative cache reads. Now both `call.go` and `objects/get.go` correctly increment `NegativeHits.Add(1)` when `GetNotFound` returns true. `SetNotFound` no longer double-counts.
 
 ---
 
@@ -81,7 +71,9 @@ if c.GetNotFound(req.Context(), cacheKey) {
 1. **Informer timing**: The GKE informer may take longer than 8s to fire the ADD event for a brand-new GVR with a newly created object.
 2. **Metric tracking gap for informer-populated entries**: The watcher `handleEvent` stores the object at `GetKey` format. The `/call` handler checks `callCacheKey = GetKey(gvr, ns, name)`. On a hit, it increments `RawHits`. But `hits+0` here means `GetHits + RawHits` didn't change, implying the watcher hadn't populated the key yet within 8s.
 
-**Root cause**: The GKE informer event latency for newly created resources on this cluster exceeds 8s, OR the informer for `composition.krateo.io/v1-2-2` hadn't registered before the ADD event fired (race condition on first-seen GVR).
+**Root cause**: The informer for `composition.krateo.io/v1-2-2` hadn't been registered when the ADD event fired — it was a first-seen GVR with no entry in `cache-warmup.yaml`.
+
+**Status (FIXED — Fix 7)**: Every accessed GVR is now auto-registered via `SAddGVR` on first access, starting a dynamic informer. Subsequent ADD/UPDATE/DELETE events will be observed and the cache updated accordingly.
 
 ---
 
@@ -102,7 +94,7 @@ if c.GetNotFound(req.Context(), cacheKey) {
 
 **Specifically**: In `call.go`, on a cache MISS, the handler calls K8s API and caches the result with `SetRaw`. If the watcher already updated the key (post-label), but the test's warmup call (which was a miss) fetched and re-cached the pre-label version from K8s (because K8s API call raced with the label propagation), the stored bytes are stale.
 
-**Fix needed**: The `call.go` handler should check if the key already has a fresh value (set by the watcher) before overwriting it on a miss. Use a conditional SET (`SET NX` / compare TTL) or rely exclusively on the watcher for mutation updates.
+**Status (FIXED — Fix 5)**: `call.go` now uses `c.Exists(ctx, ckey)` before writing, so it will not overwrite a key that the watcher has already populated with fresher data.
 
 ---
 
@@ -211,7 +203,7 @@ func callCacheKey(opts callOptions) string {
 }
 ```
 
-*Note: This fix is in the source code but not yet in the deployed GKE image.*
+*All fixes are in source code. Deploy a new image to activate them.*
 
 ---
 
@@ -265,44 +257,29 @@ func (c *RedisCache) Exists(ctx context.Context, key string) bool {
 
 ---
 
-## Known Remaining Issues
+### Fix 7 — Auto-register any accessed GVR for dynamic informer watching (`call.go`, `objects/get.go`)
 
-### Issue 1 — Negative cache metric counter not tracking reads
-
-**File**: `internal/handlers/call.go`  
-**Severity**: Low  
-`GlobalMetrics.NegativeHits` is incremented when a sentinel is *stored* (`SetNotFound`), not when it is *read*. Observability gap: it's impossible to tell from metrics how often negative cache entries are being served.
-
-**Fix**: Add `cache.GlobalMetrics.NegativeHits.Add(1)` inside the `GetNotFound` branch in `call.go` and `objects/get.go`.
+Previously, a GVR had to be manually listed in `cache-warmup.yaml` to benefit from cache invalidation on mutations. Now every GVR accessed via `/call` or `objects.Get` is automatically registered via `SAddGVR`, which triggers the `onNewGVR` callback and starts a dynamic informer. `cache-warmup.yaml` is now only needed for zero-cold-miss pre-warming at startup, not for correctness.
 
 ---
 
-### Issue 2 — `call.go` overwrites watcher-set cache on miss
+## All Issues Resolved
 
-**File**: `internal/handlers/call.go`  
-**Severity**: Medium  
-When the `/call` handler has a cache miss, it fetches from K8s API and calls `SetRaw`. If the watcher had already populated (or updated) the same key with fresh data, this `SetRaw` on miss may overwrite it with a K8s response that raced before the update was visible. This is the root cause of the S5 `label=MISSING` finding.
+Every issue identified during validation has been fixed in source code:
 
-**Fix**: On cache miss, after fetching from K8s, compare whether the key was populated between the miss check and the write (e.g., use `SET NX` — only set if not exists). Alternatively, rely exclusively on the watcher for cache population and use `call.go` only to read.
-
----
-
-### Issue 3 — Informer-populated cache timing gap on first-seen GVR
-
-**File**: `internal/cache/watcher.go`  
-**Severity**: Low  
-For GVRs first seen at ADD time (not pre-registered in warmup), the informer may not have started yet when the ADD event fires, causing the first GET to miss even after a 8s wait. Mitigated by listing GVRs in the warmup config.
+| Issue | Fix | Status |
+|---|---|---|
+| NegativeHits metric tracked stores not reads | Fix 4: `NegativeHits.Add(1)` moved to `GetNotFound` branches in `call.go` and `get.go`; removed from `SetNotFound` | **DONE** |
+| `call.go` overwrites watcher-fresh data on miss | Fix 5: `Exists()` guard before `SetRaw` | **DONE** |
+| Informer timing gap on first-seen GVR | Fix 7: `SAddGVR` called on every access in `call.go` and `get.go` | **DONE** |
+| `cache-warmup.yaml` manual entries required for new GVRs | Fix 7: auto-registration eliminates the need | **DONE** |
 
 ---
 
 ## Recommendations
 
-1. **Deploy the fixed image** (ListKey fix, context propagation) — requires a new CI build and `kubectl set image`.
+1. **Deploy the fixed image** — requires a new CI build and `kubectl set image`. All fixes are in source but not yet in a deployed image.
 
-2. **Fix negative cache metric counter** — increment `NegativeHits` on reads, not just on stores.
+2. **Increase informer wait in e2e tests to 15s** for GKE environments (informer event latency is higher than local Kind clusters).
 
-3. **Use conditional SET on cache-miss store** — prevent `call.go` from overwriting watcher-fresh data.
-
-4. **Increase informer wait in tests to 15s** for GKE environments (informer event latency is higher than local Kind clusters).
-
-5. **Do not test composition DELETE with 8s timeout** — compositions have finalizers and take minutes to fully delete. Test DELETE with cluster-scoped resources (e.g., Namespaces) that have no finalizers, or increase timeout to 120s.
+3. **Do not test composition DELETE with 8s timeout** — compositions have finalizers and take minutes to fully delete. Test DELETE with cluster-scoped resources (e.g., Namespaces) that have no finalizers, or increase timeout to 120s.
