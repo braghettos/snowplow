@@ -189,12 +189,14 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		}
 	}
 
-	// Derived caches (resolved outputs and per-user HTTP responses) depend on
-	// the resources watched here. Instead of bulk-deleting on every event —
-	// which prevents these caches from ever accumulating entries — we debounce:
-	// rapid events within a short window are coalesced into a single
-	// invalidation, giving the caches time to serve hits between changes.
-	rw.debouncer.schedule(ctx)
+	// Only trigger derived-cache invalidation for events from informers that
+	// have completed their initial sync. Events during initial list or re-lists
+	// after watch failures (e.g. RBAC-forbidden GVRs like namespaces/configmaps)
+	// are not real changes and must not wipe resolved/http caches.
+	informer := rw.factory.ForResource(gvr).Informer()
+	if informer.HasSynced() {
+		rw.debouncer.schedule(ctx)
+	}
 }
 
 // patchListCache atomically patches the cached list in-place using WATCH/MULTI/EXEC.
