@@ -176,6 +176,7 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		listKey := cache.ListKey(opts.gvr, opts.nsn.Namespace)
 		_ = c.Delete(req.Context(), getKey, listKey, cache.ListKey(opts.gvr, ""))
 		_ = c.DeletePattern(req.Context(), cache.AllResolvedPattern)
+		_ = c.DeletePattern(req.Context(), cache.AllHTTPPattern)
 		slog.Debug("cache invalidated after mutation",
 			slog.String("verb", opts.verb), slog.String("getKey", getKey))
 	}

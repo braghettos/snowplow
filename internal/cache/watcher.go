@@ -25,6 +25,7 @@ type ResourceWatcher struct {
 	factory   dynamicinformer.DynamicSharedInformerFactory
 	mu        sync.Mutex
 	watched   map[string]bool
+	appCtx    context.Context // long-lived process context; set by Start()
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -41,6 +42,7 @@ func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error
 }
 
 func (rw *ResourceWatcher) Start(ctx context.Context) {
+	rw.appCtx = ctx
 	rw.syncNewGVRs(ctx)
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
@@ -92,8 +94,8 @@ func (rw *ResourceWatcher) StartExpiryRefresh(ctx context.Context) {
 	slog.Info("resource-watcher: proactive expiry refresh enabled")
 }
 
-func (rw *ResourceWatcher) AddGVR(ctx context.Context, gvr schema.GroupVersionResource) {
-	rw.startInformer(ctx, gvr)
+func (rw *ResourceWatcher) AddGVR(_ context.Context, gvr schema.GroupVersionResource) {
+	rw.startInformer(gvr)
 }
 
 func (rw *ResourceWatcher) syncNewGVRs(ctx context.Context) {
@@ -102,33 +104,54 @@ func (rw *ResourceWatcher) syncNewGVRs(ctx context.Context) {
 		slog.Warn("resource-watcher: failed to read watched GVR set", slog.Any("err", err))
 		return
 	}
+	registered := false
 	for _, key := range members {
 		gvr := ParseGVRKey(key)
 		if gvr.Resource == "" {
 			continue
 		}
-		rw.startInformer(ctx, gvr)
+		if rw.registerInformer(gvr) {
+			registered = true
+		}
+	}
+	if registered {
+		rw.factory.Start(rw.appCtx.Done())
 	}
 }
 
-func (rw *ResourceWatcher) startInformer(ctx context.Context, gvr schema.GroupVersionResource) {
+// registerInformer creates the informer and adds event handlers without
+// calling factory.Start. Returns true if a new informer was registered.
+func (rw *ResourceWatcher) registerInformer(gvr schema.GroupVersionResource) bool {
 	key := GVRToKey(gvr)
 	rw.mu.Lock()
 	if rw.watched[key] {
 		rw.mu.Unlock()
-		return
+		return false
 	}
 	rw.watched[key] = true
 	rw.mu.Unlock()
 
+	ctx := rw.appCtx
 	informer := rw.factory.ForResource(gvr).Informer()
-	_, _ = informer.AddEventHandler(k8scache.ResourceEventHandlerFuncs{
+	if _, err := informer.AddEventHandler(k8scache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { rw.handleEvent(ctx, gvr, obj, "add") },
 		UpdateFunc: func(_, obj any) { rw.handleEvent(ctx, gvr, obj, "update") },
 		DeleteFunc: func(obj any) { rw.handleEvent(ctx, gvr, obj, "delete") },
-	})
-	rw.factory.Start(ctx.Done())
-	slog.Info("resource-watcher: started informer", slog.String("gvr", gvr.String()))
+	}); err != nil {
+		slog.Warn("resource-watcher: AddEventHandler failed",
+			slog.String("gvr", gvr.String()), slog.Any("err", err))
+		return false
+	}
+	slog.Info("resource-watcher: registered informer", slog.String("gvr", gvr.String()))
+	return true
+}
+
+// startInformer registers the informer and immediately starts the factory.
+// Used by AddGVR when a new GVR is discovered at request time.
+func (rw *ResourceWatcher) startInformer(gvr schema.GroupVersionResource) {
+	if rw.registerInformer(gvr) {
+		rw.factory.Start(rw.appCtx.Done())
+	}
 }
 
 func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVersionResource, obj any, eventType string) {
@@ -137,6 +160,11 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		return
 	}
 	ns, name := uns.GetNamespace(), uns.GetName()
+	slog.Debug("resource-watcher: event",
+		slog.String("type", eventType),
+		slog.String("gvr", gvr.String()),
+		slog.String("ns", ns),
+		slog.String("name", name))
 	getKey := GetKey(gvr, ns, name)
 	nsListKey := ListKey(gvr, ns)
 	clusterListKey := ListKey(gvr, "")
@@ -159,14 +187,16 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		}
 	}
 
-	// Dispatcher-level resolved outputs (snowplow:resolved:*) are derived from
-	// the resources watched here. Any change to a watched resource potentially
-	// affects the resolved output of widgets or RESTActions that fetch it, so
-	// we bulk-invalidate all resolved keys. They will be re-populated lazily on
-	// the next request.
-	if err := rw.cache.DeletePattern(ctx, AllResolvedPattern); err != nil {
-		slog.Warn("resource-watcher: failed to invalidate resolved cache",
-			slog.String("gvr", gvr.String()), slog.Any("err", err))
+	// Derived caches: resolved outputs (snowplow:resolved:*) and per-user HTTP
+	// responses (snowplow:http:*) are built from the resources watched here.
+	// Any change to a watched resource potentially invalidates both layers, so
+	// bulk-delete them. They will be re-populated lazily on the next request.
+	for _, pattern := range []string{AllResolvedPattern, AllHTTPPattern} {
+		if err := rw.cache.DeletePattern(ctx, pattern); err != nil {
+			slog.Warn("resource-watcher: failed to invalidate derived cache",
+				slog.String("pattern", pattern),
+				slog.String("gvr", gvr.String()), slog.Any("err", err))
+		}
 	}
 }
 

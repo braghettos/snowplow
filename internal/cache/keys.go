@@ -104,6 +104,12 @@ func ResolvedKey(username string, gvr schema.GroupVersionResource, namespace, na
 // when any watched Kubernetes resource changes.
 const AllResolvedPattern = "snowplow:resolved:*"
 
+// AllHTTPPattern matches every per-user HTTP response cache entry created
+// during RESTAction resolution. These must be invalidated alongside resolved
+// keys when a watched resource changes, because the HTTP-cached responses
+// contain raw Kubernetes API data that feeds into the resolution pipeline.
+const AllHTTPPattern = "snowplow:http:*"
+
 // IsNotFoundRaw returns true if raw is the negative-cache sentinel.
 func IsNotFoundRaw(raw []byte) bool {
 	return string(raw) == notFoundSentinel
