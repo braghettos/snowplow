@@ -85,6 +85,11 @@ warmup:
       resource: configmaps
       ttl: 6h
 
+    - group: apiextensions.k8s.io
+      version: v1
+      resource: customresourcedefinitions
+      ttl: 24h
+
   # Discovery categories to pre-cache for the /list endpoint.
   categories:
     - krateoplatformops

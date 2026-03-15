@@ -185,7 +185,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			// L2 miss → try L3 promotion: if the path maps to a K8s
 			// resource that the warmup or informer already cached in L3,
 			// serve from L3 and populate L2 — no API call needed.
-			if pathGVR, pathNS, pathName := cache.ParseK8sAPIPath(call.Path); pathGVR.Resource != "" {
+			pathGVR, pathNS, pathName := cache.ParseK8sAPIPath(call.Path)
+			if pathGVR.Resource == "" {
+				pathGVR, pathNS, pathName = cache.ParseCallPath(call.Path)
+			}
+			if pathGVR.Resource != "" {
 				var l3Key string
 				if pathName != "" {
 					l3Key = cache.GetKey(pathGVR, pathNS, pathName)

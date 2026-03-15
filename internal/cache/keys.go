@@ -3,6 +3,7 @@ package cache
 import (
 	"crypto/sha256"
 	"fmt"
+	"net/url"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -164,6 +165,39 @@ func GVRFromKey(key string) schema.GroupVersionResource {
 	}
 	gvrPart := strings.SplitN(parts[2], ":", 2)[0]
 	return ParseGVRKey(gvrPart)
+}
+
+// ParseCallPath extracts GVR, namespace, and name from a snowplow /call URL
+// (e.g. /call?apiVersion=templates.krateo.io%2Fv1&resource=restactions&name=foo&namespace=bar).
+func ParseCallPath(rawPath string) (gvr schema.GroupVersionResource, namespace, name string) {
+	idx := strings.Index(rawPath, "?")
+	if idx < 0 {
+		return
+	}
+	prefix := rawPath[:idx]
+	if prefix != "/call" && prefix != "call" {
+		return
+	}
+	q, err := url.ParseQuery(rawPath[idx+1:])
+	if err != nil {
+		return
+	}
+	apiVersion := q.Get("apiVersion")
+	resource := q.Get("resource")
+	if apiVersion == "" || resource == "" {
+		return
+	}
+	parts := strings.SplitN(apiVersion, "/", 2)
+	if len(parts) == 2 {
+		gvr.Group = parts[0]
+		gvr.Version = parts[1]
+	} else {
+		gvr.Version = parts[0]
+	}
+	gvr.Resource = resource
+	namespace = q.Get("namespace")
+	name = q.Get("name")
+	return
 }
 
 // ParseK8sAPIPath parses a Kubernetes API server path into GVR, namespace, name.
