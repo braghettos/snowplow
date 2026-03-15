@@ -26,6 +26,7 @@ type ResourceWatcher struct {
 	mu        sync.Mutex
 	watched   map[string]bool
 	appCtx    context.Context // long-lived process context; set by Start()
+	debouncer *derivedCacheDebouncer
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -38,6 +39,7 @@ func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error
 		dynClient: dynClient,
 		factory:   dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 0),
 		watched:   make(map[string]bool),
+		debouncer: newDerivedCacheDebouncer(c),
 	}, nil
 }
 
@@ -187,17 +189,12 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		}
 	}
 
-	// Derived caches: resolved outputs (snowplow:resolved:*) and per-user HTTP
-	// responses (snowplow:http:*) are built from the resources watched here.
-	// Any change to a watched resource potentially invalidates both layers, so
-	// bulk-delete them. They will be re-populated lazily on the next request.
-	for _, pattern := range []string{AllResolvedPattern, AllHTTPPattern} {
-		if err := rw.cache.DeletePattern(ctx, pattern); err != nil {
-			slog.Warn("resource-watcher: failed to invalidate derived cache",
-				slog.String("pattern", pattern),
-				slog.String("gvr", gvr.String()), slog.Any("err", err))
-		}
-	}
+	// Derived caches (resolved outputs and per-user HTTP responses) depend on
+	// the resources watched here. Instead of bulk-deleting on every event —
+	// which prevents these caches from ever accumulating entries — we debounce:
+	// rapid events within a short window are coalesced into a single
+	// invalidation, giving the caches time to serve hits between changes.
+	rw.debouncer.schedule(ctx)
 }
 
 // patchListCache atomically patches the cached list in-place using WATCH/MULTI/EXEC.
@@ -327,4 +324,77 @@ func toUnstructured(obj any) (*unstructured.Unstructured, bool) {
 		}
 	}
 	return nil, false
+}
+
+// ── Derived-cache debouncer ───────────────────────────────────────────────────
+//
+// Informer events can fire at very high rates (initial list, bulk operations,
+// noisy reflector re-lists on RBAC errors). Invalidating resolved:* and http:*
+// on every single event prevents those caches from ever accumulating entries.
+//
+// The debouncer coalesces rapid events: it waits for a quiet period (no new
+// events for quietPeriod) before flushing. A maxDelay cap ensures invalidation
+// eventually fires even under continuous event pressure.
+
+const (
+	debouncerQuietPeriod = 2 * time.Second
+	debouncerMaxDelay    = 10 * time.Second
+)
+
+type derivedCacheDebouncer struct {
+	mu         sync.Mutex
+	pending    bool
+	quietTimer *time.Timer
+	maxTimer   *time.Timer
+	cache      *RedisCache
+}
+
+func newDerivedCacheDebouncer(c *RedisCache) *derivedCacheDebouncer {
+	return &derivedCacheDebouncer{cache: c}
+}
+
+func (d *derivedCacheDebouncer) schedule(ctx context.Context) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.quietTimer != nil {
+		d.quietTimer.Stop()
+	}
+	d.quietTimer = time.AfterFunc(debouncerQuietPeriod, func() {
+		d.flush(ctx)
+	})
+
+	if !d.pending {
+		d.pending = true
+		d.maxTimer = time.AfterFunc(debouncerMaxDelay, func() {
+			d.flush(ctx)
+		})
+	}
+}
+
+func (d *derivedCacheDebouncer) flush(ctx context.Context) {
+	d.mu.Lock()
+	if !d.pending {
+		d.mu.Unlock()
+		return
+	}
+	d.pending = false
+	if d.quietTimer != nil {
+		d.quietTimer.Stop()
+		d.quietTimer = nil
+	}
+	if d.maxTimer != nil {
+		d.maxTimer.Stop()
+		d.maxTimer = nil
+	}
+	d.mu.Unlock()
+
+	for _, pattern := range []string{AllResolvedPattern, AllHTTPPattern} {
+		if err := d.cache.DeletePattern(ctx, pattern); err != nil {
+			slog.Warn("resource-watcher: debounced invalidation failed",
+				slog.String("pattern", pattern), slog.Any("err", err))
+		}
+	}
+	GlobalMetrics.DebouncedInvalidations.Add(1)
+	slog.Info("resource-watcher: debounced derived-cache invalidation complete")
 }

@@ -181,7 +181,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					if rerr != nil {
 						return rerr
 					}
-					_ = c.SetRaw(ctx, capturedKey, data)
+					_ = c.SetHTTPRaw(ctx, capturedKey, data)
 					cache.GlobalMetrics.RawMisses.Add(1)
 					if mu != nil {
 						mu.Lock()

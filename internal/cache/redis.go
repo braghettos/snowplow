@@ -14,6 +14,7 @@ import (
 
 const (
 	DefaultResourceTTL = time.Hour
+	HTTPCacheTTL       = 5 * time.Minute
 	notFoundTTL        = 30 * time.Second
 )
 
@@ -170,6 +171,17 @@ func (c *RedisCache) SetRaw(ctx context.Context, key string, val []byte) error {
 		return nil
 	}
 	return c.client.Set(ctx, key, val, c.ResourceTTL).Err()
+}
+
+// SetHTTPRaw stores a raw HTTP response with a shorter TTL than regular
+// resources. HTTP cache entries are intermediate results from the resolution
+// pipeline that are rebuilt frequently, so a shorter TTL reduces staleness
+// while still absorbing bursts of identical requests.
+func (c *RedisCache) SetHTTPRaw(ctx context.Context, key string, val []byte) error {
+	if c == nil {
+		return nil
+	}
+	return c.client.Set(ctx, key, val, HTTPCacheTTL).Err()
 }
 
 func (c *RedisCache) setWithTTL(ctx context.Context, key string, val any, ttl time.Duration) error {
