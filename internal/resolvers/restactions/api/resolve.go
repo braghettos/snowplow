@@ -192,7 +192,19 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				} else {
 					l3Key = cache.ListKey(pathGVR, pathNS)
 				}
-				if l3Raw, l3Hit, _ := c.GetRaw(ctx, l3Key); l3Hit && !cache.IsNotFoundRaw(l3Raw) {
+				l3Raw, l3Hit, _ := c.GetRaw(ctx, l3Key)
+
+				// For per-namespace lists: if the per-NS key is missing but the
+				// cluster-wide key exists, the GVR was warmed and this namespace
+				// simply has no items → synthesize an empty list.
+				if !l3Hit && pathName == "" && pathNS != "" {
+					if c.Exists(ctx, cache.ListKey(pathGVR, "")) {
+						l3Raw = []byte(`{"metadata":{},"items":[]}`)
+						l3Hit = true
+					}
+				}
+
+				if l3Hit && !cache.IsNotFoundRaw(l3Raw) {
 					_ = c.SetHTTPRaw(ctx, httpKey, l3Raw)
 					gvrKey := cache.GVRToKey(pathGVR)
 					_ = c.SAddWithTTL(ctx, cache.L2GVRKey(gvrKey), httpKey, cache.DefaultResourceTTL)
@@ -201,7 +213,6 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					}
 					cache.GlobalMetrics.RawHits.Add(1)
 					cache.GlobalMetrics.L3Promotions.Add(1)
-					log.Debug("api: L3→L2 promotion", slog.String("name", id), slog.String("l3", l3Key))
 					handler := jsonHandler(ctx, jsonHandlerOptions{
 						key: id, out: dict, filter: apiCall.Filter,
 					})
