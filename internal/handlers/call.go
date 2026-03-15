@@ -92,9 +92,10 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	if strings.ToUpper(opts.verb) == http.MethodGet {
 		cacheKey := callCacheKey(opts)
 		if c != nil {
-			// Negative cache check.
+			// Negative cache check: sentinel stored by SetNotFound means a prior
+			// K8s lookup returned 404. Serve the 404 from cache and track it.
 			if c.GetNotFound(req.Context(), cacheKey) {
-				cache.GlobalMetrics.RawMisses.Add(1)
+				cache.GlobalMetrics.NegativeHits.Add(1)
 				response.NotFound(wri, fmt.Errorf("resource not found (cached)"))
 				return
 			}
@@ -149,10 +150,16 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		slog.String("duration", util.ETA(start)),
 	)
 
-	// Cache successful GET responses.
+	// Cache successful GET responses, but only if the key is not already present.
+	// The ResourceWatcher may have populated (or freshly updated) the key while
+	// we were waiting for the K8s API response, so we must not overwrite it with
+	// potentially stale bytes fetched before the mutation was visible.
 	if strings.ToUpper(opts.verb) == http.MethodGet && c != nil && len(dict) > 0 {
-		if raw, merr := json.Marshal(dict); merr == nil {
-			_ = c.SetRaw(req.Context(), callCacheKey(opts), raw)
+		ckey := callCacheKey(opts)
+		if !c.Exists(req.Context(), ckey) {
+			if raw, merr := json.Marshal(dict); merr == nil {
+				_ = c.SetRaw(req.Context(), ckey, raw)
+			}
 		}
 	}
 
@@ -175,7 +182,14 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	}
 }
 
+// callCacheKey returns the cache key for the given call options.
+// GET requests for a named resource use the GET key format so they are
+// consistent with the keys populated by the warmup and the ResourceWatcher.
+// LIST requests (no name) use the LIST key format for the same reason.
 func callCacheKey(opts callOptions) string {
+	if opts.nsn.Name == "" {
+		return cache.ListKey(opts.gvr, opts.nsn.Namespace)
+	}
 	return cache.GetKey(opts.gvr, opts.nsn.Namespace, opts.nsn.Name)
 }
 

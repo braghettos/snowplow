@@ -78,7 +78,7 @@ func UserCan(ctx context.Context, opts UserCanOptions) (ok bool) {
 	}
 
 	resp, err := clientset.AuthorizationV1().SelfSubjectAccessReviews().
-		Create(context.TODO(), &selfCheck, metav1.CreateOptions{})
+		Create(ctx, &selfCheck, metav1.CreateOptions{})
 	if err != nil {
 		log.Error("unable to perform SelfSubjectAccessReviews",
 			slog.Any("selfCheck", selfCheck), slog.Any("err", err))

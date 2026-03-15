@@ -129,6 +129,15 @@ func (c *RedisCache) GetRaw(ctx context.Context, key string) ([]byte, bool, erro
 	return val, true, nil
 }
 
+// Exists returns true when the key is present in Redis (regardless of value).
+func (c *RedisCache) Exists(ctx context.Context, key string) bool {
+	if c == nil {
+		return false
+	}
+	n, err := c.client.Exists(ctx, key).Result()
+	return err == nil && n > 0
+}
+
 // GetNotFound returns true when the key holds the negative-cache sentinel.
 func (c *RedisCache) GetNotFound(ctx context.Context, key string) bool {
 	if c == nil {
@@ -139,11 +148,12 @@ func (c *RedisCache) GetNotFound(ctx context.Context, key string) bool {
 }
 
 // SetNotFound caches a 404 sentinel for key with a short TTL.
+// NegativeHits tracks sentinel READS (hits), not stores; use ExpiryRefreshes
+// for stored sentinels is intentional so metrics stay distinct.
 func (c *RedisCache) SetNotFound(ctx context.Context, key string) error {
 	if c == nil {
 		return nil
 	}
-	GlobalMetrics.NegativeHits.Add(1)
 	return c.client.Set(ctx, key, notFoundSentinel, notFoundTTL).Err()
 }
 

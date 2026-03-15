@@ -83,7 +83,7 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 		return
 	}
 
-	uns, err := cli.Get(context.Background(), ref.Name, dynamic.Options{
+	uns, err := cli.Get(ctx, ref.Name, dynamic.Options{
 		Namespace: ref.Namespace,
 		GVR:       res.GVR,
 	})
