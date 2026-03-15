@@ -94,7 +94,13 @@ func main() {
 	}
 
 	// Build a Redis cache (sidecar at localhost:6379).
-	redisCache := cache.New(*resourceTTL)
+	var redisCache *cache.RedisCache
+	if cache.Disabled() {
+		log.Info("caching disabled via CACHE_ENABLED=false")
+	} else {
+		redisCache = cache.New(*resourceTTL)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), []os.Signal{
 		os.Interrupt,
 		syscall.SIGINT,
@@ -112,14 +118,14 @@ func main() {
 		log.Warn("not running in-cluster; some features disabled", slog.Any("err", sarcErr))
 	}
 
-	if err := redisCache.Ping(ctx); err != nil {
-		log.Warn("redis not available; caching disabled", slog.Any("err", err))
-		redisCache = nil
-	} else {
-		log.Info("redis connected", slog.String("addr", "localhost:6379"))
-		// Run synchronously: the HTTP server does not start until warmup completes,
-		// guaranteeing a fully warm cache before the first request is served.
-		startBackgroundServices(ctx, log, redisCache, *authnNS, *warmupConfigPath)
+	if redisCache != nil {
+		if err := redisCache.Ping(ctx); err != nil {
+			log.Warn("redis not available; caching disabled", slog.Any("err", err))
+			redisCache = nil
+		} else {
+			log.Info("redis connected")
+			startBackgroundServices(ctx, log, redisCache, *authnNS, *warmupConfigPath)
+		}
 	}
 
 	// Middleware that injects the cache into every request context.

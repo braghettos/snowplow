@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,10 +29,24 @@ type RedisCache struct {
 	onNewGVR    func(context.Context, schema.GroupVersionResource)
 }
 
+func redisAddr() string {
+	if v := os.Getenv("REDIS_ADDRESS"); v != "" {
+		return v
+	}
+	return "localhost:6379"
+}
+
+// Disabled returns true when the CACHE_ENABLED env var is explicitly set to
+// "false" or "0". When not set the cache is enabled by default.
+func Disabled() bool {
+	v := strings.ToLower(os.Getenv("CACHE_ENABLED"))
+	return v == "false" || v == "0"
+}
+
 func New(resourceTTL time.Duration) *RedisCache {
 	return &RedisCache{
 		client: redis.NewClient(&redis.Options{
-			Addr:         "localhost:6379",
+			Addr:         redisAddr(),
 			DB:           0,
 			DialTimeout:  3 * time.Second,
 			ReadTimeout:  2 * time.Second,
