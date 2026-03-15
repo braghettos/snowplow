@@ -331,16 +331,20 @@ func toUnstructured(obj any) (*unstructured.Unstructured, bool) {
 // ── Derived-cache debouncer ───────────────────────────────────────────────────
 //
 // Informer events can fire at very high rates (initial list, bulk operations,
-// noisy reflector re-lists on RBAC errors). Invalidating resolved:* and http:*
+// status reconciliation across many GVRs). Invalidating resolved:* and http:*
 // on every single event prevents those caches from ever accumulating entries.
 //
-// The debouncer coalesces rapid events: it waits for a quiet period (no new
-// events for quietPeriod) before flushing. A maxDelay cap ensures invalidation
-// eventually fires even under continuous event pressure.
+// The debouncer has three mechanisms:
+//  1. Quiet period: waits for a pause in events before flushing.
+//  2. Max delay cap: forces a flush under continuous event pressure.
+//  3. Cooldown: after a flush (which empties the caches), events are ignored
+//     for a cooldown window. Re-flushing empty caches is pointless, and this
+//     gives the caches time to populate and serve hits.
 
 const (
 	debouncerQuietPeriod = 2 * time.Second
 	debouncerMaxDelay    = 10 * time.Second
+	debouncerCooldown    = 30 * time.Second
 )
 
 type derivedCacheDebouncer struct {
@@ -348,6 +352,7 @@ type derivedCacheDebouncer struct {
 	pending    bool
 	quietTimer *time.Timer
 	maxTimer   *time.Timer
+	lastFlush  time.Time
 	cache      *RedisCache
 }
 
@@ -358,6 +363,10 @@ func newDerivedCacheDebouncer(c *RedisCache) *derivedCacheDebouncer {
 func (d *derivedCacheDebouncer) schedule(ctx context.Context) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	if !d.lastFlush.IsZero() && time.Since(d.lastFlush) < debouncerCooldown {
+		return
+	}
 
 	if d.quietTimer != nil {
 		d.quietTimer.Stop()
@@ -381,6 +390,7 @@ func (d *derivedCacheDebouncer) flush(ctx context.Context) {
 		return
 	}
 	d.pending = false
+	d.lastFlush = time.Now()
 	if d.quietTimer != nil {
 		d.quietTimer.Stop()
 		d.quietTimer = nil
