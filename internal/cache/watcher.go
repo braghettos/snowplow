@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -223,12 +224,12 @@ func (rw *ResourceWatcher) patchListCache(ctx context.Context, gvr schema.GroupV
 
 func (rw *ResourceWatcher) handleExpiredKey(ctx context.Context, key string) {
 	switch {
-	case len(key) > 12 && key[:12] == "snowplow:get":
+	case strings.HasPrefix(key, "snowplow:get:"):
 		gvr, ns, name, ok := ParseGetKey(key)
 		if ok && gvr.Resource != "" && name != "" {
 			rw.refreshGetKey(ctx, gvr, ns, name)
 		}
-	case len(key) > 13 && key[:13] == "snowplow:list":
+	case strings.HasPrefix(key, "snowplow:list:"):
 		gvr, ns, ok := ParseListKey(key)
 		if ok && gvr.Resource != "" {
 			rw.refreshListKey(ctx, gvr, ns)

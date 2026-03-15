@@ -32,3 +32,6 @@ experiments/**
 **/token.txt
 **/*.crt
 **/*.key
+
+# Generated reports
+docs/CACHE_VALIDATION_REPORT.md

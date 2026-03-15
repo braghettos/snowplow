@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -82,7 +81,7 @@ func List() http.HandlerFunc {
 
 		if len(gvrs) == 0 {
 			log.Debug("performing discovery", slog.String("category", cat))
-			discovered, err := cli.Discover(context.Background(), cat)
+			discovered, err := cli.Discover(req.Context(), cat)
 			if err != nil {
 				log.Error("discovery failed", slog.Any("err", err))
 				response.InternalError(wri, err)
@@ -100,6 +99,11 @@ func List() http.HandlerFunc {
 
 		for _, gvr := range gvrs {
 			listCacheKey := cache.ListKey(gvr, ns)
+
+			// Register the GVR for dynamic informer watching early.
+			if c != nil {
+				_ = c.SAddGVR(req.Context(), gvr)
+			}
 
 			// Try list from shared cache.
 			if c != nil {
@@ -121,7 +125,7 @@ func List() http.HandlerFunc {
 				GVR:       gvr,
 			}
 
-			obj, err := cli.List(context.Background(), opts)
+			obj, err := cli.List(req.Context(), opts)
 			if err != nil {
 				log.Error("cannot list resources",
 					slog.String("gvr", gvr.String()), slog.Any("err", err))
@@ -132,7 +136,7 @@ func List() http.HandlerFunc {
 				continue
 			}
 
-			if c != nil {
+			if c != nil && !c.Exists(req.Context(), listCacheKey) {
 				_ = c.SetForGVR(req.Context(), gvr, listCacheKey, obj)
 			}
 

@@ -88,6 +88,13 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 
 	c := cache.FromContext(req.Context())
 
+	// Register every accessed GVR for dynamic informer watching as early as
+	// possible. This ensures the informer is started before the K8s API call
+	// returns, minimizing the window where a mutation could be missed.
+	if c != nil {
+		_ = c.SAddGVR(req.Context(), opts.gvr)
+	}
+
 	// Only cache GET (read-only) requests.
 	if strings.ToUpper(opts.verb) == http.MethodGet {
 		cacheKey := callCacheKey(opts)
@@ -154,9 +161,6 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// The ResourceWatcher may have populated (or freshly updated) the key while
 	// we were waiting for the K8s API response, so we must not overwrite it with
 	// potentially stale bytes fetched before the mutation was visible.
-	// Additionally, auto-register every accessed GVR for dynamic informer
-	// watching so that no GVR needs to be manually listed in cache-warmup.yaml
-	// just to benefit from cache invalidation on mutations.
 	if strings.ToUpper(opts.verb) == http.MethodGet && c != nil && len(dict) > 0 {
 		ckey := callCacheKey(opts)
 		if !c.Exists(req.Context(), ckey) {
@@ -164,9 +168,6 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 				_ = c.SetRaw(req.Context(), ckey, raw)
 			}
 		}
-		// SAddGVR is a no-op if the GVR is already registered; the onNewGVR
-		// callback starts a dynamic informer only on first registration.
-		_ = c.SAddGVR(req.Context(), opts.gvr)
 	}
 
 	// Invalidate cache for mutating operations.
@@ -174,6 +175,7 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		getKey := cache.GetKey(opts.gvr, opts.nsn.Namespace, opts.nsn.Name)
 		listKey := cache.ListKey(opts.gvr, opts.nsn.Namespace)
 		_ = c.Delete(req.Context(), getKey, listKey, cache.ListKey(opts.gvr, ""))
+		_ = c.DeletePattern(req.Context(), cache.AllResolvedPattern)
 		slog.Debug("cache invalidated after mutation",
 			slog.String("verb", opts.verb), slog.String("getKey", getKey))
 	}

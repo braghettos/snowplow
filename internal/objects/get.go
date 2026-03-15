@@ -47,6 +47,12 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 	c := cache.FromContext(ctx)
 	cacheKey := cache.GetKey(res.GVR, ref.Namespace, ref.Name)
 
+	// Register the GVR for dynamic informer watching as early as possible so
+	// the informer is started before the K8s API call returns.
+	if c != nil {
+		_ = c.SAddGVR(ctx, res.GVR)
+	}
+
 	// Negative cache check.
 	if c != nil && c.GetNotFound(ctx, cacheKey) {
 		cache.GlobalMetrics.NegativeHits.Add(1)
@@ -113,11 +119,12 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 	uns.SetManagedFields(nil)
 
 	if c != nil {
-		_ = c.SetForGVR(ctx, res.GVR, cacheKey, uns)
-		// Auto-register this GVR for dynamic informer watching so that any
-		// future mutations are reflected in the cache without requiring a
-		// manual entry in cache-warmup.yaml.
-		_ = c.SAddGVR(ctx, res.GVR)
+		// Only store the K8s API response if the key is absent. The
+		// ResourceWatcher may have already stored a fresher version while
+		// this request was in-flight (e.g., a mutation event arrived).
+		if !c.Exists(ctx, cacheKey) {
+			_ = c.SetForGVR(ctx, res.GVR, cacheKey, uns)
+		}
 	}
 
 	res.Unstructured = uns
