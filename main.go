@@ -124,7 +124,7 @@ func main() {
 			redisCache = nil
 		} else {
 			log.Info("redis connected")
-			startBackgroundServices(ctx, log, redisCache, *authnNS, *signKey, *warmupConfigPath)
+			startBackgroundServices(ctx, log, redisCache, *authnNS, *warmupConfigPath)
 		}
 	}
 
@@ -217,7 +217,7 @@ func main() {
 // Warmup and informer sync use a separate background context so that a SIGTERM
 // received during startup (e.g. from a failing liveness probe) does not abort
 // the warmup — the server will start with a fully warm cache regardless.
-func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.RedisCache, authnNS, signingKey, warmupConfigPath string) {
+func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.RedisCache, authnNS, warmupConfigPath string) {
 	rc, err := rest.InClusterConfig()
 	if err != nil {
 		log.Warn("not running in-cluster; background cache services disabled", slog.Any("err", err))
@@ -283,11 +283,10 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 	// this function returns, but the L1 warmup continues in the background.
 	if warmupCfg != nil && authnNS != "" {
 		widgetGVRs := dispatchers.FilterWidgetGVRs(warmupCfg)
-		restactionGVRs := dispatchers.FilterRESTActionGVRs(warmupCfg)
 		go func() {
 			l1Ctx, l1Cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer l1Cancel()
-			dispatchers.WarmL1ForAllUsers(l1Ctx, c, rc, authnNS, signingKey, widgetGVRs, restactionGVRs)
+			dispatchers.WarmL1ForAllUsers(l1Ctx, c, rc, authnNS, widgetGVRs)
 		}()
 	}
 }

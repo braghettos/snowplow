@@ -17,11 +17,9 @@ import (
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/objects"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -79,14 +77,16 @@ func preWarmChildWidgets(parentCtx context.Context, c *cache.RedisCache, resolve
 // ---------------------------------------------------------------------------
 
 // WarmL1ForAllUsers discovers every user from their -clientconfig Secrets, then
-// resolves every instance of every widget AND RESTAction GVR for each user,
-// populating the per-user L1 cache. Call this after L3 warmup so the raw K8s
-// objects are already cached and resolution hits L3 instead of the live API.
-func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config, authnNS, signingKey string, widgetGVRs, restactionGVRs []schema.GroupVersionResource) {
+// resolves every instance of every widget GVR for each user, populating the
+// per-user L1 cache. Only widgets are warmed here because they resolve locally
+// (read from L3 cache, no HTTP callbacks). RESTActions are excluded: they
+// involve deep API fan-out (compositions-list alone triggers 200+ K8s calls)
+// and internal HTTP callbacks to snowplow, making startup warmup too slow.
+// RESTActions will be fast on first user request thanks to L3+L2 being warm.
+func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config, authnNS string, widgetGVRs []schema.GroupVersionResource) {
 	log := slog.Default()
-	allGVRs := append(widgetGVRs, restactionGVRs...)
-	if len(allGVRs) == 0 || authnNS == "" {
-		log.Info("L1 warmup: skipped (no L1-eligible GVRs or authn namespace)")
+	if len(widgetGVRs) == 0 || authnNS == "" {
+		log.Info("L1 warmup: skipped (no widget GVRs or authn namespace)")
 		return
 	}
 
@@ -103,13 +103,11 @@ func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config
 	log.Info("L1 warmup: starting",
 		slog.Int("users", len(users)),
 		slog.Int("widgetGVRs", len(widgetGVRs)),
-		slog.Int("restactionGVRs", len(restactionGVRs)),
 	)
 
 	var totalWarmed int64
 	for _, u := range users {
-		token := mintWarmupJWT(signingKey, u.userInfo)
-		warmed := warmL1ForUser(ctx, c, u.userInfo, u.endpoint, token, allGVRs, authnNS)
+		warmed := warmL1ForUser(ctx, c, u.userInfo, u.endpoint, "", widgetGVRs, authnNS)
 		totalWarmed += warmed
 	}
 
@@ -138,24 +136,6 @@ func FilterWidgetGVRs(cfg *cache.WarmupConfig) []schema.GroupVersionResource {
 	return out
 }
 
-// FilterRESTActionGVRs returns only the RESTAction GVRs from the warmup
-// config (templates.krateo.io / restactions).
-func FilterRESTActionGVRs(cfg *cache.WarmupConfig) []schema.GroupVersionResource {
-	if cfg == nil {
-		return nil
-	}
-	var out []schema.GroupVersionResource
-	for _, entry := range cfg.Warmup.GVRs {
-		if entry.Group == templatesGroup && entry.Resource == restactionResource {
-			out = append(out, schema.GroupVersionResource{
-				Group:    entry.Group,
-				Version:  entry.Version,
-				Resource: entry.Resource,
-			})
-		}
-	}
-	return out
-}
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -201,25 +181,6 @@ func discoverUsers(ctx context.Context, rc *rest.Config, authnNS string) ([]disc
 	return users, nil
 }
 
-// mintWarmupJWT creates a short-lived JWT for a user so that RESTActions with
-// exportJwt:true can authenticate internal calls during L1 startup warmup.
-func mintWarmupJWT(signingKey string, user jwtutil.UserInfo) string {
-	if signingKey == "" {
-		return ""
-	}
-	tok, err := jwtutil.CreateToken(jwtutil.CreateTokenOptions{
-		Username:  user.Username,
-		Groups:    user.Groups,
-		Duration:  5 * time.Minute,
-		SigningKey: signingKey,
-	})
-	if err != nil {
-		slog.Warn("L1 warmup: failed to mint JWT",
-			slog.String("user", user.Username), slog.Any("err", err))
-		return ""
-	}
-	return tok
-}
 
 // extractGroupsFromClientCert parses the PEM-encoded client certificate and
 // returns the Subject.Organization values, which Kubernetes uses as groups.
@@ -350,44 +311,19 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			tracker := cache.NewDependencyTracker()
 			tctx := cache.WithDependencyTracker(rctx, tracker)
 
-			var (
-				raw []byte
-				err error
-			)
-
-			switch {
-			case r.gvr.Group == widgetGroup:
-				res, resolveErr := widgets.Resolve(tctx, widgets.ResolveOptions{
-					In:      got.Unstructured,
-					AuthnNS: authnNS,
-					PerPage: -1,
-					Page:    -1,
-				})
-				if resolveErr != nil {
-					return
-				}
-				raw, err = json.MarshalIndent(res, "", "  ")
-
-			case r.gvr.Group == templatesGroup && r.gvr.Resource == restactionResource:
-				var cr templatesv1.RESTAction
-				if convErr := runtime.DefaultUnstructuredConverter.FromUnstructured(got.Unstructured.Object, &cr); convErr != nil {
-					return
-				}
-				res, resolveErr := restactions.Resolve(tctx, restactions.ResolveOptions{
-					In:      &cr,
-					AuthnNS: authnNS,
-					PerPage: -1,
-					Page:    -1,
-				})
-				if resolveErr != nil {
-					return
-				}
-				raw, err = json.MarshalIndent(res, "", "  ")
-
-			default:
+			if r.gvr.Group != widgetGroup {
 				return
 			}
-
+			res, resolveErr := widgets.Resolve(tctx, widgets.ResolveOptions{
+				In:      got.Unstructured,
+				AuthnNS: authnNS,
+				PerPage: -1,
+				Page:    -1,
+			})
+			if resolveErr != nil {
+				return
+			}
+			raw, err := json.MarshalIndent(res, "", "  ")
 			if err != nil {
 				return
 			}
