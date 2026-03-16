@@ -273,7 +273,15 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 		log.Warn("informer caches did not sync within timeout; proceeding with warmup anyway")
 	}
 
-	// Phase 4: Run warmup using the background context.
+	// Phase 4: Run L3 warmup using the background context.
 	log.Info("starting cache warmup")
 	warmer.Run(warmupCtx)
+
+	// Phase 5: Pre-warm L1 (resolved widget output) for every known user.
+	// This runs after L3 is populated so widget resolution hits L3 instead of
+	// the live K8s API.
+	if warmupCfg != nil && authnNS != "" {
+		widgetGVRs := dispatchers.FilterWidgetGVRs(warmupCfg)
+		go dispatchers.WarmL1ForAllUsers(warmupCtx, c, rc, authnNS, widgetGVRs)
+	}
 }
