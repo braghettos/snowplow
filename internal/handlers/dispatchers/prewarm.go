@@ -200,6 +200,18 @@ func discoverUsers(ctx context.Context, rc *rest.Config, authnNS string) ([]disc
 	return users, nil
 }
 
+// restActionRequiresJWT returns true if any API call in the RESTAction spec
+// has ExportJWT set, meaning it forwards the user's JWT to an external service.
+// Such RESTActions cannot be resolved during startup warmup (no JWT available).
+func restActionRequiresJWT(cr *templatesv1.RESTAction) bool {
+	for _, api := range cr.Spec.API {
+		if api.ExportJWT != nil && *api.ExportJWT {
+			return true
+		}
+	}
+	return false
+}
+
 // extractGroupsFromClientCert parses the PEM-encoded client certificate and
 // returns the Subject.Organization values, which Kubernetes uses as groups.
 func extractGroupsFromClientCert(certPEM string) []string {
@@ -350,6 +362,9 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			case r.gvr.Group == templatesGroup && r.gvr.Resource == restactionResource:
 				var cr templatesv1.RESTAction
 				if convErr := runtime.DefaultUnstructuredConverter.FromUnstructured(got.Unstructured.Object, &cr); convErr != nil {
+					return
+				}
+				if accessToken == "" && restActionRequiresJWT(&cr) {
 					return
 				}
 				res, resolveErr := restactions.Resolve(tctx, restactions.ResolveOptions{
