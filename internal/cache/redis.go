@@ -179,6 +179,10 @@ func (c *RedisCache) Set(ctx context.Context, key string, val any) error {
 	return c.setWithTTL(ctx, key, val, c.ResourceTTL)
 }
 
+func (c *RedisCache) SetWithTTL(ctx context.Context, key string, val any, ttl time.Duration) error {
+	return c.setWithTTL(ctx, key, val, ttl)
+}
+
 func (c *RedisCache) SetPersist(ctx context.Context, key string, val any) error {
 	return c.setWithTTL(ctx, key, val, 0)
 }

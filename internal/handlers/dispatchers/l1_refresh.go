@@ -57,7 +57,8 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS string) cache
 					slog.String("user", username), slog.Any("err", err))
 				continue
 			}
-			user := jwtutil.UserInfo{Username: username}
+			groups := extractGroupsFromClientCert(ep.ClientCertificateData)
+			user := jwtutil.UserInfo{Username: username, Groups: groups}
 
 			var (
 				wg  sync.WaitGroup

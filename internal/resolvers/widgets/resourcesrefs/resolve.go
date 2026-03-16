@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/kubeconfig"
@@ -28,18 +29,34 @@ func Resolve(ctx context.Context, items []templatesv1.ResourceRef) ([]templatesv
 		return nil, err
 	}
 
-	results := []templatesv1.ResourceRefResult{}
-	for _, el := range items {
-		res, err2 := resolveOne(ctx, rc, &el)
-		if err2 != nil {
-			err = errors.Join(err, err2)
-			continue
-		}
+	const concurrency = 20
 
-		results = append(results, res...)
+	var (
+		wg      sync.WaitGroup
+		sem     = make(chan struct{}, concurrency)
+		mu      sync.Mutex
+		results []templatesv1.ResourceRefResult
+		errs    []error
+	)
+	for i := range items {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(ref *templatesv1.ResourceRef) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			res, err2 := resolveOne(ctx, rc, ref)
+			mu.Lock()
+			if err2 != nil {
+				errs = append(errs, err2)
+			} else {
+				results = append(results, res...)
+			}
+			mu.Unlock()
+		}(&items[i])
 	}
+	wg.Wait()
 
-	return results, nil
+	return results, errors.Join(errs...)
 }
 
 func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRef) ([]templatesv1.ResourceRefResult, error) {

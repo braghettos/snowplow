@@ -71,12 +71,6 @@ func RBACKeyPattern(username string) string {
 	return fmt.Sprintf("snowplow:rbac:%s:*", username)
 }
 
-// HTTPKey builds the shared (user-agnostic) cache key for a raw HTTP GET call.
-func HTTPKey(method, path string) string {
-	h := sha256.Sum256([]byte(path))
-	return fmt.Sprintf("snowplow:http:%s:%x", strings.ToUpper(method), h[:8])
-}
-
 // HTTPUserKey builds a per-user cache key for HTTP GET calls made inside the
 // RESTAction/widget resolution pipeline. These calls use the user's JWT, so
 // responses may differ per user (RBAC-filtered namespace lists, widget lists,

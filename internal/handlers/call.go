@@ -108,15 +108,15 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			}
 			// Positive cache check.
 			if raw, hit, rerr := c.GetRaw(req.Context(), cacheKey); hit && rerr == nil {
-				cache.GlobalMetrics.RawHits.Add(1)
-				log.Debug("cache hit", slog.String("key", cacheKey))
+				cache.GlobalMetrics.CallHits.Add(1)
+				log.Debug("call: cache hit", slog.String("key", cacheKey))
 				wri.Header().Set("Content-Type", "application/json")
 				wri.WriteHeader(http.StatusOK)
 				_, _ = wri.Write(raw)
 				return
 			}
-		cache.GlobalMetrics.RawMisses.Add(1)
-			log.Info("call: L2 miss", slog.String("key", cacheKey), slog.String("verb", opts.verb), slog.String("gvr", cache.GVRToKey(opts.gvr)))
+		cache.GlobalMetrics.CallMisses.Add(1)
+			log.Info("call: cache miss", slog.String("key", cacheKey), slog.String("verb", opts.verb), slog.String("gvr", cache.GVRToKey(opts.gvr)))
 		}
 	}
 

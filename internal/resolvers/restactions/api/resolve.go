@@ -148,10 +148,14 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			call.Endpoint = &ep
 			verb := strings.ToUpper(ptr.Deref(call.Verb, http.MethodGet))
 
-			// Record the GVR dependency for targeted invalidation.
+			// Record the GVR dependency for targeted invalidation and register
+			// the GVR for informer watching so L3 gets populated for dynamic CRDs.
 			if pathGVR, _, _ := cache.ParseK8sAPIPath(call.Path); pathGVR.Resource != "" {
 				if tracker := cache.TrackerFromContext(ctx); tracker != nil {
 					tracker.AddGVR(pathGVR)
+				}
+				if c != nil {
+					_ = c.SAddGVR(ctx, pathGVR)
 				}
 			}
 
@@ -163,9 +167,6 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				handler := jsonHandler(ctx, jsonHandlerOptions{
 					key: id, out: dict, filter: apiCall.Filter,
 				})
-				if tracker := cache.TrackerFromContext(ctx); tracker != nil {
-					tracker.AddL2Key(httpKey)
-				}
 				cache.GlobalMetrics.RawHits.Add(1)
 				log.Debug("api: L2 hit", slog.String("name", id), slog.String("path", call.Path))
 				if mu != nil {
@@ -202,9 +203,6 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					_ = c.SetHTTPRaw(ctx, httpKey, l3Raw)
 					gvrKey := cache.GVRToKey(pathGVR)
 					_ = c.SAddWithTTL(ctx, cache.L2GVRKey(gvrKey), httpKey, cache.DefaultResourceTTL)
-					if tracker := cache.TrackerFromContext(ctx); tracker != nil {
-						tracker.AddL2Key(httpKey)
-					}
 					cache.GlobalMetrics.RawHits.Add(1)
 					cache.GlobalMetrics.L3Promotions.Add(1)
 					handler := jsonHandler(ctx, jsonHandlerOptions{
@@ -238,9 +236,6 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				_ = c.SetHTTPRaw(ctx, capturedKey, data)
 				if pathGVR, _, _ := cache.ParseK8sAPIPath(call.Path); pathGVR.Resource != "" {
 					_ = c.SAddWithTTL(ctx, cache.L2GVRKey(cache.GVRToKey(pathGVR)), capturedKey, cache.DefaultResourceTTL)
-				}
-				if tracker := cache.TrackerFromContext(ctx); tracker != nil {
-					tracker.AddL2Key(capturedKey)
 				}
 			cache.GlobalMetrics.RawMisses.Add(1)
 			log.Info("api: L2+L3 miss (live HTTP)", slog.String("name", id), slog.String("path", call.Path), slog.String("key", capturedKey))

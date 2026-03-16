@@ -3,6 +3,7 @@ package rbac
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/kubeconfig"
@@ -12,6 +13,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes"
 )
+
+const rbacCacheTTL = 24 * time.Hour
 
 // resolveUsername extracts the best available username: JWT > ep.Username.
 func resolveUsername(ctx context.Context) string {
@@ -88,7 +91,7 @@ func UserCan(ctx context.Context, opts UserCanOptions) (ok bool) {
 	log.Debug("SelfSubjectAccessReviews result", slog.Any("response", resp))
 
 	if c != nil && cacheKey != "" {
-		_ = c.SetPersist(ctx, cacheKey, resp.Status.Allowed)
+		_ = c.SetWithTTL(ctx, cacheKey, resp.Status.Allowed, rbacCacheTTL)
 	}
 
 	return resp.Status.Allowed

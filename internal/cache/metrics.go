@@ -11,6 +11,8 @@ type Metrics struct {
 	RBACMisses      atomic.Int64
 	RawHits         atomic.Int64
 	RawMisses       atomic.Int64
+	CallHits        atomic.Int64
+	CallMisses      atomic.Int64
 	L3Promotions    atomic.Int64
 	NegativeHits    atomic.Int64
 	ExpiryRefreshes atomic.Int64
@@ -25,6 +27,8 @@ type MetricsSnapshot struct {
 	RBACMisses      int64   `json:"rbac_misses"`
 	RawHits         int64   `json:"raw_hits"`
 	RawMisses       int64   `json:"raw_misses"`
+	CallHits        int64   `json:"call_hits"`
+	CallMisses      int64   `json:"call_misses"`
 	L3Promotions    int64   `json:"l3_promotions"`
 	NegativeHits    int64   `json:"negative_hits"`
 	ExpiryRefreshes int64   `json:"expiry_refreshes"`
@@ -45,6 +49,8 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		RBACMisses:      m.RBACMisses.Load(),
 		RawHits:         m.RawHits.Load(),
 		RawMisses:       m.RawMisses.Load(),
+		CallHits:        m.CallHits.Load(),
+		CallMisses:      m.CallMisses.Load(),
 		L3Promotions:    m.L3Promotions.Load(),
 		NegativeHits:    m.NegativeHits.Load(),
 		ExpiryRefreshes: m.ExpiryRefreshes.Load(),
