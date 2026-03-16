@@ -200,6 +200,40 @@ func ParseCallPath(rawPath string) (gvr schema.GroupVersionResource, namespace, 
 	return
 }
 
+// ResolvedKeyInfo holds the parsed components of a resolved (L1) cache key.
+type ResolvedKeyInfo struct {
+	Username string
+	GVR      schema.GroupVersionResource
+	NS       string
+	Name     string
+	Page     int
+	PerPage  int
+}
+
+// ParseResolvedKey parses an L1 resolved cache key into its components.
+// Key format: snowplow:resolved:{user}:{group/version/resource}:{ns}:{name}[:p{page}-pp{perPage}]
+func ParseResolvedKey(key string) (ResolvedKeyInfo, bool) {
+	parts := strings.SplitN(key, ":", 7)
+	if len(parts) < 6 || parts[0] != "snowplow" || parts[1] != "resolved" {
+		return ResolvedKeyInfo{}, false
+	}
+	info := ResolvedKeyInfo{
+		Username: parts[2],
+		GVR:      ParseGVRKey(parts[3]),
+		NS:       parts[4],
+		Name:     parts[5],
+		Page:     -1,
+		PerPage:  -1,
+	}
+	if len(parts) == 7 {
+		fmt.Sscanf(parts[6], "p%d-pp%d", &info.Page, &info.PerPage)
+	}
+	if info.GVR.Resource == "" || info.Name == "" {
+		return ResolvedKeyInfo{}, false
+	}
+	return info, true
+}
+
 // ParseK8sAPIPath parses a Kubernetes API server path into GVR, namespace, name.
 func ParseK8sAPIPath(path string) (gvr schema.GroupVersionResource, namespace, name string) {
 	if idx := strings.Index(path, "?"); idx >= 0 {

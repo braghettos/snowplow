@@ -18,6 +18,13 @@ import (
 	k8scache "k8s.io/client-go/tools/cache"
 )
 
+// L1RefreshFunc is invoked by the ResourceWatcher to proactively re-resolve
+// L1 cache entries instead of deleting them. The function receives the GVR
+// that triggered the refresh (for logging), the list of L1 keys to refresh,
+// and a long-lived context. It must run synchronously; the caller invokes it
+// in a goroutine.
+type L1RefreshFunc func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string)
+
 // ResourceWatcher maintains dynamic informers for every GVR in the watched set.
 type ResourceWatcher struct {
 	cache     *RedisCache
@@ -26,6 +33,9 @@ type ResourceWatcher struct {
 	mu        sync.Mutex
 	watched   map[string]bool
 	appCtx    context.Context // long-lived process context; set by Start()
+
+	l1Refresh  L1RefreshFunc
+	refreshing sync.Map // gvrKey → bool; prevents concurrent refreshes for the same GVR
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -94,6 +104,12 @@ func (rw *ResourceWatcher) StartExpiryRefresh(ctx context.Context) {
 	slog.Info("resource-watcher: proactive expiry refresh enabled")
 }
 
+// SetL1Refresher registers a callback that will be used to proactively
+// re-resolve L1 entries in the background instead of deleting them.
+func (rw *ResourceWatcher) SetL1Refresher(fn L1RefreshFunc) {
+	rw.l1Refresh = fn
+}
+
 func (rw *ResourceWatcher) AddGVR(_ context.Context, gvr schema.GroupVersionResource) {
 	rw.startInformer(gvr)
 }
@@ -134,9 +150,9 @@ func (rw *ResourceWatcher) registerInformer(gvr schema.GroupVersionResource) boo
 	ctx := rw.appCtx
 	informer := rw.factory.ForResource(gvr).Informer()
 	if _, err := informer.AddEventHandler(k8scache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj any) { rw.handleEvent(ctx, gvr, obj, "add") },
-		UpdateFunc: func(_, obj any) { rw.handleEvent(ctx, gvr, obj, "update") },
-		DeleteFunc: func(obj any) { rw.handleEvent(ctx, gvr, obj, "delete") },
+		AddFunc:    func(obj any) { rw.handleEvent(ctx, gvr, nil, obj, "add") },
+		UpdateFunc: func(old, obj any) { rw.handleEvent(ctx, gvr, old, obj, "update") },
+		DeleteFunc: func(obj any) { rw.handleEvent(ctx, gvr, nil, obj, "delete") },
 	}); err != nil {
 		slog.Warn("resource-watcher: AddEventHandler failed",
 			slog.String("gvr", gvr.String()), slog.Any("err", err))
@@ -154,7 +170,7 @@ func (rw *ResourceWatcher) startInformer(gvr schema.GroupVersionResource) {
 	}
 }
 
-func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVersionResource, obj any, eventType string) {
+func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVersionResource, _, obj any, eventType string) {
 	uns, ok := toUnstructured(obj)
 	if !ok {
 		return
@@ -176,6 +192,19 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		if ns != "" {
 			rw.patchListCache(ctx, gvr, clusterListKey, uns, "delete")
 		}
+		// Full L1+L2 invalidation: the resource is gone.
+		gvrKey := GVRToKey(gvr)
+		for _, prefix := range []string{"snowplow:l1gvr:", "snowplow:l2gvr:"} {
+			idxKey := prefix + gvrKey
+			if keys, serr := rw.cache.SMembers(ctx, idxKey); serr == nil && len(keys) > 0 {
+				_ = rw.cache.Delete(ctx, append(keys, idxKey)...)
+				slog.Debug("resource-watcher: targeted invalidation (delete)",
+					slog.String("index", idxKey),
+					slog.Int("count", len(keys)))
+			}
+		}
+		return
+
 	case "add", "update":
 		if serr := rw.cache.SetForGVR(ctx, gvr, getKey, uns); serr != nil {
 			slog.Warn("resource-watcher: failed to update GET cache",
@@ -187,20 +216,48 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		}
 	}
 
-	// Targeted L1+L2 invalidation: only delete resolved/http entries that
-	// depend on the GVR that just changed. After deleting the cache entries,
-	// also delete the reverse-index SET so it doesn't accumulate stale
-	// members across invalidation cycles. The next resolution pass will
-	// re-populate a clean SET via SAddWithTTL.
+	// ── Proactive L1 refresh (stale-while-revalidate) ────────────────────────
+	// Instead of deleting L1 keys (which causes cache misses), re-resolve them
+	// in the background. The old value continues to be served until the refresh
+	// completes. L2 keys are deleted so the resolution pipeline fetches fresh
+	// data from the (already-updated) L3 layer or the live API.
 	gvrKey := GVRToKey(gvr)
-	for _, prefix := range []string{"snowplow:l1gvr:", "snowplow:l2gvr:"} {
-		idxKey := prefix + gvrKey
-		if keys, serr := rw.cache.SMembers(ctx, idxKey); serr == nil && len(keys) > 0 {
-			_ = rw.cache.Delete(ctx, append(keys, idxKey)...)
-			slog.Debug("resource-watcher: targeted invalidation",
-				slog.String("index", idxKey),
-				slog.Int("count", len(keys)))
+
+	// L2: always delete — they are rebuilt during L1 re-resolution.
+	l2IdxKey := L2GVRKey(gvrKey)
+	if l2Keys, serr := rw.cache.SMembers(ctx, l2IdxKey); serr == nil && len(l2Keys) > 0 {
+		_ = rw.cache.Delete(ctx, append(l2Keys, l2IdxKey)...)
+		slog.Debug("resource-watcher: L2 invalidated",
+			slog.String("gvr", gvr.String()),
+			slog.Int("count", len(l2Keys)))
+	}
+
+	// L1: proactively refresh instead of deleting.
+	l1IdxKey := L1GVRKey(gvrKey)
+	l1Keys, serr := rw.cache.SMembers(ctx, l1IdxKey)
+	if serr != nil || len(l1Keys) == 0 {
+		return
+	}
+
+	if rw.l1Refresh != nil {
+		// Guard: skip if a refresh for this GVR is already in-flight.
+		if _, alreadyRunning := rw.refreshing.LoadOrStore(gvrKey, true); alreadyRunning {
+			slog.Debug("resource-watcher: L1 refresh already in-flight, skipping",
+				slog.String("gvr", gvr.String()))
+			return
 		}
+		go func() {
+			defer rw.refreshing.Delete(gvrKey)
+			refreshCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			rw.l1Refresh(refreshCtx, gvr, l1Keys)
+		}()
+	} else {
+		// No refresher configured; fall back to deletion.
+		_ = rw.cache.Delete(ctx, append(l1Keys, l1IdxKey)...)
+		slog.Debug("resource-watcher: L1 invalidated (no refresher)",
+			slog.String("gvr", gvr.String()),
+			slog.Int("count", len(l1Keys)))
 	}
 }
 

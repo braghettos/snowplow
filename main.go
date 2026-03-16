@@ -232,6 +232,7 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 	}
 
 	c.SetGVRNotifier(resourceWatcher.AddGVR)
+	resourceWatcher.SetL1Refresher(dispatchers.MakeL1Refresher(c, rc, authnNS))
 
 	resourceWatcher.StartExpiryRefresh(ctx)
 	resourceWatcher.Start(ctx)
