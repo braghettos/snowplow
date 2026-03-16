@@ -278,15 +278,16 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 	log.Info("starting cache warmup")
 	warmer.Run(warmupCtx)
 
-	// Phase 5: Pre-warm L1 (resolved widget output) for every known user.
-	// Uses its own context because warmupCtx is cancelled when this function
-	// returns, but the L1 warmup continues in the background.
+	// Phase 5: Pre-warm L1 (resolved widget + RESTAction output) for every
+	// known user. Uses its own context because warmupCtx is cancelled when
+	// this function returns, but the L1 warmup continues in the background.
 	if warmupCfg != nil && authnNS != "" {
 		widgetGVRs := dispatchers.FilterWidgetGVRs(warmupCfg)
+		restactionGVRs := dispatchers.FilterRESTActionGVRs(warmupCfg)
 		go func() {
 			l1Ctx, l1Cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer l1Cancel()
-			dispatchers.WarmL1ForAllUsers(l1Ctx, c, rc, authnNS, widgetGVRs)
+			dispatchers.WarmL1ForAllUsers(l1Ctx, c, rc, authnNS, widgetGVRs, restactionGVRs)
 		}()
 	}
 }

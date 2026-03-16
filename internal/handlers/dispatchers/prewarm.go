@@ -15,9 +15,11 @@ import (
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/objects"
+	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -62,7 +64,7 @@ func preWarmChildWidgets(parentCtx context.Context, c *cache.RedisCache, resolve
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), preWarmTimeout)
 		defer cancel()
-		resolveWidgetsForUser(ctx, user, ep, accessToken, c, refs, authnNS)
+		resolveL1RefsForUser(ctx, user, ep, accessToken, c, refs, authnNS)
 		slog.Default().Info("L1 pre-warm completed",
 			slog.String("user", user.Username),
 			slog.Int("candidates", len(refs)),
@@ -75,13 +77,14 @@ func preWarmChildWidgets(parentCtx context.Context, c *cache.RedisCache, resolve
 // ---------------------------------------------------------------------------
 
 // WarmL1ForAllUsers discovers every user from their -clientconfig Secrets, then
-// resolves every instance of every widget GVR for each user, populating the
-// per-user L1 cache. Call this after L3 warmup so the raw K8s objects are
-// already cached and widget resolution hits L3 instead of the live API.
-func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config, authnNS string, widgetGVRs []schema.GroupVersionResource) {
+// resolves every instance of every widget AND RESTAction GVR for each user,
+// populating the per-user L1 cache. Call this after L3 warmup so the raw K8s
+// objects are already cached and resolution hits L3 instead of the live API.
+func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config, authnNS string, widgetGVRs, restactionGVRs []schema.GroupVersionResource) {
 	log := slog.Default()
-	if len(widgetGVRs) == 0 || authnNS == "" {
-		log.Info("L1 warmup: skipped (no widget GVRs or authn namespace)")
+	allGVRs := append(widgetGVRs, restactionGVRs...)
+	if len(allGVRs) == 0 || authnNS == "" {
+		log.Info("L1 warmup: skipped (no L1-eligible GVRs or authn namespace)")
 		return
 	}
 
@@ -98,17 +101,18 @@ func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config
 	log.Info("L1 warmup: starting",
 		slog.Int("users", len(users)),
 		slog.Int("widgetGVRs", len(widgetGVRs)),
+		slog.Int("restactionGVRs", len(restactionGVRs)),
 	)
 
 	var totalWarmed int64
 	for _, u := range users {
-		warmed := warmL1ForUser(ctx, c, u.userInfo, u.endpoint, widgetGVRs, authnNS)
+		warmed := warmL1ForUser(ctx, c, u.userInfo, u.endpoint, allGVRs, authnNS)
 		totalWarmed += warmed
 	}
 
 	log.Info("L1 warmup: completed",
 		slog.Int("users", len(users)),
-		slog.Int64("totalWidgetsWarmed", totalWarmed),
+		slog.Int64("totalWarmed", totalWarmed),
 	)
 }
 
@@ -121,6 +125,25 @@ func FilterWidgetGVRs(cfg *cache.WarmupConfig) []schema.GroupVersionResource {
 	var out []schema.GroupVersionResource
 	for _, entry := range cfg.Warmup.GVRs {
 		if entry.Group == widgetGroup {
+			out = append(out, schema.GroupVersionResource{
+				Group:    entry.Group,
+				Version:  entry.Version,
+				Resource: entry.Resource,
+			})
+		}
+	}
+	return out
+}
+
+// FilterRESTActionGVRs returns only the RESTAction GVRs from the warmup
+// config (templates.krateo.io / restactions).
+func FilterRESTActionGVRs(cfg *cache.WarmupConfig) []schema.GroupVersionResource {
+	if cfg == nil {
+		return nil
+	}
+	var out []schema.GroupVersionResource
+	for _, entry := range cfg.Warmup.GVRs {
+		if entry.Group == templatesGroup && entry.Resource == restactionResource {
 			out = append(out, schema.GroupVersionResource{
 				Group:    entry.Group,
 				Version:  entry.Version,
@@ -171,11 +194,11 @@ func discoverUsers(ctx context.Context, rc *rest.Config, authnNS string) ([]disc
 	return users, nil
 }
 
-func warmL1ForUser(ctx context.Context, c *cache.RedisCache, user jwtutil.UserInfo, ep endpoints.Endpoint, widgetGVRs []schema.GroupVersionResource, authnNS string) int64 {
+func warmL1ForUser(ctx context.Context, c *cache.RedisCache, user jwtutil.UserInfo, ep endpoints.Endpoint, gvrs []schema.GroupVersionResource, authnNS string) int64 {
 	log := slog.Default()
 
-	var allRefs []widgetRef
-	for _, gvr := range widgetGVRs {
+	var allRefs []l1Ref
+	for _, gvr := range gvrs {
 		listKey := cache.ListKey(gvr, "")
 		var list unstructured.UnstructuredList
 		if hit, err := c.Get(ctx, listKey, &list); !hit || err != nil {
@@ -186,7 +209,7 @@ func warmL1ForUser(ctx context.Context, c *cache.RedisCache, user jwtutil.UserIn
 			if c.Exists(ctx, rKey) {
 				continue
 			}
-			allRefs = append(allRefs, widgetRef{
+			allRefs = append(allRefs, l1Ref{
 				gvr:  gvr,
 				ns:   obj.GetNamespace(),
 				name: obj.GetName(),
@@ -198,7 +221,7 @@ func warmL1ForUser(ctx context.Context, c *cache.RedisCache, user jwtutil.UserIn
 		return 0
 	}
 
-	warmed := resolveWidgetsForUser(ctx, user, ep, "", c, allRefs, authnNS)
+	warmed := resolveL1RefsForUser(ctx, user, ep, "", c, allRefs, authnNS)
 
 	log.Info("L1 warmup: user done",
 		slog.String("user", user.Username),
@@ -208,14 +231,14 @@ func warmL1ForUser(ctx context.Context, c *cache.RedisCache, user jwtutil.UserIn
 	return warmed
 }
 
-type widgetRef struct {
+type l1Ref struct {
 	gvr  schema.GroupVersionResource
 	ns   string
 	name string
 }
 
-func extractChildWidgetRefs(ctx context.Context, c *cache.RedisCache, items []interface{}, username string) []widgetRef {
-	var refs []widgetRef
+func extractChildWidgetRefs(ctx context.Context, c *cache.RedisCache, items []interface{}, username string) []l1Ref {
+	var refs []l1Ref
 	for _, item := range items {
 		m, ok := item.(map[string]interface{})
 		if !ok {
@@ -236,15 +259,15 @@ func extractChildWidgetRefs(ctx context.Context, c *cache.RedisCache, items []in
 		if c.Exists(ctx, key) {
 			continue
 		}
-		refs = append(refs, widgetRef{gvr: gvr, ns: ns, name: name})
+		refs = append(refs, l1Ref{gvr: gvr, ns: ns, name: name})
 	}
 	return refs
 }
 
-// resolveWidgetsForUser resolves a batch of widgets for a specific user and
-// stores them in L1 cache. Returns the number successfully warmed.
-// The caller provides the context (with its own deadline).
-func resolveWidgetsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, c *cache.RedisCache, refs []widgetRef, authnNS string) int64 {
+// resolveL1RefsForUser resolves a batch of L1 refs (widgets or RESTActions) for
+// a specific user and stores them in L1 cache. Returns the number successfully
+// warmed. The caller provides the context (with its own deadline).
+func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, c *cache.RedisCache, refs []l1Ref, authnNS string) int64 {
 	ctx = xcontext.BuildContext(ctx,
 		xcontext.WithUserConfig(ep),
 		xcontext.WithUserInfo(user),
@@ -261,7 +284,7 @@ func resolveWidgetsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoi
 	for _, ref := range refs {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(r widgetRef) {
+		go func(r l1Ref) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
@@ -286,18 +309,45 @@ func resolveWidgetsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoi
 			tracker := cache.NewDependencyTracker()
 			tctx := cache.WithDependencyTracker(rctx, tracker)
 
-			res, err := widgets.Resolve(tctx, widgets.ResolveOptions{
-				In:      got.Unstructured,
-				AuthnNS: authnNS,
-				PerPage: -1,
-				Page:    -1,
-			})
-			if err != nil {
+			var (
+				raw []byte
+				err error
+			)
+
+			switch {
+			case r.gvr.Group == widgetGroup:
+				res, resolveErr := widgets.Resolve(tctx, widgets.ResolveOptions{
+					In:      got.Unstructured,
+					AuthnNS: authnNS,
+					PerPage: -1,
+					Page:    -1,
+				})
+				if resolveErr != nil {
+					return
+				}
+				raw, err = json.MarshalIndent(res, "", "  ")
+
+			case r.gvr.Group == templatesGroup && r.gvr.Resource == restactionResource:
+				var cr templatesv1.RESTAction
+				if convErr := runtime.DefaultUnstructuredConverter.FromUnstructured(got.Unstructured.Object, &cr); convErr != nil {
+					return
+				}
+				res, resolveErr := restactions.Resolve(tctx, restactions.ResolveOptions{
+					In:      &cr,
+					AuthnNS: authnNS,
+					PerPage: -1,
+					Page:    -1,
+				})
+				if resolveErr != nil {
+					return
+				}
+				raw, err = json.MarshalIndent(res, "", "  ")
+
+			default:
 				return
 			}
 
-			raw, merr := json.MarshalIndent(res, "", "  ")
-			if merr != nil {
+			if err != nil {
 				return
 			}
 
