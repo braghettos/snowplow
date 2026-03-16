@@ -2,7 +2,9 @@ package dispatchers
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"log/slog"
 	"strings"
 	"sync"
@@ -186,12 +188,30 @@ func discoverUsers(ctx context.Context, rc *rest.Config, authnNS string) ([]disc
 				slog.String("user", username), slog.Any("err", err))
 			continue
 		}
+		groups := extractGroupsFromClientCert(ep.ClientCertificateData)
+		slog.Debug("L1 warmup: discovered user",
+			slog.String("user", username),
+			slog.Any("groups", groups))
 		users = append(users, discoveredUser{
-			userInfo: jwtutil.UserInfo{Username: username},
+			userInfo: jwtutil.UserInfo{Username: username, Groups: groups},
 			endpoint: ep,
 		})
 	}
 	return users, nil
+}
+
+// extractGroupsFromClientCert parses the PEM-encoded client certificate and
+// returns the Subject.Organization values, which Kubernetes uses as groups.
+func extractGroupsFromClientCert(certPEM string) []string {
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		return nil
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil
+	}
+	return cert.Subject.Organization
 }
 
 func warmL1ForUser(ctx context.Context, c *cache.RedisCache, user jwtutil.UserInfo, ep endpoints.Endpoint, gvrs []schema.GroupVersionResource, authnNS string) int64 {
