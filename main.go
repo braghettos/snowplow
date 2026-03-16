@@ -278,10 +278,14 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 	warmer.Run(warmupCtx)
 
 	// Phase 5: Pre-warm L1 (resolved widget output) for every known user.
-	// This runs after L3 is populated so widget resolution hits L3 instead of
-	// the live K8s API.
+	// Uses its own context because warmupCtx is cancelled when this function
+	// returns, but the L1 warmup continues in the background.
 	if warmupCfg != nil && authnNS != "" {
 		widgetGVRs := dispatchers.FilterWidgetGVRs(warmupCfg)
-		go dispatchers.WarmL1ForAllUsers(warmupCtx, c, rc, authnNS, widgetGVRs)
+		go func() {
+			l1Ctx, l1Cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer l1Cancel()
+			dispatchers.WarmL1ForAllUsers(l1Ctx, c, rc, authnNS, widgetGVRs)
+		}()
 	}
 }

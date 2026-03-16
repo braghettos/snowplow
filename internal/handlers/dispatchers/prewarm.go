@@ -26,7 +26,6 @@ import (
 const (
 	preWarmConcurrency      = 10
 	preWarmTimeout          = 30 * time.Second
-	startupL1Timeout        = 5 * time.Minute
 	widgetGroup             = "widgets.templates.krateo.io"
 	clientConfigSecretSuffix = "-clientconfig"
 )
@@ -60,7 +59,15 @@ func preWarmChildWidgets(parentCtx context.Context, c *cache.RedisCache, resolve
 		return
 	}
 
-	go resolveWidgetsForUser(user, ep, accessToken, c, refs, authnNS)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), preWarmTimeout)
+		defer cancel()
+		resolveWidgetsForUser(ctx, user, ep, accessToken, c, refs, authnNS)
+		slog.Default().Info("L1 pre-warm completed",
+			slog.String("user", user.Username),
+			slog.Int("candidates", len(refs)),
+		)
+	}()
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +198,7 @@ func warmL1ForUser(ctx context.Context, c *cache.RedisCache, user jwtutil.UserIn
 		return 0
 	}
 
-	warmed := resolveWidgetsForUser(user, ep, "", c, allRefs, authnNS)
+	warmed := resolveWidgetsForUser(ctx, user, ep, "", c, allRefs, authnNS)
 
 	log.Info("L1 warmup: user done",
 		slog.String("user", user.Username),
@@ -236,10 +243,8 @@ func extractChildWidgetRefs(ctx context.Context, c *cache.RedisCache, items []in
 
 // resolveWidgetsForUser resolves a batch of widgets for a specific user and
 // stores them in L1 cache. Returns the number successfully warmed.
-func resolveWidgetsForUser(user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, c *cache.RedisCache, refs []widgetRef, authnNS string) int64 {
-	ctx, cancel := context.WithTimeout(context.Background(), preWarmTimeout)
-	defer cancel()
-
+// The caller provides the context (with its own deadline).
+func resolveWidgetsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, c *cache.RedisCache, refs []widgetRef, authnNS string) int64 {
 	ctx = xcontext.BuildContext(ctx,
 		xcontext.WithUserConfig(ep),
 		xcontext.WithUserInfo(user),
