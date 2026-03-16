@@ -235,6 +235,7 @@ Phase 5: L1 Warmup (background goroutine, 5min timeout)
    │   └── RESTActions are excluded (deep HTTP fan-out at startup)
    └── For each user × each widget instance:
        ├── Skip if L1 key already exists
+       ├── Skip if widget has spec.apiRef (depends on RESTAction data)
        ├── Resolve widget (reads from L3 cache)
        └── Store resolved output in L1
 ```
@@ -334,7 +335,7 @@ When RESTAction resolution makes HTTP calls to K8s API paths (e.g. listing compo
 
 1. **RESTAction API items are sequential by design.** Items are processed in topological order and share a mutable JQ `dict`. Even without explicit `DependsOn`, items may reference data produced by earlier items via JQ expressions, making parallelization unsafe.
 
-2. **RESTActions are excluded from L1 startup warmup.** Due to deep HTTP fan-out (e.g. `compositions-list` triggers 200+ K8s API calls), warming RESTActions at startup causes excessive duration. They are instead warmed on first real user request.
+2. **RESTActions and apiRef-dependent widgets are excluded from L1 startup warmup.** RESTActions are excluded due to deep HTTP fan-out. Widgets with `spec.apiRef` (e.g. PieCharts, Tables that reference a RESTAction like `compositions-list`) are also excluded because their RESTAction's dynamic CRD data may not be in L3 yet during startup. Caching these with empty results would leave stale zeros in L1 with incomplete GVR reverse indexes, preventing L1 refresh from ever firing. Both are warmed on first real user request, when L3 is fully populated.
 
 3. **L1 refresh uses the user's client certificate groups.** Groups are extracted from the `*-clientconfig` Secret's client certificate data. If the certificate is missing or malformed, the refresh runs with an empty groups list, potentially producing incorrect RBAC results.
 

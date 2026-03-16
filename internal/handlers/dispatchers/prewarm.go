@@ -308,6 +308,12 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 				return
 			}
 
+			if hasApiRef(got.Unstructured) {
+				slog.Debug("L1 warmup: skipping widget with apiRef",
+					slog.String("name", r.name), slog.String("ns", r.ns))
+				return
+			}
+
 			tracker := cache.NewDependencyTracker()
 			tctx := cache.WithDependencyTracker(rctx, tracker)
 
@@ -340,4 +346,14 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 
 	wg.Wait()
 	return warmed
+}
+
+// hasApiRef returns true when the widget spec contains a non-empty apiRef,
+// meaning it depends on a RESTAction for its data. Such widgets must NOT be
+// L1-warmed at startup because the RESTAction's dynamic CRD data may not be
+// in L3 yet, leading to empty results being cached with incomplete GVR reverse
+// indexes (so L1 refresh never fires for the missing dependencies).
+func hasApiRef(obj *unstructured.Unstructured) bool {
+	name, _, _ := unstructured.NestedString(obj.Object, "spec", "apiRef", "name")
+	return name != ""
 }
