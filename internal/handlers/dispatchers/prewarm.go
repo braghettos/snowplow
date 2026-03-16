@@ -82,7 +82,7 @@ func preWarmChildWidgets(parentCtx context.Context, c *cache.RedisCache, resolve
 // resolves every instance of every widget AND RESTAction GVR for each user,
 // populating the per-user L1 cache. Call this after L3 warmup so the raw K8s
 // objects are already cached and resolution hits L3 instead of the live API.
-func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config, authnNS string, widgetGVRs, restactionGVRs []schema.GroupVersionResource) {
+func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config, authnNS, signingKey string, widgetGVRs, restactionGVRs []schema.GroupVersionResource) {
 	log := slog.Default()
 	allGVRs := append(widgetGVRs, restactionGVRs...)
 	if len(allGVRs) == 0 || authnNS == "" {
@@ -108,7 +108,8 @@ func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config
 
 	var totalWarmed int64
 	for _, u := range users {
-		warmed := warmL1ForUser(ctx, c, u.userInfo, u.endpoint, allGVRs, authnNS)
+		token := mintWarmupJWT(signingKey, u.userInfo)
+		warmed := warmL1ForUser(ctx, c, u.userInfo, u.endpoint, token, allGVRs, authnNS)
 		totalWarmed += warmed
 	}
 
@@ -200,16 +201,24 @@ func discoverUsers(ctx context.Context, rc *rest.Config, authnNS string) ([]disc
 	return users, nil
 }
 
-// restActionRequiresJWT returns true if any API call in the RESTAction spec
-// has ExportJWT set, meaning it forwards the user's JWT to an external service.
-// Such RESTActions cannot be resolved during startup warmup (no JWT available).
-func restActionRequiresJWT(cr *templatesv1.RESTAction) bool {
-	for _, api := range cr.Spec.API {
-		if api.ExportJWT != nil && *api.ExportJWT {
-			return true
-		}
+// mintWarmupJWT creates a short-lived JWT for a user so that RESTActions with
+// exportJwt:true can authenticate internal calls during L1 startup warmup.
+func mintWarmupJWT(signingKey string, user jwtutil.UserInfo) string {
+	if signingKey == "" {
+		return ""
 	}
-	return false
+	tok, err := jwtutil.CreateToken(jwtutil.CreateTokenOptions{
+		Username:  user.Username,
+		Groups:    user.Groups,
+		Duration:  5 * time.Minute,
+		SigningKey: signingKey,
+	})
+	if err != nil {
+		slog.Warn("L1 warmup: failed to mint JWT",
+			slog.String("user", user.Username), slog.Any("err", err))
+		return ""
+	}
+	return tok
 }
 
 // extractGroupsFromClientCert parses the PEM-encoded client certificate and
@@ -226,7 +235,7 @@ func extractGroupsFromClientCert(certPEM string) []string {
 	return cert.Subject.Organization
 }
 
-func warmL1ForUser(ctx context.Context, c *cache.RedisCache, user jwtutil.UserInfo, ep endpoints.Endpoint, gvrs []schema.GroupVersionResource, authnNS string) int64 {
+func warmL1ForUser(ctx context.Context, c *cache.RedisCache, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, gvrs []schema.GroupVersionResource, authnNS string) int64 {
 	log := slog.Default()
 
 	var allRefs []l1Ref
@@ -253,7 +262,7 @@ func warmL1ForUser(ctx context.Context, c *cache.RedisCache, user jwtutil.UserIn
 		return 0
 	}
 
-	warmed := resolveL1RefsForUser(ctx, user, ep, "", c, allRefs, authnNS)
+	warmed := resolveL1RefsForUser(ctx, user, ep, accessToken, c, allRefs, authnNS)
 
 	log.Info("L1 warmup: user done",
 		slog.String("user", user.Username),
@@ -362,9 +371,6 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			case r.gvr.Group == templatesGroup && r.gvr.Resource == restactionResource:
 				var cr templatesv1.RESTAction
 				if convErr := runtime.DefaultUnstructuredConverter.FromUnstructured(got.Unstructured.Object, &cr); convErr != nil {
-					return
-				}
-				if accessToken == "" && restActionRequiresJWT(&cr) {
 					return
 				}
 				res, resolveErr := restactions.Resolve(tctx, restactions.ResolveOptions{
