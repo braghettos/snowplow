@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"log/slog"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -308,12 +310,6 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 				return
 			}
 
-			if hasApiRef(got.Unstructured) {
-				slog.Debug("L1 warmup: skipping widget with apiRef",
-					slog.String("name", r.name), slog.String("ns", r.ns))
-				return
-			}
-
 			tracker := cache.NewDependencyTracker()
 			tctx := cache.WithDependencyTracker(rctx, tracker)
 
@@ -340,6 +336,8 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 				_ = c.SAddWithTTL(rctx, cache.L1GVRKey(gvrKey), rKey, cache.DefaultResourceTTL)
 			}
 
+			registerApiRefGVRDeps(rctx, c, got.Unstructured, rKey, tracker)
+
 			atomic.AddInt64(&warmed, 1)
 		}(ref)
 	}
@@ -348,12 +346,159 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 	return warmed
 }
 
-// hasApiRef returns true when the widget spec contains a non-empty apiRef,
-// meaning it depends on a RESTAction for its data. Such widgets must NOT be
-// L1-warmed at startup because the RESTAction's dynamic CRD data may not be
-// in L3 yet, leading to empty results being cached with incomplete GVR reverse
-// indexes (so L1 refresh never fires for the missing dependencies).
-func hasApiRef(obj *unstructured.Unstructured) bool {
-	name, _, _ := unstructured.NestedString(obj.Object, "spec", "apiRef", "name")
-	return name != ""
+// registerApiRefGVRDeps ensures that widgets with an apiRef (which always
+// points to a RESTAction) are registered in the L1 GVR reverse indexes for
+// the RESTAction's transitive dependencies — even when those dependencies
+// returned empty data during warmup.
+//
+// During startup warmup, dynamic CRD data may not yet be in L3, causing the
+// RESTAction to resolve with empty results. The DependencyTracker only
+// captures GVRs that were actually visited, so the dynamic CRD GVRs are
+// missed. Without this function, L1 refresh would never fire for those
+// missing dependencies because the widget's L1 key would not appear in
+// their reverse indexes.
+//
+// The fix: fetch the RESTAction CR from L3, parse its API items' paths to
+// extract K8s API groups (both static paths and JQ template strings), use
+// the K8s discovery API to find all resources belonging to those groups,
+// register informers (SAddGVR) and add the widget's L1 key to the GVR
+// reverse indexes. This works even during early startup because CRDs are
+// already registered in the cluster API server.
+func registerApiRefGVRDeps(ctx context.Context, c *cache.RedisCache, widgetObj *unstructured.Unstructured, l1Key string, tracker *cache.DependencyTracker) {
+	if c == nil {
+		return
+	}
+
+	raName, _, _ := unstructured.NestedString(widgetObj.Object, "spec", "apiRef", "name")
+	raNS, _, _ := unstructured.NestedString(widgetObj.Object, "spec", "apiRef", "namespace")
+	if raName == "" {
+		return
+	}
+
+	raGVR := schema.GroupVersionResource{
+		Group: "templates.krateo.io", Version: "v1", Resource: "restactions",
+	}
+	raKey := cache.GetKey(raGVR, raNS, raName)
+	var raObj unstructured.Unstructured
+	if hit, err := c.Get(ctx, raKey, &raObj); !hit || err != nil {
+		return
+	}
+
+	apis, found, _ := unstructured.NestedSlice(raObj.Object, "spec", "api")
+	if !found {
+		return
+	}
+
+	alreadyTracked := make(map[string]bool)
+	for _, k := range tracker.GVRKeys() {
+		alreadyTracked[k] = true
+	}
+
+	groups := extractAPIGroups(apis)
+	if len(groups) == 0 {
+		return
+	}
+
+	rc, err := rest.InClusterConfig()
+	if err != nil {
+		return
+	}
+	discoveredGVRs := discoverGVRsForGroups(rc, groups)
+	if len(discoveredGVRs) == 0 {
+		return
+	}
+
+	var registered int
+	for _, gvr := range discoveredGVRs {
+		gvrKey := cache.GVRToKey(gvr)
+		if alreadyTracked[gvrKey] {
+			continue
+		}
+		_ = c.SAddGVR(ctx, gvr)
+		_ = c.SAddWithTTL(ctx, cache.L1GVRKey(gvrKey), l1Key, cache.DefaultResourceTTL)
+		registered++
+	}
+
+	if registered > 0 {
+		slog.Debug("L1 warmup: registered apiRef transitive GVR deps",
+			slog.String("widget", l1Key),
+			slog.String("restaction", raName),
+			slog.Int("registered", registered))
+	}
+}
+
+// discoverGVRsForGroups queries the K8s discovery API and returns all GVRs
+// whose group matches one of the requested groups. Only list-capable
+// resources are returned (subresources and non-listable resources are
+// excluded).
+func discoverGVRsForGroups(rc *rest.Config, groups []string) []schema.GroupVersionResource {
+	dc, err := discovery.NewDiscoveryClientForConfig(rc)
+	if err != nil {
+		return nil
+	}
+	lists, err := dc.ServerPreferredResources()
+	if err != nil && lists == nil {
+		return nil
+	}
+	wantGroup := make(map[string]bool, len(groups))
+	for _, g := range groups {
+		wantGroup[g] = true
+	}
+	var out []schema.GroupVersionResource
+	for _, list := range lists {
+		gv, perr := schema.ParseGroupVersion(list.GroupVersion)
+		if perr != nil {
+			continue
+		}
+		for _, res := range list.APIResources {
+			g := res.Group
+			if g == "" {
+				g = gv.Group
+			}
+			if !wantGroup[g] {
+				continue
+			}
+			if strings.Contains(res.Name, "/") {
+				continue
+			}
+			v := res.Version
+			if v == "" {
+				v = gv.Version
+			}
+			out = append(out, schema.GroupVersionResource{Group: g, Version: v, Resource: res.Name})
+		}
+	}
+	return out
+}
+
+// apisGroupRe matches "/apis/{group}/" in both static paths and JQ template
+// strings (where the path is embedded in a string literal).
+var apisGroupRe = regexp.MustCompile(`/apis/([a-zA-Z0-9][a-zA-Z0-9._-]*\.[a-zA-Z]{2,})/`)
+
+// extractAPIGroups scans RESTAction API items' paths and returns unique K8s
+// API group names found in them. It handles both direct paths
+// ("/apis/composition.krateo.io/v1/...") and JQ template strings that embed
+// such paths ("${ \"/apis/composition.krateo.io/\" + ... }").
+func extractAPIGroups(apis []interface{}) []string {
+	seen := map[string]bool{}
+	for _, item := range apis {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		path, _ := m["path"].(string)
+		if path == "" {
+			continue
+		}
+		for _, match := range apisGroupRe.FindAllStringSubmatch(path, -1) {
+			if len(match) > 1 {
+				seen[match[1]] = true
+			}
+		}
+	}
+	var out []string
+	for g := range seen {
+		out = append(out, g)
+	}
+	return out
 }
