@@ -136,6 +136,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		for _, gvrKey := range tracker.GVRKeys() {
 			_ = c.SAddWithTTL(req.Context(), cache.L1GVRKey(gvrKey), resolvedKey, cache.DefaultResourceTTL)
 		}
+
+		preWarmChildWidgets(req.Context(), c, res, r.authnNS)
 	}
 
 	wri.Header().Set("Content-Type", "application/json")
