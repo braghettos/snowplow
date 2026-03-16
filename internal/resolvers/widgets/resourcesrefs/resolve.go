@@ -31,30 +31,35 @@ func Resolve(ctx context.Context, items []templatesv1.ResourceRef) ([]templatesv
 
 	const concurrency = 20
 
+	slots := make([][]templatesv1.ResourceRefResult, len(items))
+	slotErrs := make([]error, len(items))
+
 	var (
-		wg      sync.WaitGroup
-		sem     = make(chan struct{}, concurrency)
-		mu      sync.Mutex
-		results []templatesv1.ResourceRefResult
-		errs    []error
+		wg  sync.WaitGroup
+		sem = make(chan struct{}, concurrency)
 	)
 	for i := range items {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(ref *templatesv1.ResourceRef) {
+		go func(idx int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			res, err2 := resolveOne(ctx, rc, ref)
-			mu.Lock()
-			if err2 != nil {
-				errs = append(errs, err2)
-			} else {
-				results = append(results, res...)
-			}
-			mu.Unlock()
-		}(&items[i])
+			res, err2 := resolveOne(ctx, rc, &items[idx])
+			slots[idx] = res
+			slotErrs[idx] = err2
+		}(i)
 	}
 	wg.Wait()
+
+	var results []templatesv1.ResourceRefResult
+	var errs []error
+	for i := range items {
+		if slotErrs[i] != nil {
+			errs = append(errs, slotErrs[i])
+		} else {
+			results = append(results, slots[i]...)
+		}
+	}
 
 	return results, errors.Join(errs...)
 }
