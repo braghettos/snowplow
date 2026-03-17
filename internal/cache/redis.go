@@ -328,6 +328,21 @@ func (c *RedisCache) HSetWithTTL(ctx context.Context, key, field, value string, 
 	return err
 }
 
+// IsRBACAllowed performs a cache-only RBAC lookup (no K8s API call).
+// Returns (allowed, cached). If the RBAC result is not in the cache,
+// cached is false and allowed defaults to false (conservative deny).
+func (c *RedisCache) IsRBACAllowed(ctx context.Context, username, verb string, gr schema.GroupResource, namespace string) (allowed, cached bool) {
+	if c == nil {
+		return false, false
+	}
+	key := RBACKey(username, verb, gr, namespace)
+	var val bool
+	if hit, err := c.Get(ctx, key, &val); hit && err == nil {
+		return val, true
+	}
+	return false, false
+}
+
 // HGetAll returns all field-value pairs in a Redis HASH.
 func (c *RedisCache) HGetAll(ctx context.Context, key string) (map[string]string, error) {
 	if c == nil {

@@ -278,6 +278,10 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 	log.Info("starting cache warmup")
 	warmer.Run(warmupCtx)
 
+	// Phase 4b: Pre-populate RBAC cache for all users so L3→L2 promotions
+	// and the watcher's cache-only RBAC checks work from the start.
+	dispatchers.WarmRBACForAllUsers(warmupCtx, c, rc, authnNS, signKey)
+
 	// Phase 5: Pre-warm L1 (resolved widget + RESTAction output) for every
 	// known user. Uses its own context because warmupCtx is cancelled when
 	// this function returns, but the L1 warmup continues in the background.

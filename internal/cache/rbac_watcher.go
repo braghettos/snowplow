@@ -56,13 +56,9 @@ func (rw *RBACWatcher) invalidate(ctx context.Context, _ any) {
 	}
 	total := 0
 	for _, username := range usernames {
-		keys, _ := rw.cache.ScanKeys(ctx, RBACKeyPattern(username))
-		if len(keys) > 0 {
-			_ = rw.cache.Delete(ctx, keys...)
-			total += len(keys)
-		}
+		total += rw.purgeUserCacheData(ctx, username)
 	}
-	slog.Debug("rbac-watcher: invalidated RBAC for active users after role change",
+	slog.Debug("rbac-watcher: invalidated RBAC+L1+L2 for active users after role change",
 		slog.Int("users", len(usernames)), slog.Int("keys", total))
 }
 
@@ -97,11 +93,27 @@ func (rw *RBACWatcher) invalidateFromBinding(ctx context.Context, obj any) {
 		return
 	}
 	for _, username := range usernames {
-		keys, _ := rw.cache.ScanKeys(ctx, RBACKeyPattern(username))
+		rw.purgeUserCacheData(ctx, username)
+	}
+}
+
+// purgeUserCacheData deletes RBAC, L1 (resolved), and L2 (http) cache entries
+// for a single user. Returns the total number of keys deleted.
+func (rw *RBACWatcher) purgeUserCacheData(ctx context.Context, username string) int {
+	total := 0
+	patterns := []string{
+		RBACKeyPattern(username),
+		"snowplow:resolved:" + username + ":*",
+		"snowplow:http:" + username + ":*",
+	}
+	for _, p := range patterns {
+		keys, _ := rw.cache.ScanKeys(ctx, p)
 		if len(keys) > 0 {
 			_ = rw.cache.Delete(ctx, keys...)
+			total += len(keys)
 		}
 	}
+	return total
 }
 
 func extractSubjects(obj any) ([]rbacv1.Subject, bool) {

@@ -17,6 +17,8 @@ import (
 	"github.com/krateoplatformops/plumbing/ptr"
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateoplatformops/snowplow/internal/rbac"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
 
@@ -227,6 +229,15 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				l3Raw, l3Hit, _ := c.GetRaw(ctx, l3Key)
 
 				if l3Hit && !cache.IsNotFoundRaw(l3Raw) {
+					rbacVerb := "list"
+					if pathName != "" {
+						rbacVerb = "get"
+					}
+					if rbac.UserCan(ctx, rbac.UserCanOptions{
+						Verb:          rbacVerb,
+						GroupResource: schema.GroupResource{Group: pathGVR.Group, Resource: pathGVR.Resource},
+						Namespace:     pathNS,
+					}) {
 					_ = c.SetHTTPRaw(ctx, httpKey, l3Raw)
 					gvrKey := cache.GVRToKey(pathGVR)
 					if pathName != "" {
@@ -252,6 +263,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							slog.String("key", httpKey), slog.Any("err", herr))
 					}
 					return true
+					}
+					log.Debug("api: L3 promotion denied by RBAC",
+						slog.String("user", user.Username),
+						slog.String("verb", rbacVerb),
+						slog.String("gvr", pathGVR.String()),
+						slog.String("ns", pathNS))
 				}
 			}
 

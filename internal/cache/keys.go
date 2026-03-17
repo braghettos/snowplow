@@ -80,6 +80,16 @@ func HTTPUserKey(username, method, path string) string {
 	return fmt.Sprintf("snowplow:http:%s:%s:%x", username, strings.ToUpper(method), h[:8])
 }
 
+// ParseHTTPUserKey extracts the username from an L2 HTTP cache key.
+// Key format: snowplow:http:{username}:{METHOD}:{pathHash}
+func ParseHTTPUserKey(key string) (username string, ok bool) {
+	parts := strings.SplitN(key, ":", 5)
+	if len(parts) == 5 && parts[0] == "snowplow" && parts[1] == "http" {
+		return parts[2], true
+	}
+	return "", false
+}
+
 // ResolvedKey builds the per-user cache key for a fully-resolved dispatcher
 // output (widget or RESTAction). Caching at this level eliminates both the
 // HTTP fan-out AND all JQ evaluations for repeated requests.

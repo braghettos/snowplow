@@ -18,6 +18,7 @@ import (
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/objects"
+	"github.com/krateoplatformops/snowplow/internal/rbac"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -144,6 +145,72 @@ func FilterWidgetGVRs(cfg *cache.WarmupConfig) []schema.GroupVersionResource {
 	return out
 }
 
+
+// WarmRBACForAllUsers pre-populates the RBAC cache for all discovered users
+// so that the watcher's cache-only RBAC checks and L1 warmup's L3→L2
+// promotions have permission data available from the start.
+func WarmRBACForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config, authnNS, signKey string) {
+	log := slog.Default()
+	if authnNS == "" {
+		return
+	}
+
+	users, err := discoverUsers(ctx, rc, authnNS)
+	if err != nil || len(users) == 0 {
+		log.Warn("RBAC warmup: no users discovered", slog.Any("err", err))
+		return
+	}
+
+	gvrKeys, err := c.SMembers(ctx, cache.WatchedGVRsKey)
+	if err != nil || len(gvrKeys) == 0 {
+		log.Info("RBAC warmup: no watched GVRs yet")
+		return
+	}
+
+	var namespaces []string
+	nsGVR := schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}
+	nsListKey := cache.ListKey(nsGVR, "")
+	var nsList unstructured.UnstructuredList
+	if hit, gerr := c.Get(ctx, nsListKey, &nsList); hit && gerr == nil {
+		for _, ns := range nsList.Items {
+			namespaces = append(namespaces, ns.GetName())
+		}
+	}
+	if len(namespaces) == 0 {
+		log.Info("RBAC warmup: no namespaces in L3 cache")
+		return
+	}
+
+	var total int64
+	for _, u := range users {
+		token := mintJWT(u.userInfo, signKey)
+		rctx := xcontext.BuildContext(ctx,
+			xcontext.WithUserConfig(u.endpoint),
+			xcontext.WithUserInfo(u.userInfo),
+			xcontext.WithAccessToken(token),
+		)
+		rctx = cache.WithCache(rctx, c)
+
+		for _, gvrKeyStr := range gvrKeys {
+			gvr := cache.ParseGVRKey(gvrKeyStr)
+			if gvr.Resource == "" {
+				continue
+			}
+			gr := gvr.GroupResource()
+			for _, ns := range namespaces {
+				rbac.UserCan(rctx, rbac.UserCanOptions{
+					Verb: "list", GroupResource: gr, Namespace: ns,
+				})
+				total++
+			}
+		}
+	}
+	log.Info("RBAC warmup: completed",
+		slog.Int("users", len(users)),
+		slog.Int("gvrs", len(gvrKeys)),
+		slog.Int("namespaces", len(namespaces)),
+		slog.Int64("checks", total))
+}
 
 // ---------------------------------------------------------------------------
 // helpers

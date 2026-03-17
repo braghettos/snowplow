@@ -239,11 +239,18 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	gvrKey := GVRToKey(gvr)
 
 	// L2 GET: refresh per-resource entries from the fresh L3 GET key.
+	gr := gvr.GroupResource()
 	resIdxKey := L2ResourceKey(gvrKey, ns, name)
 	if resKeys, serr := rw.cache.SMembers(ctx, resIdxKey); serr == nil && len(resKeys) > 0 {
 		l3GetKey := GetKey(gvr, ns, name)
 		if fresh, hit, _ := rw.cache.GetRaw(ctx, l3GetKey); hit && !IsNotFoundRaw(fresh) {
 			for _, l2Key := range resKeys {
+				if u, ok := ParseHTTPUserKey(l2Key); ok {
+					if allowed, _ := rw.cache.IsRBACAllowed(ctx, u, "get", gr, ns); !allowed {
+						_ = rw.cache.Delete(ctx, l2Key)
+						continue
+					}
+				}
 				_ = rw.cache.SetHTTPRaw(ctx, l2Key, fresh)
 			}
 			slog.Debug("resource-watcher: L2 resource refreshed",
@@ -260,6 +267,15 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	if mapping, serr := rw.cache.HGetAll(ctx, l2IdxKey); serr == nil && len(mapping) > 0 {
 		refreshed := 0
 		for l2Key, l3Key := range mapping {
+			if u, ok := ParseHTTPUserKey(l2Key); ok {
+				listGVR, listNS, lok := ParseListKey(l3Key)
+				if lok {
+					if allowed, _ := rw.cache.IsRBACAllowed(ctx, u, "list", listGVR.GroupResource(), listNS); !allowed {
+						_ = rw.cache.Delete(ctx, l2Key)
+						continue
+					}
+				}
+			}
 			if fresh, hit, _ := rw.cache.GetRaw(ctx, l3Key); hit && !IsNotFoundRaw(fresh) {
 				_ = rw.cache.SetHTTPRaw(ctx, l2Key, fresh)
 				refreshed++
