@@ -22,6 +22,29 @@ type ResolveOptions struct {
 
 const parallelThreshold = 3
 
+// deepCopyValue recursively clones map[string]any and []any trees so that
+// each goroutine gets its own mutable copy. gojq.normalizeNumbers mutates
+// input maps in-place, so sharing a single DataSource across goroutines
+// causes "concurrent map iteration and map write" panics.
+func deepCopyValue(v any) any {
+	switch val := v.(type) {
+	case map[string]any:
+		m := make(map[string]any, len(val))
+		for k, v := range val {
+			m[k] = deepCopyValue(v)
+		}
+		return m
+	case []any:
+		s := make([]any, len(val))
+		for i, v := range val {
+			s[i] = deepCopyValue(v)
+		}
+		return s
+	default:
+		return v
+	}
+}
+
 func Resolve(ctx context.Context, opts ResolveOptions) ([]EvalResult, error) {
 	if len(opts.Items) == 0 {
 		return []EvalResult{}, nil
@@ -51,11 +74,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) ([]EvalResult, error) {
 
 	results := make([]EvalResult, len(work))
 
-	eval := func(w workItem) error {
+	eval := func(w workItem, ds map[string]any) error {
 		s := w.expression
 		if exp, ok := jqutil.MaybeQuery(w.expression); ok {
 			val, err := jqutil.Eval(ctx, jqutil.EvalOptions{
-				Query: exp, Data: opts.DataSource, Unquote: false,
+				Query: exp, Data: ds, Unquote: false,
 				ModuleLoader: jqsupport.ModuleLoader(),
 			})
 			if err != nil {
@@ -69,7 +92,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) ([]EvalResult, error) {
 
 	if len(work) < parallelThreshold {
 		for _, w := range work {
-			if err := eval(w); err != nil {
+			if err := eval(w, opts.DataSource); err != nil {
 				return nil, err
 			}
 		}
@@ -77,15 +100,16 @@ func Resolve(ctx context.Context, opts ResolveOptions) ([]EvalResult, error) {
 	}
 
 	var (
-		wg      sync.WaitGroup
-		errOnce sync.Once
+		wg       sync.WaitGroup
+		errOnce  sync.Once
 		firstErr error
 	)
 	for _, w := range work {
 		wg.Add(1)
+		dsCopy := deepCopyValue(opts.DataSource).(map[string]any)
 		go func(w workItem) {
 			defer wg.Done()
-			if err := eval(w); err != nil {
+			if err := eval(w, dsCopy); err != nil {
 				errOnce.Do(func() { firstErr = err })
 			}
 		}(w)
