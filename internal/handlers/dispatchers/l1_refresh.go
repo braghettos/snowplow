@@ -29,7 +29,7 @@ const (
 // MakeL1Refresher returns a cache.L1RefreshFunc that re-resolves L1 keys in
 // the background instead of deleting them. Old values keep being served while
 // the refresh runs (stale-while-revalidate).
-func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS string) cache.L1RefreshFunc {
+func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey string) cache.L1RefreshFunc {
 	return func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string) {
 		log := slog.Default()
 		log.Info("L1 refresh: starting",
@@ -59,6 +59,7 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS string) cache
 			}
 			groups := extractGroupsFromClientCert(ep.ClientCertificateData)
 			user := jwtutil.UserInfo{Username: username, Groups: groups}
+			accessToken := mintJWT(user, signKey)
 
 			var (
 				wg  sync.WaitGroup
@@ -69,10 +70,10 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS string) cache
 			for _, k := range keys {
 				wg.Add(1)
 				sem <- struct{}{}
-				go func(info cache.ResolvedKeyInfo, rawKey string) {
-					defer wg.Done()
-					defer func() { <-sem }()
-					if refreshSingleL1(ctx, c, user, ep, info, rawKey, authnNS) {
+			go func(info cache.ResolvedKeyInfo, rawKey string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				if refreshSingleL1(ctx, c, user, ep, accessToken, info, rawKey, authnNS) {
 						mu.Lock()
 						n++
 						mu.Unlock()
@@ -91,10 +92,11 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS string) cache
 }
 
 // refreshSingleL1 re-resolves one L1 entry and updates the cache in-place.
-func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.UserInfo, ep endpoints.Endpoint, info cache.ResolvedKeyInfo, rawKey, authnNS string) bool {
+func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, info cache.ResolvedKeyInfo, rawKey, authnNS string) bool {
 	rctx := xcontext.BuildContext(ctx,
 		xcontext.WithUserConfig(ep),
 		xcontext.WithUserInfo(user),
+		xcontext.WithAccessToken(accessToken),
 	)
 	rctx = cache.WithCache(rctx, c)
 

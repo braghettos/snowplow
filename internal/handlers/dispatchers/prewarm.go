@@ -85,7 +85,7 @@ func preWarmChildWidgets(parentCtx context.Context, c *cache.RedisCache, resolve
 // involve deep API fan-out (compositions-list alone triggers 200+ K8s calls)
 // and internal HTTP callbacks to snowplow, making startup warmup too slow.
 // RESTActions will be fast on first user request thanks to L3+L2 being warm.
-func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config, authnNS string, widgetGVRs []schema.GroupVersionResource) {
+func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config, authnNS, signKey string, widgetGVRs []schema.GroupVersionResource) {
 	log := slog.Default()
 	if len(widgetGVRs) == 0 || authnNS == "" {
 		log.Info("L1 warmup: skipped (no widget GVRs or authn namespace)")
@@ -109,7 +109,8 @@ func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config
 
 	var totalWarmed int64
 	for _, u := range users {
-		warmed := warmL1ForUser(ctx, c, u.userInfo, u.endpoint, "", widgetGVRs, authnNS)
+		token := mintJWT(u.userInfo, signKey)
+		warmed := warmL1ForUser(ctx, c, u.userInfo, u.endpoint, token, widgetGVRs, authnNS)
 		totalWarmed += warmed
 	}
 
@@ -431,6 +432,26 @@ func registerApiRefGVRDeps(ctx context.Context, c *cache.RedisCache, widgetObj *
 			slog.Int("registered", len(newGVRs)))
 	}
 	return len(newGVRs)
+}
+
+// mintJWT creates a short-lived JWT for internal use during L1 warmup and
+// refresh. The token allows internal HTTP callbacks (e.g. RESTAction API items
+// with exportJwt:true) to authenticate with snowplow.
+func mintJWT(user jwtutil.UserInfo, signKey string) string {
+	if signKey == "" {
+		return ""
+	}
+	tok, err := jwtutil.CreateToken(jwtutil.CreateTokenOptions{
+		Username:  user.Username,
+		Groups:    user.Groups,
+		Duration:  5 * time.Minute,
+		SigningKey: signKey,
+	})
+	if err != nil {
+		slog.Warn("L1: failed to mint JWT", slog.String("user", user.Username), slog.Any("err", err))
+		return ""
+	}
+	return tok
 }
 
 // discoverGVRsForGroups queries the K8s discovery API and returns all GVRs
