@@ -309,7 +309,7 @@ func warmL1RestActionsForUser(ctx context.Context, c *cache.RedisCache, user jwt
 
 		_ = c.SetResolvedRaw(tctx, rKey, raw)
 		for _, gvrKey := range tracker.GVRKeys() {
-			_ = c.SAddWithTTL(tctx, cache.L1GVRKey(gvrKey), rKey, cache.DefaultResourceTTL)
+			_ = c.SAddWithTTL(tctx, cache.L1GVRKey(gvrKey), rKey, cache.ReverseIndexTTL)
 		}
 
 		warmed++
@@ -412,7 +412,7 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			rKey := cache.ResolvedKey(user.Username, r.gvr, r.ns, r.name, -1, -1)
 			_ = c.SetResolvedRaw(rctx, rKey, raw)
 			for _, gvrKey := range tracker.GVRKeys() {
-				_ = c.SAddWithTTL(rctx, cache.L1GVRKey(gvrKey), rKey, cache.DefaultResourceTTL)
+				_ = c.SAddWithTTL(rctx, cache.L1GVRKey(gvrKey), rKey, cache.ReverseIndexTTL)
 			}
 
 			if newDeps := registerApiRefGVRDeps(rctx, c, got.Unstructured, rKey, tracker); newDeps > 0 {
@@ -495,7 +495,7 @@ func registerApiRefGVRDeps(ctx context.Context, c *cache.RedisCache, widgetObj *
 		if alreadyTracked[gvrKey] {
 			continue
 		}
-		_ = c.SAddWithTTL(ctx, cache.L1GVRKey(gvrKey), l1Key, cache.DefaultResourceTTL)
+		_ = c.SAddWithTTL(ctx, cache.L1GVRKey(gvrKey), l1Key, cache.ReverseIndexTTL)
 		newGVRs = append(newGVRs, gvr)
 	}
 

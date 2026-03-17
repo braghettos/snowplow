@@ -145,7 +145,7 @@ Reverse indexes are Redis SETs that map a GVR to the L1/L2 cache keys that **dep
 
 **Population**: During resolution, a `DependencyTracker` records every GVR accessed. L2 reverse indexes are populated inline during resolution (in `api/resolve.go`). After resolution completes, the dispatcher calls `SAddWithTTL` to register the L1 keys in the appropriate reverse index SETs.
 
-**TTL**: Reverse index SETs share the same TTL as the cache entries they reference (`DefaultResourceTTL`). The TTL is refreshed every time a member is added.
+**TTL**: Reverse index SETs use `ReverseIndexTTL` (2h), which is 2x the cache entry TTL (`DefaultResourceTTL` = 1h). This prevents silent expiry of reverse indexes for infrequently accessed GVRs. The TTL is refreshed every time a member is added.
 
 **Example flow**:
 1. Widget `dashboard-page` for user `admin` is resolved. During resolution, the pipeline reads compositions (`apiextensions.crossplane.io/v1/compositions`) and namespaces (`core/v1/namespaces`).

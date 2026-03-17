@@ -230,9 +230,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					_ = c.SetHTTPRaw(ctx, httpKey, l3Raw)
 					gvrKey := cache.GVRToKey(pathGVR)
 					if pathName != "" {
-						_ = c.SAddWithTTL(ctx, cache.L2ResourceKey(gvrKey, pathNS, pathName), httpKey, cache.DefaultResourceTTL)
+						_ = c.SAddWithTTL(ctx, cache.L2ResourceKey(gvrKey, pathNS, pathName), httpKey, cache.ReverseIndexTTL)
 					} else {
-						_ = c.SAddWithTTL(ctx, cache.L2GVRKey(gvrKey), httpKey, cache.DefaultResourceTTL)
+						_ = c.HSetWithTTL(ctx, cache.L2GVRKey(gvrKey), httpKey, l3Key, cache.ReverseIndexTTL)
 					}
 					cache.GlobalMetrics.RawHits.Add(1)
 					cache.GlobalMetrics.L2Hits.Add(1)
@@ -270,9 +270,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				if pathGVR, pNS, pName := cache.ParseK8sAPIPath(call.Path); pathGVR.Resource != "" {
 					gk := cache.GVRToKey(pathGVR)
 					if pName != "" {
-						_ = c.SAddWithTTL(ctx, cache.L2ResourceKey(gk, pNS, pName), capturedKey, cache.DefaultResourceTTL)
+						_ = c.SAddWithTTL(ctx, cache.L2ResourceKey(gk, pNS, pName), capturedKey, cache.ReverseIndexTTL)
 					} else {
-						_ = c.SAddWithTTL(ctx, cache.L2GVRKey(gk), capturedKey, cache.DefaultResourceTTL)
+						l3ListKey := cache.ListKey(pathGVR, pNS)
+						_ = c.HSetWithTTL(ctx, cache.L2GVRKey(gk), capturedKey, l3ListKey, cache.ReverseIndexTTL)
 					}
 				}
 			cache.GlobalMetrics.RawMisses.Add(1)

@@ -18,6 +18,7 @@ const (
 	DefaultResourceTTL = time.Hour
 	ResolvedCacheTTL   = time.Hour
 	HTTPCacheTTL       = time.Hour
+	ReverseIndexTTL    = 2 * time.Hour
 	notFoundTTL        = 30 * time.Second
 )
 
@@ -310,6 +311,29 @@ func (c *RedisCache) SAddWithTTL(ctx context.Context, key, member string, ttl ti
 	pipe.Expire(ctx, key, ttl)
 	_, err := pipe.Exec(ctx)
 	return err
+}
+
+// HSetWithTTL sets a field in a Redis HASH and refreshes the key's TTL.
+// Used for the L2 LIST reverse index (L2GVRKey) where each field is an L2
+// HTTP key and the value is the corresponding L3 key, enabling in-place
+// refresh instead of deletion.
+func (c *RedisCache) HSetWithTTL(ctx context.Context, key, field, value string, ttl time.Duration) error {
+	if c == nil {
+		return nil
+	}
+	pipe := c.client.Pipeline()
+	pipe.HSet(ctx, key, field, value)
+	pipe.Expire(ctx, key, ttl)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// HGetAll returns all field-value pairs in a Redis HASH.
+func (c *RedisCache) HGetAll(ctx context.Context, key string) (map[string]string, error) {
+	if c == nil {
+		return nil, nil
+	}
+	return c.client.HGetAll(ctx, key).Result()
 }
 
 func (c *RedisCache) SAddGVR(ctx context.Context, gvr schema.GroupVersionResource) error {

@@ -160,7 +160,7 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 
 	_ = c.SetResolvedRaw(rctx, rawKey, raw)
 	for _, gvrKey := range tracker.GVRKeys() {
-		_ = c.SAddWithTTL(rctx, cache.L1GVRKey(gvrKey), rawKey, cache.DefaultResourceTTL)
+		_ = c.SAddWithTTL(rctx, cache.L1GVRKey(gvrKey), rawKey, cache.ReverseIndexTTL)
 	}
 	registerApiRefGVRDeps(rctx, c, got.Unstructured, rawKey, tracker)
 	return true

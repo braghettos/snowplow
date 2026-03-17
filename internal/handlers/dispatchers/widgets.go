@@ -136,7 +136,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	if c != nil && resolvedKey != "" {
 		_ = c.SetResolvedRaw(req.Context(), resolvedKey, raw)
 		for _, gvrKey := range tracker.GVRKeys() {
-			_ = c.SAddWithTTL(req.Context(), cache.L1GVRKey(gvrKey), resolvedKey, cache.DefaultResourceTTL)
+			_ = c.SAddWithTTL(req.Context(), cache.L1GVRKey(gvrKey), resolvedKey, cache.ReverseIndexTTL)
 		}
 
 		preWarmChildWidgets(req.Context(), c, res, r.authnNS)
