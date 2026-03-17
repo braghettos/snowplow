@@ -130,10 +130,10 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		return
 	}
 
-	// Populate the resolved cache and register GVR reverse indexes so that
-	// informer events can do targeted invalidation instead of bulk deletes.
+	raw = cache.StripBulkyAnnotations(raw)
+
 	if c != nil && resolvedKey != "" {
-		_ = c.SetResolvedRaw(req.Context(), resolvedKey, cache.StripBulkyAnnotations(raw))
+		_ = c.SetResolvedRaw(req.Context(), resolvedKey, raw)
 		for _, gvrKey := range tracker.GVRKeys() {
 			_ = c.SAddWithTTL(req.Context(), cache.L1GVRKey(gvrKey), resolvedKey, cache.ReverseIndexTTL)
 		}

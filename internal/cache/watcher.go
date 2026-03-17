@@ -246,7 +246,8 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		if fresh, hit, _ := rw.cache.GetRaw(ctx, l3GetKey); hit && !IsNotFoundRaw(fresh) {
 			for _, l2Key := range resKeys {
 				if u, ok := ParseHTTPUserKey(l2Key); ok {
-					if allowed, _ := rw.cache.IsRBACAllowed(ctx, u, "get", gr, ns); !allowed {
+					allowed, cached := rw.cache.IsRBACAllowed(ctx, u, "get", gr, ns)
+					if cached && !allowed {
 						_ = rw.cache.Delete(ctx, l2Key)
 						continue
 					}
@@ -270,7 +271,8 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 			if u, ok := ParseHTTPUserKey(l2Key); ok {
 				listGVR, listNS, lok := ParseListKey(l3Key)
 				if lok {
-					if allowed, _ := rw.cache.IsRBACAllowed(ctx, u, "list", listGVR.GroupResource(), listNS); !allowed {
+					allowed, cached := rw.cache.IsRBACAllowed(ctx, u, "list", listGVR.GroupResource(), listNS)
+					if cached && !allowed {
 						_ = rw.cache.Delete(ctx, l2Key)
 						continue
 					}
@@ -328,6 +330,13 @@ func (rw *ResourceWatcher) patchListCache(ctx context.Context, gvr schema.GroupV
 		if raw != nil {
 			if err := json.Unmarshal(raw, &list); err != nil {
 				return nil, err
+			}
+		}
+		if list.Object == nil {
+			list.Object = map[string]interface{}{
+				"kind":       uns.GetKind() + "List",
+				"apiVersion": uns.GetAPIVersion(),
+				"metadata":   map[string]interface{}{"resourceVersion": ""},
 			}
 		}
 		idx := -1

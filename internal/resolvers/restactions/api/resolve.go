@@ -238,31 +238,31 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						GroupResource: schema.GroupResource{Group: pathGVR.Group, Resource: pathGVR.Resource},
 						Namespace:     pathNS,
 					}) {
-					_ = c.SetHTTPRaw(ctx, httpKey, l3Raw)
-					gvrKey := cache.GVRToKey(pathGVR)
-					if pathName != "" {
-						_ = c.SAddWithTTL(ctx, cache.L2ResourceKey(gvrKey, pathNS, pathName), httpKey, cache.ReverseIndexTTL)
-					} else {
-						_ = c.HSetWithTTL(ctx, cache.L2GVRKey(gvrKey), httpKey, l3Key, cache.ReverseIndexTTL)
-					}
-					cache.GlobalMetrics.RawHits.Add(1)
-					cache.GlobalMetrics.L2Hits.Add(1)
-					cache.GlobalMetrics.L3Promotions.Add(1)
-					handler := jsonHandler(ctx, jsonHandlerOptions{
-						key: id, out: dict, filter: apiCall.Filter,
-					})
-					if mu != nil {
-						mu.Lock()
-					}
-					herr := handler(io.NopCloser(bytes.NewReader(l3Raw)))
-					if mu != nil {
-						mu.Unlock()
-					}
-					if herr != nil {
-						log.Warn("api: L3 promoted response handler error",
-							slog.String("key", httpKey), slog.Any("err", herr))
-					}
-					return true
+						_ = c.SetHTTPRaw(ctx, httpKey, l3Raw)
+						gvrKey := cache.GVRToKey(pathGVR)
+						if pathName != "" {
+							_ = c.SAddWithTTL(ctx, cache.L2ResourceKey(gvrKey, pathNS, pathName), httpKey, cache.ReverseIndexTTL)
+						} else {
+							_ = c.HSetWithTTL(ctx, cache.L2GVRKey(gvrKey), httpKey, l3Key, cache.ReverseIndexTTL)
+						}
+						cache.GlobalMetrics.RawHits.Add(1)
+						cache.GlobalMetrics.L2Hits.Add(1)
+						cache.GlobalMetrics.L3Promotions.Add(1)
+						handler := jsonHandler(ctx, jsonHandlerOptions{
+							key: id, out: dict, filter: apiCall.Filter,
+						})
+						if mu != nil {
+							mu.Lock()
+						}
+						herr := handler(io.NopCloser(bytes.NewReader(l3Raw)))
+						if mu != nil {
+							mu.Unlock()
+						}
+						if herr != nil {
+							log.Warn("api: L3 promoted response handler error",
+								slog.String("key", httpKey), slog.Any("err", herr))
+						}
+						return true
 					}
 					log.Debug("api: L3 promotion denied by RBAC",
 						slog.String("user", user.Username),
