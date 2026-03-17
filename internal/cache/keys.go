@@ -112,9 +112,18 @@ func L1GVRKey(gvrKey string) string {
 }
 
 // L2GVRKey returns the Redis SET key that maps a GVR to all L2 (http)
-// cache entries that depend on it. Used for targeted invalidation.
+// cache entries that depend on it. Used for targeted invalidation of
+// LIST-level entries (affected by any resource change within the GVR).
 func L2GVRKey(gvrKey string) string {
 	return "snowplow:l2gvr:" + gvrKey
+}
+
+// L2ResourceKey returns the Redis SET key that maps a specific resource
+// instance to L2 (http) cache entries that reference it. When a resource
+// changes, only L2 entries for that exact resource are invalidated — not
+// every L2 entry for the entire GVR.
+func L2ResourceKey(gvrKey, namespace, name string) string {
+	return "snowplow:l2res:" + gvrKey + ":" + namespace + ":" + name
 }
 
 // UserConfigKey builds the per-user cache key for the Endpoint fetched from

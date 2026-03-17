@@ -18,9 +18,11 @@ import (
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/objects"
+	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/kubernetes"
@@ -80,15 +82,12 @@ func preWarmChildWidgets(parentCtx context.Context, c *cache.RedisCache, resolve
 
 // WarmL1ForAllUsers discovers every user from their -clientconfig Secrets, then
 // resolves every instance of every widget GVR for each user, populating the
-// per-user L1 cache. Only widgets are warmed here because they resolve locally
-// (read from L3 cache, no HTTP callbacks). RESTActions are excluded: they
-// involve deep API fan-out (compositions-list alone triggers 200+ K8s calls)
-// and internal HTTP callbacks to snowplow, making startup warmup too slow.
-// RESTActions will be fast on first user request thanks to L3+L2 being warm.
-func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config, authnNS, signKey string, widgetGVRs []schema.GroupVersionResource) {
+// per-user L1 cache. It also warms explicitly-configured RESTActions so that
+// navigation and dashboard requests have zero cold-start latency.
+func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config, authnNS, signKey string, widgetGVRs []schema.GroupVersionResource, restActions []cache.WarmupRestAction) {
 	log := slog.Default()
-	if len(widgetGVRs) == 0 || authnNS == "" {
-		log.Info("L1 warmup: skipped (no widget GVRs or authn namespace)")
+	if len(widgetGVRs) == 0 && len(restActions) == 0 || authnNS == "" {
+		log.Info("L1 warmup: skipped (no GVRs/restactions or authn namespace)")
 		return
 	}
 
@@ -105,6 +104,7 @@ func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config
 	log.Info("L1 warmup: starting",
 		slog.Int("users", len(users)),
 		slog.Int("widgetGVRs", len(widgetGVRs)),
+		slog.Int("restActions", len(restActions)),
 	)
 
 	var totalWarmed int64
@@ -112,6 +112,11 @@ func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config
 		token := mintJWT(u.userInfo, signKey)
 		warmed := warmL1ForUser(ctx, c, u.userInfo, u.endpoint, token, widgetGVRs, authnNS)
 		totalWarmed += warmed
+
+		if len(restActions) > 0 {
+			raWarmed := warmL1RestActionsForUser(ctx, c, u.userInfo, u.endpoint, token, restActions, authnNS)
+			totalWarmed += raWarmed
+		}
 	}
 
 	log.Info("L1 warmup: completed",
@@ -242,6 +247,79 @@ type l1Ref struct {
 	name string
 }
 
+// warmL1RestActionsForUser resolves the explicitly-configured RESTActions for
+// a single user and stores them in L1 cache. Returns the number warmed.
+func warmL1RestActionsForUser(ctx context.Context, c *cache.RedisCache, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, ras []cache.WarmupRestAction, authnNS string) int64 {
+	log := slog.Default()
+	raGVR := schema.GroupVersionResource{
+		Group: "templates.krateo.io", Version: "v1", Resource: "restactions",
+	}
+
+	rctx := xcontext.BuildContext(ctx,
+		xcontext.WithUserConfig(ep),
+		xcontext.WithUserInfo(user),
+		xcontext.WithAccessToken(accessToken),
+	)
+	rctx = cache.WithCache(rctx, c)
+
+	var warmed int64
+	for _, ra := range ras {
+		rKey := cache.ResolvedKey(user.Username, raGVR, ra.Namespace, ra.Name, -1, -1)
+		if c.Exists(rctx, rKey) {
+			continue
+		}
+
+		got := objects.Get(rctx, templatesv1.ObjectReference{
+			Reference:  templatesv1.Reference{Name: ra.Name, Namespace: ra.Namespace},
+			APIVersion: raGVR.GroupVersion().String(),
+			Resource:   raGVR.Resource,
+		})
+		if got.Err != nil {
+			log.Warn("L1 warmup: failed to fetch RESTAction",
+				slog.String("name", ra.Name), slog.Any("err", got.Err))
+			continue
+		}
+
+		var cr templatesv1.RESTAction
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(got.Unstructured.Object, &cr); err != nil {
+			log.Warn("L1 warmup: failed to convert RESTAction",
+				slog.String("name", ra.Name), slog.Any("err", err))
+			continue
+		}
+
+		tracker := cache.NewDependencyTracker()
+		tctx := cache.WithDependencyTracker(rctx, tracker)
+
+		res, err := restactions.Resolve(tctx, restactions.ResolveOptions{
+			In:      &cr,
+			AuthnNS: authnNS,
+			PerPage: -1,
+			Page:    -1,
+		})
+		if err != nil {
+			log.Warn("L1 warmup: failed to resolve RESTAction",
+				slog.String("name", ra.Name), slog.Any("err", err))
+			continue
+		}
+
+		raw, merr := json.Marshal(res)
+		if merr != nil {
+			continue
+		}
+
+		_ = c.SetResolvedRaw(tctx, rKey, raw)
+		for _, gvrKey := range tracker.GVRKeys() {
+			_ = c.SAddWithTTL(tctx, cache.L1GVRKey(gvrKey), rKey, cache.DefaultResourceTTL)
+		}
+
+		warmed++
+		log.Info("L1 warmup: warmed RESTAction",
+			slog.String("user", user.Username),
+			slog.String("name", ra.Name))
+	}
+	return warmed
+}
+
 func extractChildWidgetRefs(ctx context.Context, c *cache.RedisCache, items []interface{}, username string) []l1Ref {
 	var refs []l1Ref
 	for _, item := range items {
@@ -326,7 +404,7 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			if resolveErr != nil {
 				return
 			}
-			raw, err := json.MarshalIndent(res, "", "  ")
+			raw, err := json.Marshal(res)
 			if err != nil {
 				return
 			}

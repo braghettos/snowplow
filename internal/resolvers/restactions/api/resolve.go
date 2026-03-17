@@ -168,6 +168,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					key: id, out: dict, filter: apiCall.Filter,
 				})
 				cache.GlobalMetrics.RawHits.Add(1)
+				cache.GlobalMetrics.L2Hits.Add(1)
 				log.Debug("api: L2 hit", slog.String("name", id), slog.String("path", call.Path))
 				if mu != nil {
 					mu.Lock()
@@ -183,12 +184,38 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				return true
 			}
 
+			// L2 miss → try L1 promotion for /call paths: if the target is
+			// another snowplow /call endpoint, check if L1 already has
+			// the resolved output. This avoids a full HTTP round-trip.
+			if callGVR, callNS, callName := cache.ParseCallPath(call.Path); callGVR.Resource != "" && callName != "" {
+				l1Key := cache.ResolvedKey(user.Username, callGVR, callNS, callName, 0, 0)
+				if l1Raw, l1Hit, _ := c.GetRaw(ctx, l1Key); l1Hit {
+					_ = c.SetHTTPRaw(ctx, httpKey, l1Raw)
+					cache.GlobalMetrics.RawHits.Add(1)
+					cache.GlobalMetrics.L1Hits.Add(1)
+					log.Debug("api: L1→L2 promotion for /call path",
+						slog.String("name", id), slog.String("l1Key", l1Key))
+					handler := jsonHandler(ctx, jsonHandlerOptions{
+						key: id, out: dict, filter: apiCall.Filter,
+					})
+					if mu != nil {
+						mu.Lock()
+					}
+					herr := handler(io.NopCloser(bytes.NewReader(l1Raw)))
+					if mu != nil {
+						mu.Unlock()
+					}
+					if herr != nil {
+						log.Warn("api: L1→L2 promoted response handler error",
+							slog.String("key", httpKey), slog.Any("err", herr))
+					}
+					return true
+				}
+			}
+
 			// L2 miss → try L3 promotion: if the path maps to a K8s
 			// resource that the warmup or informer already cached in L3,
 			// serve from L3 and populate L2 — no API call needed.
-			// NOTE: only use ParseK8sAPIPath here. ParseCallPath is NOT
-			// suitable because /call returns a *resolved* output, not the
-			// raw K8s object stored in L3.
 			pathGVR, pathNS, pathName := cache.ParseK8sAPIPath(call.Path)
 			if pathGVR.Resource != "" {
 				var l3Key string
@@ -202,8 +229,13 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				if l3Hit && !cache.IsNotFoundRaw(l3Raw) {
 					_ = c.SetHTTPRaw(ctx, httpKey, l3Raw)
 					gvrKey := cache.GVRToKey(pathGVR)
-					_ = c.SAddWithTTL(ctx, cache.L2GVRKey(gvrKey), httpKey, cache.DefaultResourceTTL)
+					if pathName != "" {
+						_ = c.SAddWithTTL(ctx, cache.L2ResourceKey(gvrKey, pathNS, pathName), httpKey, cache.DefaultResourceTTL)
+					} else {
+						_ = c.SAddWithTTL(ctx, cache.L2GVRKey(gvrKey), httpKey, cache.DefaultResourceTTL)
+					}
 					cache.GlobalMetrics.RawHits.Add(1)
+					cache.GlobalMetrics.L2Hits.Add(1)
 					cache.GlobalMetrics.L3Promotions.Add(1)
 					handler := jsonHandler(ctx, jsonHandlerOptions{
 						key: id, out: dict, filter: apiCall.Filter,
@@ -224,6 +256,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			}
 
 			// True L2+L3 miss → HTTP call.
+			cache.GlobalMetrics.L2Misses.Add(1)
 			baseHandler := jsonHandler(ctx, jsonHandlerOptions{
 				key: id, out: dict, filter: apiCall.Filter,
 			})
@@ -234,8 +267,13 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					return rerr
 				}
 				_ = c.SetHTTPRaw(ctx, capturedKey, data)
-				if pathGVR, _, _ := cache.ParseK8sAPIPath(call.Path); pathGVR.Resource != "" {
-					_ = c.SAddWithTTL(ctx, cache.L2GVRKey(cache.GVRToKey(pathGVR)), capturedKey, cache.DefaultResourceTTL)
+				if pathGVR, pNS, pName := cache.ParseK8sAPIPath(call.Path); pathGVR.Resource != "" {
+					gk := cache.GVRToKey(pathGVR)
+					if pName != "" {
+						_ = c.SAddWithTTL(ctx, cache.L2ResourceKey(gk, pNS, pName), capturedKey, cache.DefaultResourceTTL)
+					} else {
+						_ = c.SAddWithTTL(ctx, cache.L2GVRKey(gk), capturedKey, cache.DefaultResourceTTL)
+					}
 				}
 			cache.GlobalMetrics.RawMisses.Add(1)
 			log.Info("api: L2+L3 miss (live HTTP)", slog.String("name", id), slog.String("path", call.Path), slog.String("key", capturedKey))

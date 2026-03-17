@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	refreshConcurrency = 10
+	refreshConcurrency = 20
 	restactionResource = "restactions"
 	templatesGroup     = "templates.krateo.io"
 )
@@ -130,7 +130,7 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 		if resolveErr != nil {
 			return false
 		}
-		raw, err = json.MarshalIndent(res, "", "  ")
+		raw, err = json.Marshal(res)
 
 	case info.GVR.Group == templatesGroup && info.GVR.Resource == restactionResource:
 		scheme := runtime.NewScheme()
@@ -148,7 +148,7 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 		if resolveErr != nil {
 			return false
 		}
-		raw, err = json.MarshalIndent(res, "", "  ")
+		raw, err = json.Marshal(res)
 
 	default:
 		return false

@@ -192,16 +192,27 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		if ns != "" {
 			rw.patchListCache(ctx, gvr, clusterListKey, uns, "delete")
 		}
-		// Full L1+L2 invalidation: the resource is gone.
+		// Full L1 + per-resource L2 + GVR-wide L2 invalidation: the resource is gone.
 		gvrKey := GVRToKey(gvr)
-		for _, prefix := range []string{"snowplow:l1gvr:", "snowplow:l2gvr:"} {
-			idxKey := prefix + gvrKey
-			if keys, serr := rw.cache.SMembers(ctx, idxKey); serr == nil && len(keys) > 0 {
-				_ = rw.cache.Delete(ctx, append(keys, idxKey)...)
-				slog.Debug("resource-watcher: targeted invalidation (delete)",
-					slog.String("index", idxKey),
-					slog.Int("count", len(keys)))
-			}
+		l1Idx := L1GVRKey(gvrKey)
+		if keys, serr := rw.cache.SMembers(ctx, l1Idx); serr == nil && len(keys) > 0 {
+			_ = rw.cache.Delete(ctx, append(keys, l1Idx)...)
+			slog.Debug("resource-watcher: L1 invalidation (delete)",
+				slog.String("index", l1Idx), slog.Int("count", len(keys)))
+		}
+		// Delete per-resource L2 entries for this specific resource
+		resIdx := L2ResourceKey(gvrKey, ns, name)
+		if keys, serr := rw.cache.SMembers(ctx, resIdx); serr == nil && len(keys) > 0 {
+			_ = rw.cache.Delete(ctx, append(keys, resIdx)...)
+			slog.Debug("resource-watcher: L2 resource invalidation (delete)",
+				slog.String("index", resIdx), slog.Int("count", len(keys)))
+		}
+		// Delete GVR-wide L2 entries (LIST caches)
+		l2Idx := L2GVRKey(gvrKey)
+		if keys, serr := rw.cache.SMembers(ctx, l2Idx); serr == nil && len(keys) > 0 {
+			_ = rw.cache.Delete(ctx, append(keys, l2Idx)...)
+			slog.Debug("resource-watcher: L2 GVR invalidation (delete)",
+				slog.String("index", l2Idx), slog.Int("count", len(keys)))
 		}
 		return
 
@@ -219,15 +230,24 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	// ── Proactive L1 refresh (stale-while-revalidate) ────────────────────────
 	// Instead of deleting L1 keys (which causes cache misses), re-resolve them
 	// in the background. The old value continues to be served until the refresh
-	// completes. L2 keys are deleted so the resolution pipeline fetches fresh
-	// data from the (already-updated) L3 layer or the live API.
+	// completes. L2 keys referencing the changed resource are deleted so the
+	// resolution pipeline fetches fresh data from L3 or the live API.
 	gvrKey := GVRToKey(gvr)
 
-	// L2: always delete — they are rebuilt during L1 re-resolution.
+	// L2: delete only entries for the specific changed resource + LIST entries.
+	// Per-resource GET L2 entries for other resources of the same GVR are preserved.
+	resIdxKey := L2ResourceKey(gvrKey, ns, name)
+	if resKeys, serr := rw.cache.SMembers(ctx, resIdxKey); serr == nil && len(resKeys) > 0 {
+		_ = rw.cache.Delete(ctx, append(resKeys, resIdxKey)...)
+		slog.Debug("resource-watcher: L2 resource invalidated",
+			slog.String("resource", ns+"/"+name),
+			slog.Int("count", len(resKeys)))
+	}
+	// LIST L2 entries are always invalidated since any resource change affects LIST results.
 	l2IdxKey := L2GVRKey(gvrKey)
 	if l2Keys, serr := rw.cache.SMembers(ctx, l2IdxKey); serr == nil && len(l2Keys) > 0 {
 		_ = rw.cache.Delete(ctx, append(l2Keys, l2IdxKey)...)
-		slog.Debug("resource-watcher: L2 invalidated",
+		slog.Debug("resource-watcher: L2 GVR (LIST) invalidated",
 			slog.String("gvr", gvr.String()),
 			slog.Int("count", len(l2Keys)))
 	}

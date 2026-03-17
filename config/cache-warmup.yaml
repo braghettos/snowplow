@@ -90,6 +90,19 @@ warmup:
       resource: customresourcedefinitions
       ttl: 24h
 
+  # RESTActions to pre-warm in L1 at startup (resolved for every known user).
+  # These are the navigation and dashboard RESTActions that the frontend calls
+  # on every page load, so zero cold miss matters here.
+  l1RestActions:
+    - name: all-routes
+      namespace: krateo-system
+    - name: blueprints-list
+      namespace: krateo-system
+    - name: compositions-list
+      namespace: krateo-system
+    - name: sidebar-nav-menu-items
+      namespace: krateo-system
+
   # Discovery categories to pre-cache for the /list endpoint.
   categories:
     - krateoplatformops

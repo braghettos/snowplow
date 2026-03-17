@@ -26,10 +26,16 @@ type WarmupGVR struct {
 	TTL      string `yaml:"ttl,omitempty"`
 }
 
+type WarmupRestAction struct {
+	Name      string `yaml:"name"`
+	Namespace string `yaml:"namespace"`
+}
+
 type WarmupConfig struct {
 	Warmup struct {
-		GVRs       []WarmupGVR `yaml:"gvrs"`
-		Categories []string    `yaml:"categories,omitempty"`
+		GVRs           []WarmupGVR        `yaml:"gvrs"`
+		L1RestActions  []WarmupRestAction  `yaml:"l1RestActions,omitempty"`
+		Categories     []string            `yaml:"categories,omitempty"`
 	} `yaml:"warmup"`
 }
 
