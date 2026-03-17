@@ -336,7 +336,9 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 				_ = c.SAddWithTTL(rctx, cache.L1GVRKey(gvrKey), rKey, cache.DefaultResourceTTL)
 			}
 
-			registerApiRefGVRDeps(rctx, c, got.Unstructured, rKey, tracker)
+			if newDeps := registerApiRefGVRDeps(rctx, c, got.Unstructured, rKey, tracker); newDeps > 0 {
+				_ = c.Delete(rctx, rKey)
+			}
 
 			atomic.AddInt64(&warmed, 1)
 		}(ref)
@@ -364,15 +366,15 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 // register informers (SAddGVR) and add the widget's L1 key to the GVR
 // reverse indexes. This works even during early startup because CRDs are
 // already registered in the cluster API server.
-func registerApiRefGVRDeps(ctx context.Context, c *cache.RedisCache, widgetObj *unstructured.Unstructured, l1Key string, tracker *cache.DependencyTracker) {
+func registerApiRefGVRDeps(ctx context.Context, c *cache.RedisCache, widgetObj *unstructured.Unstructured, l1Key string, tracker *cache.DependencyTracker) int {
 	if c == nil {
-		return
+		return 0
 	}
 
 	raName, _, _ := unstructured.NestedString(widgetObj.Object, "spec", "apiRef", "name")
 	raNS, _, _ := unstructured.NestedString(widgetObj.Object, "spec", "apiRef", "namespace")
 	if raName == "" {
-		return
+		return 0
 	}
 
 	raGVR := schema.GroupVersionResource{
@@ -381,12 +383,12 @@ func registerApiRefGVRDeps(ctx context.Context, c *cache.RedisCache, widgetObj *
 	raKey := cache.GetKey(raGVR, raNS, raName)
 	var raObj unstructured.Unstructured
 	if hit, err := c.Get(ctx, raKey, &raObj); !hit || err != nil {
-		return
+		return 0
 	}
 
 	apis, found, _ := unstructured.NestedSlice(raObj.Object, "spec", "api")
 	if !found {
-		return
+		return 0
 	}
 
 	alreadyTracked := make(map[string]bool)
@@ -396,35 +398,39 @@ func registerApiRefGVRDeps(ctx context.Context, c *cache.RedisCache, widgetObj *
 
 	groups := extractAPIGroups(apis)
 	if len(groups) == 0 {
-		return
+		return 0
 	}
 
 	rc, err := rest.InClusterConfig()
 	if err != nil {
-		return
+		return 0
 	}
 	discoveredGVRs := discoverGVRsForGroups(rc, groups)
 	if len(discoveredGVRs) == 0 {
-		return
+		return 0
 	}
 
-	var registered int
+	var newGVRs []schema.GroupVersionResource
 	for _, gvr := range discoveredGVRs {
 		gvrKey := cache.GVRToKey(gvr)
 		if alreadyTracked[gvrKey] {
 			continue
 		}
-		_ = c.SAddGVR(ctx, gvr)
 		_ = c.SAddWithTTL(ctx, cache.L1GVRKey(gvrKey), l1Key, cache.DefaultResourceTTL)
-		registered++
+		newGVRs = append(newGVRs, gvr)
 	}
 
-	if registered > 0 {
+	for _, gvr := range newGVRs {
+		_ = c.SAddGVR(ctx, gvr)
+	}
+
+	if len(newGVRs) > 0 {
 		slog.Debug("L1 warmup: registered apiRef transitive GVR deps",
 			slog.String("widget", l1Key),
 			slog.String("restaction", raName),
-			slog.Int("registered", registered))
+			slog.Int("registered", len(newGVRs)))
 	}
+	return len(newGVRs)
 }
 
 // discoverGVRsForGroups queries the K8s discovery API and returns all GVRs

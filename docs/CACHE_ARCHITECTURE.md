@@ -241,8 +241,9 @@ Phase 5: L1 Warmup (background goroutine, 5min timeout)
            ├── Fetch referenced RESTAction CR from L3
            ├── Extract K8s API groups from API item paths (static + JQ templates)
            ├── Use discovery API to find all GVRs in those groups
-           ├── SAddGVR for each → start informers
-           └── Register widget L1 key in GVR reverse indexes
+           ├── Pass 1: Register widget L1 key in GVR reverse indexes (SAddWithTTL)
+           ├── Pass 2: SAddGVR for each → start informers
+           └── If new deps found → evict stale L1 key (first request resolves live)
 ```
 
 ---
@@ -340,7 +341,7 @@ When RESTAction resolution makes HTTP calls to K8s API paths (e.g. listing compo
 
 1. **RESTAction API items are sequential by design.** Items are processed in topological order and share a mutable JQ `dict`. Even without explicit `DependsOn`, items may reference data produced by earlier items via JQ expressions, making parallelization unsafe.
 
-2. **RESTActions are excluded from L1 startup warmup; apiRef widgets use transitive GVR registration.** RESTActions are excluded due to deep HTTP fan-out. Widgets with `spec.apiRef` ARE warmed at startup — after resolution, the referenced RESTAction's API item paths are parsed to extract K8s API groups (including from JQ templates like `${ "/apis/composition.krateo.io/" + ... }`). The K8s discovery API is used to find all GVRs in those groups, which are then registered with `SAddGVR` (starting informers) and added to the widget's L1 GVR reverse index. This ensures L1 refresh fires when dynamic CRD data arrives, even if the RESTAction returned empty during warmup.
+2. **RESTActions are excluded from L1 startup warmup; apiRef widgets use transitive GVR registration.** RESTActions are excluded due to deep HTTP fan-out. Widgets with `spec.apiRef` ARE warmed at startup — after resolution, the referenced RESTAction's API item paths are parsed to extract K8s API groups (including from JQ templates like `${ "/apis/composition.krateo.io/" + ... }`). The K8s discovery API is used to find all GVRs in those groups. These are registered in two passes: first all reverse index entries are written (`SAddWithTTL`), then informers are started (`SAddGVR`). This ordering prevents a race where informer `add` events fire before the reverse index is populated, which would cause L1 refresh to silently skip the widget. If new transitive GVR deps are discovered, the potentially-stale L1 key is evicted so the first real request resolves live. Additionally, `refreshSingleL1` re-invokes `registerApiRefGVRDeps` after each L1 refresh to keep the transitive reverse index entries alive and prevent TTL drift.
 
 3. **L1 refresh uses the user's client certificate groups.** Groups are extracted from the `*-clientconfig` Secret's client certificate data. If the certificate is missing or malformed, the refresh runs with an empty groups list, potentially producing incorrect RBAC results.
 
