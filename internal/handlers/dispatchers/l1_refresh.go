@@ -158,7 +158,7 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 		return false
 	}
 
-	_ = c.SetResolvedRaw(rctx, rawKey, raw)
+	_ = c.SetResolvedRaw(rctx, rawKey, cache.StripBulkyAnnotations(raw))
 	for _, gvrKey := range tracker.GVRKeys() {
 		_ = c.SAddWithTTL(rctx, cache.L1GVRKey(gvrKey), rawKey, cache.ReverseIndexTTL)
 	}

@@ -168,7 +168,7 @@ func main() {
 
 	server := &http.Server{
 		Addr: fmt.Sprintf(":%d", *port),
-		Handler: use.CORS(cors.Options{
+		Handler: handlers.Gzip(use.CORS(cors.Options{
 			AllowedOrigins: []string{"*"},
 			AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 			AllowedHeaders: []string{
@@ -181,7 +181,7 @@ func main() {
 			ExposedHeaders:   []string{"Link"},
 			AllowCredentials: true,
 			MaxAge:           300,
-		})(mux),
+		})(mux)),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 50 * time.Second,
 		IdleTimeout:  30 * time.Second,

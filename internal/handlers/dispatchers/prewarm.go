@@ -307,7 +307,7 @@ func warmL1RestActionsForUser(ctx context.Context, c *cache.RedisCache, user jwt
 			continue
 		}
 
-		_ = c.SetResolvedRaw(tctx, rKey, raw)
+		_ = c.SetResolvedRaw(tctx, rKey, cache.StripBulkyAnnotations(raw))
 		for _, gvrKey := range tracker.GVRKeys() {
 			_ = c.SAddWithTTL(tctx, cache.L1GVRKey(gvrKey), rKey, cache.ReverseIndexTTL)
 		}
