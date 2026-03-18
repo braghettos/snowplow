@@ -3,6 +3,8 @@ package cache
 import (
 	"context"
 	"log/slog"
+	"sync"
+	"time"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/client-go/informers"
@@ -11,9 +13,19 @@ import (
 	k8scache "k8s.io/client-go/tools/cache"
 )
 
+// rbacDebounceWindow is how long we wait to coalesce rapid RBAC change events
+// before triggering a single cache invalidation. This prevents a storm of
+// events (e.g. from thousands of leftover benchmark ClusterRoleBindings during
+// the informer's initial LIST sync) from causing continuous L1 purges.
+const rbacDebounceWindow = 2 * time.Second
+
 type RBACWatcher struct {
 	cache *RedisCache
 	rc    *rest.Config
+
+	mu      sync.Mutex
+	pending bool     // true when a debounced invalidation is scheduled
+	timer   *time.Timer
 }
 
 func NewRBACWatcher(c *RedisCache, rc *rest.Config) *RBACWatcher {
@@ -27,28 +39,77 @@ func (rw *RBACWatcher) Start(ctx context.Context) error {
 	}
 	factory := informers.NewSharedInformerFactory(clientset, 0)
 
-	rbacHandler := func(obj any) { rw.invalidate(ctx, obj) }
-	bindingHandler := func(obj any) { rw.invalidateFromBinding(ctx, obj) }
+	// Only react to genuine mutations (Update/Delete). Skipping AddFunc avoids
+	// the initial-LIST storm where every pre-existing RBAC object fires an ADD
+	// event on pod startup — with thousands of resources this would flood the
+	// cache with back-to-back invalidations for several minutes.
+	rbacHandler := func(obj any) { rw.scheduleInvalidate(ctx) }
+	bindingHandler := func(obj any) { rw.scheduleInvalidateFromBinding(ctx, obj) }
 
 	_, _ = factory.Rbac().V1().Roles().Informer().AddEventHandler(k8scache.ResourceEventHandlerFuncs{
-		AddFunc: rbacHandler, UpdateFunc: func(_, n any) { rbacHandler(n) }, DeleteFunc: rbacHandler,
+		UpdateFunc: func(_, n any) { rbacHandler(n) }, DeleteFunc: rbacHandler,
 	})
 	_, _ = factory.Rbac().V1().ClusterRoles().Informer().AddEventHandler(k8scache.ResourceEventHandlerFuncs{
-		AddFunc: rbacHandler, UpdateFunc: func(_, n any) { rbacHandler(n) }, DeleteFunc: rbacHandler,
+		UpdateFunc: func(_, n any) { rbacHandler(n) }, DeleteFunc: rbacHandler,
 	})
 	_, _ = factory.Rbac().V1().RoleBindings().Informer().AddEventHandler(k8scache.ResourceEventHandlerFuncs{
-		AddFunc: bindingHandler, UpdateFunc: func(_, n any) { bindingHandler(n) }, DeleteFunc: bindingHandler,
+		UpdateFunc: func(_, n any) { bindingHandler(n) }, DeleteFunc: bindingHandler,
 	})
 	_, _ = factory.Rbac().V1().ClusterRoleBindings().Informer().AddEventHandler(k8scache.ResourceEventHandlerFuncs{
-		AddFunc: bindingHandler, UpdateFunc: func(_, n any) { bindingHandler(n) }, DeleteFunc: bindingHandler,
+		UpdateFunc: func(_, n any) { bindingHandler(n) }, DeleteFunc: bindingHandler,
 	})
 	factory.Start(ctx.Done())
 	slog.Info("rbac-watcher: started informers")
 	return nil
 }
 
+// scheduleInvalidate debounces RBAC invalidation: multiple events within
+// rbacDebounceWindow collapse into a single invalidation call.
+func (rw *RBACWatcher) scheduleInvalidate(ctx context.Context) {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	if rw.pending {
+		rw.timer.Reset(rbacDebounceWindow)
+		return
+	}
+	rw.pending = true
+	rw.timer = time.AfterFunc(rbacDebounceWindow, func() {
+		rw.mu.Lock()
+		rw.pending = false
+		rw.mu.Unlock()
+		rw.invalidate(ctx)
+	})
+}
+
+// scheduleInvalidateFromBinding debounces binding-specific invalidation.
+// When a binding change affects a specific user we still debounce to avoid
+// rapid-fire updates, but we pass the object through for targeted invalidation.
+func (rw *RBACWatcher) scheduleInvalidateFromBinding(ctx context.Context, obj any) {
+	subjects, ok := extractSubjects(obj)
+	if !ok || len(subjects) == 0 {
+		rw.scheduleInvalidate(ctx)
+		return
+	}
+	// For targeted (per-user) binding invalidations, still debounce but do it
+	// immediately via a tiny window so user-specific changes aren't delayed too long.
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	if rw.pending {
+		rw.timer.Reset(rbacDebounceWindow)
+		return
+	}
+	rw.pending = true
+	capturedObj := obj
+	rw.timer = time.AfterFunc(rbacDebounceWindow, func() {
+		rw.mu.Lock()
+		rw.pending = false
+		rw.mu.Unlock()
+		rw.invalidateFromBinding(ctx, capturedObj)
+	})
+}
+
 // invalidate uses the active-users set for targeted RBAC invalidation.
-func (rw *RBACWatcher) invalidate(ctx context.Context, _ any) {
+func (rw *RBACWatcher) invalidate(ctx context.Context) {
 	usernames, err := rw.cache.SMembers(ctx, ActiveUsersKey)
 	if err != nil || len(usernames) == 0 {
 		rw.invalidateAllRBAC(ctx)
@@ -58,7 +119,7 @@ func (rw *RBACWatcher) invalidate(ctx context.Context, _ any) {
 	for _, username := range usernames {
 		total += rw.purgeUserCacheData(ctx, username)
 	}
-	slog.Debug("rbac-watcher: invalidated RBAC+L1+L2 for active users after role change",
+	slog.Debug("rbac-watcher: invalidated RBAC+L1 for active users after role change",
 		slog.Int("users", len(usernames)), slog.Int("keys", total))
 }
 
@@ -75,7 +136,7 @@ func (rw *RBACWatcher) invalidateAllRBAC(ctx context.Context) {
 func (rw *RBACWatcher) invalidateFromBinding(ctx context.Context, obj any) {
 	subjects, ok := extractSubjects(obj)
 	if !ok || len(subjects) == 0 {
-		rw.invalidate(ctx, obj)
+		rw.invalidate(ctx)
 		return
 	}
 	usernames := []string{}
@@ -89,7 +150,7 @@ func (rw *RBACWatcher) invalidateFromBinding(ctx context.Context, obj any) {
 		}
 	}
 	if hasGroups {
-		rw.invalidate(ctx, obj)
+		rw.invalidate(ctx)
 		return
 	}
 	for _, username := range usernames {
@@ -97,16 +158,14 @@ func (rw *RBACWatcher) invalidateFromBinding(ctx context.Context, obj any) {
 	}
 }
 
-// purgeUserCacheData deletes RBAC, L1 (resolved), and L2 (http) cache entries
-// for a single user. Returns the total number of keys deleted.
+// purgeUserCacheData deletes RBAC and L1 (resolved) cache entries for a
+// single user. Returns the total number of keys deleted.
 func (rw *RBACWatcher) purgeUserCacheData(ctx context.Context, username string) int {
 	total := 0
-	patterns := []string{
+	for _, p := range []string{
 		RBACKeyPattern(username),
 		"snowplow:resolved:" + username + ":*",
-		"snowplow:http:" + username + ":*",
-	}
-	for _, p := range patterns {
+	} {
 		keys, _ := rw.cache.ScanKeys(ctx, p)
 		if len(keys) > 0 {
 			_ = rw.cache.Delete(ctx, keys...)

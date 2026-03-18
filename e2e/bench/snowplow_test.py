@@ -22,6 +22,10 @@ Environment:
   ITERS           iterations for latency/warm measurements (default: 10)
   WARMUP_ITERS    warmup requests before measurement (default: 3)
   SMOKE           "1" to limit scaling to stages 1-3 (default: "0")
+  EXPECTED_IMAGE_TAG  (required) e.g. 0.25.19 — tests will not start until deployment
+                      runs this image. Deploy first: kubectl set image deployment/snowplow
+                      snowplow=ghcr.io/<repo>/snowplow:0.25.19 -n krateo-system
+  SKIP_IMAGE_CHECK   set to "1" to bypass image version check (not recommended)
 """
 
 import argparse
@@ -296,6 +300,42 @@ def call_url(ns, name=""):
     if name:
         url += f"&name={name}"
     return url
+
+
+def verify_deployed_image():
+    """Ensure deployment runs the expected image before starting tests."""
+    if os.environ.get("SKIP_IMAGE_CHECK", "0") == "1":
+        log("SKIP_IMAGE_CHECK=1 — skipping image version check")
+        return
+    expected = os.environ.get("EXPECTED_IMAGE_TAG", "").strip()
+    if not expected:
+        print(f"\n{RED}{BOLD}ERROR: EXPECTED_IMAGE_TAG is required.{RESET}")
+        print(f"  Tests must not run until the new image is deployed.")
+        print(f"  Example:")
+        print(f"    export EXPECTED_IMAGE_TAG=0.25.19")
+        print(f"    kubectl set image deployment/snowplow snowplow=ghcr.io/braghettos/snowplow:0.25.19 -n krateo-system")
+        print(f"    kubectl rollout status deployment/snowplow -n krateo-system --timeout=300s")
+        print(f"    python3 e2e/bench/snowplow_test.py")
+        print(f"\n  Or set SKIP_IMAGE_CHECK=1 to bypass (not recommended).\n")
+        sys.exit(1)
+    rc, out, err = kubectl(
+        "get", "deployment", "snowplow", "-n", NS,
+        "-o", "jsonpath={.spec.template.spec.containers[?(@.name==\"snowplow\")].image}"
+    )
+    if rc != 0 or not out.strip():
+        print(f"\n{RED}{BOLD}ERROR: Could not get snowplow deployment image.{RESET}")
+        print(f"  kubectl failed or snowplow not found in {NS}. Ensure cluster access.")
+        print(f"  stderr: {err[:200] if err else 'none'}\n")
+        sys.exit(1)
+    current_image = out.strip()
+    current_tag = current_image.split(":")[-1] if ":" in current_image else ""
+    if current_tag != expected:
+        print(f"\n{RED}{BOLD}ERROR: Deployed image does not match EXPECTED_IMAGE_TAG.{RESET}")
+        print(f"  Expected tag: {expected}")
+        print(f"  Current image: {current_image}")
+        print(f"  Deploy the new image first, then run tests.\n")
+        sys.exit(1)
+    log(f"Deployed image verified: {current_image}")
 
 
 def wait_for_snowplow(max_wait=240):
@@ -592,10 +632,52 @@ def delete_all_clientconfigs():
     log(f"Deleted {len(secrets)} clientconfig secrets")
 
 
+def delete_bench_rbac():
+    """Delete RBAC resources left by bench compositions.
+
+    Each composition creates ClusterRoles, ClusterRoleBindings, and namespace-
+    scoped Roles and RoleBindings named bench-app-* (usually in krateo-system).
+    When namespaces are force-deleted those cluster-scoped resources survive.
+    Without cleanup the RBACWatcher informer delivers thousands of ADD events
+    on every pod start or watch-reconnect, causing a perpetual invalidation storm
+    that suppresses L1 cache effectiveness.
+    """
+    chunk_size = 50
+
+    # Cluster-scoped resources
+    for kind in ("clusterrolebinding", "clusterrole"):
+        rc, out, _ = kubectl("get", kind, "--no-headers", "-o", "name")
+        names = [
+            line.split("/", 1)[-1]
+            for line in out.splitlines()
+            if "bench-app" in line
+        ]
+        if not names:
+            continue
+        for i in range(0, len(names), chunk_size):
+            kubectl("delete", kind, *names[i:i + chunk_size], "--ignore-not-found")
+        log(f"Deleted {len(names)} {kind}s (bench-app-*)")
+
+    # Namespace-scoped resources (compositions create these in krateo-system)
+    for kind in ("rolebinding", "role"):
+        rc, out, _ = kubectl("get", kind, "-n", NS, "--no-headers", "-o", "name")
+        names = [
+            line.split("/", 1)[-1]
+            for line in out.splitlines()
+            if "bench-app" in line
+        ]
+        if not names:
+            continue
+        for i in range(0, len(names), chunk_size):
+            kubectl("delete", kind, "-n", NS, *names[i:i + chunk_size], "--ignore-not-found")
+        log(f"Deleted {len(names)} {kind}s in {NS} (bench-app-*)")
+
+
 def clean_environment():
     section("Cleaning environment")
     delete_all_clientconfigs()
     delete_bench_namespaces()
+    delete_bench_rbac()
     log("Waiting 15s for cleanup to propagate ...")
     time.sleep(15)
 
@@ -1099,6 +1181,7 @@ def main():
     print(f"  Iterations: {ITERS}  Smoke: {SMOKE}")
     print(f"{BOLD}{DSEP}{RESET}\n")
 
+    verify_deployed_image()
     setup_cyberjoker_rbac()
     tokens = login_all()
 
