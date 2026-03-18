@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"runtime"
 	"os/signal"
 	"strconv"
 	"syscall"
@@ -126,7 +127,6 @@ func main() {
 			redisCache = nil
 		} else {
 			log.Info("redis connected")
-			startBackgroundServices(ctx, log, redisCache, *authnNS, *warmupConfigPath, *signKey)
 		}
 	}
 
@@ -168,7 +168,7 @@ func main() {
 
 	mux.Handle("POST /jq", chain.Append(userCfg).Then(handlers.JQ()))
 
-	httpHandler := handlers.Gzip(use.CORS(cors.Options{
+	httpHandler := recoveryMiddleware(handlers.Gzip(use.CORS(cors.Options{
 		AllowedOrigins: []string{"*"},
 		AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowedHeaders: []string{
@@ -181,7 +181,7 @@ func main() {
 		ExposedHeaders:   []string{"Link"},
 		AllowCredentials: true,
 		MaxAge:           300,
-	})(mux))
+	})(mux)))
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", *port),
@@ -200,6 +200,13 @@ func main() {
 	}()
 
 	log.Info("server is ready to handle requests", slog.String("addr", server.Addr))
+
+	// Run cache warmup in background so /health responds immediately.
+	// Previously this ran before ListenAndServe, causing startup probe failures
+	// when informer sync + L3/RBAC warmup exceeded the probe timeout.
+	if redisCache != nil {
+		go startBackgroundServices(ctx, log, redisCache, *authnNS, *warmupConfigPath, *signKey)
+	}
 	<-ctx.Done()
 
 	stop()
@@ -214,6 +221,23 @@ func main() {
 	}
 
 	log.Info("server gracefully stopped")
+}
+
+func recoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				buf := make([]byte, 4096)
+				n := runtime.Stack(buf, false)
+				slog.Error("panic recovered",
+					slog.Any("error", err),
+					slog.String("stack", string(buf[:n])),
+					slog.String("path", r.URL.Path))
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
 // startBackgroundServices sets up the four-phase cache startup sequence.

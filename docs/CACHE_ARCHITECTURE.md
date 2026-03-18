@@ -2,9 +2,9 @@
 
 ## Overview
 
-Snowplow uses a **three-layer Redis cache** backed by Kubernetes informers for event-driven consistency. The cache eliminates repeated Kubernetes API calls and expensive resolution pipelines (HTTP fan-out, JQ evaluations) by storing data at multiple levels of the request lifecycle.
+Snowplow uses a **two-layer Redis cache** (L3 + L1) backed by Kubernetes informers for event-driven consistency. The cache eliminates repeated Kubernetes API calls and expensive resolution pipelines (HTTP fan-out, JQ evaluations) by storing data at two levels of the request lifecycle.
 
-All cache state lives in a single Redis instance (sidecar at `localhost:6379`, configurable via `REDIS_ADDRESS`). Caching can be entirely disabled by setting `CACHE_ENABLED=false`.
+All Redis cache state lives in a single Redis instance (sidecar at `localhost:6379`, configurable via `REDIS_ADDRESS`). Caching can be entirely disabled by setting `CACHE_ENABLED=false` or `CACHE_ENABLED=0`.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -13,16 +13,15 @@ All cache state lives in a single Redis instance (sidecar at `localhost:6379`, c
 └────────────────────────────┬─────────────────────────────────────┘
                              │
                     ┌────────▼────────┐
-                    │   L1 (Resolved) │  per-user, fully resolved JSON
-                    │   HIT → return  │
+                    │   L1 (Resolved) │  per-user, fully resolved JSON (Redis)
+                    │   HIT → return  │  gzip-compressed when ≥256 bytes
                     └────────┬────────┘
                              │ MISS
                     ┌────────▼────────┐
-                    │   L2 (HTTP)     │  per-user, raw HTTP responses
-                    │   used during   │  from K8s API calls in pipeline
-                    │   resolution    │
+                    │   Resolution    │  HTTP fan-out + JQ evaluations
+                    │   Pipeline      │  reads from L3 where possible
                     └────────┬────────┘
-                             │ MISS
+                             │
                     ┌────────▼────────┐
                     │   L3 (Objects)  │  shared, raw K8s objects
                     │   GET + LIST    │  populated by informers
@@ -63,26 +62,6 @@ The foundational layer. Stores raw `Unstructured` Kubernetes objects as JSON.
 
 **Expiry refresh**: When a GET or LIST key expires via TTL, the `ResourceWatcher.StartExpiryRefresh` subscriber re-fetches the resource from the Kubernetes API and re-populates the cache, preventing cold misses after TTL expiry.
 
-### L2 — HTTP Responses (per-user)
-
-Caches raw HTTP responses produced during widget/RESTAction resolution. These are the intermediate K8s API call results (e.g. fetching compositions, namespaces, secrets) that the resolution pipeline makes on behalf of a specific user.
-
-| Operation | Key Format | Example |
-|-----------|-----------|---------|
-| Per-user HTTP | `snowplow:http:{username}:{METHOD}:{sha256_hash}` | `snowplow:http:admin:GET:a1b2c3d4e5f6a7b8` |
-
-The path (including query parameters) is SHA-256 hashed to keep key length bounded. Keys are per-user because responses may differ per user due to RBAC filtering.
-
-**TTL**: `1h`. Freshness is maintained by targeted invalidation, not TTL.
-
-**Create**: Populated during resolution when the pipeline makes HTTP calls to the Kubernetes API. L2 keys are also registered in reverse indexes (`snowplow:l2gvr:{gvrKey}`) inline during resolution.
-
-**L3 → L2 Promotion**: When an L2 miss occurs for a K8s API path, the resolver checks whether L3 already has the raw object (via `ParseK8sAPIPath`). If found, the L3 data is copied into the L2 key and the reverse index is updated — no live API call is needed. This is particularly effective after the first request registers informers for dynamic CRDs via `SAddGVR`.
-
-**Update**: L2 keys are **not updated in-place**. When a watched resource changes, all L2 keys that depend on the changed GVR are **deleted** (via the reverse index). They are naturally rebuilt during the next L1 refresh or user request.
-
-**Delete**: Targeted deletion via the `snowplow:l2gvr:{gvrKey}` reverse index (see [Reverse Indexes](#reverse-indexes)).
-
 ### L1 — Resolved Output (per-user)
 
 The highest-value layer. Stores the **fully resolved JSON** output of widget and RESTAction dispatchers — the final response sent to the frontend. An L1 hit eliminates the entire resolution pipeline: no K8s API calls, no HTTP fan-out, no JQ evaluations.
@@ -94,17 +73,20 @@ The highest-value layer. Stores the **fully resolved JSON** output of widget and
 
 **TTL**: `1h`. Freshness is maintained by proactive background refresh, not TTL.
 
+**Compression**: Values ≥256 bytes are gzip-compressed before storing in Redis; decompressed on read.
+
 **Create**: Populated when:
-1. **User request** — On L1 miss, the full resolution pipeline runs. The result is stored with `SetResolvedRaw` and the GVR dependencies are recorded in reverse indexes.
-2. **Startup L1 warmup** — `WarmL1ForAllUsers` discovers all users from `*-clientconfig` secrets, then resolves every **widget** instance (from `cache-warmup.yaml` GVRs with group `widgets.templates.krateo.io`) for each user. RESTActions are **excluded** from startup L1 warmup because they trigger deeply nested HTTP fan-out (e.g. `compositions-list` generates 200+ K8s API calls), causing excessive startup time. RESTActions populate L1 on first real user request, which is fast due to warm L3/L2 caches.
+1. **User request** — On L1 miss, the full resolution pipeline runs (reading from L3 where possible). The result is stored with `SetResolvedRaw` and the GVR dependencies are recorded in reverse indexes.
+2. **Startup L1 warmup** — `WarmL1ForAllUsers` discovers all users from `*-clientconfig` secrets, then resolves:
+   - Every **widget** instance (from `cache-warmup.yaml` GVRs with group `widgets.templates.krateo.io`) for each user.
+   - Every **RESTAction** listed in `l1RestActions` (e.g. `all-routes`, `blueprints-list`, `compositions-list`, `sidebar-nav-menu-items`) for each user.
 3. **Request-time child pre-warming** — When a parent widget (e.g. `RoutesLoader`) is resolved, its child widget references (`status.resourcesRefs.items`) are resolved concurrently in a background goroutine.
 4. **Proactive L1 refresh** — When a resource changes, existing L1 keys are re-resolved in background instead of being deleted (stale-while-revalidate).
 
 **Update (Stale-While-Revalidate)**: When a watched resource fires an `add` or `update` informer event:
 1. L3 is updated in-place (see above).
-2. L2 keys dependent on the changed GVR are deleted.
-3. L1 keys dependent on the changed GVR are **NOT deleted**. Instead, they are re-resolved in a background goroutine via `L1RefreshFunc`. The old value continues to be served to users until the refresh completes and atomically overwrites the key.
-4. A per-GVR in-flight guard (`sync.Map`) prevents thundering herd — if a refresh for a GVR is already running, subsequent events for the same GVR are skipped (the next event will trigger a new refresh).
+2. L1 keys dependent on the changed GVR are **NOT deleted**. Instead, they are re-resolved in a background goroutine via `L1RefreshFunc`. The old value continues to be served to users until the refresh completes and atomically overwrites the key.
+3. A per-GVR in-flight guard (`sync.Map`) prevents thundering herd — if a refresh for a GVR is already running, subsequent events for the same GVR are skipped (the next event will trigger a new refresh).
 
 **Delete**: On `delete` events (resource removed from cluster), L1 keys are fully invalidated via the reverse index.
 
@@ -136,14 +118,13 @@ When a GET request returns `404 Not Found`, a sentinel value (`{"__snowplow_not_
 
 ## Reverse Indexes
 
-Reverse indexes are Redis SETs that map a GVR to the L1/L2 cache keys that **depend on it**. They enable targeted invalidation: when a resource changes, only the cache entries that actually used that resource are affected.
+Reverse indexes are Redis SETs that map a GVR to the L1 cache keys that **depend on it**. They enable targeted invalidation: when a resource changes, only the cache entries that actually used that resource are affected.
 
 | Index Key | Members |
 |-----------|---------|
 | `snowplow:l1gvr:{group/version/resource}` | Set of `snowplow:resolved:...` keys |
-| `snowplow:l2gvr:{group/version/resource}` | Set of `snowplow:http:...` keys |
 
-**Population**: During resolution, a `DependencyTracker` records every GVR accessed. L2 reverse indexes are populated inline during resolution (in `api/resolve.go`). After resolution completes, the dispatcher calls `SAddWithTTL` to register the L1 keys in the appropriate reverse index SETs.
+**Population**: During resolution, a `DependencyTracker` records every GVR accessed. After resolution completes, the dispatcher calls `SAddWithTTL` to register the L1 keys in the appropriate reverse index SETs.
 
 **TTL**: Reverse index SETs use `ReverseIndexTTL` (2h), which is 2x the cache entry TTL (`DefaultResourceTTL` = 1h). This prevents silent expiry of reverse indexes for infrequently accessed GVRs. The TTL is refreshed every time a member is added.
 
@@ -163,17 +144,17 @@ Reverse indexes are Redis SETs that map a GVR to the L1/L2 cache keys that **dep
 
 The `ResourceWatcher` maintains dynamic Kubernetes informers for every GVR in the watched set. It reacts to three event types:
 
-| Event | L3 Action | L2 Action | L1 Action |
-|-------|-----------|-----------|-----------|
-| `add` | Upsert GET key, patch LIST keys | Delete dependent L2 keys | Background refresh dependent L1 keys |
-| `update` | Upsert GET key, patch LIST keys | Delete dependent L2 keys | Background refresh dependent L1 keys |
-| `delete` | Delete GET key, patch LIST keys | Delete dependent L2 keys | **Delete** dependent L1 keys |
+| Event | L3 Action | L1 Action |
+|-------|-----------|-----------|
+| `add` | Upsert GET key, patch LIST keys | Background refresh dependent L1 keys |
+| `update` | Upsert GET key, patch LIST keys | Background refresh dependent L1 keys |
+| `delete` | Delete GET key, patch LIST keys | **Delete** dependent L1 keys |
 
 The key design choice: on `add`/`update`, L1 keys are **refreshed** (re-resolved in background) rather than deleted. This implements the **stale-while-revalidate** pattern — users always get a fast L1 hit, even during periods of frequent resource changes (e.g. composition controllers updating `lastTransitionTime` every few seconds).
 
 **GVR registration**: Informers are registered in two ways:
 1. **Startup** — All GVRs from `cache-warmup.yaml` are pre-registered via `PreRegisterGVRs`.
-2. **Dynamic** — When a request accesses a new GVR, `SAddGVR` triggers `onNewGVR`, which calls `AddGVR` to register a new informer at runtime. This includes dynamic CRDs accessed during RESTAction resolution (e.g. composition-instance resources), which call `SAddGVR` from `api/resolve.go` when parsing K8s API paths.
+2. **Dynamic** — When a request accesses a new GVR, `SAddGVR` triggers `onNewGVR`, which calls `AddGVR` to register a new informer at runtime.
 3. **Periodic sync** — Every 60 seconds, `syncNewGVRs` reads the `snowplow:watched-gvrs` Redis SET and registers any new GVRs that were added by other code paths.
 
 ### L1 Refresh Callback
@@ -188,6 +169,10 @@ The `L1RefreshFunc` callback is injected from `main.go` and implemented in `disp
    - **RESTActions** (`templates.krateo.io` group, `restactions` resource): `objects.Get` → convert to typed `RESTAction` → `restactions.Resolve` → `SetResolvedRaw`
 5. Reverse indexes are updated with the new GVR dependencies from the `DependencyTracker`.
 
+### L3 → Resolution Pipeline (direct read)
+
+During resolution, when the pipeline needs to make an HTTP GET to the Kubernetes API, it first checks if L3 already has the data (via `ParseK8sAPIPath`). If found and the user passes RBAC checks (`rbac.UserCan`), the L3 data is served directly — no live API call needed. For `/call` paths targeting other snowplow endpoints, L1 is checked for existing resolved output.
+
 ### RBACWatcher
 
 Watches Roles, ClusterRoles, RoleBindings, and ClusterRoleBindings. On any change:
@@ -200,6 +185,12 @@ Watches `*-clientconfig` Secrets in the `AUTHN_NAMESPACE`:
 - **Add**: Register username in `snowplow:active-users` SET.
 - **Update**: Invalidate the `snowplow:userconfig:{username}` key (forces re-load on next request).
 - **Delete**: Remove from active users, purge userconfig key and all RBAC keys for that user.
+
+---
+
+## Crash Recovery
+
+All background goroutines (informer event handlers, L1 refresh, expiry refresh) are wrapped with `recover()` to prevent panics from crashing the process. The HTTP handler chain includes a recovery middleware that catches panics during request processing, logs the full stack trace, and returns a 500 error.
 
 ---
 
@@ -231,30 +222,23 @@ Phase 4: L3 Warmup (Warmer.Run)
 Phase 5: L1 Warmup (background goroutine, 5min timeout)
    ├── Discover users from *-clientconfig secrets
    │   └── Extract groups from client certificate for correct RBAC
-   ├── Filter widget GVRs only (group = widgets.templates.krateo.io)
-   │   └── RESTActions are excluded (deep HTTP fan-out at startup)
-   └── For each user × each widget instance:
+   ├── Widgets: filter GVRs with group = widgets.templates.krateo.io
+   ├── RESTActions: resolve each entry in l1RestActions
+   └── For each user × (each widget instance + each l1RestAction):
        ├── Skip if L1 key already exists
        ├── Resolve widget (reads from L3 cache)
        ├── Store resolved output in L1
-       └── If widget has spec.apiRef → registerApiRefGVRDeps:
-           ├── Fetch referenced RESTAction CR from L3
-           ├── Extract K8s API groups from API item paths (static + JQ templates)
-           ├── Use discovery API to find all GVRs in those groups
-           ├── Pass 1: Register widget L1 key in GVR reverse indexes (SAddWithTTL)
-           ├── Pass 2: SAddGVR for each → start informers
-           └── If new deps found → evict stale L1 key (first request resolves live)
+       └── Register GVR dependencies in reverse indexes
 ```
 
 ---
 
 ## Key Design Choices
 
-### Why three layers instead of one?
+### Why two layers instead of one?
 
 Each layer serves a different purpose with different cache hit characteristics:
-- **L3** is shared across all users and updated atomically by informers. Even when L1/L2 miss, L3 prevents hitting the Kubernetes API.
-- **L2** captures per-user HTTP responses from the resolution pipeline. Since responses may differ per user (RBAC-filtered), L2 must be per-user.
+- **L3** is shared across all users and updated atomically by informers. Even when L1 misses, L3 prevents hitting the Kubernetes API during resolution.
 - **L1** stores the final assembled output. A single L1 hit replaces dozens of L3 reads, JQ evaluations, and HTTP calls.
 
 ### Why stale-while-revalidate instead of delete-on-change?
@@ -266,7 +250,7 @@ Composition controllers frequently update `.status.lastTransitionTime` every few
 
 ### Why reverse indexes instead of pattern-based invalidation?
 
-Redis `SCAN` with wildcards is O(N) where N is the total number of keys. Reverse indexes (Redis SETs) provide O(1) membership reads and targeted O(K) deletes where K is only the number of actually-dependent keys. This is critical at scale when thousands of L1/L2 keys exist but only a handful depend on the changed GVR.
+Redis `SCAN` with wildcards is O(N) where N is the total number of keys. Reverse indexes (Redis SETs) provide O(1) membership reads and targeted O(K) deletes where K is only the number of actually-dependent keys. This is critical at scale when thousands of L1 keys exist but only a handful depend on the changed GVR.
 
 ### Why atomic list patching?
 
@@ -285,12 +269,10 @@ Resources like namespaces and CRDs change rarely and are expensive to re-fetch. 
 | `snowplow:get:` | L3 | Shared | Single Kubernetes object |
 | `snowplow:list:` | L3 | Shared | List of Kubernetes objects |
 | `snowplow:discovery:` | L3 | Shared | API discovery result |
-| `snowplow:http:` | L2 | Per-user | Raw HTTP response from resolution |
 | `snowplow:resolved:` | L1 | Per-user | Fully resolved widget/RESTAction output |
 | `snowplow:rbac:` | — | Per-user | SelfSubjectAccessReview result |
 | `snowplow:userconfig:` | — | Per-user | User endpoint config from Secret |
 | `snowplow:l1gvr:` | Index | Shared | Reverse index: GVR → dependent L1 keys |
-| `snowplow:l2gvr:` | Index | Shared | Reverse index: GVR → dependent L2 keys |
 | `snowplow:watched-gvrs` | Meta | Shared | SET of all GVRs with active informers |
 | `snowplow:active-users` | Meta | Shared | SET of usernames with active sessions |
 
@@ -317,9 +299,10 @@ Available at `GET /metrics/cache`:
 | `get_hits` / `get_misses` | L3 GET cache performance |
 | `list_hits` / `list_misses` | L3 LIST cache performance |
 | `rbac_hits` / `rbac_misses` | RBAC cache performance |
-| `raw_hits` / `raw_misses` | L1 resolved output cache performance |
+| `l1_hits` / `l1_misses` | L1 resolved output cache performance |
+| `raw_hits` / `raw_misses` | Resolution pipeline cache performance |
 | `call_hits` / `call_misses` | `/call` handler L3-direct cache performance |
-| `l3_promotions` | Times L3 data was used to serve an L2 miss |
+| `l3_promotions` | Times L3 data was served directly during resolution |
 | `negative_hits` | Times a 404 sentinel was served |
 | `expiry_refreshes` | Times a key was proactively re-fetched after TTL expiry |
 
@@ -333,7 +316,7 @@ Widgets with many child references (e.g. `RoutesLoader` with 42 routes) resolve 
 
 ### Dynamic CRD Informer Registration
 
-When RESTAction resolution makes HTTP calls to K8s API paths (e.g. listing composition instances), the parsed GVR is registered for informer watching via `SAddGVR`. This ensures L3 cache is populated for dynamic CRDs, enabling L3 → L2 promotion on subsequent requests. Without this, every RESTAction call for dynamic CRDs would hit the live API.
+When RESTAction resolution makes HTTP calls to K8s API paths (e.g. listing composition instances), the parsed GVR is registered for informer watching via `SAddGVR`. This ensures L3 cache is populated for dynamic CRDs, enabling direct L3 reads on subsequent requests. Without this, every RESTAction call for dynamic CRDs would hit the live API.
 
 ---
 
@@ -341,7 +324,7 @@ When RESTAction resolution makes HTTP calls to K8s API paths (e.g. listing compo
 
 1. **RESTAction API items are sequential by design.** Items are processed in topological order and share a mutable JQ `dict`. Even without explicit `DependsOn`, items may reference data produced by earlier items via JQ expressions, making parallelization unsafe.
 
-2. **RESTActions are excluded from L1 startup warmup; apiRef widgets use transitive GVR registration.** RESTActions are excluded due to deep HTTP fan-out. Widgets with `spec.apiRef` ARE warmed at startup — after resolution, the referenced RESTAction's API item paths are parsed to extract K8s API groups (including from JQ templates like `${ "/apis/composition.krateo.io/" + ... }`). The K8s discovery API is used to find all GVRs in those groups. These are registered in two passes: first all reverse index entries are written (`SAddWithTTL`), then informers are started (`SAddGVR`). This ordering prevents a race where informer `add` events fire before the reverse index is populated, which would cause L1 refresh to silently skip the widget. If new transitive GVR deps are discovered, the potentially-stale L1 key is evicted so the first real request resolves live. Additionally, `refreshSingleL1` re-invokes `registerApiRefGVRDeps` after each L1 refresh to keep the transitive reverse index entries alive and prevent TTL drift.
+2. **L1 startup warmup includes widgets and l1RestActions; apiRef widgets use transitive GVR registration.** RESTActions listed in `l1RestActions` in `cache-warmup.yaml` (e.g. `all-routes`, `blueprints-list`, `compositions-list`, `sidebar-nav-menu-items`) are warmed at startup. Other RESTActions populate L1 on first real user request.
 
 3. **L1 refresh uses the user's client certificate groups.** Groups are extracted from the `*-clientconfig` Secret's client certificate data. If the certificate is missing or malformed, the refresh runs with an empty groups list, potentially producing incorrect RBAC results.
 
@@ -353,7 +336,7 @@ When RESTAction resolution makes HTTP calls to K8s API paths (e.g. listing compo
 |------|---------------|
 | `internal/cache/redis.go` | RedisCache core: connection, CRUD, TTL, atomic ops |
 | `internal/cache/keys.go` | Key format builders and parsers |
-| `internal/cache/watcher.go` | ResourceWatcher: informers, L3 updates, L1/L2 refresh/invalidation |
+| `internal/cache/watcher.go` | ResourceWatcher: informers, L3 updates, L1 refresh/invalidation |
 | `internal/cache/warmup.go` | Startup L3 warmup and discovery caching |
 | `internal/cache/tracker.go` | DependencyTracker: records GVR dependencies during resolution |
 | `internal/cache/context.go` | Context helpers for cache injection |
@@ -364,4 +347,4 @@ When RESTAction resolution makes HTTP calls to K8s API paths (e.g. listing compo
 | `internal/handlers/dispatchers/restactions.go` | RESTAction dispatcher with L1 cache read/write |
 | `internal/handlers/dispatchers/prewarm.go` | L1 startup warmup and request-time child pre-warming |
 | `internal/handlers/dispatchers/l1_refresh.go` | L1RefreshFunc: background re-resolution on resource changes |
-| `config/cache-warmup.yaml` | GVRs and categories to pre-populate at startup |
+| `config/cache-warmup.yaml` | GVRs, `l1RestActions`, and categories to pre-populate at startup |

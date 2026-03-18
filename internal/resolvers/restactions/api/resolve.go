@@ -161,150 +161,58 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				}
 			}
 
-			// ── HTTP response cache ────────────────────────────────────────────
+			// ── L3 direct read ──────────────────────────────────────────────
 			if c != nil && verb == http.MethodGet {
-				httpKey := cache.HTTPUserKey(user.Username, verb, call.Path)
-
-			if raw, hit, _ := c.GetRaw(ctx, httpKey); hit {
-				handler := jsonHandler(ctx, jsonHandlerOptions{
-					key: id, out: dict, filter: apiCall.Filter,
-				})
-				cache.GlobalMetrics.RawHits.Add(1)
-				cache.GlobalMetrics.L2Hits.Add(1)
-				log.Debug("api: L2 hit", slog.String("name", id), slog.String("path", call.Path))
-				if mu != nil {
-					mu.Lock()
-				}
-				herr := handler(io.NopCloser(bytes.NewReader(raw)))
-				if mu != nil {
-					mu.Unlock()
-				}
-				if herr != nil {
-					log.Warn("api: cached response handler error",
-						slog.String("key", httpKey), slog.Any("err", herr))
-				}
-				return true
-			}
-
-			// L2 miss → try L1 promotion for /call paths: if the target is
-			// another snowplow /call endpoint, check if L1 already has
-			// the resolved output. This avoids a full HTTP round-trip.
-			if callGVR, callNS, callName := cache.ParseCallPath(call.Path); callGVR.Resource != "" && callName != "" {
-				l1Key := cache.ResolvedKey(user.Username, callGVR, callNS, callName, 0, 0)
-				if l1Raw, l1Hit, _ := c.GetRaw(ctx, l1Key); l1Hit {
-					_ = c.SetHTTPRaw(ctx, httpKey, l1Raw)
-					cache.GlobalMetrics.RawHits.Add(1)
-					cache.GlobalMetrics.L1Hits.Add(1)
-					log.Debug("api: L1→L2 promotion for /call path",
-						slog.String("name", id), slog.String("l1Key", l1Key))
-					handler := jsonHandler(ctx, jsonHandlerOptions{
-						key: id, out: dict, filter: apiCall.Filter,
-					})
-					if mu != nil {
-						mu.Lock()
-					}
-					herr := handler(io.NopCloser(bytes.NewReader(l1Raw)))
-					if mu != nil {
-						mu.Unlock()
-					}
-					if herr != nil {
-						log.Warn("api: L1→L2 promoted response handler error",
-							slog.String("key", httpKey), slog.Any("err", herr))
-					}
-					return true
-				}
-			}
-
-			// L2 miss → try L3 promotion: if the path maps to a K8s
-			// resource that the warmup or informer already cached in L3,
-			// serve from L3 and populate L2 — no API call needed.
-			pathGVR, pathNS, pathName := cache.ParseK8sAPIPath(call.Path)
-			if pathGVR.Resource != "" {
-				var l3Key string
-				if pathName != "" {
-					l3Key = cache.GetKey(pathGVR, pathNS, pathName)
-				} else {
-					l3Key = cache.ListKey(pathGVR, pathNS)
-				}
-				l3Raw, l3Hit, _ := c.GetRaw(ctx, l3Key)
-
-				if l3Hit && !cache.IsNotFoundRaw(l3Raw) {
-					rbacVerb := "list"
+				pathGVR, pathNS, pathName := cache.ParseK8sAPIPath(call.Path)
+				if pathGVR.Resource != "" {
+					var l3Key string
 					if pathName != "" {
-						rbacVerb = "get"
+						l3Key = cache.GetKey(pathGVR, pathNS, pathName)
+					} else {
+						l3Key = cache.ListKey(pathGVR, pathNS)
 					}
-					if rbac.UserCan(ctx, rbac.UserCanOptions{
-						Verb:          rbacVerb,
-						GroupResource: schema.GroupResource{Group: pathGVR.Group, Resource: pathGVR.Resource},
-						Namespace:     pathNS,
-					}) {
-						_ = c.SetHTTPRaw(ctx, httpKey, l3Raw)
-						gvrKey := cache.GVRToKey(pathGVR)
+					if l3Raw, l3Hit, _ := c.GetRaw(ctx, l3Key); l3Hit && !cache.IsNotFoundRaw(l3Raw) {
+						rbacVerb := "list"
 						if pathName != "" {
-							_ = c.SAddWithTTL(ctx, cache.L2ResourceKey(gvrKey, pathNS, pathName), httpKey, cache.ReverseIndexTTL)
-						} else {
-							_ = c.HSetWithTTL(ctx, cache.L2GVRKey(gvrKey), httpKey, l3Key, cache.ReverseIndexTTL)
+							rbacVerb = "get"
 						}
-						cache.GlobalMetrics.RawHits.Add(1)
-						cache.GlobalMetrics.L2Hits.Add(1)
-						cache.GlobalMetrics.L3Promotions.Add(1)
-						handler := jsonHandler(ctx, jsonHandlerOptions{
-							key: id, out: dict, filter: apiCall.Filter,
-						})
+						if rbac.UserCan(ctx, rbac.UserCanOptions{
+							Verb:          rbacVerb,
+							GroupResource: schema.GroupResource{Group: pathGVR.Group, Resource: pathGVR.Resource},
+							Namespace:     pathNS,
+						}) {
+							cache.GlobalMetrics.L3Promotions.Add(1)
+							handler := jsonHandler(ctx, jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter})
+							if mu != nil {
+								mu.Lock()
+							}
+							_ = handler(io.NopCloser(bytes.NewReader(l3Raw)))
+							if mu != nil {
+								mu.Unlock()
+							}
+							return true
+						}
+					}
+				}
+
+				if callGVR, callNS, callName := cache.ParseCallPath(call.Path); callGVR.Resource != "" && callName != "" {
+					l1Key := cache.ResolvedKey(user.Username, callGVR, callNS, callName, 0, 0)
+					if l1Raw, l1Hit, _ := c.GetRaw(ctx, l1Key); l1Hit {
+						cache.GlobalMetrics.L1Hits.Add(1)
+						handler := jsonHandler(ctx, jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter})
 						if mu != nil {
 							mu.Lock()
 						}
-						herr := handler(io.NopCloser(bytes.NewReader(l3Raw)))
+						_ = handler(io.NopCloser(bytes.NewReader(l1Raw)))
 						if mu != nil {
 							mu.Unlock()
 						}
-						if herr != nil {
-							log.Warn("api: L3 promoted response handler error",
-								slog.String("key", httpKey), slog.Any("err", herr))
-						}
 						return true
 					}
-					log.Debug("api: L3 promotion denied by RBAC",
-						slog.String("user", user.Username),
-						slog.String("verb", rbacVerb),
-						slog.String("gvr", pathGVR.String()),
-						slog.String("ns", pathNS))
 				}
 			}
-
-			// True L2+L3 miss → HTTP call.
-			cache.GlobalMetrics.L2Misses.Add(1)
-			baseHandler := jsonHandler(ctx, jsonHandlerOptions{
-				key: id, out: dict, filter: apiCall.Filter,
-			})
-			capturedKey := httpKey
-			call.ResponseHandler = func(r io.ReadCloser) error {
-				data, rerr := io.ReadAll(r)
-				if rerr != nil {
-					return rerr
-				}
-				_ = c.SetHTTPRaw(ctx, capturedKey, data)
-				if pathGVR, pNS, pName := cache.ParseK8sAPIPath(call.Path); pathGVR.Resource != "" {
-					gk := cache.GVRToKey(pathGVR)
-					if pName != "" {
-						_ = c.SAddWithTTL(ctx, cache.L2ResourceKey(gk, pNS, pName), capturedKey, cache.ReverseIndexTTL)
-					} else {
-						l3ListKey := cache.ListKey(pathGVR, pNS)
-						_ = c.HSetWithTTL(ctx, cache.L2GVRKey(gk), capturedKey, l3ListKey, cache.ReverseIndexTTL)
-					}
-				}
-			cache.GlobalMetrics.RawMisses.Add(1)
-			log.Info("api: L2+L3 miss (live HTTP)", slog.String("name", id), slog.String("path", call.Path), slog.String("key", capturedKey))
-			if mu != nil {
-				mu.Lock()
-			}
-			werr := baseHandler(io.NopCloser(bytes.NewReader(data)))
-			if mu != nil {
-				mu.Unlock()
-			}
-			return werr
-		}
-		} else {
+			// ── L3 miss → live HTTP call ───────────────────────────────────
+			{
 				plain := jsonHandler(ctx, jsonHandlerOptions{
 					key: id, out: dict, filter: apiCall.Filter,
 				})
@@ -322,7 +230,6 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					call.ResponseHandler = plain
 				}
 			}
-			// ── End HTTP response cache ────────────────────────────────────────
 
 			log.Debug("calling api", slog.String("name", id),
 				slog.String("host", call.Endpoint.ServerURL), slog.String("path", call.Path))

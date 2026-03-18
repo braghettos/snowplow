@@ -145,7 +145,7 @@ echo "   Flushing resolved cache keys..."
 # different L1 key if L1 is per-user+token)
 # Instead, just note the current values as baseline.
 # For a true L1 miss test, the operator should restart snowplow or flush Redis.
-echo "   (Using warm L3/L2 — measures resolution pipeline overhead only)"
+echo "   (Using warm L3 — measures resolution pipeline overhead only)"
 echo "   Skipping explicit L1 flush (requires Redis access)."
 echo "   To measure true L1 miss: restart snowplow, then immediately run this script."
 

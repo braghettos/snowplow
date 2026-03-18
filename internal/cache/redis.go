@@ -10,23 +10,18 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	expirable "github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/redis/go-redis/v9"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-const (
-	l0MaxEntries = 2048
-	l0TTL        = 10 * time.Second
-	l0Prefix     = "snowplow:resolved:"
-)
+type gvrNotifyFunc = func(context.Context, schema.GroupVersionResource)
 
 const (
 	DefaultResourceTTL = time.Hour
 	ResolvedCacheTTL   = time.Hour
-	HTTPCacheTTL       = time.Hour
 	ReverseIndexTTL    = 2 * time.Hour
 	notFoundTTL        = 30 * time.Second
 )
@@ -77,8 +72,7 @@ type RedisCache struct {
 	client      *redis.Client
 	ResourceTTL time.Duration
 	gvrTTLs     sync.Map
-	onNewGVR    func(context.Context, schema.GroupVersionResource)
-	l0          *expirable.LRU[string, []byte]
+	onNewGVR    atomic.Value // stores gvrNotifyFunc
 }
 
 func redisAddr() string {
@@ -108,7 +102,6 @@ func New(resourceTTL time.Duration) *RedisCache {
 			MaxRetries:   2,
 		}),
 		ResourceTTL: resourceTTL,
-		l0:          expirable.NewLRU[string, []byte](l0MaxEntries, nil, l0TTL),
 	}
 }
 
@@ -144,9 +137,9 @@ func (c *RedisCache) SetRawForGVR(ctx context.Context, gvr schema.GroupVersionRe
 
 // ── GVR notifier ──────────────────────────────────────────────────────────────
 
-func (c *RedisCache) SetGVRNotifier(fn func(context.Context, schema.GroupVersionResource)) {
+func (c *RedisCache) SetGVRNotifier(fn gvrNotifyFunc) {
 	if c != nil {
-		c.onNewGVR = fn
+		c.onNewGVR.Store(fn)
 	}
 }
 
@@ -188,13 +181,6 @@ func (c *RedisCache) GetRaw(ctx context.Context, key string) ([]byte, bool, erro
 	if c == nil {
 		return nil, false, nil
 	}
-	if strings.HasPrefix(key, l0Prefix) {
-		if v, ok := c.l0.Get(key); ok {
-			GlobalMetrics.L0Hits.Add(1)
-			return v, true, nil
-		}
-		GlobalMetrics.L0Misses.Add(1)
-	}
 	val, err := c.client.Get(ctx, key).Bytes()
 	if errors.Is(err, redis.Nil) {
 		return nil, false, nil
@@ -205,9 +191,6 @@ func (c *RedisCache) GetRaw(ctx context.Context, key string) ([]byte, bool, erro
 	val = decompressValue(val)
 	if bytes.Equal(val, []byte(notFoundSentinel)) {
 		return nil, false, nil
-	}
-	if strings.HasPrefix(key, l0Prefix) {
-		c.l0.Add(key, val)
 	}
 	return val, true, nil
 }
@@ -271,20 +254,7 @@ func (c *RedisCache) SetResolvedRaw(ctx context.Context, key string, val []byte)
 	if c == nil {
 		return nil
 	}
-	if strings.HasPrefix(key, l0Prefix) {
-		c.l0.Add(key, val)
-	}
 	return c.client.Set(ctx, key, compressValue(val), ResolvedCacheTTL).Err()
-}
-
-// SetHTTPRaw stores a raw HTTP response. Freshness is guaranteed by the GVR
-// reverse index (targeted invalidation from informer events); TTL is only for
-// memory management.
-func (c *RedisCache) SetHTTPRaw(ctx context.Context, key string, val []byte) error {
-	if c == nil {
-		return nil
-	}
-	return c.client.Set(ctx, key, compressValue(val), HTTPCacheTTL).Err()
 }
 
 func (c *RedisCache) setWithTTL(ctx context.Context, key string, val any, ttl time.Duration) error {
@@ -301,11 +271,6 @@ func (c *RedisCache) setWithTTL(ctx context.Context, key string, val any, ttl ti
 func (c *RedisCache) Delete(ctx context.Context, keys ...string) error {
 	if c == nil || len(keys) == 0 {
 		return nil
-	}
-	for _, k := range keys {
-		if strings.HasPrefix(k, l0Prefix) {
-			c.l0.Remove(k)
-		}
 	}
 	return c.client.Del(ctx, keys...).Err()
 }
@@ -379,7 +344,7 @@ func (c *RedisCache) DeletePattern(ctx context.Context, pattern string) error {
 }
 
 // SAddWithTTL adds member to a Redis set and refreshes the set's TTL.
-// Used for reverse-index sets (l1gvr, l2gvr) that should expire when the
+// Used for reverse-index sets (l1gvr) that should expire when the
 // associated cache entries expire.
 func (c *RedisCache) SAddWithTTL(ctx context.Context, key, member string, ttl time.Duration) error {
 	if c == nil {
@@ -387,21 +352,6 @@ func (c *RedisCache) SAddWithTTL(ctx context.Context, key, member string, ttl ti
 	}
 	pipe := c.client.Pipeline()
 	pipe.SAdd(ctx, key, member)
-	pipe.Expire(ctx, key, ttl)
-	_, err := pipe.Exec(ctx)
-	return err
-}
-
-// HSetWithTTL sets a field in a Redis HASH and refreshes the key's TTL.
-// Used for the L2 LIST reverse index (L2GVRKey) where each field is an L2
-// HTTP key and the value is the corresponding L3 key, enabling in-place
-// refresh instead of deletion.
-func (c *RedisCache) HSetWithTTL(ctx context.Context, key, field, value string, ttl time.Duration) error {
-	if c == nil {
-		return nil
-	}
-	pipe := c.client.Pipeline()
-	pipe.HSet(ctx, key, field, value)
 	pipe.Expire(ctx, key, ttl)
 	_, err := pipe.Exec(ctx)
 	return err
@@ -422,14 +372,6 @@ func (c *RedisCache) IsRBACAllowed(ctx context.Context, username, verb string, g
 	return false, false
 }
 
-// HGetAll returns all field-value pairs in a Redis HASH.
-func (c *RedisCache) HGetAll(ctx context.Context, key string) (map[string]string, error) {
-	if c == nil {
-		return nil, nil
-	}
-	return c.client.HGetAll(ctx, key).Result()
-}
-
 func (c *RedisCache) SAddGVR(ctx context.Context, gvr schema.GroupVersionResource) error {
 	if c == nil {
 		return nil
@@ -438,8 +380,10 @@ func (c *RedisCache) SAddGVR(ctx context.Context, gvr schema.GroupVersionResourc
 	if err != nil {
 		return err
 	}
-	if added > 0 && c.onNewGVR != nil {
-		c.onNewGVR(ctx, gvr)
+	if added > 0 {
+		if fn, ok := c.onNewGVR.Load().(gvrNotifyFunc); ok && fn != nil {
+			fn(ctx, gvr)
+		}
 	}
 	return nil
 }

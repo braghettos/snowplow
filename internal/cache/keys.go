@@ -1,7 +1,6 @@
 package cache
 
 import (
-	"crypto/sha256"
 	"fmt"
 	"net/url"
 	"strings"
@@ -71,25 +70,6 @@ func RBACKeyPattern(username string) string {
 	return fmt.Sprintf("snowplow:rbac:%s:*", username)
 }
 
-// HTTPUserKey builds a per-user cache key for HTTP GET calls made inside the
-// RESTAction/widget resolution pipeline. These calls use the user's JWT, so
-// responses may differ per user (RBAC-filtered namespace lists, widget lists,
-// etc.). The path hash includes query parameters to avoid collisions.
-func HTTPUserKey(username, method, path string) string {
-	h := sha256.Sum256([]byte(path))
-	return fmt.Sprintf("snowplow:http:%s:%s:%x", username, strings.ToUpper(method), h[:8])
-}
-
-// ParseHTTPUserKey extracts the username from an L2 HTTP cache key.
-// Key format: snowplow:http:{username}:{METHOD}:{pathHash}
-func ParseHTTPUserKey(key string) (username string, ok bool) {
-	parts := strings.SplitN(key, ":", 5)
-	if len(parts) == 5 && parts[0] == "snowplow" && parts[1] == "http" {
-		return parts[2], true
-	}
-	return "", false
-}
-
 // ResolvedKey builds the per-user cache key for a fully-resolved dispatcher
 // output (widget or RESTAction). Caching at this level eliminates both the
 // HTTP fan-out AND all JQ evaluations for repeated requests.
@@ -109,31 +89,10 @@ func ResolvedKey(username string, gvr schema.GroupVersionResource, namespace, na
 // when any watched Kubernetes resource changes.
 const AllResolvedPattern = "snowplow:resolved:*"
 
-// AllHTTPPattern matches every per-user HTTP response cache entry created
-// during RESTAction resolution. These must be invalidated alongside resolved
-// keys when a watched resource changes, because the HTTP-cached responses
-// contain raw Kubernetes API data that feeds into the resolution pipeline.
-const AllHTTPPattern = "snowplow:http:*"
-
 // L1GVRKey returns the Redis SET key that maps a GVR to all L1 (resolved)
 // cache entries that depend on it. Used for targeted invalidation.
 func L1GVRKey(gvrKey string) string {
 	return "snowplow:l1gvr:" + gvrKey
-}
-
-// L2GVRKey returns the Redis SET key that maps a GVR to all L2 (http)
-// cache entries that depend on it. Used for targeted invalidation of
-// LIST-level entries (affected by any resource change within the GVR).
-func L2GVRKey(gvrKey string) string {
-	return "snowplow:l2gvr:" + gvrKey
-}
-
-// L2ResourceKey returns the Redis SET key that maps a specific resource
-// instance to L2 (http) cache entries that reference it. When a resource
-// changes, only L2 entries for that exact resource are invalidated — not
-// every L2 entry for the entire GVR.
-func L2ResourceKey(gvrKey, namespace, name string) string {
-	return "snowplow:l2res:" + gvrKey + ":" + namespace + ":" + name
 }
 
 // UserConfigKey builds the per-user cache key for the Endpoint fetched from

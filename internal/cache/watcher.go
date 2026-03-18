@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -34,8 +36,8 @@ type ResourceWatcher struct {
 	watched   map[string]bool
 	appCtx    context.Context // long-lived process context; set by Start()
 
-	l1Refresh  L1RefreshFunc
-	refreshing sync.Map // gvrKey → bool; prevents concurrent refreshes for the same GVR
+	l1Refresh  atomic.Value // stores L1RefreshFunc
+	refreshing sync.Map     // gvrKey → bool; prevents concurrent refreshes for the same GVR
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -107,7 +109,7 @@ func (rw *ResourceWatcher) StartExpiryRefresh(ctx context.Context) {
 // SetL1Refresher registers a callback that will be used to proactively
 // re-resolve L1 entries in the background instead of deleting them.
 func (rw *ResourceWatcher) SetL1Refresher(fn L1RefreshFunc) {
-	rw.l1Refresh = fn
+	rw.l1Refresh.Store(fn)
 }
 
 func (rw *ResourceWatcher) AddGVR(_ context.Context, gvr schema.GroupVersionResource) {
@@ -171,6 +173,17 @@ func (rw *ResourceWatcher) startInformer(gvr schema.GroupVersionResource) {
 }
 
 func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVersionResource, _, obj any, eventType string) {
+	defer func() {
+		if r := recover(); r != nil {
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			slog.Error("resource-watcher: panic recovered in handleEvent",
+				slog.Any("error", r),
+				slog.String("gvr", gvr.String()),
+				slog.String("event", eventType),
+				slog.String("stack", string(buf[:n])))
+		}
+	}()
 	uns, ok := toUnstructured(obj)
 	if !ok {
 		return
@@ -192,32 +205,12 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		if ns != "" {
 			rw.patchListCache(ctx, gvr, clusterListKey, uns, "delete")
 		}
-		// Full L1 + per-resource L2 + GVR-wide L2 invalidation: the resource is gone.
 		gvrKey := GVRToKey(gvr)
 		l1Idx := L1GVRKey(gvrKey)
 		if keys, serr := rw.cache.SMembers(ctx, l1Idx); serr == nil && len(keys) > 0 {
 			_ = rw.cache.Delete(ctx, append(keys, l1Idx)...)
 			slog.Debug("resource-watcher: L1 invalidation (delete)",
 				slog.String("index", l1Idx), slog.Int("count", len(keys)))
-		}
-		// Delete per-resource L2 entries for this specific resource
-		resIdx := L2ResourceKey(gvrKey, ns, name)
-		if keys, serr := rw.cache.SMembers(ctx, resIdx); serr == nil && len(keys) > 0 {
-			_ = rw.cache.Delete(ctx, append(keys, resIdx)...)
-			slog.Debug("resource-watcher: L2 resource invalidation (delete)",
-				slog.String("index", resIdx), slog.Int("count", len(keys)))
-		}
-		// Delete GVR-wide L2 entries (LIST caches — stored as HASH)
-		l2Idx := L2GVRKey(gvrKey)
-		if mapping, serr := rw.cache.HGetAll(ctx, l2Idx); serr == nil && len(mapping) > 0 {
-			keysToDelete := make([]string, 0, len(mapping)+1)
-			for l2Key := range mapping {
-				keysToDelete = append(keysToDelete, l2Key)
-			}
-			keysToDelete = append(keysToDelete, l2Idx)
-			_ = rw.cache.Delete(ctx, keysToDelete...)
-			slog.Debug("resource-watcher: L2 GVR invalidation (delete)",
-				slog.String("index", l2Idx), slog.Int("count", len(mapping)))
 		}
 		return
 
@@ -235,64 +228,8 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		}
 	}
 
-	// ── Proactive L2 + L1 refresh (stale-while-revalidate) ───────────────────
-	// Instead of deleting L2 keys (which causes cache misses during L1 refresh),
-	// update them in-place from the fresh L3 data. L3 was already updated above
-	// (SetForGVR + patchListCache), so the data is authoritative.
+	// ── Proactive L1 refresh (stale-while-revalidate) ────────────────────────
 	gvrKey := GVRToKey(gvr)
-
-	// L2 GET: refresh per-resource entries from the fresh L3 GET key.
-	gr := gvr.GroupResource()
-	resIdxKey := L2ResourceKey(gvrKey, ns, name)
-	if resKeys, serr := rw.cache.SMembers(ctx, resIdxKey); serr == nil && len(resKeys) > 0 {
-		l3GetKey := GetKey(gvr, ns, name)
-		if fresh, hit, _ := rw.cache.GetRaw(ctx, l3GetKey); hit && !IsNotFoundRaw(fresh) {
-			for _, l2Key := range resKeys {
-				if u, ok := ParseHTTPUserKey(l2Key); ok {
-					allowed, cached := rw.cache.IsRBACAllowed(ctx, u, "get", gr, ns)
-					if cached && !allowed {
-						_ = rw.cache.Delete(ctx, l2Key)
-						continue
-					}
-				}
-				_ = rw.cache.SetHTTPRaw(ctx, l2Key, fresh)
-			}
-			slog.Debug("resource-watcher: L2 resource refreshed",
-				slog.String("resource", ns+"/"+name),
-				slog.Int("count", len(resKeys)))
-		} else {
-			_ = rw.cache.Delete(ctx, append(resKeys, resIdxKey)...)
-			slog.Debug("resource-watcher: L2 resource deleted (L3 miss)",
-				slog.String("resource", ns+"/"+name))
-		}
-	}
-	// L2 LIST: refresh each entry from its recorded L3 key (stored in HASH).
-	l2IdxKey := L2GVRKey(gvrKey)
-	if mapping, serr := rw.cache.HGetAll(ctx, l2IdxKey); serr == nil && len(mapping) > 0 {
-		refreshed := 0
-		for l2Key, l3Key := range mapping {
-			if u, ok := ParseHTTPUserKey(l2Key); ok {
-				listGVR, listNS, lok := ParseListKey(l3Key)
-				if lok {
-					allowed, cached := rw.cache.IsRBACAllowed(ctx, u, "list", listGVR.GroupResource(), listNS)
-					if cached && !allowed {
-						_ = rw.cache.Delete(ctx, l2Key)
-						continue
-					}
-				}
-			}
-			if fresh, hit, _ := rw.cache.GetRaw(ctx, l3Key); hit && !IsNotFoundRaw(fresh) {
-				_ = rw.cache.SetHTTPRaw(ctx, l2Key, fresh)
-				refreshed++
-			} else {
-				_ = rw.cache.Delete(ctx, l2Key)
-			}
-		}
-		slog.Debug("resource-watcher: L2 LIST refreshed",
-			slog.String("gvr", gvr.String()),
-			slog.Int("refreshed", refreshed),
-			slog.Int("total", len(mapping)))
-	}
 
 	// L1: proactively refresh instead of deleting.
 	l1IdxKey := L1GVRKey(gvrKey)
@@ -301,8 +238,7 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		return
 	}
 
-	if rw.l1Refresh != nil {
-		// Guard: skip if a refresh for this GVR is already in-flight.
+	if fn, ok := rw.l1Refresh.Load().(L1RefreshFunc); ok && fn != nil {
 		if _, alreadyRunning := rw.refreshing.LoadOrStore(gvrKey, true); alreadyRunning {
 			slog.Debug("resource-watcher: L1 refresh already in-flight, skipping",
 				slog.String("gvr", gvr.String()))
@@ -310,12 +246,21 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		}
 		go func() {
 			defer rw.refreshing.Delete(gvrKey)
+			defer func() {
+				if r := recover(); r != nil {
+					buf := make([]byte, 4096)
+					n := runtime.Stack(buf, false)
+					slog.Error("resource-watcher: panic recovered in L1 refresh",
+						slog.Any("error", r),
+						slog.String("gvr", gvr.String()),
+						slog.String("stack", string(buf[:n])))
+				}
+			}()
 			refreshCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
-			rw.l1Refresh(refreshCtx, gvr, l1Keys)
+			fn(refreshCtx, gvr, l1Keys)
 		}()
 	} else {
-		// No refresher configured; fall back to deletion.
 		_ = rw.cache.Delete(ctx, append(l1Keys, l1IdxKey)...)
 		slog.Debug("resource-watcher: L1 invalidated (no refresher)",
 			slog.String("gvr", gvr.String()),
@@ -388,6 +333,16 @@ func (rw *ResourceWatcher) patchListCache(ctx context.Context, gvr schema.GroupV
 // ── Proactive expiry refresh ──────────────────────────────────────────────────
 
 func (rw *ResourceWatcher) handleExpiredKey(ctx context.Context, key string) {
+	defer func() {
+		if r := recover(); r != nil {
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			slog.Error("resource-watcher: panic recovered in handleExpiredKey",
+				slog.Any("error", r),
+				slog.String("key", key),
+				slog.String("stack", string(buf[:n])))
+		}
+	}()
 	switch {
 	case strings.HasPrefix(key, "snowplow:get:"):
 		gvr, ns, name, ok := ParseGetKey(key)

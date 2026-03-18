@@ -35,3 +35,10 @@ experiments/**
 
 # Generated reports
 docs/CACHE_VALIDATION_REPORT.md
+
+# Bench venv (playwright)
+.venv-bench/
+
+# Bench outputs
+e2e/bench/__pycache__/
+e2e/bench/*_results.json
