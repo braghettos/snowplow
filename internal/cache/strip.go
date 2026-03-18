@@ -1,6 +1,10 @@
 package cache
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+)
 
 // StripBulkyAnnotations removes kubectl.kubernetes.io/last-applied-configuration
 // from every metadata.annotations map found recursively in the JSON payload.
@@ -23,6 +27,26 @@ func StripBulkyAnnotations(raw []byte) []byte {
 }
 
 const lastAppliedKey = "kubectl.kubernetes.io/last-applied-configuration"
+
+// StripAnnotationsFromUnstructured removes the last-applied-configuration
+// annotation from an Unstructured object in-place. Returns true if the
+// annotation was present and removed. The caller must DeepCopy the object
+// first if the informer's shared copy must not be mutated.
+func StripAnnotationsFromUnstructured(uns *unstructured.Unstructured) bool {
+	ann := uns.GetAnnotations()
+	if ann == nil {
+		return false
+	}
+	if _, ok := ann[lastAppliedKey]; !ok {
+		return false
+	}
+	delete(ann, lastAppliedKey)
+	if len(ann) == 0 {
+		ann = nil
+	}
+	uns.SetAnnotations(ann)
+	return true
+}
 
 // stripAnnotationRecursive walks maps and slices, deleting the
 // last-applied-configuration annotation from any metadata.annotations map.

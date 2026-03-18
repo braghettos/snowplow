@@ -2,9 +2,11 @@ package cache
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -21,6 +23,47 @@ const (
 	ReverseIndexTTL    = 2 * time.Hour
 	notFoundTTL        = 30 * time.Second
 )
+
+// ── Transparent gzip compression ──────────────────────────────────────────────
+
+const compressMinSize = 256
+
+var gzWriterPool = sync.Pool{
+	New: func() any {
+		w, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed)
+		return w
+	},
+}
+
+func compressValue(data []byte) []byte {
+	if len(data) < compressMinSize {
+		return data
+	}
+	var buf bytes.Buffer
+	buf.Grow(len(data) / 3)
+	w := gzWriterPool.Get().(*gzip.Writer)
+	w.Reset(&buf)
+	_, _ = w.Write(data)
+	_ = w.Close()
+	gzWriterPool.Put(w)
+	return buf.Bytes()
+}
+
+func decompressValue(data []byte) []byte {
+	if len(data) < 2 || data[0] != 0x1f || data[1] != 0x8b {
+		return data
+	}
+	r, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return data
+	}
+	defer r.Close()
+	out, err := io.ReadAll(r)
+	if err != nil {
+		return data
+	}
+	return out
+}
 
 // RedisCache is a Redis-backed cache. All methods are safe on a nil receiver.
 type RedisCache struct {
@@ -87,7 +130,7 @@ func (c *RedisCache) SetRawForGVR(ctx context.Context, gvr schema.GroupVersionRe
 	if c == nil {
 		return nil
 	}
-	return c.client.Set(ctx, key, val, c.TTLForGVR(gvr)).Err()
+	return c.client.Set(ctx, key, compressValue(val), c.TTLForGVR(gvr)).Err()
 }
 
 // ── GVR notifier ──────────────────────────────────────────────────────────────
@@ -125,6 +168,7 @@ func (c *RedisCache) Get(ctx context.Context, key string, dest any) (bool, error
 	if err != nil {
 		return false, err
 	}
+	val = decompressValue(val)
 	if bytes.Equal(val, []byte(notFoundSentinel)) {
 		return false, nil
 	}
@@ -142,6 +186,7 @@ func (c *RedisCache) GetRaw(ctx context.Context, key string) ([]byte, bool, erro
 	if err != nil {
 		return nil, false, err
 	}
+	val = decompressValue(val)
 	if bytes.Equal(val, []byte(notFoundSentinel)) {
 		return nil, false, nil
 	}
@@ -163,7 +208,11 @@ func (c *RedisCache) GetNotFound(ctx context.Context, key string) bool {
 		return false
 	}
 	val, err := c.client.Get(ctx, key).Bytes()
-	return err == nil && bytes.Equal(val, []byte(notFoundSentinel))
+	if err != nil {
+		return false
+	}
+	val = decompressValue(val)
+	return bytes.Equal(val, []byte(notFoundSentinel))
 }
 
 // SetNotFound caches a 404 sentinel for key with a short TTL.
@@ -192,7 +241,7 @@ func (c *RedisCache) SetRaw(ctx context.Context, key string, val []byte) error {
 	if c == nil {
 		return nil
 	}
-	return c.client.Set(ctx, key, val, c.ResourceTTL).Err()
+	return c.client.Set(ctx, key, compressValue(val), c.ResourceTTL).Err()
 }
 
 // SetResolvedRaw stores a fully-resolved widget/restaction output with
@@ -203,7 +252,7 @@ func (c *RedisCache) SetResolvedRaw(ctx context.Context, key string, val []byte)
 	if c == nil {
 		return nil
 	}
-	return c.client.Set(ctx, key, val, ResolvedCacheTTL).Err()
+	return c.client.Set(ctx, key, compressValue(val), ResolvedCacheTTL).Err()
 }
 
 // SetHTTPRaw stores a raw HTTP response. Freshness is guaranteed by the GVR
@@ -213,7 +262,7 @@ func (c *RedisCache) SetHTTPRaw(ctx context.Context, key string, val []byte) err
 	if c == nil {
 		return nil
 	}
-	return c.client.Set(ctx, key, val, HTTPCacheTTL).Err()
+	return c.client.Set(ctx, key, compressValue(val), HTTPCacheTTL).Err()
 }
 
 func (c *RedisCache) setWithTTL(ctx context.Context, key string, val any, ttl time.Duration) error {
@@ -224,7 +273,7 @@ func (c *RedisCache) setWithTTL(ctx context.Context, key string, val any, ttl ti
 	if err != nil {
 		return err
 	}
-	return c.client.Set(ctx, key, data, ttl).Err()
+	return c.client.Set(ctx, key, compressValue(data), ttl).Err()
 }
 
 func (c *RedisCache) Delete(ctx context.Context, keys ...string) error {
@@ -252,15 +301,18 @@ func (c *RedisCache) AtomicUpdateJSON(ctx context.Context, key string, fn func([
 				val = nil
 			} else if err != nil {
 				return err
-			} else if bytes.Equal(val, []byte(notFoundSentinel)) {
-				val = nil
+			} else {
+				val = decompressValue(val)
+				if bytes.Equal(val, []byte(notFoundSentinel)) {
+					val = nil
+				}
 			}
 			newVal, ferr := fn(val)
 			if ferr != nil || newVal == nil {
 				return ferr
 			}
 			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-				return pipe.Set(ctx, key, newVal, ttl).Err()
+				return pipe.Set(ctx, key, compressValue(newVal), ttl).Err()
 			})
 			return err
 		}, key)

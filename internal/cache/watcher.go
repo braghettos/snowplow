@@ -222,13 +222,16 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		return
 
 	case "add", "update":
-		if serr := rw.cache.SetForGVR(ctx, gvr, getKey, uns); serr != nil {
+		stripped := uns.DeepCopy()
+		StripAnnotationsFromUnstructured(stripped)
+
+		if serr := rw.cache.SetForGVR(ctx, gvr, getKey, stripped); serr != nil {
 			slog.Warn("resource-watcher: failed to update GET cache",
 				slog.String("key", getKey), slog.Any("err", serr))
 		}
-		rw.patchListCache(ctx, gvr, nsListKey, uns, eventType)
+		rw.patchListCache(ctx, gvr, nsListKey, stripped, eventType)
 		if ns != "" {
-			rw.patchListCache(ctx, gvr, clusterListKey, uns, eventType)
+			rw.patchListCache(ctx, gvr, clusterListKey, stripped, eventType)
 		}
 	}
 
