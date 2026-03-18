@@ -352,20 +352,36 @@ def wait_for_snowplow(max_wait=240):
 
 
 def wait_for_l1_warmup(timeout=300):
+    """Wait until L1 cache is populated.
+
+    Checking pod logs with --tail=N is fragile: when the pod has been running
+    for a while, high-frequency informer events (e.g. cluster-kubestore
+    configmap updates every 2s) push the warmup log message beyond the tail
+    window. Instead, check Redis directly — if snowplow:resolved:* keys exist
+    the warmup has run (or the pod already had a warm L1 from a prior run).
+    """
     log("Waiting for L1 warmup ...")
     deadline = time.time() + timeout
     while time.time() < deadline:
+        # Primary signal: Redis resolved keys
+        resolved = redis_cmd("KEYS", "snowplow:resolved:*")
+        if resolved and resolved.strip():
+            count = len([k for k in resolved.strip().split("\n") if k.strip()])
+            if count > 0:
+                log(f"L1 warmup detected ({count} resolved keys in Redis)")
+                return True
+
+        # Fallback: scan logs (works when pod just started and --tail is enough)
         rc, out, _ = kubectl("logs", "deployment/snowplow", "-n", NS,
                              "-c", "snowplow", "--tail=500")
-        if rc != 0:
-            time.sleep(5)
-            continue
-        if "L1 warmup: completed" in out:
-            log("L1 warmup completed")
-            return True
-        if "L1 warmup: skipped" in out or "L1 warmup: no users found" in out:
-            log("L1 warmup skipped")
-            return True
+        if rc == 0:
+            if "L1 warmup: completed" in out:
+                log("L1 warmup completed (log)")
+                return True
+            if "L1 warmup: skipped" in out or "L1 warmup: no users found" in out:
+                log("L1 warmup skipped (log)")
+                return True
+
         time.sleep(5)
     log("WARNING: L1 warmup not detected within timeout")
     return False
