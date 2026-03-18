@@ -727,13 +727,14 @@ def run_phase_functional(tokens):
     m0 = cache_metrics(token)
     ms, code, _ = http_get(path, token)
     m1 = cache_metrics(token)
-    d = m1.get("raw_hits", 0) - m0.get("raw_hits", 0)
-    record("admin: L1 hit (page/dashboard)", code == 200 and (d >= 1 or ms < 200), ms, code, f"raw_hits+{d}")
+    d_raw = m1.get("raw_hits", 0) - m0.get("raw_hits", 0)
+    d_l1 = m1.get("l1_hits", 0) - m0.get("l1_hits", 0)
+    record("admin: L1 hit (page/dashboard)", code == 200 and (d_raw >= 1 or d_l1 >= 1), ms, code, f"raw_hits+{d_raw} l1_hits+{d_l1}")
     if "cyberjoker" in tokens:
         ms_cj, code_cj, _ = http_get(path, tokens["cyberjoker"])
         record("cyberjoker: L1 cold miss (1st request)", code_cj == 200, ms_cj, code_cj)
         ms_cj2, code_cj2, _ = http_get(path, tokens["cyberjoker"])
-        record("cyberjoker: L1 hit (2nd request)", code_cj2 == 200 and ms_cj2 < 500, ms_cj2, code_cj2)
+        record("cyberjoker: L1 hit (2nd request)", code_cj2 == 200 and ms_cj2 <= ms_cj, ms_cj2, code_cj2)
 
     # T3 — Cache hits on all endpoints
     section("T3 — Cache Hits (all endpoints)")
@@ -746,23 +747,32 @@ def run_phase_functional(tokens):
             ms, code, _ = http_get(p, tk)
             m1 = cache_metrics(tk)
             total_d = (m1.get("raw_hits", 0) - m0.get("raw_hits", 0) +
-                       m1.get("get_hits", 0) - m0.get("get_hits", 0))
-            record(f"{username}: {label} cache hit", code == 200 and (total_d >= 1 or ms < 300), ms, code, f"hits+{total_d}")
+                       m1.get("l1_hits", 0) - m0.get("l1_hits", 0) +
+                       m1.get("get_hits", 0) - m0.get("get_hits", 0) +
+                       m1.get("call_hits", 0) - m0.get("call_hits", 0))
+            record(f"{username}: {label} cache hit", code == 200 and total_d >= 1, ms, code, f"hits+{total_d}")
 
     # T4 — L3 direct read
     section("T4 — L3 Direct Read")
-    m = cache_metrics(token)
-    l3p = m.get("l3_promotions", 0)
     l3_key = "snowplow:get:widgets.templates.krateo.io/v1beta1/pages:krateo-system:dashboard-page"
+    for attempt in range(3):
+        if redis_cmd("EXISTS", l3_key) == "1":
+            break
+        log(f"L3 key not found yet (attempt {attempt + 1}/3), waiting 3s ...")
+        time.sleep(3)
     record("L3 object key exists for dashboard-page", redis_cmd("EXISTS", l3_key) == "1", note=f"key={l3_key}")
-    record("L3 promotions counter is positive", l3p > 0, note=f"l3_promotions={l3p}")
+    l3_get_count = len([k for k in (redis_cmd("KEYS", "snowplow:get:*") or "").split("\n") if k.strip()])
+    record("L3 GET cache populated", l3_get_count > 10, note=f"get_keys={l3_get_count}")
 
-    # T5 — /call paths skip L3 promotion
-    section("T5 — /call Paths Skip L3 Promotion")
-    p5 = "/call?apiVersion=templates.krateo.io%2Fv1&resource=restactions&name=compositions-get-ns-and-crd&namespace=krateo-system"
+    # T5 — /call for RESTAction returns resolved output (not raw K8s object)
+    section("T5 — RESTAction Resolved Output")
+    p5 = "/call?apiVersion=templates.krateo.io%2Fv1&resource=restactions&name=compositions-list&namespace=krateo-system"
     ms, code, body = http_get_json(p5, token)
-    status = body.get("status") if isinstance(body, dict) else None
-    record("/call returns resolved output (not raw K8s)", code == 200 and isinstance(status, list), ms, code)
+    # Resolved RESTAction output has a "status" key with resolved data (dict or list),
+    # NOT a raw K8s object (which would have "apiVersion", "kind", "metadata", "spec").
+    has_status = isinstance(body, dict) and "status" in body
+    is_raw_k8s = isinstance(body, dict) and "spec" in body and "apiVersion" in body
+    record("/call returns resolved output (not raw K8s)", code == 200 and has_status and not is_raw_k8s, ms, code)
 
     # T6 — Compositions-list correctness
     section("T6 — Compositions-List Correctness")
@@ -854,7 +864,7 @@ def run_phase_functional(tokens):
         ms_cj, c_cj, _ = http_get(ra_path, tokens["cyberjoker"])
         ms_cj2, _, _ = http_get(ra_path, tokens["cyberjoker"])
         record("cyberjoker: L1 miss but L3 shared", c_cj == 200, ms_cj, c_cj)
-        record("cyberjoker: L1 hit on 2nd request", ms_cj2 < ms_cj or ms_cj2 < 200, ms_cj2, 200)
+        record("cyberjoker: L1 hit on 2nd request", ms_cj2 <= ms_cj, ms_cj2, 200)
 
     # T13 — Metrics counters
     section("T13 — Metrics Counter Validation")
@@ -867,19 +877,23 @@ def run_phase_functional(tokens):
         record(f"Metric {key} increments", d >= 0, note=f"delta={d}")
 
     # T14 — L1 proactive refresh
+    # Mutate a widget resource that IS in the L1 reverse index (dashboard-page),
+    # then verify L1 is refreshed (not evicted) so the next request is still fast.
     section("T14 — L1 Proactive Refresh")
-    http_get(path, token); http_get(path, token)
-    ms_before, _, _ = http_get(path, token)
+    dash_path = WIDGET_ENDPOINTS[0][1]  # page/dashboard
+    http_get(dash_path, token); http_get(dash_path, token)
+    ms_before, _, _ = http_get(dash_path, token)
     ts = str(int(time.time()))
-    kubectl("label", f"{COMP_RES}.{COMP_GVR}/{TEST_NAME_WARM}", "-n", TEST_NS,
+    kubectl("label", "pages.widgets.templates.krateo.io/dashboard-page", "-n", NS,
             f"cache-refresh-test={ts}", "--overwrite")
     log("Waiting 15s for L1 refresh ...")
     time.sleep(15)
     m0 = cache_metrics(token)
-    ms_after, code, _ = http_get(path, token)
+    ms_after, code, _ = http_get(dash_path, token)
     m1 = cache_metrics(token)
-    d = m1.get("raw_hits", 0) - m0.get("raw_hits", 0)
-    record("L1 hit after resource update", code == 200 and (d >= 1 or ms_after < 200), ms_after, code, f"raw_hits+{d}")
+    d_raw = m1.get("raw_hits", 0) - m0.get("raw_hits", 0)
+    d_l1 = m1.get("l1_hits", 0) - m0.get("l1_hits", 0)
+    record("L1 hit after resource update", code == 200 and (d_raw >= 1 or d_l1 >= 1), ms_after, code, f"raw_hits+{d_raw} l1_hits+{d_l1}")
     record("Response time stable after refresh", ms_after <= ms_before * 3, note=f"before={ms_before}ms after={ms_after}ms")
 
 
@@ -901,6 +915,49 @@ def _bench_endpoints(endpoints, token, base_url, iters, warmup):
         results.append({"label": label, "p50": p50, "p90": p90, "mean": mean})
         log(f"  {label:<30s}  p50={p50:>5d}ms  p90={p90:>5d}ms  mean={mean:>5d}ms")
     return results
+
+
+DASHBOARD_WATERFALL_PATHS = [
+    "/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1&resource=navmenus&name=sidebar-nav-menu&namespace=krateo-system",
+    "/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1&resource=routesloaders&name=routes-loader&namespace=krateo-system",
+    "/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1&resource=pages&name=dashboard-page&namespace=krateo-system",
+    "/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1&resource=navmenuitems&name=nav-menu-item-dashboard&namespace=krateo-system",
+    "/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1&resource=navmenuitems&name=nav-menu-item-blueprints&namespace=krateo-system",
+    "/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1&resource=navmenuitems&name=nav-menu-item-compositions&namespace=krateo-system",
+    "/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1&resource=panels&name=dashboard-blueprints-panel&namespace=krateo-system",
+    "/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1&resource=panels&name=dashboard-compositions-panel&namespace=krateo-system",
+    "/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1&resource=rows&name=dashboard-blueprints-panel-row&namespace=krateo-system",
+    "/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1&resource=rows&name=dashboard-compositions-panel-row&namespace=krateo-system",
+    "/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1&resource=piecharts&name=dashboard-blueprints-panel-row-piechart&namespace=krateo-system",
+    "/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1&resource=tables&name=dashboard-blueprints-panel-row-table&namespace=krateo-system",
+    "/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1&resource=piecharts&name=dashboard-compositions-panel-row-piechart&namespace=krateo-system",
+    "/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1&resource=tables&name=dashboard-compositions-panel-row-table&namespace=krateo-system",
+]
+
+
+def _page_waterfall_ms(paths, token, base_url):
+    """Fire all dashboard /call requests in parallel and return total wall-clock time."""
+    t0 = time.perf_counter()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(paths)) as ex:
+        futs = [ex.submit(http_get, p, token, base_url=base_url) for p in paths]
+        concurrent.futures.wait(futs)
+    return int((time.perf_counter() - t0) * 1000)
+
+
+def _bench_page_waterfall(token, base_url, has_cached, has_nocache):
+    """Measure page-level waterfall: all dashboard requests fired in parallel."""
+    # Warmup
+    _page_waterfall_ms(DASHBOARD_WATERFALL_PATHS, token, base_url)
+    # Measure
+    results = []
+    for _ in range(3):
+        results.append(_page_waterfall_ms(DASHBOARD_WATERFALL_PATHS, token, base_url))
+    avg = round(statistics.mean(results))
+    p50 = pct(results, 50)
+    log(f"  Dashboard waterfall ({len(DASHBOARD_WATERFALL_PATHS)} parallel requests): "
+        f"p50={p50}ms  avg={avg}ms  samples={results}")
+    record(f"Dashboard waterfall ({len(DASHBOARD_WATERFALL_PATHS)} reqs)", avg < 5000,
+           ms=avg, note=f"p50={p50}ms samples={results}")
 
 
 def _print_comparison(title, cached, nocache):
@@ -950,10 +1007,19 @@ def run_phase_latency(tokens):
 
     section("Restoring cache ...")
     enable_cache()
+    tokens_refreshed = login_all()
+    wait_for_l1_warmup(timeout=120)
 
     _print_comparison("Backend (Direct Snowplow)", cached_be, nocache_be)
     if cached_fe and nocache_fe:
         _print_comparison("Frontend Proxy (UI Perspective)", cached_fe, nocache_fe)
+
+    # ── Page-level waterfall benchmark ──────────────────────────────────────
+    # Measures what the frontend actually experiences: all /call requests
+    # needed to render the dashboard page, fired in parallel.
+    section("Page Waterfall — Dashboard (parallel requests)")
+    refresh_token = tokens_refreshed.get("admin", token)
+    _bench_page_waterfall(refresh_token, SNOWPLOW, cached_be is not None, nocache_be is not None)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
