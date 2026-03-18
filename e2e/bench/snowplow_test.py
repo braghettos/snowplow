@@ -375,9 +375,9 @@ def wait_for_l1_warmup(timeout=300):
 
 def enable_cache():
     log("Enabling cache (CACHE_ENABLED=true) ...")
+    # kubectl set env already triggers a rollout — no extra rollout restart needed.
     kubectl("set", "env", "deployment/snowplow", "-n", NS,
             "-c", "snowplow", "CACHE_ENABLED=true")
-    kubectl("rollout", "restart", "deployment/snowplow", "-n", NS)
     kubectl("rollout", "status", "deployment/snowplow", "-n", NS, "--timeout=300s")
     wait_for_snowplow()
     log("Cache enabled")
@@ -385,9 +385,9 @@ def enable_cache():
 
 def disable_cache():
     log("Disabling cache (CACHE_ENABLED=false) ...")
+    # kubectl set env already triggers a rollout — no extra rollout restart needed.
     kubectl("set", "env", "deployment/snowplow", "-n", NS,
             "-c", "snowplow", "CACHE_ENABLED=false")
-    kubectl("rollout", "restart", "deployment/snowplow", "-n", NS)
     kubectl("rollout", "status", "deployment/snowplow", "-n", NS, "--timeout=300s")
     wait_for_snowplow()
     log("Cache disabled")
@@ -780,8 +780,22 @@ def run_phase_functional(tokens):
     neg_after = m1.get("negative_hits", 0) - m0.get("negative_hits", 0)
     record("Post-expiry: K8s API again (no cache hit)", c3 in (404, 500) and neg_after == 0, ms3, c3, f"neg_hits+{neg_after}")
 
-    # T9 — Informer CRUD
-    section("T9 — Informer CRUD: ADD → UPDATE → DELETE")
+    # T9 — Redis key structure (must run before T10 which invalidates L1 via CRUD)
+    section("T9 — Redis Key Structure")
+    for prefix, label, threshold in [
+        ("snowplow:get:*", "L3 GET keys", 10),
+        ("snowplow:list:*", "L3 LIST keys", 5),
+        ("snowplow:resolved:*", "L1 resolved keys", 1),
+    ]:
+        keys = redis_cmd("KEYS", prefix)
+        count = len(keys.split("\n")) if keys else 0
+        record(f"{label}: {count}", count >= threshold, note=prefix)
+    watched = redis_cmd("SMEMBERS", "snowplow:watched-gvrs")
+    wcount = len([g for g in watched.split("\n") if g.strip()]) if watched else 0
+    record(f"Watched GVRs: {wcount}", wcount > 5, note=f"count={wcount}")
+
+    # T10 — Informer CRUD (deliberately mutates resources — may invalidate L1)
+    section("T10 — Informer CRUD: ADD → UPDATE → DELETE")
     kubectl("delete", "-n", TEST_NS, f"{COMP_RES}.{COMP_GVR}", TEST_NAME_NEW, "--ignore-not-found")
     time.sleep(2)
     rc, out, err = kubectl("apply", "-f", "-", input_data=COMPOSITION_YAML)
@@ -802,8 +816,8 @@ def run_phase_functional(tokens):
         ms, code, _ = http_get(call_url(TEST_NS, TEST_NAME_NEW), token)
         record("DELETE: resource removed from cache", code in (404, 500), ms, code)
 
-    # T10 — RBAC cache
-    section("T10 — RBAC Cache")
+    # T11 — RBAC cache
+    section("T11 — RBAC Cache")
     for username in tokens:
         tk = tokens[username]
         http_get(WIDGET_ENDPOINTS[0][1], tk); http_get(WIDGET_ENDPOINTS[0][1], tk)
@@ -813,8 +827,8 @@ def run_phase_functional(tokens):
         rbac_d = m1.get("rbac_hits", 0) - m0.get("rbac_hits", 0)
         record(f"{username}: RBAC cache hit", code == 200 and rbac_d >= 0, ms, code, f"rbac_hits+{rbac_d}")
 
-    # T11 — Shared L3 layer
-    section("T11 — Shared L3 Layer Verification")
+    # T12 — Shared L3 layer
+    section("T12 — Shared L3 Layer Verification")
     ra_path = RESTACTION_ENDPOINTS[0][1]
     http_get(ra_path, tokens["admin"])
     ms1, c1, _ = http_get(ra_path, tokens["admin"])
@@ -825,20 +839,6 @@ def run_phase_functional(tokens):
         ms_cj2, _, _ = http_get(ra_path, tokens["cyberjoker"])
         record("cyberjoker: L1 miss but L3 shared", c_cj == 200, ms_cj, c_cj)
         record("cyberjoker: L1 hit on 2nd request", ms_cj2 < ms_cj or ms_cj2 < 200, ms_cj2, 200)
-
-    # T12 — Redis key structure
-    section("T12 — Redis Key Structure")
-    for prefix, label, threshold in [
-        ("snowplow:get:*", "L3 GET keys", 10),
-        ("snowplow:list:*", "L3 LIST keys", 5),
-        ("snowplow:resolved:*", "L1 resolved keys", 1),
-    ]:
-        keys = redis_cmd("KEYS", prefix)
-        count = len(keys.split("\n")) if keys else 0
-        record(f"{label}: {count}", count >= threshold, note=prefix)
-    watched = redis_cmd("SMEMBERS", "snowplow:watched-gvrs")
-    wcount = len([g for g in watched.split("\n") if g.strip()]) if watched else 0
-    record(f"Watched GVRs: {wcount}", wcount > 5, note=f"count={wcount}")
 
     # T13 — Metrics counters
     section("T13 — Metrics Counter Validation")
