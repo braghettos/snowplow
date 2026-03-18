@@ -12,8 +12,15 @@ import (
 	"sync"
 	"time"
 
+	expirable "github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/redis/go-redis/v9"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+)
+
+const (
+	l0MaxEntries = 2048
+	l0TTL        = 10 * time.Second
+	l0Prefix     = "snowplow:resolved:"
 )
 
 const (
@@ -71,6 +78,7 @@ type RedisCache struct {
 	ResourceTTL time.Duration
 	gvrTTLs     sync.Map
 	onNewGVR    func(context.Context, schema.GroupVersionResource)
+	l0          *expirable.LRU[string, []byte]
 }
 
 func redisAddr() string {
@@ -100,6 +108,7 @@ func New(resourceTTL time.Duration) *RedisCache {
 			MaxRetries:   2,
 		}),
 		ResourceTTL: resourceTTL,
+		l0:          expirable.NewLRU[string, []byte](l0MaxEntries, nil, l0TTL),
 	}
 }
 
@@ -179,6 +188,13 @@ func (c *RedisCache) GetRaw(ctx context.Context, key string) ([]byte, bool, erro
 	if c == nil {
 		return nil, false, nil
 	}
+	if strings.HasPrefix(key, l0Prefix) {
+		if v, ok := c.l0.Get(key); ok {
+			GlobalMetrics.L0Hits.Add(1)
+			return v, true, nil
+		}
+		GlobalMetrics.L0Misses.Add(1)
+	}
 	val, err := c.client.Get(ctx, key).Bytes()
 	if errors.Is(err, redis.Nil) {
 		return nil, false, nil
@@ -189,6 +205,9 @@ func (c *RedisCache) GetRaw(ctx context.Context, key string) ([]byte, bool, erro
 	val = decompressValue(val)
 	if bytes.Equal(val, []byte(notFoundSentinel)) {
 		return nil, false, nil
+	}
+	if strings.HasPrefix(key, l0Prefix) {
+		c.l0.Add(key, val)
 	}
 	return val, true, nil
 }
@@ -252,6 +271,9 @@ func (c *RedisCache) SetResolvedRaw(ctx context.Context, key string, val []byte)
 	if c == nil {
 		return nil
 	}
+	if strings.HasPrefix(key, l0Prefix) {
+		c.l0.Add(key, val)
+	}
 	return c.client.Set(ctx, key, compressValue(val), ResolvedCacheTTL).Err()
 }
 
@@ -279,6 +301,11 @@ func (c *RedisCache) setWithTTL(ctx context.Context, key string, val any, ttl ti
 func (c *RedisCache) Delete(ctx context.Context, keys ...string) error {
 	if c == nil || len(keys) == 0 {
 		return nil
+	}
+	for _, k := range keys {
+		if strings.HasPrefix(k, l0Prefix) {
+			c.l0.Remove(k)
+		}
 	}
 	return c.client.Del(ctx, keys...).Err()
 }

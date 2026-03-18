@@ -18,6 +18,8 @@ import (
 	"github.com/krateoplatformops/plumbing/server/use/cors"
 	"github.com/krateoplatformops/plumbing/slogs/pretty"
 	_ "github.com/krateoplatformops/snowplow/docs"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers"
 	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
@@ -166,22 +168,24 @@ func main() {
 
 	mux.Handle("POST /jq", chain.Append(userCfg).Then(handlers.JQ()))
 
+	httpHandler := handlers.Gzip(use.CORS(cors.Options{
+		AllowedOrigins: []string{"*"},
+		AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowedHeaders: []string{
+			"Accept",
+			"Authorization",
+			"Content-Type",
+			"X-Auth-Code",
+			"X-Krateo-TraceId",
+		},
+		ExposedHeaders:   []string{"Link"},
+		AllowCredentials: true,
+		MaxAge:           300,
+	})(mux))
+
 	server := &http.Server{
-		Addr: fmt.Sprintf(":%d", *port),
-		Handler: handlers.Gzip(use.CORS(cors.Options{
-			AllowedOrigins: []string{"*"},
-			AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-			AllowedHeaders: []string{
-				"Accept",
-				"Authorization",
-				"Content-Type",
-				"X-Auth-Code",
-				"X-Krateo-TraceId",
-			},
-			ExposedHeaders:   []string{"Link"},
-			AllowCredentials: true,
-			MaxAge:           300,
-		})(mux)),
+		Addr:         fmt.Sprintf(":%d", *port),
+		Handler:      h2c.NewHandler(httpHandler, &http2.Server{}),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 50 * time.Second,
 		IdleTimeout:  30 * time.Second,

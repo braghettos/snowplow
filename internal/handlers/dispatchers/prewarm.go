@@ -33,6 +33,7 @@ import (
 const (
 	preWarmConcurrency      = 10
 	preWarmTimeout          = 30 * time.Second
+	preWarmMaxDepth         = 5
 	widgetGroup             = "widgets.templates.krateo.io"
 	clientConfigSecretSuffix = "-clientconfig"
 )
@@ -41,10 +42,10 @@ const (
 // Request-time child pre-warming
 // ---------------------------------------------------------------------------
 
-// preWarmChildWidgets resolves child widget references discovered during parent
-// widget resolution and stores them in L1 cache. This eliminates the cold-start
-// fan-out where the frontend issues N individual requests (e.g. 42 Routes after
-// a RoutesLoader) that would each be an L1 miss.
+// preWarmChildWidgets recursively resolves child widget references discovered
+// during parent widget resolution and stores them in L1 cache. It walks the
+// entire widget tree (up to preWarmMaxDepth levels) so that all descendants
+// are cached before the frontend requests them.
 func preWarmChildWidgets(parentCtx context.Context, c *cache.RedisCache, resolved *unstructured.Unstructured, authnNS string) {
 	items, found, err := unstructured.NestedSlice(resolved.Object, "status", "resourcesRefs", "items")
 	if err != nil || !found || len(items) == 0 {
@@ -69,12 +70,50 @@ func preWarmChildWidgets(parentCtx context.Context, c *cache.RedisCache, resolve
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), preWarmTimeout)
 		defer cancel()
-		resolveL1RefsForUser(ctx, user, ep, accessToken, c, refs, authnNS)
-		slog.Default().Info("L1 pre-warm completed",
+		visited := make(map[string]bool)
+		recursivePreWarm(ctx, user, ep, accessToken, c, refs, authnNS, visited, 1)
+		slog.Default().Info("L1 recursive pre-warm completed",
 			slog.String("user", user.Username),
-			slog.Int("candidates", len(refs)),
+			slog.Int("total_warmed", len(visited)),
 		)
 	}()
+}
+
+// recursivePreWarm resolves refs into L1 cache, then extracts their children
+// and recurses until maxDepth or no more children are found.
+func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, c *cache.RedisCache, refs []l1Ref, authnNS string, visited map[string]bool, depth int) {
+	if depth > preWarmMaxDepth || len(refs) == 0 {
+		return
+	}
+	if ctx.Err() != nil {
+		return
+	}
+
+	var unvisited []l1Ref
+	for _, r := range refs {
+		key := r.gvr.String() + ":" + r.ns + ":" + r.name
+		if visited[key] {
+			continue
+		}
+		visited[key] = true
+		unvisited = append(unvisited, r)
+	}
+	if len(unvisited) == 0 {
+		return
+	}
+
+	resolved := resolveL1RefsCollect(ctx, user, ep, accessToken, c, unvisited, authnNS)
+
+	var nextRefs []l1Ref
+	for _, res := range resolved {
+		childItems, found, err := unstructured.NestedSlice(res.Object, "status", "resourcesRefs", "items")
+		if err != nil || !found || len(childItems) == 0 {
+			continue
+		}
+		nextRefs = append(nextRefs, extractChildWidgetRefs(ctx, c, childItems, user.Username)...)
+	}
+
+	recursivePreWarm(ctx, user, ep, accessToken, c, nextRefs, authnNS, visited, depth+1)
 }
 
 // ---------------------------------------------------------------------------
@@ -298,9 +337,11 @@ func warmL1ForUser(ctx context.Context, c *cache.RedisCache, user jwtutil.UserIn
 		return 0
 	}
 
-	warmed := resolveL1RefsForUser(ctx, user, ep, accessToken, c, allRefs, authnNS)
+	visited := make(map[string]bool)
+	recursivePreWarm(ctx, user, ep, accessToken, c, allRefs, authnNS, visited, 1)
 
-	log.Info("L1 warmup: user done",
+	warmed := int64(len(visited))
+	log.Info("L1 warmup: user done (recursive)",
 		slog.String("user", user.Username),
 		slog.Int("candidates", len(allRefs)),
 		slog.Int64("warmed", warmed),
@@ -417,6 +458,88 @@ func extractChildWidgetRefs(ctx context.Context, c *cache.RedisCache, items []in
 // resolveL1RefsForUser resolves a batch of L1 refs (widgets or RESTActions) for
 // a specific user and stores them in L1 cache. Returns the number successfully
 // warmed. The caller provides the context (with its own deadline).
+// resolveL1RefsCollect resolves refs into L1 and returns the resolved objects
+// so callers can inspect children for recursive pre-warming.
+func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, c *cache.RedisCache, refs []l1Ref, authnNS string) []*unstructured.Unstructured {
+	ctx = xcontext.BuildContext(ctx,
+		xcontext.WithUserConfig(ep),
+		xcontext.WithUserInfo(user),
+		xcontext.WithAccessToken(accessToken),
+	)
+	ctx = cache.WithCache(ctx, c)
+
+	var (
+		wg      sync.WaitGroup
+		sem     = make(chan struct{}, preWarmConcurrency)
+		mu      sync.Mutex
+		results []*unstructured.Unstructured
+	)
+
+	for _, ref := range refs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(r l1Ref) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			rctx := xcontext.BuildContext(ctx,
+				xcontext.WithUserConfig(ep),
+				xcontext.WithUserInfo(user),
+				xcontext.WithAccessToken(accessToken),
+			)
+			rctx = cache.WithCache(rctx, c)
+
+			got := objects.Get(rctx, templatesv1.ObjectReference{
+				Reference: templatesv1.Reference{
+					Name: r.name, Namespace: r.ns,
+				},
+				APIVersion: r.gvr.GroupVersion().String(),
+				Resource:   r.gvr.Resource,
+			})
+			if got.Err != nil {
+				return
+			}
+
+			tracker := cache.NewDependencyTracker()
+			tctx := cache.WithDependencyTracker(rctx, tracker)
+
+			if r.gvr.Group != widgetGroup {
+				return
+			}
+			res, resolveErr := widgets.Resolve(tctx, widgets.ResolveOptions{
+				In:      got.Unstructured,
+				AuthnNS: authnNS,
+				PerPage: -1,
+				Page:    -1,
+			})
+			if resolveErr != nil {
+				return
+			}
+			raw, err := json.Marshal(res)
+			if err != nil {
+				return
+			}
+
+			rKey := cache.ResolvedKey(user.Username, r.gvr, r.ns, r.name, -1, -1)
+			_ = c.SetResolvedRaw(rctx, rKey, raw)
+			for _, gvrKey := range tracker.GVRKeys() {
+				_ = c.SAddWithTTL(rctx, cache.L1GVRKey(gvrKey), rKey, cache.ReverseIndexTTL)
+			}
+
+			if newDeps := registerApiRefGVRDeps(rctx, c, got.Unstructured, rKey, tracker); newDeps > 0 {
+				_ = c.Delete(rctx, rKey)
+			}
+
+			mu.Lock()
+			results = append(results, res)
+			mu.Unlock()
+		}(ref)
+	}
+
+	wg.Wait()
+	return results
+}
+
 func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, c *cache.RedisCache, refs []l1Ref, authnNS string) int64 {
 	ctx = xcontext.BuildContext(ctx,
 		xcontext.WithUserConfig(ep),

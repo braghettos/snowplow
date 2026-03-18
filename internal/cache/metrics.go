@@ -11,6 +11,8 @@ type Metrics struct {
 	RBACMisses      atomic.Int64
 	RawHits         atomic.Int64
 	RawMisses       atomic.Int64
+	L0Hits          atomic.Int64
+	L0Misses        atomic.Int64
 	L1Hits          atomic.Int64
 	L1Misses        atomic.Int64
 	L2Hits          atomic.Int64
@@ -31,6 +33,8 @@ type MetricsSnapshot struct {
 	RBACMisses      int64   `json:"rbac_misses"`
 	RawHits         int64   `json:"raw_hits"`
 	RawMisses       int64   `json:"raw_misses"`
+	L0Hits          int64   `json:"l0_hits"`
+	L0Misses        int64   `json:"l0_misses"`
 	L1Hits          int64   `json:"l1_hits"`
 	L1Misses        int64   `json:"l1_misses"`
 	L2Hits          int64   `json:"l2_hits"`
@@ -43,6 +47,7 @@ type MetricsSnapshot struct {
 	GetHitRate      float64 `json:"get_hit_rate"`
 	ListHitRate     float64 `json:"list_hit_rate"`
 	RBACHitRate     float64 `json:"rbac_hit_rate"`
+	L0HitRate       float64 `json:"l0_hit_rate"`
 	L1HitRate       float64 `json:"l1_hit_rate"`
 	L2HitRate       float64 `json:"l2_hit_rate"`
 }
@@ -59,6 +64,8 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		RBACMisses:      m.RBACMisses.Load(),
 		RawHits:         m.RawHits.Load(),
 		RawMisses:       m.RawMisses.Load(),
+		L0Hits:          m.L0Hits.Load(),
+		L0Misses:        m.L0Misses.Load(),
 		L1Hits:          m.L1Hits.Load(),
 		L1Misses:        m.L1Misses.Load(),
 		L2Hits:          m.L2Hits.Load(),
@@ -72,6 +79,7 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 	s.GetHitRate = hitRate(s.GetHits, s.GetMisses)
 	s.ListHitRate = hitRate(s.ListHits, s.ListMisses)
 	s.RBACHitRate = hitRate(s.RBACHits, s.RBACMisses)
+	s.L0HitRate = hitRate(s.L0Hits, s.L0Misses)
 	s.L1HitRate = hitRate(s.L1Hits, s.L1Misses)
 	s.L2HitRate = hitRate(s.L2Hits, s.L2Misses)
 	return s
