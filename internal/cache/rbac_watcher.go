@@ -159,16 +159,25 @@ func (rw *RBACWatcher) invalidateFromBinding(ctx context.Context, obj any) {
 }
 
 // purgeUserCacheData deletes RBAC and L1 (resolved) cache entries for a
-// single user. Returns the total number of keys deleted.
+// single user. Uses per-user index SETs for O(1) lookup instead of SCAN.
+// Falls back to SCAN if the index is empty (e.g., keys created before
+// index tracking was added). Returns the total number of keys deleted.
 func (rw *RBACWatcher) purgeUserCacheData(ctx context.Context, username string) int {
 	total := 0
-	for _, p := range []string{
-		RBACKeyPattern(username),
-		"snowplow:resolved:" + username + ":*",
+	for _, idx := range []struct {
+		indexKey string
+		pattern  string // fallback SCAN pattern
+	}{
+		{UserRBACIndexKey(username), RBACKeyPattern(username)},
+		{UserResolvedIndexKey(username), "snowplow:resolved:" + username + ":*"},
 	} {
-		keys, _ := rw.cache.ScanKeys(ctx, p)
+		keys, _ := rw.cache.SMembers(ctx, idx.indexKey)
+		if len(keys) == 0 {
+			// Fallback to SCAN for keys created before index tracking.
+			keys, _ = rw.cache.ScanKeys(ctx, idx.pattern)
+		}
 		if len(keys) > 0 {
-			_ = rw.cache.Delete(ctx, keys...)
+			_ = rw.cache.Delete(ctx, append(keys, idx.indexKey)...)
 			total += len(keys)
 		}
 	}

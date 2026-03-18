@@ -68,6 +68,42 @@ warmup:
       version: v1beta1
       resource: tables
 
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: barcharts
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: linecharts
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: eventlists
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: flowcharts
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: forms
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: markdowns
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: paragraphs
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: tablists
+
+    - group: widgets.templates.krateo.io
+      version: v1beta1
+      resource: yamlviewers
+
     # ── Core Krateo types ────────────────────────────────────────────────────
     - group: core.krateo.io
       version: v1alpha1

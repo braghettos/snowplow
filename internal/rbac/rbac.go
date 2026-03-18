@@ -92,6 +92,7 @@ func UserCan(ctx context.Context, opts UserCanOptions) (ok bool) {
 
 	if c != nil && cacheKey != "" {
 		_ = c.SetWithTTL(ctx, cacheKey, resp.Status.Allowed, rbacCacheTTL)
+		_ = c.SAddWithTTL(ctx, cache.UserRBACIndexKey(username), cacheKey, rbacCacheTTL)
 	}
 
 	return resp.Status.Allowed

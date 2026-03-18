@@ -141,6 +141,7 @@ func (w *Warmer) warmGVR(ctx context.Context, dynClient k8sdynamic.Interface, gv
 	byNamespace := make(map[string][]int)
 	for i := range list.Items {
 		obj := &list.Items[i]
+		StripAnnotationsFromUnstructured(obj)
 		getKey := GetKey(gvr, obj.GetNamespace(), obj.GetName())
 		if serr := w.cache.SetForGVR(ctx, gvr, getKey, obj); serr != nil {
 			log.Warn("warmup: failed to cache object", slog.String("key", getKey), slog.Any("err", serr))

@@ -109,7 +109,14 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// Positive cache check.
 			if raw, hit, rerr := c.GetRaw(req.Context(), cacheKey); hit && rerr == nil {
 				cache.GlobalMetrics.CallHits.Add(1)
-				log.Debug("call: cache hit", slog.String("key", cacheKey))
+				user, _ := xcontext.UserInfo(req.Context())
+				log.Info("call: cache hit",
+					slog.String("key", cacheKey),
+					slog.String("user", user.Username),
+					slog.String("resource", opts.gvr.Resource),
+					slog.String("name", opts.nsn.Name),
+					slog.String("namespace", opts.nsn.Namespace),
+					slog.String("source", "L3-cache"))
 				wri.Header().Set("Content-Type", "application/json")
 				wri.WriteHeader(http.StatusOK)
 				_, _ = wri.Write(raw)
@@ -179,7 +186,7 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		_ = c.Delete(req.Context(), getKey, listKey, cache.ListKey(opts.gvr, ""))
 
 		gvrKey := cache.GVRToKey(opts.gvr)
-		for _, prefix := range []string{"snowplow:l1gvr:", "snowplow:l2gvr:"} {
+		for _, prefix := range []string{"snowplow:l1gvr:"} {
 			idxKey := prefix + gvrKey
 			if keys, serr := c.SMembers(req.Context(), idxKey); serr == nil && len(keys) > 0 {
 				_ = c.Delete(req.Context(), append(keys, idxKey)...)

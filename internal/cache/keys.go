@@ -70,6 +70,18 @@ func RBACKeyPattern(username string) string {
 	return fmt.Sprintf("snowplow:rbac:%s:*", username)
 }
 
+// UserRBACIndexKey returns the Redis SET key that tracks all RBAC cache keys
+// for a given user. Used for O(1) invalidation instead of SCAN.
+func UserRBACIndexKey(username string) string {
+	return "snowplow:rbac-idx:" + username
+}
+
+// UserResolvedIndexKey returns the Redis SET key that tracks all resolved (L1)
+// cache keys for a given user. Used for O(1) invalidation instead of SCAN.
+func UserResolvedIndexKey(username string) string {
+	return "snowplow:resolved-idx:" + username
+}
+
 // ResolvedKey builds the per-user cache key for a fully-resolved dispatcher
 // output (widget or RESTAction). Caching at this level eliminates both the
 // HTTP fan-out AND all JQ evaluations for repeated requests.

@@ -61,6 +61,11 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 					cache.GlobalMetrics.L1Hits.Add(1)
 					log.Info("RESTAction resolved from cache",
 						slog.String("key", resolvedKey),
+						slog.String("user", user.Username),
+						slog.String("resource", gvr.Resource),
+						slog.String("name", nsn.Name),
+						slog.String("namespace", nsn.Namespace),
+						slog.String("source", "L1-cache"),
 						slog.String("duration", util.ETA(start)))
 					wri.Header().Set("Content-Type", "application/json")
 					wri.Header().Set("Cache-Control", "public, max-age=15")

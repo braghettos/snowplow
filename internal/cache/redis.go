@@ -249,12 +249,19 @@ func (c *RedisCache) SetRaw(ctx context.Context, key string, val []byte) error {
 // SetResolvedRaw stores a fully-resolved widget/restaction output with
 // ResolvedCacheTTL. Freshness is guaranteed by the GVR reverse index
 // (targeted invalidation from informer events); TTL is only for memory
-// management.
+// management. Also tracks the key in a per-user index SET for O(1) invalidation.
 func (c *RedisCache) SetResolvedRaw(ctx context.Context, key string, val []byte) error {
 	if c == nil {
 		return nil
 	}
-	return c.client.Set(ctx, key, compressValue(val), ResolvedCacheTTL).Err()
+	if err := c.client.Set(ctx, key, compressValue(val), ResolvedCacheTTL).Err(); err != nil {
+		return err
+	}
+	// Track in per-user index for fast invalidation (avoid SCAN).
+	if info, ok := ParseResolvedKey(key); ok && info.Username != "" {
+		_ = c.SAddWithTTL(ctx, UserResolvedIndexKey(info.Username), key, ReverseIndexTTL)
+	}
+	return nil
 }
 
 func (c *RedisCache) setWithTTL(ctx context.Context, key string, val any, ttl time.Duration) error {

@@ -27,6 +27,11 @@ import (
 // in a goroutine.
 type L1RefreshFunc func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string)
 
+// expiryRefreshWorkers limits the number of concurrent goroutines handling
+// Redis key expiry refresh to prevent unbounded goroutine creation under
+// mass TTL expiry (e.g., after Redis restart or bulk warmup with identical TTLs).
+const expiryRefreshWorkers = 10
+
 // ResourceWatcher maintains dynamic informers for every GVR in the watched set.
 type ResourceWatcher struct {
 	cache     *RedisCache
@@ -83,6 +88,7 @@ func (rw *ResourceWatcher) WaitForSync(ctx context.Context) bool {
 
 // StartExpiryRefresh subscribes to Redis expired-key events and proactively
 // re-fetches resources so the cache never goes cold from TTL expiry alone.
+// Uses a bounded worker pool to prevent goroutine storms under mass TTL expiry.
 func (rw *ResourceWatcher) StartExpiryRefresh(ctx context.Context) {
 	if err := rw.cache.EnableExpiryNotifications(ctx); err != nil {
 		slog.Warn("resource-watcher: cannot enable Redis expiry notifications",
@@ -90,6 +96,7 @@ func (rw *ResourceWatcher) StartExpiryRefresh(ctx context.Context) {
 		return
 	}
 	ch := rw.cache.SubscribeExpired(ctx)
+	sem := make(chan struct{}, expiryRefreshWorkers)
 	go func() {
 		for {
 			select {
@@ -99,11 +106,16 @@ func (rw *ResourceWatcher) StartExpiryRefresh(ctx context.Context) {
 				if !ok {
 					return
 				}
-				go rw.handleExpiredKey(ctx, key)
+				sem <- struct{}{}
+				go func(k string) {
+					defer func() { <-sem }()
+					rw.handleExpiredKey(ctx, k)
+				}(key)
 			}
 		}
 	}()
-	slog.Info("resource-watcher: proactive expiry refresh enabled")
+	slog.Info("resource-watcher: proactive expiry refresh enabled",
+		slog.Int("workers", expiryRefreshWorkers))
 }
 
 // SetL1Refresher registers a callback that will be used to proactively
