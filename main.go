@@ -289,6 +289,7 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 			slog.String("path", warmupConfigPath), slog.Any("err", err))
 	} else {
 		warmer.SetWarmupConfig(warmupCfg)
+		warmer.DiscoverCompositionGVRs(warmupCtx)
 		warmer.PreRegisterGVRs(warmupCtx)
 	}
 

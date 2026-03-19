@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -85,6 +86,58 @@ func (w *Warmer) SetWarmupConfig(cfg *WarmupConfig) {
 }
 
 func (w *Warmer) SetGVRs(gvrs []schema.GroupVersionResource) { w.gvrs = gvrs }
+
+// DiscoverCompositionGVRs finds all CRDs in the composition.krateo.io group
+// and adds them to the warmup set. These are dynamic CRDs created by
+// CompositionDefinitions — they can't be hardcoded in the warmup config
+// because they vary per cluster.
+func (w *Warmer) DiscoverCompositionGVRs(ctx context.Context) {
+	dc, err := discovery.NewDiscoveryClientForConfig(w.rc)
+	if err != nil {
+		slog.Warn("warmup: failed to create discovery client for composition GVRs",
+			slog.Any("err", err))
+		return
+	}
+	lists, err := dc.ServerPreferredResources()
+	if err != nil && lists == nil {
+		slog.Warn("warmup: failed to fetch server resources for composition GVRs",
+			slog.Any("err", err))
+		return
+	}
+
+	var added int
+	for _, list := range lists {
+		gv, perr := schema.ParseGroupVersion(list.GroupVersion)
+		if perr != nil {
+			continue
+		}
+		g := gv.Group
+		if !strings.HasSuffix(g, ".krateo.io") || g == "core.krateo.io" || g == "templates.krateo.io" || g == "widgets.templates.krateo.io" {
+			continue
+		}
+		for _, res := range list.APIResources {
+			if strings.Contains(res.Name, "/") {
+				continue // skip subresources
+			}
+			v := res.Version
+			if v == "" {
+				v = gv.Version
+			}
+			rg := res.Group
+			if rg == "" {
+				rg = g
+			}
+			gvr := schema.GroupVersionResource{Group: rg, Version: v, Resource: res.Name}
+			w.gvrs = append(w.gvrs, gvr)
+			added++
+			slog.Info("warmup: auto-discovered composition GVR",
+				slog.String("gvr", gvr.String()))
+		}
+	}
+	if added > 0 {
+		slog.Info("warmup: discovered composition GVRs", slog.Int("count", added))
+	}
+}
 
 // PreRegisterGVRs calls SAddGVR for every configured GVR to trigger informers
 // before WaitForSync is called.
