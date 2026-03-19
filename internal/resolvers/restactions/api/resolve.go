@@ -62,13 +62,18 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	// Extract Redis cache from context (nil-safe: all cache ops are no-ops on nil).
 	c := cache.FromContext(ctx)
 
-	// Sort API by Depends
-	names, err := topologicalSort(opts.Items)
+	// Sort API by Depends into parallel levels
+	levels, err := topologicalLevels(opts.Items)
 	if err != nil {
-		log.Error("unable to sorted api by deps", slog.Any("error", err))
+		log.Error("unable to sort api by deps", slog.Any("error", err))
 		return map[string]any{}
 	}
-	log.Debug("sorted api by deps", slog.Any("names", names))
+	// Flatten for backward compat logging
+	var names []string
+	for _, lvl := range levels {
+		names = append(names, lvl...)
+	}
+	log.Debug("sorted api by deps", slog.Any("names", names), slog.Int("levels", len(levels)))
 
 	apiMap := make(map[string]*templates.API, len(opts.Items))
 	for _, id := range names {

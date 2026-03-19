@@ -184,6 +184,14 @@ func (rw *ResourceWatcher) startInformer(gvr schema.GroupVersionResource) {
 	}
 }
 
+// noisyConfigMapNamespaces are namespaces whose configmaps update very
+// frequently (e.g. cluster-kubestore every 2s) but are never referenced
+// by any widget. Skipping these avoids unnecessary L3 cache churn.
+var noisyConfigMapNamespaces = map[string]bool{
+	"kube-system": true,
+	"gmp-system":  true,
+}
+
 func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVersionResource, _, obj any, eventType string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -201,6 +209,14 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		return
 	}
 	ns, name := uns.GetNamespace(), uns.GetName()
+
+	// Skip noisy configmap updates from system namespaces (e.g. cluster-kubestore
+	// updates every 2s) that no widget depends on. These generate continuous
+	// L3 cache churn with no benefit.
+	if gvr.Resource == "configmaps" && noisyConfigMapNamespaces[ns] {
+		return
+	}
+
 	slog.Debug("resource-watcher: event",
 		slog.String("type", eventType),
 		slog.String("gvr", gvr.String()),

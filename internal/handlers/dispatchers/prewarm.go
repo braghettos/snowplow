@@ -237,10 +237,12 @@ func WarmRBACForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Conf
 			}
 			gr := gvr.GroupResource()
 			for _, ns := range namespaces {
-				rbac.UserCan(rctx, rbac.UserCanOptions{
-					Verb: "list", GroupResource: gr, Namespace: ns,
-				})
-				total++
+				for _, verb := range []string{"list", "get", "create", "update", "delete", "patch"} {
+					rbac.UserCan(rctx, rbac.UserCanOptions{
+						Verb: verb, GroupResource: gr, Namespace: ns,
+					})
+					total++
+				}
 			}
 		}
 	}

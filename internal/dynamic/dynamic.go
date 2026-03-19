@@ -2,6 +2,7 @@ package dynamic
 
 import (
 	"strings"
+	"sync"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -13,6 +14,13 @@ import (
 	cacheddiscovery "k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
+)
+
+// cachedKindFor caches GVR→GVK lookups to avoid creating a new discovery
+// client and REST mapper on every call. The mapping is stable — it only
+// changes when CRDs are installed or removed.
+var (
+	kindCache   sync.Map // schema.GroupVersionResource → schema.GroupVersionKind
 )
 
 func ResourceFor(rc *rest.Config, gvk schema.GroupVersionKind) (schema.GroupVersionResource, error) {
@@ -42,6 +50,11 @@ func ResourceFor(rc *rest.Config, gvk schema.GroupVersionKind) (schema.GroupVers
 }
 
 func KindFor(rc *rest.Config, gvr schema.GroupVersionResource) (gvk schema.GroupVersionKind, err error) {
+	// Check in-memory cache first — GVR→GVK mappings are stable.
+	if cached, ok := kindCache.Load(gvr); ok {
+		return cached.(schema.GroupVersionKind), nil
+	}
+
 	discoveryClient, err := discovery.NewDiscoveryClientForConfig(rc)
 	if err != nil {
 		return gvk, err
@@ -52,7 +65,9 @@ func KindFor(rc *rest.Config, gvr schema.GroupVersionResource) (gvk schema.Group
 	)
 
 	gvk, err = mapper.KindFor(gvr)
-
+	if err == nil {
+		kindCache.Store(gvr, gvk)
+	}
 	return
 }
 
