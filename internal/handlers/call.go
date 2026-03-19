@@ -102,27 +102,20 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			// Negative cache check: sentinel stored by SetNotFound means a prior
 			// K8s lookup returned 404. Serve the 404 from cache and track it.
 			if c.GetNotFound(req.Context(), cacheKey) {
-				cache.GlobalMetrics.NegativeHits.Add(1)
+				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.NegativeHits, "negative_hits")
 				response.NotFound(wri, fmt.Errorf("resource not found (cached)"))
 				return
 			}
 			// Positive cache check.
 			if raw, hit, rerr := c.GetRaw(req.Context(), cacheKey); hit && rerr == nil {
-				cache.GlobalMetrics.CallHits.Add(1)
-				user, _ := xcontext.UserInfo(req.Context())
-				log.Info("call: cache hit",
-					slog.String("key", cacheKey),
-					slog.String("user", user.Username),
-					slog.String("resource", opts.gvr.Resource),
-					slog.String("name", opts.nsn.Name),
-					slog.String("namespace", opts.nsn.Namespace),
-					slog.String("source", "L3-cache"))
+				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.CallHits, "call_hits")
+				log.Debug("call: cache hit", slog.String("key", cacheKey))
 				wri.Header().Set("Content-Type", "application/json")
 				wri.WriteHeader(http.StatusOK)
 				_, _ = wri.Write(raw)
 				return
 			}
-		cache.GlobalMetrics.CallMisses.Add(1)
+		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.CallMisses, "call_misses")
 			log.Info("call: cache miss", slog.String("key", cacheKey), slog.String("verb", opts.verb), slog.String("gvr", cache.GVRToKey(opts.gvr)))
 		}
 	}
@@ -186,7 +179,7 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		_ = c.Delete(req.Context(), getKey, listKey, cache.ListKey(opts.gvr, ""))
 
 		gvrKey := cache.GVRToKey(opts.gvr)
-		for _, prefix := range []string{"snowplow:l1gvr:"} {
+		for _, prefix := range []string{"snowplow:l1gvr:", "snowplow:l2gvr:"} {
 			idxKey := prefix + gvrKey
 			if keys, serr := c.SMembers(req.Context(), idxKey); serr == nil && len(keys) > 0 {
 				_ = c.Delete(req.Context(), append(keys, idxKey)...)

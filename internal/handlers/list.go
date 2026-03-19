@@ -109,15 +109,15 @@ func List() http.HandlerFunc {
 			if c != nil {
 				var cached unstructured.UnstructuredList
 				if hit, rerr := c.Get(req.Context(), listCacheKey, &cached); hit && rerr == nil {
-					cache.GlobalMetrics.ListHits.Add(1)
-					log.Debug("list cache hit", slog.String("gvr", gvr.String()))
-					for _, x := range cached.Items {
-						unstructured.RemoveNestedField(x.UnstructuredContent(), "metadata", "managedFields")
-						rt = append(rt, x)
-					}
-					continue
+				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.ListHits, "list_hits")
+				log.Debug("list cache hit", slog.String("gvr", gvr.String()))
+				for _, x := range cached.Items {
+					unstructured.RemoveNestedField(x.UnstructuredContent(), "metadata", "managedFields")
+					rt = append(rt, x)
 				}
-				cache.GlobalMetrics.ListMisses.Add(1)
+				continue
+			}
+				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.ListMisses, "list_misses")
 			}
 
 			opts := dynamic.Options{

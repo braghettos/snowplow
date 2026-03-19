@@ -406,7 +406,7 @@ func (rw *ResourceWatcher) refreshGetKey(ctx context.Context, gvr schema.GroupVe
 	}
 	key := GetKey(gvr, ns, name)
 	if serr := rw.cache.SetForGVR(ctx, gvr, key, obj); serr == nil {
-		GlobalMetrics.ExpiryRefreshes.Add(1)
+		GlobalMetrics.Inc(&GlobalMetrics.ExpiryRefreshes, "expiry_refreshes")
 	}
 }
 
@@ -431,7 +431,7 @@ func (rw *ResourceWatcher) refreshListKey(ctx context.Context, gvr schema.GroupV
 			obj := &list.Items[i]
 			_ = rw.cache.SetForGVR(ctx, gvr, GetKey(gvr, obj.GetNamespace(), obj.GetName()), obj)
 		}
-		GlobalMetrics.ExpiryRefreshes.Add(1)
+		GlobalMetrics.Inc(&GlobalMetrics.ExpiryRefreshes, "expiry_refreshes")
 	}
 }
 

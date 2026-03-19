@@ -59,7 +59,7 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 
 	// Negative cache check.
 	if c != nil && c.GetNotFound(ctx, cacheKey) {
-		cache.GlobalMetrics.NegativeHits.Add(1)
+		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.NegativeHits, "negative_hits")
 		log.Debug("object not-found cache hit", slog.String("key", cacheKey))
 		res.Err = response.New(http.StatusNotFound, apierrors.NewNotFound(schema.GroupResource{
 			Group: res.GVR.Group, Resource: res.GVR.Resource,
@@ -71,12 +71,12 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 	if c != nil {
 		var cached unstructured.Unstructured
 		if hit, rerr := c.Get(ctx, cacheKey, &cached); hit && rerr == nil {
-			cache.GlobalMetrics.GetHits.Add(1)
+			cache.GlobalMetrics.Inc(&cache.GlobalMetrics.GetHits, "get_hits")
 			log.Debug("object cache hit", slog.String("key", cacheKey))
 			res.Unstructured = &cached
 			return
 		}
-		cache.GlobalMetrics.GetMisses.Add(1)
+		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.GetMisses, "get_misses")
 	}
 
 	rc, err := kubeconfig.NewClientConfig(ctx, ep)

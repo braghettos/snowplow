@@ -1,9 +1,12 @@
 package cache
 
 import (
+	"context"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -11,8 +14,32 @@ import (
 const (
 	WatchedGVRsKey   = "snowplow:watched-gvrs"
 	ActiveUsersKey   = "snowplow:active-users"
+	L1ReadyKey       = "snowplow:l1:ready"
 	notFoundSentinel = `{"__snowplow_not_found__":true}`
 )
+
+// MarkL1Ready writes a Unix-epoch timestamp to the L1 ready sentinel key.
+// External consumers (e.g. e2e tests) can poll this key to deterministically
+// know when the most recent L1 warmup or refresh cycle completed.
+func MarkL1Ready(ctx context.Context, c *RedisCache) {
+	if c == nil {
+		return
+	}
+	_ = c.SetString(ctx, L1ReadyKey, strconv.FormatInt(time.Now().Unix(), 10))
+}
+
+// L1ReadyTimestamp returns the Unix epoch stored in the L1 ready key, or 0.
+func L1ReadyTimestamp(ctx context.Context, c *RedisCache) int64 {
+	if c == nil {
+		return 0
+	}
+	raw, _, err := c.GetRaw(ctx, L1ReadyKey)
+	if err != nil || len(raw) == 0 {
+		return 0
+	}
+	ts, _ := strconv.ParseInt(string(raw), 10, 64)
+	return ts
+}
 
 func GVRToKey(gvr schema.GroupVersionResource) string {
 	g := gvr.Group

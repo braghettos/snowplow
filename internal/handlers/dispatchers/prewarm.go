@@ -163,6 +163,7 @@ func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config
 		slog.Int("users", len(users)),
 		slog.Int64("totalWarmed", totalWarmed),
 	)
+	cache.MarkL1Ready(ctx, c)
 }
 
 // FilterWidgetGVRs returns only the GVRs from the warmup config whose group

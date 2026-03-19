@@ -127,6 +127,7 @@ func main() {
 			redisCache = nil
 		} else {
 			log.Info("redis connected")
+			cache.GlobalMetrics.SetRedis(redisCache)
 		}
 	}
 

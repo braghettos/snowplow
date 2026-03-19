@@ -88,6 +88,7 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 			slog.String("trigger", triggerGVR.String()),
 			slog.Int64("refreshed", totalRefreshed),
 			slog.Int("total", len(l1Keys)))
+		cache.MarkL1Ready(ctx, c)
 	}
 }
 

@@ -57,8 +57,8 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			if uerr == nil {
 				resolvedKey = cache.ResolvedKey(user.Username, gvr, nsn.Namespace, nsn.Name, page, perPage)
 				if raw, hit, _ := c.GetRaw(req.Context(), resolvedKey); hit {
-					cache.GlobalMetrics.RawHits.Add(1)
-					cache.GlobalMetrics.L1Hits.Add(1)
+				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
+				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 					log.Info("RESTAction resolved from cache",
 						slog.String("key", resolvedKey),
 						slog.String("user", user.Username),
@@ -73,8 +73,8 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 					_, _ = wri.Write(raw)
 					return
 				}
-			cache.GlobalMetrics.RawMisses.Add(1)
-			cache.GlobalMetrics.L1Misses.Add(1)
+		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawMisses, "raw_misses")
+		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Misses, "l1_misses")
 				log.Info("restaction: L1 miss", slog.String("key", resolvedKey))
 			}
 		}

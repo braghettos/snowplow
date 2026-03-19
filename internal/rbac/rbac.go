@@ -50,11 +50,11 @@ func UserCan(ctx context.Context, opts UserCanOptions) (ok bool) {
 		cacheKey = cache.RBACKey(username, opts.Verb, opts.GroupResource, opts.Namespace)
 		var allowed bool
 		if hit, rerr := c.Get(ctx, cacheKey, &allowed); hit && rerr == nil {
-			cache.GlobalMetrics.RBACHits.Add(1)
+			cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RBACHits, "rbac_hits")
 			log.Debug("RBAC cache hit", slog.String("key", cacheKey))
 			return allowed
 		}
-		cache.GlobalMetrics.RBACMisses.Add(1)
+		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RBACMisses, "rbac_misses")
 	}
 
 	rc, err := kubeconfig.NewClientConfig(ctx, ep)

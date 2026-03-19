@@ -186,7 +186,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							GroupResource: schema.GroupResource{Group: pathGVR.Group, Resource: pathGVR.Resource},
 							Namespace:     pathNS,
 						}) {
-							cache.GlobalMetrics.L3Promotions.Add(1)
+							cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L3Promotions, "l3_promotions")
 							handler := jsonHandler(ctx, jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter})
 							if mu != nil {
 								mu.Lock()
@@ -203,7 +203,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				if callGVR, callNS, callName := cache.ParseCallPath(call.Path); callGVR.Resource != "" && callName != "" {
 					l1Key := cache.ResolvedKey(user.Username, callGVR, callNS, callName, 0, 0)
 					if l1Raw, l1Hit, _ := c.GetRaw(ctx, l1Key); l1Hit {
-						cache.GlobalMetrics.L1Hits.Add(1)
+						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 						handler := jsonHandler(ctx, jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter})
 						if mu != nil {
 							mu.Lock()
