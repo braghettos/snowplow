@@ -136,6 +136,12 @@ warmup:
       namespace: krateo-system
     - name: compositions-list
       namespace: krateo-system
+    - name: compositions-get-ns-and-crd
+      namespace: krateo-system
+    - name: blueprints-panels
+      namespace: krateo-system
+    - name: compositions-panels
+      namespace: krateo-system
     - name: sidebar-nav-menu-items
       namespace: krateo-system
 
