@@ -81,12 +81,13 @@ The highest-value layer. Stores the **fully resolved JSON** output of widget and
    - Every **widget** instance (from `cache-warmup.yaml` GVRs with group `widgets.templates.krateo.io`) for each user.
    - Every **RESTAction** listed in `l1RestActions` (e.g. `all-routes`, `blueprints-list`, `compositions-list`, `sidebar-nav-menu-items`) for each user.
 3. **Request-time child pre-warming** — When a parent widget (e.g. `RoutesLoader`) is resolved, its child widget references (`status.resourcesRefs.items`) are resolved concurrently in a background goroutine.
-4. **Proactive L1 refresh** — When a resource changes, existing L1 keys are re-resolved in background instead of being deleted (stale-while-revalidate).
+4. **Proactive L1 refresh with child pre-warming** — When a resource changes, existing L1 keys are re-resolved in background instead of being deleted (stale-while-revalidate). After re-resolving a widget, `preWarmChildWidgets` is called on the refreshed result, so newly-discovered child widgets (e.g. composition-panels from compositions deployed after initial warmup) are recursively pre-warmed into L1 up to depth 5. This ensures the full widget tree is cached, not just the top-level widgets that existed at startup time.
 
 **Update (Stale-While-Revalidate)**: When a watched resource fires an `add` or `update` informer event:
 1. L3 is updated in-place (see above).
 2. L1 keys dependent on the changed GVR are **NOT deleted**. Instead, they are re-resolved in a background goroutine via `L1RefreshFunc`. The old value continues to be served to users until the refresh completes and atomically overwrites the key.
 3. A per-GVR in-flight guard (`sync.Map`) prevents thundering herd — if a refresh for a GVR is already running, subsequent events for the same GVR are skipped (the next event will trigger a new refresh).
+4. After all L1 keys are refreshed, `MarkL1Ready` writes the current Unix epoch to the `snowplow:l1:ready` sentinel key, providing a deterministic signal that the refresh cycle is complete.
 
 **Delete**: On `delete` events (resource removed from cluster), L1 keys are fully invalidated via the reverse index.
 
@@ -164,10 +165,26 @@ The `L1RefreshFunc` callback is injected from `main.go` and implemented in `disp
 1. The watcher spawns a goroutine with a 60-second timeout.
 2. The callback parses each L1 key to extract `{username, GVR, namespace, name, page, perPage}`.
 3. Keys are grouped by username. For each user, the endpoint config is loaded from their `-clientconfig` Secret. User groups are extracted from the client certificate data to ensure correct RBAC impersonation.
-4. Each L1 key is re-resolved concurrently (semaphore-bounded at 10):
-   - **Widgets** (`widgets.templates.krateo.io` group): `objects.Get` → `widgets.Resolve` → `SetResolvedRaw`
-   - **RESTActions** (`templates.krateo.io` group, `restactions` resource): `objects.Get` → convert to typed `RESTAction` → `restactions.Resolve` → `SetResolvedRaw`
+4. Each L1 key is re-resolved concurrently (semaphore-bounded at 20) via the shared singleflight groups (see below):
+   - **Widgets** (`widgets.templates.krateo.io` group): `objects.Get` → `ResolveWidgetDirect` (singleflight) → `SetResolvedRaw` → `preWarmChildWidgets` (recursive, depth 5)
+   - **RESTActions** (`templates.krateo.io` group, `restactions` resource): `objects.Get` → `ResolveRESTActionDirect` (singleflight) → `SetResolvedRaw`
 5. Reverse indexes are updated with the new GVR dependencies from the `DependencyTracker`.
+6. After all keys are refreshed, `MarkL1Ready` writes the current epoch to `snowplow:l1:ready`.
+
+### Singleflight Deduplication
+
+Widget and RESTAction resolutions are wrapped in `singleflight.Group` instances (`widgetFlight` and `restactionFlight` in `dispatchers/singleflight.go`). This ensures that concurrent resolutions of the same L1 key — whether from an HTTP request or a background L1 refresh goroutine — are deduplicated: only one resolution runs, and all callers receive the same result.
+
+This is critical at high cardinality (e.g. 1200 compositions). Without singleflight, a browser request and 20 concurrent L1 refresh goroutines could all try to resolve the same widget simultaneously, doing duplicate JQ + RBAC work and competing for CPU. With singleflight:
+- If L1 refresh is already resolving a widget, the HTTP handler **joins the in-flight resolution** instead of starting a second one.
+- If the HTTP handler starts first, the L1 refresh goroutine joins its resolution.
+- `context.WithoutCancel` is used in the HTTP handler path so that if a client disconnects, the resolution still completes for other waiters.
+
+### Child Pre-Warming During L1 Refresh
+
+When an informer event triggers L1 refresh for a parent widget (e.g. `compositions-page-datagrid`), the resolution now also calls `preWarmChildWidgets` on the refreshed result. This recursively discovers and pre-warms all child widget references (e.g. `composition-panel`, `composition-panel-markdown`, `composition-panel-button-delete`) up to depth 5.
+
+Previously, `preWarmChildWidgets` was only called during initial startup warmup and request-time resolution. This meant child widgets from resources deployed after startup (e.g. compositions created after cache was enabled) were never pre-warmed — every browser request for those children was an L1 miss requiring full resolution (18-19s per widget at 1200 compositions). With child pre-warming during L1 refresh, the informer event that updates the datagrid also ensures all visible composition-panel widgets and their descendants are cached.
 
 ### L3 → Resolution Pipeline (direct read)
 
@@ -273,6 +290,7 @@ Resources like namespaces and CRDs change rarely and are expensive to re-fetch. 
 | `snowplow:rbac:` | — | Per-user | SelfSubjectAccessReview result |
 | `snowplow:userconfig:` | — | Per-user | User endpoint config from Secret |
 | `snowplow:l1gvr:` | Index | Shared | Reverse index: GVR → dependent L1 keys |
+| `snowplow:l1:ready` | Meta | Shared | Unix epoch of last L1 refresh completion (sentinel) |
 | `snowplow:watched-gvrs` | Meta | Shared | SET of all GVRs with active informers |
 | `snowplow:active-users` | Meta | Shared | SET of usernames with active sessions |
 
@@ -310,6 +328,19 @@ Available at `GET /metrics/cache`:
 
 ## Performance Optimizations
 
+### Singleflight Resolution Deduplication
+
+Concurrent resolutions of the same L1 key are deduplicated via `golang.org/x/sync/singleflight`. Shared `widgetFlight` and `restactionFlight` groups span both the HTTP handler and L1 refresh paths. Under high cardinality (1200+ compositions), this prevents duplicate CPU work (JQ evaluations, RBAC checks, HTTP fan-out) when multiple goroutines try to resolve the same widget simultaneously.
+
+### Recursive Child Pre-Warming
+
+`preWarmChildWidgets` walks `status.resourcesRefs.items` from any resolved widget and pre-warms every child whose GVR group is `widgets.templates.krateo.io`, recursively up to depth 5. This runs:
+- During startup warmup (initial population)
+- During request-time resolution (on L1 miss)
+- During informer-triggered L1 refresh (ensures newly-deployed resources' child widgets are cached)
+
+The function is agnostic to widget types — it follows whatever child refs the resolution produced.
+
 ### Parallel Widget `resourcesRefs` Resolution
 
 Widgets with many child references (e.g. `RoutesLoader` with 42 routes) resolve all `ResourceRef` items concurrently using a goroutine pool with a semaphore (concurrency = 20). Each reference independently checks RBAC for up to 4 verbs. Previously sequential, this reduces wall-clock time from ~168 sequential operations to ~9 batches of concurrent operations for a typical routes page.
@@ -343,8 +374,9 @@ When RESTAction resolution makes HTTP calls to K8s API paths (e.g. listing compo
 | `internal/cache/rbac_watcher.go` | RBACWatcher: role/binding informers |
 | `internal/cache/user_watcher.go` | UserSecretWatcher: clientconfig Secret informers |
 | `internal/cache/metrics.go` | Global cache hit/miss counters |
-| `internal/handlers/dispatchers/widgets.go` | Widget dispatcher with L1 cache read/write |
-| `internal/handlers/dispatchers/restactions.go` | RESTAction dispatcher with L1 cache read/write |
-| `internal/handlers/dispatchers/prewarm.go` | L1 startup warmup and request-time child pre-warming |
-| `internal/handlers/dispatchers/l1_refresh.go` | L1RefreshFunc: background re-resolution on resource changes |
+| `internal/handlers/dispatchers/widgets.go` | Widget dispatcher with L1 cache read/write and singleflight dedup |
+| `internal/handlers/dispatchers/restactions.go` | RESTAction dispatcher with L1 cache read/write and singleflight dedup |
+| `internal/handlers/dispatchers/singleflight.go` | Shared singleflight groups for widget and RESTAction resolution |
+| `internal/handlers/dispatchers/prewarm.go` | L1 startup warmup, request-time and refresh-time child pre-warming |
+| `internal/handlers/dispatchers/l1_refresh.go` | L1RefreshFunc: background re-resolution with singleflight and child pre-warming |
 | `config/cache-warmup.yaml` | GVRs, `l1RestActions`, and categories to pre-populate at startup |
