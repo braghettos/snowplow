@@ -126,7 +126,14 @@ func (q *refreshQueue) flush() {
 			q.mu.Unlock()
 		}()
 
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		// Scale the timeout with the number of keys: 10s base + 3s per key,
+		// capped at 10 minutes. With 512 keys this gives ~25 min (capped to 10),
+		// plenty for concurrent resolution with refreshConcurrency=20.
+		timeout := 10*time.Second + time.Duration(len(keys))*3*time.Second
+		if timeout > 10*time.Minute {
+			timeout = 10 * time.Minute
+		}
+		ctx, cancel := context.WithTimeout(q.watcher.appCtx, timeout)
 		defer cancel()
 		fn(ctx, q.gvr, keys)
 	}()

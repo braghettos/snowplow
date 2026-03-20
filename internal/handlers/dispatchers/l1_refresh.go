@@ -79,11 +79,20 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 			totalRefreshed += n
 		}
 
+		if ctx.Err() != nil {
+			log.Warn("L1 refresh: context expired before completion",
+				slog.String("trigger", triggerGVR.String()),
+				slog.Int64("refreshed", totalRefreshed),
+				slog.Int("total", len(l1Keys)),
+				slog.Any("err", ctx.Err()))
+		}
 		log.Info("L1 refresh: done",
 			slog.String("trigger", triggerGVR.String()),
 			slog.Int64("refreshed", totalRefreshed),
 			slog.Int("total", len(l1Keys)))
-		cache.MarkL1Ready(ctx, c)
+		// Use a fresh background context so the sentinel is always written,
+		// even if the refresh context has expired.
+		cache.MarkL1Ready(context.Background(), c)
 	}
 }
 
