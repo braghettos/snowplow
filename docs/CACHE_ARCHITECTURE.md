@@ -89,7 +89,7 @@ The highest-value layer. Stores the **fully resolved JSON** output of widget and
 3. A per-GVR in-flight guard (`sync.Map`) prevents thundering herd — if a refresh for a GVR is already running, subsequent events for the same GVR are skipped (the next event will trigger a new refresh).
 4. After all L1 keys are refreshed, `MarkL1Ready` writes the current Unix epoch to the `snowplow:l1:ready` sentinel key, providing a deterministic signal that the refresh cycle is complete.
 
-**Delete**: On `delete` events (resource removed from cluster), L1 keys are fully invalidated via the reverse index.
+**Delete**: On `delete` events (resource removed from cluster), L1 keys are first **invalidated** (hard-deleted via the reverse index) to stop serving stale data, then a **background L1 refresh** is triggered for those same keys. This re-resolves parent widgets (e.g. compositions-list datagrid, piechart) to reflect the removed resource. The same per-GVR in-flight guard and `MarkL1Ready` sentinel apply, providing a deterministic signal that the post-deletion refresh is complete.
 
 ---
 

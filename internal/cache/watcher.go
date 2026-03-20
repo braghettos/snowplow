@@ -233,12 +233,41 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		if ns != "" {
 			rw.patchListCache(ctx, gvr, clusterListKey, uns, "delete")
 		}
-		gvrKey := GVRToKey(gvr)
-		l1Idx := L1GVRKey(gvrKey)
-		if keys, serr := rw.cache.SMembers(ctx, l1Idx); serr == nil && len(keys) > 0 {
-			_ = rw.cache.Delete(ctx, append(keys, l1Idx)...)
-			slog.Debug("resource-watcher: L1 invalidation (delete)",
-				slog.String("index", l1Idx), slog.Int("count", len(keys)))
+		// On delete we invalidate L1 resolved outputs immediately, but we
+		// also need to trigger an L1 refresh so that parent widgets (e.g.
+		// compositions-list datagrid) are re-resolved to reflect the removal.
+		// We save the L1 keys BEFORE deleting so the refresher can re-resolve them.
+		gvrKeyDel := GVRToKey(gvr)
+		l1Idx := L1GVRKey(gvrKeyDel)
+		l1KeysDel, serr := rw.cache.SMembers(ctx, l1Idx)
+		if serr != nil || len(l1KeysDel) == 0 {
+			return
+		}
+		// Delete the stale resolved outputs so they aren't served while refreshing.
+		_ = rw.cache.Delete(ctx, append(l1KeysDel, l1Idx)...)
+		slog.Debug("resource-watcher: L1 invalidation (delete)",
+			slog.String("index", l1Idx), slog.Int("count", len(l1KeysDel)))
+
+		// Trigger L1 refresh in the background to re-populate the deleted entries.
+		if fn, ok := rw.l1Refresh.Load().(L1RefreshFunc); ok && fn != nil {
+			if _, alreadyRunning := rw.refreshing.LoadOrStore(gvrKeyDel, true); !alreadyRunning {
+				go func() {
+					defer rw.refreshing.Delete(gvrKeyDel)
+					defer func() {
+						if r := recover(); r != nil {
+							buf := make([]byte, 4096)
+							n := runtime.Stack(buf, false)
+							slog.Error("resource-watcher: panic recovered in L1 refresh (delete)",
+								slog.Any("error", r),
+								slog.String("gvr", gvr.String()),
+								slog.String("stack", string(buf[:n])))
+						}
+					}()
+					refreshCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+					defer cancel()
+					fn(refreshCtx, gvr, l1KeysDel)
+				}()
+			}
 		}
 		return
 

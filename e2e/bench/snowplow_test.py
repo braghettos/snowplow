@@ -761,21 +761,34 @@ spec:
     return False
 
 
-def deploy_compositions(ns_start, ns_end, comps_per_ns):
+def deploy_compositions(ns_start, ns_end, comps_per_ns, max_retries=3):
     total = (ns_end - ns_start + 1) * comps_per_ns
-    log(f"Deploying {total} compositions one by one ...")
+    log(f"Deploying {total} compositions one by one (max {max_retries} retries each) ...")
     deployed = 0
+    failed = []
     for ns_i in range(ns_start, ns_end + 1):
         for comp_i in range(1, comps_per_ns + 1):
             ns = f"bench-ns-{ns_i:02d}"
             name = f"bench-app-{ns_i:02d}-{comp_i:02d}"
             yaml = composition_yaml(ns, name)
-            rc, _, err = kubectl("apply", "--server-side", "-f", "-", input_data=yaml)
-            if rc != 0:
-                log(f"  WARNING: {ns}/{name} failed (rc={rc}): {err[:200]}")
+            ok = False
+            for attempt in range(1, max_retries + 1):
+                rc, _, err = kubectl("apply", "--server-side", "-f", "-", input_data=yaml)
+                if rc == 0:
+                    ok = True
+                    break
+                if attempt < max_retries:
+                    time.sleep(2 * attempt)  # backoff: 2s, 4s
+            if not ok:
+                failed.append(f"{ns}/{name}")
+                log(f"  FAILED after {max_retries} attempts: {ns}/{name}: {err[:200]}")
             deployed += 1
             if deployed % 100 == 0:
                 log(f"  Deployed {deployed}/{total} compositions")
+    if failed:
+        log(f"  WARNING: {len(failed)}/{total} compositions failed to deploy")
+    else:
+        log(f"  All {total} compositions deployed successfully")
 
 
 def composition_yaml(ns, name):
@@ -1759,6 +1772,41 @@ BROWSER_SCALING_PAGES = [
 ]
 
 
+def _browser_verify_composition_count(page, expected_comp_count):
+    """Verify that the browser renders the expected number of compositions.
+
+    Uses two strategies:
+    1. Count composition-panel /call XHR requests in performance timing — each
+       composition that renders triggers a separate /call for its panel widget.
+    2. Look for a piechart or text element in the DOM that displays the total count.
+
+    Returns the observed count or -1 if verification was not possible.
+    """
+    if expected_comp_count == 0:
+        return 0  # nothing to verify
+    try:
+        observed = page.evaluate("""() => {
+            // Strategy 1: count composition-panel /call requests
+            // Each composition triggers a /call for its panel widget
+            const panelCalls = performance.getEntriesByType('resource')
+                .filter(e => e.name.includes('/call') && e.name.includes('composition-panel'));
+            if (panelCalls.length > 0) return panelCalls.length;
+
+            // Strategy 2: look for text in the DOM containing the count
+            // The piechart widget typically renders the total count as text
+            const allText = document.body ? document.body.innerText : '';
+            // Look for patterns like "1200 compositions" or just a large number
+            // near composition-related content
+            const match = allText.match(/(\\d+)\\s*[Cc]omposition/);
+            if (match) return parseInt(match[1], 10);
+
+            return -1;
+        }""")
+        return observed
+    except Exception:
+        return -1
+
+
 def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, num_navs=3):
     """Navigate browser to each page num_navs times, return timing data.
     Expects an already-logged-in page object."""
@@ -1772,10 +1820,26 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, num_navs=3):
             m = _browser_measure_navigation(page, page_path,
                                             f"S{stage_num} {cache_mode} nav#{nav_num} {page_name}")
             navs.append(m)
-            log(f"  {'COLD' if nav_num == 1 else 'WARM'} {page_name:<15s} "
+            cold_warm = 'COLD' if nav_num == 1 else 'WARM'
+            log(f"  {cold_warm} {page_name:<15s} "
                 f"waterfall={m['waterfallMs']:>5d}ms  "
                 f"load={m['loadComplete']:>5d}ms  "
                 f"calls={m['callCount']}")
+
+            # On the last warm navigation, verify that the rendered content
+            # matches the expected composition count. Works on both Dashboard
+            # (piechart shows total) and Compositions (panel /call count).
+            if page_name in ("Dashboard", "Compositions") and nav_num == num_navs and comp_count > 0:
+                observed = _browser_verify_composition_count(page, comp_count)
+                m["verified_comp_count"] = observed
+                if observed > 0:
+                    log(f"    VERIFY: browser shows {observed} compositions "
+                        f"(cluster has {comp_count})")
+                elif observed == 0:
+                    log(f"    VERIFY WARNING: browser shows 0 compositions "
+                        f"(cluster has {comp_count}) — stale cache?")
+                else:
+                    log(f"    VERIFY: could not determine composition count in DOM")
 
         # Compute p50 from all navigations for waterfall and loadComplete
         wf_vals = [n["waterfallMs"] for n in navs if n["waterfallMs"] > 0]
