@@ -354,23 +354,6 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		if ns != "" {
 			rw.patchListCache(ctx, gvr, clusterListKey, uns, "delete")
 		}
-		// Invalidate L1 resolved outputs immediately so stale data
-		// (containing the deleted resource) is not served.
-		gvrKeyDel := GVRToKey(gvr)
-		l1Idx := L1GVRKey(gvrKeyDel)
-		l1KeysDel, serr := rw.cache.SMembers(ctx, l1Idx)
-		if serr != nil || len(l1KeysDel) == 0 {
-			return
-		}
-		_ = rw.cache.Delete(ctx, append(l1KeysDel, l1Idx)...)
-		slog.Debug("resource-watcher: L1 invalidation (delete)",
-			slog.String("index", l1Idx), slog.Int("count", len(l1KeysDel)))
-
-		// Enqueue L1 refresh via the coalescing queue. Burst DELETEs
-		// (e.g. 10 compositions in a namespace) are batched into a single
-		// refresh cycle after the coalesce period.
-		rw.enqueueL1Refresh(gvr, l1KeysDel)
-		return
 
 	case "add", "update":
 		stripped := uns.DeepCopy()
@@ -386,16 +369,66 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		}
 	}
 
-	// ── Proactive L1 refresh (stale-while-revalidate) ────────────────────────
-	// Enqueue via the coalescing queue. Old L1 values keep being served while
-	// the refresh runs. Burst events are coalesced — nothing is skipped.
+	// ── Targeted L1 refresh via per-resource dependency index ─────────────────
+	// Look up L1 keys that depend on this specific resource (GET), or that list
+	// resources in its namespace or cluster-wide (LIST). This is O(affected)
+	// instead of O(all-keys-for-GVR).
 	gvrKey := GVRToKey(gvr)
-	l1IdxKey := L1GVRKey(gvrKey)
-	l1Keys, serr := rw.cache.SMembers(ctx, l1IdxKey)
-	if serr != nil || len(l1Keys) == 0 {
+	l1Keys := rw.collectAffectedL1Keys(ctx, gvrKey, ns, name)
+
+	if len(l1Keys) == 0 {
 		return
 	}
+
+	if eventType == "delete" {
+		// Delete affected L1 entries and the per-resource dep index (resource
+		// is gone). Keep the LIST dep indexes — they're shared across resources.
+		resDepKey := L1ResourceDepKey(gvrKey, ns, name)
+		_ = rw.cache.Delete(ctx, append(l1Keys, resDepKey)...)
+	}
+
+	slog.Debug("resource-watcher: L1 targeted refresh",
+		slog.String("event", eventType),
+		slog.String("gvr", gvr.String()),
+		slog.String("ns", ns),
+		slog.String("name", name),
+		slog.Int("affected", len(l1Keys)))
+
 	rw.enqueueL1Refresh(gvr, l1Keys)
+}
+
+// collectAffectedL1Keys returns the deduplicated set of L1 resolved keys that
+// depend on the given K8s resource via per-resource dependency indexes:
+//   - GET dependency:    L1 keys that fetched this specific resource
+//   - LIST (namespaced): L1 keys that listed this GVR in this namespace
+//   - LIST (cluster):    L1 keys that listed this GVR across all namespaces
+func (rw *ResourceWatcher) collectAffectedL1Keys(ctx context.Context, gvrKey, ns, name string) []string {
+	seen := map[string]bool{}
+	collect := func(idxKey string) {
+		if keys, err := rw.cache.SMembers(ctx, idxKey); err == nil {
+			for _, k := range keys {
+				seen[k] = true
+			}
+		}
+	}
+
+	// GET dependency: specific resource
+	collect(L1ResourceDepKey(gvrKey, ns, name))
+	// LIST dependency: namespaced
+	if ns != "" {
+		collect(L1ResourceDepKey(gvrKey, ns, ""))
+	}
+	// LIST dependency: cluster-wide
+	collect(L1ResourceDepKey(gvrKey, "", ""))
+
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	return out
 }
 
 // enqueueL1Refresh adds L1 keys to the coalescing queue for the given GVR.

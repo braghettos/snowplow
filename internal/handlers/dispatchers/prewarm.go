@@ -419,9 +419,7 @@ func warmL1RestActionsForUser(ctx context.Context, c *cache.RedisCache, user jwt
 		}
 
 		_ = c.SetResolvedRaw(tctx, rKey, cache.StripBulkyAnnotations(raw))
-		for _, gvrKey := range tracker.GVRKeys() {
-			_ = c.SAddWithTTL(tctx, cache.L1GVRKey(gvrKey), rKey, cache.ReverseIndexTTL)
-		}
+		cache.RegisterL1Dependencies(tctx, c, tracker, rKey)
 
 		warmed++
 		log.Info("L1 warmup: warmed RESTAction",
@@ -525,9 +523,7 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 
 			rKey := cache.ResolvedKey(user.Username, r.gvr, r.ns, r.name, -1, -1)
 			_ = c.SetResolvedRaw(rctx, rKey, raw)
-			for _, gvrKey := range tracker.GVRKeys() {
-				_ = c.SAddWithTTL(rctx, cache.L1GVRKey(gvrKey), rKey, cache.ReverseIndexTTL)
-			}
+			cache.RegisterL1Dependencies(rctx, c, tracker, rKey)
 
 			if newDeps := registerApiRefGVRDeps(rctx, c, got.Unstructured, rKey, tracker); newDeps > 0 {
 				_ = c.Delete(rctx, rKey)
@@ -604,9 +600,7 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 
 			rKey := cache.ResolvedKey(user.Username, r.gvr, r.ns, r.name, -1, -1)
 			_ = c.SetResolvedRaw(rctx, rKey, raw)
-			for _, gvrKey := range tracker.GVRKeys() {
-				_ = c.SAddWithTTL(rctx, cache.L1GVRKey(gvrKey), rKey, cache.ReverseIndexTTL)
-			}
+			cache.RegisterL1Dependencies(rctx, c, tracker, rKey)
 
 			if newDeps := registerApiRefGVRDeps(rctx, c, got.Unstructured, rKey, tracker); newDeps > 0 {
 				_ = c.Delete(rctx, rKey)

@@ -39,6 +39,7 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 
 	if tracker := cache.TrackerFromContext(ctx); tracker != nil {
 		tracker.AddGVR(res.GVR)
+		tracker.AddResource(res.GVR, ref.Namespace, ref.Name)
 	}
 
 	ep, err := xcontext.UserConfig(ctx)

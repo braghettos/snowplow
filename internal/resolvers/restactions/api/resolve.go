@@ -155,14 +155,25 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			call.Endpoint = &ep
 			verb := strings.ToUpper(ptr.Deref(call.Verb, http.MethodGet))
 
-			// Record the GVR dependency for targeted invalidation and register
-			// the GVR for informer watching so L3 gets populated for dynamic CRDs.
-			if pathGVR, _, _ := cache.ParseK8sAPIPath(call.Path); pathGVR.Resource != "" {
+			// Record the GVR and per-resource dependency for targeted invalidation
+			// and register the GVR for informer watching so L3 gets populated.
+			// RESTAction paths can be either K8s API paths (/apis/group/version/...)
+			// or snowplow /call paths (/call?resource=...&apiVersion=...).
+			if pathGVR, pathNS, pathName := cache.ParseK8sAPIPath(call.Path); pathGVR.Resource != "" {
 				if tracker := cache.TrackerFromContext(ctx); tracker != nil {
 					tracker.AddGVR(pathGVR)
+					tracker.AddResource(pathGVR, pathNS, pathName)
 				}
 				if c != nil {
 					_ = c.SAddGVR(ctx, pathGVR)
+				}
+			} else if callGVR, callNS, callName := cache.ParseCallPath(call.Path); callGVR.Resource != "" {
+				if tracker := cache.TrackerFromContext(ctx); tracker != nil {
+					tracker.AddGVR(callGVR)
+					tracker.AddResource(callGVR, callNS, callName)
+				}
+				if c != nil {
+					_ = c.SAddGVR(ctx, callGVR)
 				}
 			}
 

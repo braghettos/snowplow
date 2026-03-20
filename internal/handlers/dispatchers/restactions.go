@@ -169,9 +169,7 @@ func resolveRESTActionFromObject(ctx context.Context, c *cache.RedisCache, obj m
 
 	if c != nil && resolvedKey != "" {
 		_ = c.SetResolvedRaw(ctx, resolvedKey, raw)
-		for _, gvrKey := range tracker.GVRKeys() {
-			_ = c.SAddWithTTL(ctx, cache.L1GVRKey(gvrKey), resolvedKey, cache.ReverseIndexTTL)
-		}
+		cache.RegisterL1Dependencies(ctx, c, tracker, resolvedKey)
 	}
 
 	return raw, nil
