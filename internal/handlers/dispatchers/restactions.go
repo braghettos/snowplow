@@ -1,6 +1,7 @@
 package dispatchers
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -81,36 +82,68 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	}
 	// ── End resolved-output cache ─────────────────────────────────────────────
 
+	// Fetch the K8s object (needs HTTP request for query params).
 	got := fetchObject(req)
 	if got.Err != nil {
 		response.Encode(wri, got.Err)
 		return
 	}
 
+	// ── Singleflight: deduplicate concurrent resolutions of the same key ──────
+	if resolvedKey != "" {
+		ctx := context.WithoutCancel(req.Context())
+		result, resolveErr, _ := restactionFlight.Do(resolvedKey, func() (interface{}, error) {
+			return resolveRESTActionFromObject(ctx, c, got.Unstructured.Object, resolvedKey, r.authnNS, perPage, page, extras)
+		})
+		if resolveErr != nil {
+			response.InternalError(wri, resolveErr)
+			return
+		}
+		log.Info("RESTAction successfully resolved (singleflight)",
+			slog.String("key", resolvedKey),
+			slog.String("duration", util.ETA(start)))
+		wri.Header().Set("Content-Type", "application/json")
+		wri.WriteHeader(http.StatusOK)
+		_, _ = wri.Write(result.([]byte))
+		return
+	}
+
+	// Non-cacheable path (extras present): resolve inline without singleflight.
+	raw, resolveErr := resolveRESTActionFromObject(req.Context(), c, got.Unstructured.Object, "", r.authnNS, perPage, page, extras)
+	if resolveErr != nil {
+		response.InternalError(wri, resolveErr)
+		return
+	}
+	log.Info("RESTAction successfully resolved",
+		slog.String("duration", util.ETA(start)))
+	wri.Header().Set("Content-Type", "application/json")
+	wri.WriteHeader(http.StatusOK)
+	_, _ = wri.Write(raw)
+}
+
+// resolveRESTActionFromObject performs the full RESTAction resolution: convert →
+// resolve → marshal → strip annotations → cache-set. Called from the HTTP
+// handler (via singleflight) and from L1 refresh (via ResolveRESTActionDirect).
+func resolveRESTActionFromObject(ctx context.Context, c *cache.RedisCache, obj map[string]interface{}, resolvedKey, authnNS string, perPage, page int, extras map[string]any) ([]byte, error) {
+	log := xcontext.Logger(ctx)
+
 	scheme := runtime.NewScheme()
 	if err := apis.AddToScheme(scheme); err != nil {
-		log.Error("unable to add apis to scheme",
-			slog.Any("err", err))
-		response.InternalError(wri, err)
-		return
+		return nil, err
 	}
 
 	var cr v1.RESTAction
-	err = runtime.DefaultUnstructuredConverter.FromUnstructured(got.Unstructured.Object, &cr)
-	if err != nil {
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj, &cr); err != nil {
 		log.Error("unable to convert unstructured to typed rest action",
-			slog.String("name", got.Unstructured.GetName()),
-			slog.String("namespace", got.Unstructured.GetNamespace()),
 			slog.Any("err", err))
-		response.InternalError(wri, err)
-		return
+		return nil, err
 	}
 
 	tracker := cache.NewDependencyTracker()
-	ctx := cache.WithDependencyTracker(xcontext.BuildContext(req.Context()), tracker)
-	res, err := restactions.Resolve(ctx, restactions.ResolveOptions{
+	tctx := cache.WithDependencyTracker(xcontext.BuildContext(ctx), tracker)
+	res, err := restactions.Resolve(tctx, restactions.ResolveOptions{
 		In:      &cr,
-		AuthnNS: r.authnNS,
+		AuthnNS: authnNS,
 		PerPage: perPage,
 		Page:    page,
 		Extras:  extras,
@@ -120,32 +153,38 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			slog.String("name", cr.GetName()),
 			slog.String("namespace", cr.GetNamespace()),
 			slog.Any("err", err))
-		response.InternalError(wri, err)
-		return
+		return nil, err
 	}
 
-	log.Info("RESTAction successfully resolved",
+	log.Info("RESTAction resolved",
 		slog.String("name", cr.Name),
-		slog.String("namespace", cr.Namespace),
-		slog.String("duration", util.ETA(start)),
-	)
+		slog.String("namespace", cr.Namespace))
 
 	raw, merr := json.Marshal(res)
 	if merr != nil {
-		response.InternalError(wri, merr)
-		return
+		return nil, merr
 	}
 
 	raw = cache.StripBulkyAnnotations(raw)
 
 	if c != nil && resolvedKey != "" {
-		_ = c.SetResolvedRaw(req.Context(), resolvedKey, raw)
+		_ = c.SetResolvedRaw(ctx, resolvedKey, raw)
 		for _, gvrKey := range tracker.GVRKeys() {
-			_ = c.SAddWithTTL(req.Context(), cache.L1GVRKey(gvrKey), resolvedKey, cache.ReverseIndexTTL)
+			_ = c.SAddWithTTL(ctx, cache.L1GVRKey(gvrKey), resolvedKey, cache.ReverseIndexTTL)
 		}
 	}
 
-	wri.Header().Set("Content-Type", "application/json")
-	wri.WriteHeader(http.StatusOK)
-	_, _ = wri.Write(raw)
+	return raw, nil
+}
+
+// ResolveRESTActionDirect is the entry point for L1 refresh to resolve a
+// RESTAction using the same singleflight group as the HTTP handler.
+func ResolveRESTActionDirect(ctx context.Context, c *cache.RedisCache, obj map[string]interface{}, resolvedKey, authnNS string, perPage, page int) ([]byte, error) {
+	result, err, _ := restactionFlight.Do(resolvedKey, func() (interface{}, error) {
+		return resolveRESTActionFromObject(ctx, c, obj, resolvedKey, authnNS, perPage, page, nil)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result.([]byte), nil
 }

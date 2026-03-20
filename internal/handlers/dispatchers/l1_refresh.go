@@ -2,20 +2,15 @@ package dispatchers
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"sync"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/plumbing/jwtutil"
-	"github.com/krateoplatformops/snowplow/apis"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/objects"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
@@ -93,6 +88,8 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 }
 
 // refreshSingleL1 re-resolves one L1 entry and updates the cache in-place.
+// For widget entries, it also calls preWarmChildWidgets so that child widgets
+// discovered during resolution (e.g. composition-panels) are pre-warmed into L1.
 func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, info cache.ResolvedKeyInfo, rawKey, authnNS string) bool {
 	rctx := xcontext.BuildContext(ctx,
 		xcontext.WithUserConfig(ep),
@@ -112,57 +109,32 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 		return false
 	}
 
-	tracker := cache.NewDependencyTracker()
-	tctx := cache.WithDependencyTracker(rctx, tracker)
-
-	var (
-		raw []byte
-		err error
-	)
-
 	switch {
 	case info.GVR.Group == widgetGroup:
-		res, resolveErr := widgets.Resolve(tctx, widgets.ResolveOptions{
-			In:      got.Unstructured,
-			AuthnNS: authnNS,
-			PerPage: info.PerPage,
-			Page:    info.Page,
-		})
-		if resolveErr != nil {
+		// Use ResolveWidgetDirect which shares the singleflight group with
+		// the HTTP handler — concurrent resolutions are deduplicated.
+		result, err := ResolveWidgetDirect(rctx, c, got, rawKey, authnNS, info.PerPage, info.Page)
+		if err != nil {
 			return false
 		}
-		raw, err = json.Marshal(res)
+		// preWarmChildWidgets is already called inside resolveWidgetFromObject
+		// (via ResolveWidgetDirect), so newly-discovered child widgets
+		// (e.g. composition-panels) are pre-warmed automatically.
+		_ = result
+		registerApiRefGVRDeps(rctx, c, got.Unstructured, rawKey, nil)
+		return true
 
 	case info.GVR.Group == templatesGroup && info.GVR.Resource == restactionResource:
-		scheme := runtime.NewScheme()
-		_ = apis.AddToScheme(scheme)
-		var cr templatesv1.RESTAction
-		if convErr := runtime.DefaultUnstructuredConverter.FromUnstructured(got.Unstructured.Object, &cr); convErr != nil {
+		// Use ResolveRESTActionDirect which shares the singleflight group
+		// with the HTTP handler.
+		_, err := ResolveRESTActionDirect(rctx, c, got.Unstructured.Object, rawKey, authnNS, info.PerPage, info.Page)
+		if err != nil {
 			return false
 		}
-		res, resolveErr := restactions.Resolve(tctx, restactions.ResolveOptions{
-			In:      &cr,
-			AuthnNS: authnNS,
-			PerPage: info.PerPage,
-			Page:    info.Page,
-		})
-		if resolveErr != nil {
-			return false
-		}
-		raw, err = json.Marshal(res)
+		registerApiRefGVRDeps(rctx, c, got.Unstructured, rawKey, nil)
+		return true
 
 	default:
 		return false
 	}
-
-	if err != nil {
-		return false
-	}
-
-	_ = c.SetResolvedRaw(rctx, rawKey, cache.StripBulkyAnnotations(raw))
-	for _, gvrKey := range tracker.GVRKeys() {
-		_ = c.SAddWithTTL(rctx, cache.L1GVRKey(gvrKey), rawKey, cache.ReverseIndexTTL)
-	}
-	registerApiRefGVRDeps(rctx, c, got.Unstructured, rawKey, tracker)
-	return true
 }

@@ -1,6 +1,7 @@
 package dispatchers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,8 +15,10 @@ import (
 	"github.com/krateoplatformops/plumbing/maps"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
+	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 func Widgets() http.Handler {
@@ -82,11 +85,56 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	}
 	// ── End resolved-output cache ─────────────────────────────────────────────
 
+	// Fetch the K8s object (needed for resolution). Done outside singleflight
+	// because it requires the HTTP request to parse query parameters.
 	got := fetchObject(req)
 	if got.Err != nil {
 		response.Encode(wri, got.Err)
 		return
 	}
+
+	// ── Singleflight: deduplicate concurrent resolutions of the same key ──────
+	if resolvedKey != "" {
+		// Use context.WithoutCancel so that if the HTTP client disconnects,
+		// the resolution still completes for other waiters.
+		ctx := context.WithoutCancel(req.Context())
+		result, resolveErr, _ := widgetFlight.Do(resolvedKey, func() (interface{}, error) {
+			return resolveWidgetFromObject(ctx, c, got, resolvedKey, r.authnNS, perPage, page, extras)
+		})
+		if resolveErr != nil {
+			writeWidgetError(wri, resolveErr)
+			return
+		}
+		log.Info("Widget successfully resolved (singleflight)",
+			slog.String("key", resolvedKey),
+			slog.String("duration", util.ETA(start)))
+		wri.Header().Set("Content-Type", "application/json")
+		wri.WriteHeader(http.StatusOK)
+		_, _ = wri.Write(result.(*ResolveWidgetResult).Raw)
+		return
+	}
+
+	// Non-cacheable path (extras present): resolve inline without singleflight.
+	res, resolveErr := resolveWidgetFromObject(req.Context(), c, got, "", r.authnNS, perPage, page, extras)
+	if resolveErr != nil {
+		writeWidgetError(wri, resolveErr)
+		return
+	}
+	log.Info("Widget successfully resolved",
+		slog.String("duration", util.ETA(start)))
+	wri.Header().Set("Content-Type", "application/json")
+	wri.WriteHeader(http.StatusOK)
+	_, _ = wri.Write(res.Raw)
+}
+
+// resolveWidgetFromObject performs the full widget resolution: resolve → marshal
+// → cache-set → pre-warm children. It is called both from the HTTP handler
+// (via singleflight) and from L1 refresh (via ResolveWidgetDirect).
+//
+// Returns a *ResolveWidgetResult so singleflight callers can access both the
+// raw JSON (for HTTP response) and the resolved unstructured (for child pre-warming).
+func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objects.Result, resolvedKey, authnNS string, perPage, page int, extras map[string]any) (*ResolveWidgetResult, error) {
+	log := xcontext.Logger(ctx)
 
 	log = log.With(
 		slog.Group("widget",
@@ -98,57 +146,72 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	)
 
 	tracker := cache.NewDependencyTracker()
-	ctx := cache.WithDependencyTracker(xcontext.BuildContext(req.Context()), tracker)
+	tctx := cache.WithDependencyTracker(xcontext.BuildContext(ctx), tracker)
 
-	res, err := widgets.Resolve(ctx, widgets.ResolveOptions{
+	res, err := widgets.Resolve(tctx, widgets.ResolveOptions{
 		In:      got.Unstructured,
-		AuthnNS: r.authnNS,
+		AuthnNS: authnNS,
 		PerPage: perPage,
 		Page:    page,
 		Extras:  extras,
 	})
 	if err != nil {
 		log.Error("unable to resolve widget", slog.Any("err", err))
-		var statusErr *apierrors.StatusError
-		if errors.As(err, &statusErr) {
-			code := int(statusErr.Status().Code)
-			msg := fmt.Errorf("%s", statusErr.Status().Message)
-			response.Encode(wri, response.New(code, msg))
-			return
-		}
-		response.InternalError(wri, err)
-		return
+		return nil, err
 	}
 
-	traceId := xcontext.TraceId(ctx, false)
+	traceId := xcontext.TraceId(tctx, false)
 	if traceId != "" {
 		if terr := maps.SetNestedField(res.Object, traceId, "status", "traceId"); terr != nil {
 			log.Warn("unable to set traceId in status", slog.Any("err", terr))
 		}
 	}
 
-	log.Info("Widget successfully resolved",
-		slog.String("duration", util.ETA(start)),
-	)
-
 	raw, merr := json.Marshal(res)
 	if merr != nil {
-		response.InternalError(wri, merr)
-		return
+		return nil, merr
 	}
 
 	// Populate the resolved cache and register GVR reverse indexes so that
 	// informer events can do targeted invalidation instead of bulk deletes.
 	if c != nil && resolvedKey != "" {
-		_ = c.SetResolvedRaw(req.Context(), resolvedKey, raw)
+		_ = c.SetResolvedRaw(ctx, resolvedKey, raw)
 		for _, gvrKey := range tracker.GVRKeys() {
-			_ = c.SAddWithTTL(req.Context(), cache.L1GVRKey(gvrKey), resolvedKey, cache.ReverseIndexTTL)
+			_ = c.SAddWithTTL(ctx, cache.L1GVRKey(gvrKey), resolvedKey, cache.ReverseIndexTTL)
 		}
-
-		preWarmChildWidgets(req.Context(), c, res, r.authnNS)
+		preWarmChildWidgets(ctx, c, res, authnNS)
 	}
 
-	wri.Header().Set("Content-Type", "application/json")
-	wri.WriteHeader(http.StatusOK)
-	_, _ = wri.Write(raw)
+	return &ResolveWidgetResult{Raw: raw, Resolved: res}, nil
+}
+
+// ResolveWidgetDirect is the entry point for L1 refresh to resolve a widget
+// using the same singleflight group as the HTTP handler. Returns both the raw
+// JSON and the resolved unstructured for child pre-warming.
+func ResolveWidgetDirect(ctx context.Context, c *cache.RedisCache, got objects.Result, resolvedKey, authnNS string, perPage, page int) (*ResolveWidgetResult, error) {
+	result, err, _ := widgetFlight.Do(resolvedKey, func() (interface{}, error) {
+		return resolveWidgetFromObject(ctx, c, got, resolvedKey, authnNS, perPage, page, nil)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result.(*ResolveWidgetResult), nil
+}
+
+func writeWidgetError(wri http.ResponseWriter, err error) {
+	var statusErr *apierrors.StatusError
+	if errors.As(err, &statusErr) {
+		code := int(statusErr.Status().Code)
+		msg := fmt.Errorf("%s", statusErr.Status().Message)
+		response.Encode(wri, response.New(code, msg))
+		return
+	}
+	response.InternalError(wri, err)
+}
+
+// ResolveWidgetResult holds the resolved unstructured widget and its serialized
+// JSON. Used by L1 refresh to pass the result to preWarmChildWidgets.
+type ResolveWidgetResult struct {
+	Raw      []byte
+	Resolved *unstructured.Unstructured
 }

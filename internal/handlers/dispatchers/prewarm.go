@@ -664,8 +664,10 @@ func registerApiRefGVRDeps(ctx context.Context, c *cache.RedisCache, widgetObj *
 	}
 
 	alreadyTracked := make(map[string]bool)
-	for _, k := range tracker.GVRKeys() {
-		alreadyTracked[k] = true
+	if tracker != nil {
+		for _, k := range tracker.GVRKeys() {
+			alreadyTracked[k] = true
+		}
 	}
 
 	groups := extractAPIGroups(apis)

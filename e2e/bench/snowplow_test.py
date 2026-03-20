@@ -473,6 +473,32 @@ def wait_for_l1_ready(since_epoch=None, timeout=120):
     return False
 
 
+def wait_for_l1_quiescent(stable_secs=15, timeout=180):
+    """Wait until the L1 sentinel stops changing (no more informer refreshes).
+
+    After large cluster mutations (e.g. deploying 1200 compositions), the
+    informer fires add events continuously.  Each event triggers an L1 refresh
+    that updates the sentinel.  This function waits until the sentinel has been
+    stable for ``stable_secs`` consecutive seconds, meaning the informer churn
+    has settled and the L1 cache content won't change mid-measurement.
+    """
+    log(f"Waiting for L1 quiescence ({stable_secs}s stable sentinel) ...")
+    prev_ts = _read_l1_ready_ts()
+    stable_since = time.time()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        cur_ts = _read_l1_ready_ts()
+        if cur_ts != prev_ts:
+            prev_ts = cur_ts
+            stable_since = time.time()
+        elif time.time() - stable_since >= stable_secs:
+            log(f"L1 quiescent (sentinel={cur_ts}, stable for {stable_secs}s)")
+            return True
+        time.sleep(2)
+    log(f"WARNING: L1 not quiescent within {timeout}s (sentinel still changing)")
+    return False
+
+
 # ── Cache toggle ─────────────────────────────────────────────────────────────
 
 def enable_cache():
@@ -555,6 +581,31 @@ def count_compositions():
     if rc != 0 or not out.strip():
         return 0
     return len(out.strip().split("\n"))
+
+
+def count_compositions_in_ns(ns_name):
+    rc, out, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "-n", ns_name, "--no-headers")
+    if rc != 0 or not out.strip():
+        return 0
+    return len(out.strip().split("\n"))
+
+
+def wait_for_compositions(expected, timeout=300):
+    """Wait until at least `expected` compositions exist in the cluster."""
+    log(f"Waiting for {expected} compositions to exist ...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        actual = count_compositions()
+        if actual >= expected:
+            log(f"All {actual} compositions exist")
+            return True
+        elapsed = int(time.time() - (deadline - timeout))
+        if elapsed % 30 < 5:  # log every ~30s
+            log(f"  {actual}/{expected} compositions exist ({elapsed}s elapsed)")
+        time.sleep(5)
+    actual = count_compositions()
+    log(f"WARNING: only {actual}/{expected} compositions after {timeout}s")
+    return False
 
 
 def delete_all_compositions():
@@ -711,14 +762,20 @@ spec:
 
 
 def deploy_compositions(ns_start, ns_end, comps_per_ns):
-    yaml_parts = []
+    total = (ns_end - ns_start + 1) * comps_per_ns
+    log(f"Deploying {total} compositions one by one ...")
+    deployed = 0
     for ns_i in range(ns_start, ns_end + 1):
         for comp_i in range(1, comps_per_ns + 1):
-            yaml_parts.append(composition_yaml(f"bench-ns-{ns_i:02d}",
-                                               f"bench-app-{ns_i:02d}-{comp_i:02d}"))
-    total = (ns_end - ns_start + 1) * comps_per_ns
-    log(f"Deploying {total} compositions ...")
-    kubectl("apply", "--server-side", "-f", "-", input_data="\n---\n".join(yaml_parts))
+            ns = f"bench-ns-{ns_i:02d}"
+            name = f"bench-app-{ns_i:02d}-{comp_i:02d}"
+            yaml = composition_yaml(ns, name)
+            rc, _, err = kubectl("apply", "--server-side", "-f", "-", input_data=yaml)
+            if rc != 0:
+                log(f"  WARNING: {ns}/{name} failed (rc={rc}): {err[:200]}")
+            deployed += 1
+            if deployed % 100 == 0:
+                log(f"  Deployed {deployed}/{total} compositions")
 
 
 def composition_yaml(ns, name):
@@ -791,7 +848,68 @@ def delete_one_composition(ns, name):
     log(f"Deleted composition {ns}/{name}")
 
 
+def wait_for_composition_gone(ns, name, timeout=60):
+    """Wait until a specific composition no longer exists in K8s."""
+    fqn = f"{ns}/{name}"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rc, _, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", name, "-n", ns,
+                           "--no-headers")
+        if rc != 0:
+            log(f"Composition {fqn} confirmed gone from K8s")
+            return True
+        time.sleep(2)
+    log(f"WARNING: composition {fqn} still exists after {timeout}s")
+    return False
+
+
+def wait_for_namespace_gone(ns_name, timeout=120):
+    """Wait until a namespace no longer exists in K8s."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rc, _, _ = kubectl("get", "ns", ns_name, "--no-headers")
+        if rc != 0:
+            log(f"Namespace {ns_name} confirmed gone from K8s")
+            return True
+        time.sleep(3)
+    log(f"WARNING: namespace {ns_name} still exists after {timeout}s")
+    return False
+
+
+def wait_for_l1_key_gone(pattern, timeout=60):
+    """Wait until no Redis keys match the given pattern."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        raw = redis_cmd("KEYS", pattern)
+        keys = [k for k in raw.split("\n") if k.strip()] if raw else []
+        if not keys:
+            log(f"L1 keys matching '{pattern}' confirmed evicted")
+            return True
+        time.sleep(2)
+    log(f"WARNING: {len(keys)} L1 keys still match '{pattern}' after {timeout}s")
+    return False
+
+
 def delete_one_bench_namespace(ns_name):
+    # Delete compositions in this namespace first (otherwise ns gets stuck)
+    rc, out, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "-n", ns_name,
+                         "--no-headers", "-o", "custom-columns=NAME:.metadata.name")
+    if rc == 0 and out.strip():
+        comps = [c.strip() for c in out.strip().split("\n") if c.strip()]
+        for comp_name in comps:
+            kubectl("patch", f"{COMP_RES}.{COMP_GVR}", comp_name, "-n", ns_name,
+                    "--type=merge", f"-p={FINALIZER_PATCH}")
+            kubectl("delete", f"{COMP_RES}.{COMP_GVR}", comp_name, "-n", ns_name,
+                    "--ignore-not-found", "--wait=false")
+        log(f"Deleted {len(comps)} compositions in {ns_name}")
+        # Wait for compositions to be gone before deleting the namespace
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            remaining = count_compositions_in_ns(ns_name)
+            if remaining == 0:
+                break
+            time.sleep(2)
+
     for resource in FINALIZER_RESOURCES:
         rc, objs, _ = kubectl("get", resource, "-n", ns_name, "-o", "name")
         if rc == 0 and objs.strip():
@@ -1454,8 +1572,14 @@ def _browser_login(page, username, password, retries=3):
 
 def _browser_measure_navigation(page, page_path, label):
     """Navigate to a page and measure the /call API waterfall timing."""
-    # Clear previous performance entries
-    page.evaluate("() => performance.clearResourceTimings()")
+    # Clear previous performance entries and expand the resource timing buffer.
+    # The default buffer (250 entries) includes ALL resources (JS, CSS, images,
+    # fonts).  At high cardinality the buffer overflows and late /call entries
+    # are silently dropped — this caused the "2 /call" anomaly at S5/S6.
+    page.evaluate("""() => {
+        performance.clearResourceTimings();
+        performance.setResourceTimingBufferSize(2000);
+    }""")
 
     # Navigate and wait for network to settle
     page.goto(f"{FRONTEND}{page_path}", wait_until="networkidle", timeout=120_000)
@@ -1467,13 +1591,19 @@ def _browser_measure_navigation(page, page_path, label):
     # Wait for /call requests to stabilize — networkidle fires after 500ms of
     # no network activity, but at high cardinality without cache the backend
     # can take >500ms between responses, causing premature "idle" detection.
-    # Poll call count every 1s; once stable for 2s we're done.
+    # Poll call count every 1s; require 3 consecutive identical counts (3s
+    # stability window) to avoid exiting after only the first 2 fast requests.
+    _stable_streak = 0
     _prev_count = -1
-    for _ in range(30):  # up to 30s
+    for _ in range(60):  # up to 60s
         _cur_count = page.evaluate(
             "() => performance.getEntriesByType('resource').filter(e => e.name.includes('/call')).length")
         if _cur_count == _prev_count and _cur_count > 0:
-            break
+            _stable_streak += 1
+            if _stable_streak >= 2:  # 3 consecutive identical polls = 3s stable
+                break
+        else:
+            _stable_streak = 0
         _prev_count = _cur_count
         page.wait_for_timeout(1000)
 
@@ -1713,10 +1843,16 @@ def run_phase_browser_scaling(tokens):
                 """Snapshot L1 sentinel before a cluster mutation."""
                 return _read_l1_ready_ts() if cache_mode == "ON" else 0
 
-            def _stabilize(before_ts):
-                """Wait for L1 ready sentinel to advance past before_ts."""
+            def _stabilize(before_ts, quiesce=False):
+                """Wait for L1 ready sentinel to advance past before_ts.
+
+                If quiesce=True, also wait for the sentinel to stop changing
+                (informer churn settled).  Use for large mutations like S6.
+                """
                 if cache_mode == "ON":
                     wait_for_l1_ready(since_epoch=before_ts)
+                    if quiesce:
+                        wait_for_l1_quiescent(stable_secs=15, timeout=180)
 
             # S1 — Zero state
             r = _browser_measure_stage(page, 1, "Zero state", cache_mode)
@@ -1747,31 +1883,34 @@ def run_phase_browser_scaling(tokens):
 
             # S4 — 20 compositions
             ts = _snapshot_l1()
-            wait_for_crd(); deploy_compositions(1, 20, 1); time.sleep(30)
-            _stabilize(ts)
+            wait_for_crd(); deploy_compositions(1, 20, 1)
+            wait_for_compositions(20)
+            _stabilize(ts, quiesce=True)
             r = _browser_measure_stage(page, 4, "20 compositions", cache_mode)
             if r:
                 all_results.append(r)
 
             # S5 — 120 namespaces
             ts = _snapshot_l1()
-            create_bench_namespaces(21, 120); wait_for_bench_namespaces(120); time.sleep(30)
-            _stabilize(ts)
+            create_bench_namespaces(21, 120); wait_for_bench_namespaces(120)
+            _stabilize(ts, quiesce=True)
             r = _browser_measure_stage(page, 5, "120 bench ns", cache_mode)
             if r:
                 all_results.append(r)
 
             # S6 — 1200 compositions
             ts = _snapshot_l1()
-            deploy_compositions(1, 120, 10); time.sleep(90)
-            _stabilize(ts)
+            deploy_compositions(1, 120, 10)
+            wait_for_compositions(1200, timeout=600)
+            _stabilize(ts, quiesce=True)
             r = _browser_measure_stage(page, 6, "1200 compositions", cache_mode)
             if r:
                 all_results.append(r)
 
             # S7 — Delete 1 composition
             ts = _snapshot_l1()
-            delete_one_composition("bench-ns-01", "bench-app-01-01"); time.sleep(15)
+            delete_one_composition("bench-ns-01", "bench-app-01-01")
+            wait_for_composition_gone("bench-ns-01", "bench-app-01-01")
             _stabilize(ts)
             r = _browser_measure_stage(page, 7, "Deleted 1 comp", cache_mode)
             if r:
@@ -1779,7 +1918,8 @@ def run_phase_browser_scaling(tokens):
 
             # S8 — Delete 1 namespace
             ts = _snapshot_l1()
-            delete_one_bench_namespace("bench-ns-120"); time.sleep(20)
+            delete_one_bench_namespace("bench-ns-120")
+            wait_for_namespace_gone("bench-ns-120")
             _stabilize(ts)
             r = _browser_measure_stage(page, 8, "Deleted 1 ns", cache_mode)
             if r:
