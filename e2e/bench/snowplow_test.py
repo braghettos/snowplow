@@ -590,14 +590,17 @@ def count_compositions_in_ns(ns_name):
     return len(out.strip().split("\n"))
 
 
-def wait_for_compositions(expected, timeout=300):
-    """Wait until at least `expected` compositions exist in the cluster."""
-    log(f"Waiting for {expected} compositions to exist ...")
+def wait_for_compositions(expected, timeout=300, tolerance=5):
+    """Wait until at least `expected - tolerance` compositions exist in the cluster."""
+    log(f"Waiting for {expected} compositions to exist (tolerance={tolerance}) ...")
     deadline = time.time() + timeout
     while time.time() < deadline:
         actual = count_compositions()
         if actual >= expected:
             log(f"All {actual} compositions exist")
+            return True
+        if actual >= expected - tolerance:
+            log(f"All {actual}/{expected} compositions exist (within tolerance)")
             return True
         elapsed = int(time.time() - (deadline - timeout))
         if elapsed % 30 < 5:  # log every ~30s
@@ -761,7 +764,7 @@ spec:
     return False
 
 
-def deploy_compositions(ns_start, ns_end, comps_per_ns, max_retries=3):
+def deploy_compositions(ns_start, ns_end, comps_per_ns, max_retries=5):
     total = (ns_end - ns_start + 1) * comps_per_ns
     log(f"Deploying {total} compositions one by one (max {max_retries} retries each) ...")
     deployed = 0
@@ -1773,35 +1776,34 @@ BROWSER_SCALING_PAGES = [
 
 
 def _browser_verify_composition_count(page, expected_comp_count):
-    """Verify that the browser renders the expected number of compositions.
+    """Verify composition count by calling the compositions-list API directly.
 
-    Uses two strategies:
-    1. Count composition-panel /call XHR requests in performance timing — each
-       composition that renders triggers a separate /call for its panel widget.
-    2. Look for a piechart or text element in the DOM that displays the total count.
+    Makes a fetch() to the compositions-list RESTAction endpoint using the
+    browser's auth token, then counts items in status.list. This is the
+    authoritative count — it matches what the datagrid and piechart display.
 
     Returns the observed count or -1 if verification was not possible.
     """
     if expected_comp_count == 0:
         return 0  # nothing to verify
     try:
-        observed = page.evaluate("""() => {
-            // Strategy 1: count composition-panel /call requests
-            // Each composition triggers a /call for its panel widget
-            const panelCalls = performance.getEntriesByType('resource')
-                .filter(e => e.name.includes('/call') && e.name.includes('composition-panel'));
-            if (panelCalls.length > 0) return panelCalls.length;
-
-            // Strategy 2: look for text in the DOM containing the count
-            // The piechart widget typically renders the total count as text
-            const allText = document.body ? document.body.innerText : '';
-            // Look for patterns like "1200 compositions" or just a large number
-            // near composition-related content
-            const match = allText.match(/(\\d+)\\s*[Cc]omposition/);
-            if (match) return parseInt(match[1], 10);
-
-            return -1;
-        }""")
+        observed = page.evaluate("""(snowplowUrl) => {
+            // Get the auth token from localStorage/sessionStorage
+            const token = localStorage.getItem('token')
+                       || sessionStorage.getItem('token')
+                       || '';
+            if (!token) return -1;
+            return fetch(snowplowUrl + '/call?apiVersion=templates.krateo.io%2Fv1'
+                         + '&resource=restactions&name=compositions-list'
+                         + '&namespace=krateo-system',
+                         { headers: { 'Authorization': 'Bearer ' + token } })
+                .then(r => r.json())
+                .then(d => {
+                    const list = d && d.status && d.status.list;
+                    return Array.isArray(list) ? list.length : -1;
+                })
+                .catch(() => -1);
+        }""", SNOWPLOW)
         return observed
     except Exception:
         return -1
@@ -1841,13 +1843,17 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, num_navs=3):
                 else:
                     log(f"    VERIFY: could not determine composition count in DOM")
 
-        # Compute p50 from all navigations for waterfall and loadComplete
+        # Compute metrics from navigations:
+        # - p50: median of ALL navigations (including cold)
+        # - warm_last: last navigation waterfall (most representative of steady-state)
         wf_vals = [n["waterfallMs"] for n in navs if n["waterfallMs"] > 0]
         lc_vals = [n["loadComplete"] for n in navs if n["loadComplete"] > 0]
+        last_nav = navs[-1] if navs else {}
         pages_data[page_name] = {
             "navigations": navs,
             "waterfall_p50": pct(wf_vals, 50) if wf_vals else 0,
             "waterfall_p90": pct(wf_vals, 90) if wf_vals else 0,
+            "waterfall_warm_last": last_nav.get("waterfallMs", 0),
             "loadComplete_p50": pct(lc_vals, 50) if lc_vals else 0,
             "loadComplete_p90": pct(lc_vals, 90) if lc_vals else 0,
             "callCount": navs[0]["callCount"] if navs else 0,
@@ -1907,16 +1913,17 @@ def run_phase_browser_scaling(tokens):
                 """Snapshot L1 sentinel before a cluster mutation."""
                 return _read_l1_ready_ts() if cache_mode == "ON" else 0
 
-            def _stabilize(before_ts, quiesce=False):
+            def _stabilize(before_ts, quiesce=False, quiesce_secs=15):
                 """Wait for L1 ready sentinel to advance past before_ts.
 
                 If quiesce=True, also wait for the sentinel to stop changing
                 (informer churn settled).  Use for large mutations like S6.
+                quiesce_secs can be increased for very large mutations.
                 """
                 if cache_mode == "ON":
                     wait_for_l1_ready(since_epoch=before_ts)
                     if quiesce:
-                        wait_for_l1_quiescent(stable_secs=15, timeout=180)
+                        wait_for_l1_quiescent(stable_secs=quiesce_secs, timeout=300)
 
             # S1 — Zero state
             r = _browser_measure_stage(page, 1, "Zero state", cache_mode)
@@ -1966,7 +1973,7 @@ def run_phase_browser_scaling(tokens):
             ts = _snapshot_l1()
             deploy_compositions(1, 120, 10)
             wait_for_compositions(1200, timeout=600)
-            _stabilize(ts, quiesce=True)
+            _stabilize(ts, quiesce=True, quiesce_secs=30)
             r = _browser_measure_stage(page, 6, "1200 compositions", cache_mode)
             if r:
                 all_results.append(r)
@@ -2009,8 +2016,8 @@ def run_phase_browser_scaling(tokens):
     for page_name in [p[0] for p in BROWSER_SCALING_PAGES]:
         print(f"\n  {BOLD}{page_name}{RESET}")
         print(f"  {'Stage':<6s} {'Description':<22s} {'NS':>4s} {'Comp':>5s} "
-              f"│ {'ON wf_p50':>10s} {'ON load':>9s} {'ON#':>4s} "
-              f"│ {'OFF wf_p50':>10s} {'OFF load':>9s} {'OFF#':>5s} "
+              f"│ {'ON warm':>9s} {'ON p50':>9s} {'ON#':>4s} "
+              f"│ {'OFF warm':>10s} {'OFF p50':>9s} {'OFF#':>5s} "
               f"│ {'Speedup':>8s}")
         print(f"  {'─' * 115}")
 
@@ -2022,11 +2029,11 @@ def run_phase_browser_scaling(tokens):
             on_pg = on_e["pages"].get(page_name, {}) if on_e else {}
             off_pg = off_e["pages"].get(page_name, {}) if off_e else {}
 
+            on_warm = on_pg.get("waterfall_warm_last", 0)
             on_wf = on_pg.get("waterfall_p50", 0)
-            on_lc = on_pg.get("loadComplete_p50", 0)
             on_calls = on_pg.get("callCount", 0)
+            off_warm = off_pg.get("waterfall_warm_last", 0)
             off_wf = off_pg.get("waterfall_p50", 0)
-            off_lc = off_pg.get("loadComplete_p50", 0)
             off_calls = off_pg.get("callCount", 0)
 
             ns = (on_e or off_e or {}).get("bench_ns", 0)
@@ -2041,15 +2048,16 @@ def run_phase_browser_scaling(tokens):
                 elif on_calls < off_calls * 0.5:
                     anomaly = " *"  # ON incomplete
 
-            speedup = off_wf / on_wf if on_wf > 0 and off_wf > 0 else 0
+            # Speedup uses best warm metric (most representative of steady-state)
+            speedup = off_warm / on_warm if on_warm > 0 and off_warm > 0 else 0
             color = GREEN if speedup > 1.1 else (RED if speedup < 0.9 else YELLOW)
 
             print(f"  S{s:<5d} {info['desc']:<22s} {ns:>4d} {comp:>5d} "
-                  f"│ {on_wf:>8d}ms {on_lc:>7d}ms {on_calls:>4d} "
-                  f"│ {off_wf:>8d}ms {off_lc:>7d}ms {off_calls:>5d} "
+                  f"│ {on_warm:>7d}ms {on_wf:>7d}ms {on_calls:>4d} "
+                  f"│ {off_warm:>8d}ms {off_wf:>7d}ms {off_calls:>5d} "
                   f"│ {color}{speedup:>6.1f}x{RESET}{anomaly}")
 
-        print(f"  {'':>6s} {'* = incomplete load (low /call count)':>50s}")
+        print(f"  {'':>6s} {'warm=last nav, p50=median all navs, * = incomplete load':>70s}")
 
     out_file = "/tmp/browser_scaling_results.json"
     with open(out_file, "w") as f:

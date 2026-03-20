@@ -85,11 +85,11 @@ The highest-value layer. Stores the **fully resolved JSON** output of widget and
 
 **Update (Stale-While-Revalidate)**: When a watched resource fires an `add` or `update` informer event:
 1. L3 is updated in-place (see above).
-2. L1 keys dependent on the changed GVR are **NOT deleted**. Instead, they are re-resolved in a background goroutine via `L1RefreshFunc`. The old value continues to be served to users until the refresh completes and atomically overwrites the key.
-3. A per-GVR in-flight guard (`sync.Map`) prevents thundering herd — if a refresh for a GVR is already running, subsequent events for the same GVR are skipped (the next event will trigger a new refresh).
+2. L1 keys dependent on the changed GVR are **NOT deleted**. Instead, they are enqueued for re-resolution via a **coalescing queue**. The old value continues to be served to users until the refresh completes and atomically overwrites the key.
+3. The coalescing queue batches burst events: on the first event, a 3-second timer starts. All events arriving within that window have their L1 keys merged into a single pending set. When the timer fires, one refresh cycle runs for the full batch. Events arriving while a refresh is in-flight are queued for the next cycle — **nothing is ever skipped**.
 4. After all L1 keys are refreshed, `MarkL1Ready` writes the current Unix epoch to the `snowplow:l1:ready` sentinel key, providing a deterministic signal that the refresh cycle is complete.
 
-**Delete**: On `delete` events (resource removed from cluster), L1 keys are first **invalidated** (hard-deleted via the reverse index) to stop serving stale data, then a **background L1 refresh** is triggered for those same keys. This re-resolves parent widgets (e.g. compositions-list datagrid, piechart) to reflect the removed resource. The same per-GVR in-flight guard and `MarkL1Ready` sentinel apply, providing a deterministic signal that the post-deletion refresh is complete.
+**Delete**: On `delete` events (resource removed from cluster), L1 keys are first **invalidated** (hard-deleted via the reverse index) to stop serving stale data, then enqueued for refresh via the same coalescing queue. This re-resolves parent widgets (e.g. compositions-list datagrid, piechart) to reflect the removed resource. Burst deletions (e.g. 10 compositions deleted when a namespace is removed) are batched into a single refresh cycle, ensuring all L3 list patches complete before re-resolution.
 
 ---
 
@@ -263,7 +263,7 @@ Each layer serves a different purpose with different cache hit characteristics:
 Composition controllers frequently update `.status.lastTransitionTime` every few seconds, even when no meaningful state changes. Under a delete-on-change strategy, this causes constant L1 cache misses — every user request triggers a full re-resolution (~800ms). With stale-while-revalidate:
 - Users always get a fast response (L1 hit, <5ms).
 - The background refresh updates the cached output with fresh data.
-- The per-GVR in-flight guard prevents overlapping refreshes from piling up.
+- The per-GVR coalescing queue batches burst events and prevents overlapping refreshes — events during a refresh are queued for the next cycle.
 
 ### Why reverse indexes instead of pattern-based invalidation?
 

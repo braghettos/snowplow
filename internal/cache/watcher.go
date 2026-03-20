@@ -32,6 +32,120 @@ type L1RefreshFunc func(ctx context.Context, triggerGVR schema.GroupVersionResou
 // mass TTL expiry (e.g., after Redis restart or bulk warmup with identical TTLs).
 const expiryRefreshWorkers = 10
 
+// l1CoalescePeriod is the time to wait after the first event before triggering
+// an L1 refresh. This allows burst events (e.g. 10 rapid DELETEs when a namespace
+// is removed) to be coalesced into a single refresh cycle.
+const l1CoalescePeriod = 3 * time.Second
+
+// refreshQueue coalesces L1 refresh requests for a single GVR. Events arriving
+// while a refresh is in-flight are queued for the next cycle — nothing is skipped.
+type refreshQueue struct {
+	mu        sync.Mutex
+	pending   map[string]bool // deduplicated L1 keys waiting for next refresh
+	timer     *time.Timer     // coalesce timer; nil when no events are pending
+	running   bool            // true while a refresh goroutine is executing
+	gvr       schema.GroupVersionResource
+	gvrKey    string
+	watcher   *ResourceWatcher
+}
+
+// enqueue adds L1 keys to the pending set and starts the coalesce timer if
+// no refresh is currently in-flight. If a refresh IS running, the keys are
+// queued and will be processed when the current refresh completes.
+func (q *refreshQueue) enqueue(keys []string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	for _, k := range keys {
+		q.pending[k] = true
+	}
+
+	// If a refresh is running, the completion handler will pick up the
+	// pending keys — no timer needed.
+	if q.running {
+		return
+	}
+
+	// Start or reset the coalesce timer.
+	if q.timer == nil {
+		q.timer = time.AfterFunc(l1CoalescePeriod, q.flush)
+	}
+	// Don't reset the timer — we want to fire l1CoalescePeriod after the
+	// FIRST event, not the last. This prevents unbounded delays during
+	// continuous streams (e.g. deploying 1200 compositions over 25 min).
+}
+
+// flush is called when the coalesce timer fires. It drains the pending set
+// and starts a refresh goroutine.
+func (q *refreshQueue) flush() {
+	fn, ok := q.watcher.l1Refresh.Load().(L1RefreshFunc)
+	if !ok || fn == nil {
+		// No refresher registered — fall back to invalidation.
+		q.mu.Lock()
+		keys := q.drainLocked()
+		q.mu.Unlock()
+		if len(keys) > 0 {
+			ctx := q.watcher.appCtx
+			idxKey := L1GVRKey(q.gvrKey)
+			_ = q.watcher.cache.Delete(ctx, append(keys, idxKey)...)
+			slog.Debug("resource-watcher: L1 invalidated (no refresher, queued)",
+				slog.String("gvr", q.gvr.String()), slog.Int("count", len(keys)))
+		}
+		return
+	}
+
+	q.mu.Lock()
+	keys := q.drainLocked()
+	if len(keys) == 0 {
+		q.mu.Unlock()
+		return
+	}
+	q.running = true
+	q.mu.Unlock()
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				buf := make([]byte, 4096)
+				n := runtime.Stack(buf, false)
+				slog.Error("resource-watcher: panic in queued L1 refresh",
+					slog.Any("error", r),
+					slog.String("gvr", q.gvr.String()),
+					slog.String("stack", string(buf[:n])))
+			}
+
+			// Check if more events arrived while we were refreshing.
+			q.mu.Lock()
+			q.running = false
+			hasPending := len(q.pending) > 0
+			if hasPending {
+				q.timer = time.AfterFunc(l1CoalescePeriod, q.flush)
+			} else {
+				q.timer = nil
+			}
+			q.mu.Unlock()
+		}()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		fn(ctx, q.gvr, keys)
+	}()
+}
+
+// drainLocked moves all pending keys out and returns them. Caller must hold q.mu.
+func (q *refreshQueue) drainLocked() []string {
+	if len(q.pending) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(q.pending))
+	for k := range q.pending {
+		keys = append(keys, k)
+	}
+	q.pending = make(map[string]bool)
+	q.timer = nil
+	return keys
+}
+
 // ResourceWatcher maintains dynamic informers for every GVR in the watched set.
 type ResourceWatcher struct {
 	cache     *RedisCache
@@ -41,8 +155,8 @@ type ResourceWatcher struct {
 	watched   map[string]bool
 	appCtx    context.Context // long-lived process context; set by Start()
 
-	l1Refresh  atomic.Value // stores L1RefreshFunc
-	refreshing sync.Map     // gvrKey → bool; prevents concurrent refreshes for the same GVR
+	l1Refresh atomic.Value // stores L1RefreshFunc
+	queues    sync.Map     // gvrKey → *refreshQueue
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -233,42 +347,22 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		if ns != "" {
 			rw.patchListCache(ctx, gvr, clusterListKey, uns, "delete")
 		}
-		// On delete we invalidate L1 resolved outputs immediately, but we
-		// also need to trigger an L1 refresh so that parent widgets (e.g.
-		// compositions-list datagrid) are re-resolved to reflect the removal.
-		// We save the L1 keys BEFORE deleting so the refresher can re-resolve them.
+		// Invalidate L1 resolved outputs immediately so stale data
+		// (containing the deleted resource) is not served.
 		gvrKeyDel := GVRToKey(gvr)
 		l1Idx := L1GVRKey(gvrKeyDel)
 		l1KeysDel, serr := rw.cache.SMembers(ctx, l1Idx)
 		if serr != nil || len(l1KeysDel) == 0 {
 			return
 		}
-		// Delete the stale resolved outputs so they aren't served while refreshing.
 		_ = rw.cache.Delete(ctx, append(l1KeysDel, l1Idx)...)
 		slog.Debug("resource-watcher: L1 invalidation (delete)",
 			slog.String("index", l1Idx), slog.Int("count", len(l1KeysDel)))
 
-		// Trigger L1 refresh in the background to re-populate the deleted entries.
-		if fn, ok := rw.l1Refresh.Load().(L1RefreshFunc); ok && fn != nil {
-			if _, alreadyRunning := rw.refreshing.LoadOrStore(gvrKeyDel, true); !alreadyRunning {
-				go func() {
-					defer rw.refreshing.Delete(gvrKeyDel)
-					defer func() {
-						if r := recover(); r != nil {
-							buf := make([]byte, 4096)
-							n := runtime.Stack(buf, false)
-							slog.Error("resource-watcher: panic recovered in L1 refresh (delete)",
-								slog.Any("error", r),
-								slog.String("gvr", gvr.String()),
-								slog.String("stack", string(buf[:n])))
-						}
-					}()
-					refreshCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-					defer cancel()
-					fn(refreshCtx, gvr, l1KeysDel)
-				}()
-			}
-		}
+		// Enqueue L1 refresh via the coalescing queue. Burst DELETEs
+		// (e.g. 10 compositions in a namespace) are batched into a single
+		// refresh cycle after the coalesce period.
+		rw.enqueueL1Refresh(gvr, l1KeysDel)
 		return
 
 	case "add", "update":
@@ -286,43 +380,30 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	}
 
 	// ── Proactive L1 refresh (stale-while-revalidate) ────────────────────────
+	// Enqueue via the coalescing queue. Old L1 values keep being served while
+	// the refresh runs. Burst events are coalesced — nothing is skipped.
 	gvrKey := GVRToKey(gvr)
-
-	// L1: proactively refresh instead of deleting.
 	l1IdxKey := L1GVRKey(gvrKey)
 	l1Keys, serr := rw.cache.SMembers(ctx, l1IdxKey)
 	if serr != nil || len(l1Keys) == 0 {
 		return
 	}
+	rw.enqueueL1Refresh(gvr, l1Keys)
+}
 
-	if fn, ok := rw.l1Refresh.Load().(L1RefreshFunc); ok && fn != nil {
-		if _, alreadyRunning := rw.refreshing.LoadOrStore(gvrKey, true); alreadyRunning {
-			slog.Debug("resource-watcher: L1 refresh already in-flight, skipping",
-				slog.String("gvr", gvr.String()))
-			return
-		}
-		go func() {
-			defer rw.refreshing.Delete(gvrKey)
-			defer func() {
-				if r := recover(); r != nil {
-					buf := make([]byte, 4096)
-					n := runtime.Stack(buf, false)
-					slog.Error("resource-watcher: panic recovered in L1 refresh",
-						slog.Any("error", r),
-						slog.String("gvr", gvr.String()),
-						slog.String("stack", string(buf[:n])))
-				}
-			}()
-			refreshCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			defer cancel()
-			fn(refreshCtx, gvr, l1Keys)
-		}()
-	} else {
-		_ = rw.cache.Delete(ctx, append(l1Keys, l1IdxKey)...)
-		slog.Debug("resource-watcher: L1 invalidated (no refresher)",
-			slog.String("gvr", gvr.String()),
-			slog.Int("count", len(l1Keys)))
-	}
+// enqueueL1Refresh adds L1 keys to the coalescing queue for the given GVR.
+// The queue batches events and triggers a single refresh after the coalesce
+// period, ensuring burst events (rapid ADD/UPDATE/DELETE) are handled efficiently.
+func (rw *ResourceWatcher) enqueueL1Refresh(gvr schema.GroupVersionResource, l1Keys []string) {
+	gvrKey := GVRToKey(gvr)
+	raw, _ := rw.queues.LoadOrStore(gvrKey, &refreshQueue{
+		pending: make(map[string]bool),
+		gvr:     gvr,
+		gvrKey:  gvrKey,
+		watcher: rw,
+	})
+	q := raw.(*refreshQueue)
+	q.enqueue(l1Keys)
 }
 
 // patchListCache atomically patches the cached list in-place using WATCH/MULTI/EXEC.
