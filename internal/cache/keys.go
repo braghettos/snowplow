@@ -148,6 +148,16 @@ func L1ResourceDepKey(gvrKey, ns, name string) string {
 	return "snowplow:l1dep:" + gvrKey + ":" + ns + ":" + name
 }
 
+// L1ApiDepKey builds the Redis key for the API-level dependency index.
+// It maps a GVR key (e.g. "composition.krateo.io/v1-2-2/githubscaffoldingwithcompositionpages")
+// to L1 resolved keys that depend on that resource type.
+// Unlike the per-resource dep index (populated during resolution via tracker),
+// this index is populated from the actual API request paths recorded in the
+// resolved output — ensuring deps are registered even when zero resources exist.
+func L1ApiDepKey(gvrKey string) string {
+	return "snowplow:l1api:" + gvrKey
+}
+
 // RegisterL1Dependencies registers the L1 resolved key in both the GVR-level
 // and per-resource reverse indexes based on dependencies captured by the tracker.
 func RegisterL1Dependencies(ctx context.Context, c *RedisCache, tracker *DependencyTracker, l1Key string) {
@@ -161,6 +171,74 @@ func RegisterL1Dependencies(ctx context.Context, c *RedisCache, tracker *Depende
 		depKey := L1ResourceDepKey(ref.GVRKey, ref.NS, ref.Name)
 		_ = c.SAddWithTTL(ctx, depKey, l1Key, ReverseIndexTTL)
 	}
+}
+
+// RegisterL1ApiDeps extracts K8s API GVRs from a list of resolved API request
+// paths and registers the L1 key under each GVR's API dependency index.
+// This ensures that when any resource of that type changes, L1 keys that
+// depend on it are refreshed — even if no per-resource deps exist (zero-state).
+//
+// Supports both /apis/<group>/<version>/... and /api/<version>/... (core K8s).
+func RegisterL1ApiDeps(ctx context.Context, c *RedisCache, l1Key string, apiRequests []string) {
+	if c == nil || len(apiRequests) == 0 {
+		return
+	}
+	seen := make(map[string]bool)
+	for _, path := range apiRequests {
+		group, version, resource := ExtractAPIGVR(path)
+		if group == "" || resource == "" {
+			continue
+		}
+		if group == "core" {
+			group = ""
+		}
+		gvrKey := GVRToKey(schema.GroupVersionResource{
+			Group: group, Version: version, Resource: resource,
+		})
+		if seen[gvrKey] {
+			continue
+		}
+		seen[gvrKey] = true
+		_ = c.SAddWithTTL(ctx, L1ApiDepKey(gvrKey), l1Key, ReverseIndexTTL)
+	}
+}
+
+// ExtractAPIGVR extracts the K8s API group, version, and resource from a request path.
+// Supports both namespaced and cluster-scoped paths:
+//
+//	/apis/<group>/<version>/namespaces/<ns>/<resource>[/<name>]
+//	/apis/<group>/<version>/<resource>[/<name>]
+//	/api/<version>/namespaces/<ns>/<resource>[/<name>]
+//	/api/<version>/<resource>[/<name>]
+//
+// Returns ("", "", "") if the path is not a K8s API path.
+func ExtractAPIGVR(path string) (group, version, resource string) {
+	// Strip query string
+	if idx := strings.Index(path, "?"); idx >= 0 {
+		path = path[:idx]
+	}
+	path = strings.TrimPrefix(path, "/")
+	segs := strings.Split(path, "/")
+
+	switch {
+	case len(segs) >= 4 && segs[0] == "apis":
+		// /apis/<group>/<version>/...
+		group, version = segs[1], segs[2]
+		if len(segs) >= 6 && segs[3] == "namespaces" {
+			resource = segs[5] // /apis/g/v/namespaces/ns/<resource>
+		} else {
+			resource = segs[3] // /apis/g/v/<resource>
+		}
+	case len(segs) >= 3 && segs[0] == "api":
+		// /api/<version>/...
+		group, version = "core", segs[1]
+		if len(segs) >= 5 && segs[2] == "namespaces" {
+			resource = segs[4] // /api/v1/namespaces/ns/<resource>
+		} else {
+			resource = segs[2] // /api/v1/<resource>
+		}
+	}
+	return
 }
 
 // UserConfigKey builds the per-user cache key for the Endpoint fetched from
@@ -315,3 +393,4 @@ func ParseK8sAPIPath(path string) (gvr schema.GroupVersionResource, namespace, n
 	}
 	return
 }
+

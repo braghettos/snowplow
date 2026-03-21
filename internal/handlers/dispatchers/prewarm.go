@@ -418,8 +418,10 @@ func warmL1RestActionsForUser(ctx context.Context, c *cache.RedisCache, user jwt
 			continue
 		}
 
-		_ = c.SetResolvedRaw(tctx, rKey, cache.StripBulkyAnnotations(raw))
+		strippedRaw := cache.StripBulkyAnnotations(raw)
+		_ = c.SetResolvedRaw(tctx, rKey, strippedRaw)
 		cache.RegisterL1Dependencies(tctx, c, tracker, rKey)
+		cache.RegisterL1ApiDeps(tctx, c, rKey, extractAPIRequests(strippedRaw))
 
 		warmed++
 		log.Info("L1 warmup: warmed RESTAction",

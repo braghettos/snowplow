@@ -57,10 +57,11 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 			accessToken := mintJWT(user, signKey)
 
 			var (
-				wg  sync.WaitGroup
-				sem = make(chan struct{}, refreshConcurrency)
-				mu  sync.Mutex
-				n   int64
+				wg           sync.WaitGroup
+				sem          = make(chan struct{}, refreshConcurrency)
+				mu           sync.Mutex
+				n            int64
+				allCascade   []string
 			)
 			for _, k := range keys {
 				wg.Add(1)
@@ -68,15 +69,56 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 			go func(info cache.ResolvedKeyInfo, rawKey string) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				if refreshSingleL1(ctx, c, user, ep, accessToken, info, rawKey, authnNS) {
+				ok, cascade := refreshSingleL1(ctx, c, user, ep, accessToken, info, rawKey, authnNS)
+				if ok {
 						mu.Lock()
 						n++
+						allCascade = append(allCascade, cascade...)
 						mu.Unlock()
 					}
 				}(k.info, k.raw)
 			}
 			wg.Wait()
 			totalRefreshed += n
+
+			// Cascading refresh: iteratively re-resolve L1 keys that depend
+			// on refreshed RESTActions. Each round may discover more dependents
+			// (e.g. CRD event → compositions-get-ns-and-crd → compositions-list
+			// → piechart). Limit depth to avoid infinite loops.
+			refreshed := make(map[string]bool, len(keys))
+			for _, k := range keys {
+				refreshed[k.raw] = true
+			}
+			const maxCascadeDepth = 5
+			pending := allCascade
+			for depth := 0; depth < maxCascadeDepth && len(pending) > 0; depth++ {
+				var nextCascade []string
+				for _, ck := range pending {
+					if refreshed[ck] {
+						continue
+					}
+					refreshed[ck] = true
+					ci, cok := cache.ParseResolvedKey(ck)
+					if !cok || ci.Username != username {
+						continue
+					}
+					wg.Add(1)
+					sem <- struct{}{}
+					go func(cInfo cache.ResolvedKeyInfo, cRawKey string) {
+						defer wg.Done()
+						defer func() { <-sem }()
+						ok, cascade := refreshSingleL1(ctx, c, user, ep, accessToken, cInfo, cRawKey, authnNS)
+						if ok {
+							mu.Lock()
+							totalRefreshed++
+							nextCascade = append(nextCascade, cascade...)
+							mu.Unlock()
+						}
+					}(ci, ck)
+				}
+				wg.Wait()
+				pending = nextCascade
+			}
 		}
 
 		if ctx.Err() != nil {
@@ -99,7 +141,11 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 // refreshSingleL1 re-resolves one L1 entry and updates the cache in-place.
 // For widget entries, it also calls preWarmChildWidgets so that child widgets
 // discovered during resolution (e.g. composition-panels) are pre-warmed into L1.
-func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, info cache.ResolvedKeyInfo, rawKey, authnNS string) bool {
+//
+// Returns (ok, cascadeKeys): ok indicates success, cascadeKeys contains L1 keys
+// that depend on the refreshed resource and should be enqueued for refresh too
+// (cascading invalidation for RESTAction → widget dependency chains).
+func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, info cache.ResolvedKeyInfo, rawKey, authnNS string) (bool, []string) {
 	rctx := xcontext.BuildContext(ctx,
 		xcontext.WithUserConfig(ep),
 		xcontext.WithUserInfo(user),
@@ -115,7 +161,7 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 		Resource:   info.GVR.Resource,
 	})
 	if got.Err != nil {
-		return false
+		return false, nil
 	}
 
 	switch {
@@ -124,26 +170,33 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 		// the HTTP handler — concurrent resolutions are deduplicated.
 		result, err := ResolveWidgetDirect(rctx, c, got, rawKey, authnNS, info.PerPage, info.Page)
 		if err != nil {
-			return false
+			return false, nil
 		}
 		// preWarmChildWidgets is already called inside resolveWidgetFromObject
 		// (via ResolveWidgetDirect), so newly-discovered child widgets
 		// (e.g. composition-panels) are pre-warmed automatically.
 		_ = result
 		registerApiRefGVRDeps(rctx, c, got.Unstructured, rawKey, nil)
-		return true
+		return true, nil
 
 	case info.GVR.Group == templatesGroup && info.GVR.Resource == restactionResource:
 		// Use ResolveRESTActionDirect which shares the singleflight group
 		// with the HTTP handler.
 		_, err := ResolveRESTActionDirect(rctx, c, got.Unstructured.Object, rawKey, authnNS, info.PerPage, info.Page)
 		if err != nil {
-			return false
+			return false, nil
 		}
 		registerApiRefGVRDeps(rctx, c, got.Unstructured, rawKey, nil)
-		return true
+
+		// Cascading refresh: find L1 keys that depend on this RESTAction
+		// as a resource (e.g. piechart depends on compositions-list).
+		depKey := cache.L1ResourceDepKey(
+			cache.GVRToKey(info.GVR), info.NS, info.Name,
+		)
+		cascade, _ := c.SMembers(rctx, depKey)
+		return true, cascade
 
 	default:
-		return false
+		return false, nil
 	}
 }

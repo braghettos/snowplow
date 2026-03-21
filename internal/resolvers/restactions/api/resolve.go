@@ -108,6 +108,13 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 
 	log.Info("base dict for api resolver", slog.Any("dict", dict))
 
+	// Collect all API request paths executed during resolution.
+	// These are the actual expanded paths (not JQ templates) and are
+	// stored in the resolved output so callers can extract K8s API
+	// group dependencies deterministically.
+	var apiRequestsMu sync.Mutex
+	var apiRequests []string
+
 	for _, id := range names {
 		// Get the api with this identifier
 		apiCall, ok := apiMap[id]
@@ -140,6 +147,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			slog.String("name", id), slog.String("host", ep.ServerURL))
 
 		tmp := createRequestOptions(log, apiCall, dict)
+
 		if len(tmp) == 0 {
 			log.Warn("empty request options for http call", slog.Any("name", id))
 			continue
@@ -159,6 +167,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			// and register the GVR for informer watching so L3 gets populated.
 			// RESTAction paths can be either K8s API paths (/apis/group/version/...)
 			// or snowplow /call paths (/call?resource=...&apiVersion=...).
+			// Record the path for the apiRequests list in the resolved output.
+			apiRequestsMu.Lock()
+			apiRequests = append(apiRequests, call.Path)
+			apiRequestsMu.Unlock()
+
 			if pathGVR, pathNS, pathName := cache.ParseK8sAPIPath(call.Path); pathGVR.Resource != "" {
 				if tracker := cache.TrackerFromContext(ctx); tracker != nil {
 					tracker.AddGVR(pathGVR)
@@ -302,6 +315,21 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 
 	removeManagedFields(dict)
 	//delete(dict, "slice")
+
+	// Store the collected API request paths in the resolved output.
+	// Deduplicate to keep the list compact (iterator calls often share
+	// the same path pattern across namespaces — we only need unique paths).
+	if len(apiRequests) > 0 {
+		seen := make(map[string]bool, len(apiRequests))
+		unique := make([]any, 0, len(apiRequests))
+		for _, p := range apiRequests {
+			if !seen[p] {
+				seen[p] = true
+				unique = append(unique, p)
+			}
+		}
+		dict["apiRequests"] = unique
+	}
 
 	return dict
 }

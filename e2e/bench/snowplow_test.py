@@ -1471,13 +1471,13 @@ def run_phase_browser():
             page = ctx.new_page()
 
             page.goto(f"{FRONTEND}/login", wait_until="networkidle", timeout=60000)
-            page.fill('input[name="username"], input[type="text"]', username)
-            page.fill('input[type="password"]', password)
-            page.click('button:has-text("Sign In"), button[type="submit"]')
-            try:
-                page.wait_for_url("**/dashboard**", timeout=15000)
-            except Exception:
-                page.wait_for_load_state("networkidle", timeout=45000)
+            page.click('#basic_username', timeout=10000)
+            page.keyboard.type(username, delay=30)
+            page.click('#basic_password', timeout=10000)
+            page.keyboard.type(password, delay=30)
+            page.click('button[type="submit"]')
+            page.wait_for_load_state("networkidle", timeout=30000)
+            page.wait_for_timeout(5000)
 
             user_results = {}
             for page_name, page_path in BROWSER_PAGES:
@@ -1563,21 +1563,26 @@ def _browser_login(page, username, password, retries=3):
         try:
             page.goto(f"{FRONTEND}/login", wait_until="networkidle", timeout=60000)
             log(f"    browser: login page loaded, URL={page.url}")
-            page.fill('input[name="username"], input[type="text"]', username, timeout=10000)
-            page.fill('input[type="password"]', password, timeout=10000)
-            page.click('button:has-text("Sign In"), button[type="submit"]', timeout=10000)
-            page.wait_for_url("**/dashboard**", timeout=30000)
-            log(f"    browser: login OK, URL={page.url}")
-            # Verify /call requests happen (proves auth is working)
-            page.wait_for_load_state("networkidle", timeout=15000)
-            call_count = page.evaluate("""() => {
-                return performance.getEntriesByType('resource')
-                    .filter(e => e.name.includes('/call')).length;
+            page.click('#basic_username', timeout=10000)
+            page.keyboard.type(username, delay=30)
+            page.click('#basic_password', timeout=10000)
+            page.keyboard.type(password, delay=30)
+            page.click('button[type="submit"]', timeout=10000)
+            # The frontend may not update the URL to /dashboard; wait for
+            # the login form to disappear and dashboard content to appear.
+            page.wait_for_load_state("networkidle", timeout=30000)
+            page.wait_for_timeout(5000)
+            # Verify auth token is stored (proves login succeeded)
+            has_token = page.evaluate("""() => {
+                try {
+                    const u = JSON.parse(localStorage.getItem('K_user') || '{}');
+                    return !!u.accessToken;
+                } catch { return false; }
             }""")
-            if call_count > 0:
-                log(f"    browser: verified {call_count} /call requests — auth working")
+            if has_token:
+                log(f"    browser: login OK — auth token in localStorage")
                 return True
-            log(f"    browser: at dashboard but 0 /call requests, retry {attempt + 1}/{retries}")
+            log(f"    browser: login attempt {attempt + 1}: no auth token, retrying")
         except Exception as e:
             current = page.url
             log(f"    browser: login attempt {attempt + 1} failed (URL={current}): {e}")
@@ -1775,43 +1780,73 @@ BROWSER_SCALING_PAGES = [
 ]
 
 
-def _browser_verify_composition_count(page, expected_comp_count):
-    """Verify composition count by calling the compositions-list API directly.
+def _verify_composition_count_api(token):
+    """Verify composition count by calling the piechart widget API.
 
-    Makes a fetch() to the compositions-list RESTAction endpoint using the
-    browser's auth token, then counts items in status.list. This is the
-    authoritative count — it matches what the datagrid and piechart display.
+    Calls the dashboard-compositions-panel-row-piechart widget endpoint via
+    Python HTTP and reads status.widgetData.title (a string like "1200" or "0").
+    This is exactly what the dashboard piechart displays.
 
     Returns the observed count or -1 if verification was not possible.
     """
-    if expected_comp_count == 0:
-        return 0  # nothing to verify
     try:
-        observed = page.evaluate("""(snowplowUrl) => {
-            // Get the auth token from localStorage/sessionStorage
-            const token = localStorage.getItem('token')
-                       || sessionStorage.getItem('token')
-                       || '';
-            if (!token) return -1;
-            return fetch(snowplowUrl + '/call?apiVersion=templates.krateo.io%2Fv1'
-                         + '&resource=restactions&name=compositions-list'
-                         + '&namespace=krateo-system',
-                         { headers: { 'Authorization': 'Bearer ' + token } })
-                .then(r => r.json())
-                .then(d => {
-                    const list = d && d.status && d.status.list;
-                    return Array.isArray(list) ? list.length : -1;
-                })
-                .catch(() => -1);
-        }""", SNOWPLOW)
-        return observed
+        _ms, code, body = http_get_json(
+            '/call?apiVersion=widgets.templates.krateo.io%2Fv1beta1'
+            '&resource=piecharts'
+            '&name=dashboard-compositions-panel-row-piechart'
+            '&namespace=krateo-system',
+            token,
+        )
+        if code != 200 or not isinstance(body, dict):
+            return -1
+        title = (body.get("status") or {}).get("widgetData", {}).get("title")
+        if title is None:
+            return -1
+        return int(title)
     except Exception:
         return -1
 
 
-def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, num_navs=3):
+def _verify_composition_count_ui(page):
+    """Verify composition count by fetching the piechart widget from the browser.
+
+    The piechart is rendered on a Canvas element, so the count cannot be read
+    from the DOM.  Instead, we fetch the piechart widget endpoint from the
+    browser context using the browser's own auth token (localStorage K_user).
+    This verifies the same data path the UI uses: browser → snowplow → cache.
+
+    Returns the observed count or -1 if verification was not possible.
+    """
+    try:
+        result = page.evaluate("""(snowplowUrl) => {
+            return (async () => {
+                try {
+                    const userData = JSON.parse(localStorage.getItem('K_user') || '{}');
+                    const token = userData.accessToken;
+                    if (!token) return -1;
+                    const resp = await fetch(
+                        snowplowUrl + '/call?apiVersion=widgets.templates.krateo.io'
+                        + '%2Fv1beta1&resource=piecharts'
+                        + '&name=dashboard-compositions-panel-row-piechart'
+                        + '&namespace=krateo-system',
+                        { headers: { 'Authorization': 'Bearer ' + token } }
+                    );
+                    if (resp.status !== 200) return -1;
+                    const body = await resp.json();
+                    const title = (body.status || {}).widgetData?.title;
+                    if (title === undefined || title === null) return -1;
+                    return parseInt(title, 10);
+                } catch (e) { return -1; }
+            })();
+        }""", SNOWPLOW)
+        return result
+    except Exception:
+        return -1
+
+
+def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, token=None, num_navs=3):
     """Navigate browser to each page num_navs times, return timing data.
-    Expects an already-logged-in page object."""
+    Expects an already-logged-in page object and an admin JWT token."""
     ns_count, comp_count = count_bench_ns(), count_compositions()
     log(f"Cluster: {ns_count} bench ns, {comp_count} compositions")
 
@@ -1828,20 +1863,22 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, num_navs=3):
                 f"load={m['loadComplete']:>5d}ms  "
                 f"calls={m['callCount']}")
 
-            # On the last warm navigation, verify that the rendered content
-            # matches the expected composition count. Works on both Dashboard
-            # (piechart shows total) and Compositions (panel /call count).
-            if page_name in ("Dashboard", "Compositions") and nav_num == num_navs and comp_count > 0:
-                observed = _browser_verify_composition_count(page, comp_count)
-                m["verified_comp_count"] = observed
-                if observed > 0:
-                    log(f"    VERIFY: browser shows {observed} compositions "
-                        f"(cluster has {comp_count})")
-                elif observed == 0:
-                    log(f"    VERIFY WARNING: browser shows 0 compositions "
-                        f"(cluster has {comp_count}) — stale cache?")
-                else:
-                    log(f"    VERIFY: could not determine composition count in DOM")
+            # On the last warm navigation, verify composition count via both
+            # the piechart widget API and the browser DOM (at every stage,
+            # including 0 compositions).
+            if page_name == "Dashboard" and nav_num == num_navs:
+                api_count = _verify_composition_count_api(token) if token else -1
+                ui_count = _verify_composition_count_ui(page)
+                m["verified_api"] = api_count
+                m["verified_ui"] = ui_count
+                api_ok = api_count == comp_count
+                ui_ok = ui_count == comp_count
+                api_str = f"{api_count}" if api_count >= 0 else "?"
+                ui_str = f"{ui_count}" if ui_count >= 0 else "?"
+                status = "\u2713" if (api_ok and ui_ok) else "\u2717"
+                log(f"    VERIFY {status} api={api_str} ui={ui_str} "
+                    f"cluster={comp_count}"
+                    + ("" if (api_ok and ui_ok) else " — MISMATCH"))
 
         # Compute metrics from navigations:
         # - p50: median of ALL navigations (including cold)
@@ -1896,6 +1933,7 @@ def run_phase_browser_scaling(tokens):
                 continue
 
             tokens_fresh = login_all()
+            admin_token = tokens_fresh.get("admin")
             if cache_mode == "ON":
                 wait_for_l1_warmup()
 
@@ -1926,7 +1964,7 @@ def run_phase_browser_scaling(tokens):
                         wait_for_l1_quiescent(stable_secs=quiesce_secs, timeout=300)
 
             # S1 — Zero state
-            r = _browser_measure_stage(page, 1, "Zero state", cache_mode)
+            r = _browser_measure_stage(page, 1, "Zero state", cache_mode, token=admin_token)
             if r:
                 all_results.append(r)
 
@@ -1935,7 +1973,7 @@ def run_phase_browser_scaling(tokens):
             create_bench_namespaces(1, 1); wait_for_bench_namespaces(1)
             deploy_compositiondefinition("bench-ns-01"); time.sleep(15)
             _stabilize(ts)
-            r = _browser_measure_stage(page, 2, "1 ns + compdef", cache_mode)
+            r = _browser_measure_stage(page, 2, "1 ns + compdef", cache_mode, token=admin_token)
             if r:
                 all_results.append(r)
 
@@ -1943,7 +1981,7 @@ def run_phase_browser_scaling(tokens):
             ts = _snapshot_l1()
             create_bench_namespaces(2, 20); wait_for_bench_namespaces(20); time.sleep(10)
             _stabilize(ts)
-            r = _browser_measure_stage(page, 3, "20 bench ns", cache_mode)
+            r = _browser_measure_stage(page, 3, "20 bench ns", cache_mode, token=admin_token)
             if r:
                 all_results.append(r)
 
@@ -1957,7 +1995,7 @@ def run_phase_browser_scaling(tokens):
             wait_for_crd(); deploy_compositions(1, 20, 1)
             wait_for_compositions(20)
             _stabilize(ts, quiesce=True)
-            r = _browser_measure_stage(page, 4, "20 compositions", cache_mode)
+            r = _browser_measure_stage(page, 4, "20 compositions", cache_mode, token=admin_token)
             if r:
                 all_results.append(r)
 
@@ -1965,7 +2003,7 @@ def run_phase_browser_scaling(tokens):
             ts = _snapshot_l1()
             create_bench_namespaces(21, 120); wait_for_bench_namespaces(120)
             _stabilize(ts, quiesce=True)
-            r = _browser_measure_stage(page, 5, "120 bench ns", cache_mode)
+            r = _browser_measure_stage(page, 5, "120 bench ns", cache_mode, token=admin_token)
             if r:
                 all_results.append(r)
 
@@ -1974,7 +2012,7 @@ def run_phase_browser_scaling(tokens):
             deploy_compositions(1, 120, 10)
             wait_for_compositions(1200, timeout=600)
             _stabilize(ts, quiesce=True, quiesce_secs=30)
-            r = _browser_measure_stage(page, 6, "1200 compositions", cache_mode)
+            r = _browser_measure_stage(page, 6, "1200 compositions", cache_mode, token=admin_token)
             if r:
                 all_results.append(r)
 
@@ -1983,7 +2021,7 @@ def run_phase_browser_scaling(tokens):
             delete_one_composition("bench-ns-01", "bench-app-01-01")
             wait_for_composition_gone("bench-ns-01", "bench-app-01-01")
             _stabilize(ts)
-            r = _browser_measure_stage(page, 7, "Deleted 1 comp", cache_mode)
+            r = _browser_measure_stage(page, 7, "Deleted 1 comp", cache_mode, token=admin_token)
             if r:
                 all_results.append(r)
 
@@ -1992,7 +2030,7 @@ def run_phase_browser_scaling(tokens):
             delete_one_bench_namespace("bench-ns-120")
             wait_for_namespace_gone("bench-ns-120")
             _stabilize(ts)
-            r = _browser_measure_stage(page, 8, "Deleted 1 ns", cache_mode)
+            r = _browser_measure_stage(page, 8, "Deleted 1 ns", cache_mode, token=admin_token)
             if r:
                 all_results.append(r)
 

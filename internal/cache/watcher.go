@@ -421,6 +421,10 @@ func (rw *ResourceWatcher) collectAffectedL1Keys(ctx context.Context, gvrKey, ns
 	// LIST dependency: cluster-wide
 	collect(L1ResourceDepKey(gvrKey, "", ""))
 
+	// API-level dependency: RESTActions that declared interest in this
+	// GVR via their apiRequests. The GVR key format is "group/version/resource".
+	collect(L1ApiDepKey(gvrKey))
+
 	if len(seen) == 0 {
 		return nil
 	}
