@@ -376,37 +376,15 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	gvrKey := GVRToKey(gvr)
 	l1Keys := rw.collectAffectedL1Keys(ctx, gvrKey, ns, name)
 
-	if eventType == "delete" {
-		// Hard-delete L1 entries that directly reference this resource, and
-		// clean up its per-resource dep index (resource is gone).
-		if len(l1Keys) > 0 {
-			resDepKey := L1ResourceDepKey(gvrKey, ns, name)
-			_ = rw.cache.Delete(ctx, append(l1Keys, resDepKey)...)
-		}
-
-		// On DELETE we must also refresh L1 keys that aggregate data across
-		// resources (e.g. piecharts, tables, datagrids showing counts/lists).
-		// These widgets register under LIST deps in whichever namespaces were
-		// resolved, but a delete in ANY namespace changes the aggregate.
-		// Use the GVR-level index to discover ALL L1 keys for this GVR and
-		// enqueue them for refresh (NOT hard-delete — the widgets still exist,
-		// they just need re-resolution with updated data).
-		gvrIdxKey := L1GVRKey(gvrKey)
-		if gvrL1Keys, err := rw.cache.SMembers(ctx, gvrIdxKey); err == nil {
-			seen := make(map[string]bool, len(l1Keys))
-			for _, k := range l1Keys {
-				seen[k] = true
-			}
-			for _, k := range gvrL1Keys {
-				if !seen[k] {
-					l1Keys = append(l1Keys, k)
-				}
-			}
-		}
-	}
-
 	if len(l1Keys) == 0 {
 		return
+	}
+
+	if eventType == "delete" {
+		// Delete affected L1 entries and the per-resource dep index (resource
+		// is gone). Keep the LIST dep indexes — they're shared across resources.
+		resDepKey := L1ResourceDepKey(gvrKey, ns, name)
+		_ = rw.cache.Delete(ctx, append(l1Keys, resDepKey)...)
 	}
 
 	slog.Debug("resource-watcher: L1 targeted refresh",
