@@ -128,13 +128,6 @@ func ResolvedKey(username string, gvr schema.GroupVersionResource, namespace, na
 // when any watched Kubernetes resource changes.
 const AllResolvedPattern = "snowplow:resolved:*"
 
-// L1GVRKey returns the Redis SET key that maps a GVR to all L1 (resolved)
-// cache entries that depend on it. Used as a fallback for targeted invalidation
-// when per-resource dependency indexes are not yet populated.
-func L1GVRKey(gvrKey string) string {
-	return "snowplow:l1gvr:" + gvrKey
-}
-
 // L1ResourceDepKey returns the Redis SET key for a per-resource L1 dependency.
 // It maps a specific K8s resource (GVR + namespace + name) to the L1 resolved
 // keys that accessed it during resolution.
@@ -158,14 +151,11 @@ func L1ApiDepKey(gvrKey string) string {
 	return "snowplow:l1api:" + gvrKey
 }
 
-// RegisterL1Dependencies registers the L1 resolved key in both the GVR-level
-// and per-resource reverse indexes based on dependencies captured by the tracker.
+// RegisterL1Dependencies registers the L1 resolved key in per-resource
+// reverse indexes based on dependencies captured by the tracker.
 func RegisterL1Dependencies(ctx context.Context, c *RedisCache, tracker *DependencyTracker, l1Key string) {
 	if c == nil || tracker == nil {
 		return
-	}
-	for _, gvrKey := range tracker.GVRKeys() {
-		_ = c.SAddWithTTL(ctx, L1GVRKey(gvrKey), l1Key, ReverseIndexTTL)
 	}
 	for _, ref := range tracker.ResourceRefs() {
 		depKey := L1ResourceDepKey(ref.GVRKey, ref.NS, ref.Name)

@@ -686,7 +686,7 @@ func registerApiRefGVRDeps(ctx context.Context, c *cache.RedisCache, widgetObj *
 		if alreadyTracked[gvrKey] {
 			continue
 		}
-		_ = c.SAddWithTTL(ctx, cache.L1GVRKey(gvrKey), l1Key, cache.ReverseIndexTTL)
+		_ = c.SAddWithTTL(ctx, cache.L1ApiDepKey(gvrKey), l1Key, cache.ReverseIndexTTL)
 		newGVRs = append(newGVRs, gvr)
 	}
 
