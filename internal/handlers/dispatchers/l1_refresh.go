@@ -120,20 +120,6 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 				pending = nextCascade
 			}
 
-			// Settling pass: re-refresh the original keys to pick up any L3
-			// patches that landed during the cascade. The informer patches L3
-			// concurrently with the refresh goroutine, so the first pass may
-			// have read stale L3 data. This final pass reads the latest L3.
-			for _, k := range keys {
-				wg.Add(1)
-				sem <- struct{}{}
-				go func(info cache.ResolvedKeyInfo, rawKey string) {
-					defer wg.Done()
-					defer func() { <-sem }()
-					refreshSingleL1(ctx, c, user, ep, accessToken, info, rawKey, authnNS)
-				}(k.info, k.raw)
-			}
-			wg.Wait()
 		}
 
 		if ctx.Err() != nil {
