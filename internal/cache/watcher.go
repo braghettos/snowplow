@@ -115,10 +115,29 @@ func (rw *ResourceWatcher) processL1Event(ctx context.Context, evt l1Event) {
 		}
 	}()
 
+	queueLen := len(rw.eventCh)
+	slog.Info("L1 worker: processing event",
+		slog.String("event", evt.eventType),
+		slog.String("gvr", evt.gvr.String()),
+		slog.String("ns", evt.ns),
+		slog.String("name", evt.name),
+		slog.Int("queueDepth", queueLen))
+
 	l1Keys := rw.collectAffectedL1Keys(ctx, evt.gvrKey, evt.ns, evt.name)
 	if len(l1Keys) == 0 {
+		slog.Debug("L1 worker: no affected L1 keys, skipping",
+			slog.String("gvr", evt.gvr.String()),
+			slog.String("ns", evt.ns),
+			slog.String("name", evt.name))
 		return
 	}
+	slog.Info("L1 worker: found affected L1 keys",
+		slog.String("event", evt.eventType),
+		slog.String("gvr", evt.gvr.String()),
+		slog.String("ns", evt.ns),
+		slog.String("name", evt.name),
+		slog.Int("affected", len(l1Keys)),
+		slog.Any("keys", l1Keys))
 
 	if evt.eventType == "delete" {
 		resDepKey := L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)
