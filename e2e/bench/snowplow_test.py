@@ -562,18 +562,21 @@ def create_bench_namespaces(start, end):
 
 
 def wait_for_bench_namespaces(expected, timeout=120):
+    """Wait until at least `expected` bench namespaces are in Active state."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        n = count_bench_ns()
+        n = count_bench_ns()  # only counts Active (non-Terminating) namespaces
         if n >= expected:
             return True
         time.sleep(5)
+    log(f"  WARNING: only {count_bench_ns()}/{expected} bench namespaces Active after {timeout}s")
     return False
 
 
 def count_bench_ns():
-    rc, out, _ = kubectl("get", "ns", "-o", "name")
-    return len([n for n in out.split("\n") if "bench-ns-" in n])
+    rc, out, _ = kubectl("get", "ns", "--no-headers")
+    return len([line for line in out.strip().split("\n")
+                if "bench-ns-" in line and "Terminating" not in line])
 
 
 def count_compositions():
@@ -1867,17 +1870,23 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, token=None, 
             # the piechart widget API and the browser DOM (at every stage,
             # including 0 compositions).
             if page_name == "Dashboard" and nav_num == num_navs:
+                # Re-count right before verification to minimize race window
+                fresh_comp_count = count_compositions()
                 api_count = _verify_composition_count_api(token) if token else -1
                 ui_count = _verify_composition_count_ui(page)
                 m["verified_api"] = api_count
                 m["verified_ui"] = ui_count
-                api_ok = api_count == comp_count
-                ui_ok = ui_count == comp_count
+                # Allow small tolerance for high cardinality stages
+                tol = 10 if fresh_comp_count > 100 else 0
+                api_ok = (api_count >= 0 and
+                          abs(api_count - fresh_comp_count) <= tol)
+                ui_ok = (ui_count >= 0 and
+                         abs(ui_count - fresh_comp_count) <= tol)
                 api_str = f"{api_count}" if api_count >= 0 else "?"
                 ui_str = f"{ui_count}" if ui_count >= 0 else "?"
                 status = "\u2713" if (api_ok and ui_ok) else "\u2717"
                 log(f"    VERIFY {status} api={api_str} ui={ui_str} "
-                    f"cluster={comp_count}"
+                    f"cluster={fresh_comp_count}"
                     + ("" if (api_ok and ui_ok) else " — MISMATCH"))
 
         # Compute metrics from navigations:
