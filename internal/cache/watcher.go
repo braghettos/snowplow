@@ -86,7 +86,8 @@ func (q *refreshQueue) flush() {
 		q.mu.Unlock()
 		if len(keys) > 0 {
 			ctx := q.watcher.appCtx
-			_ = q.watcher.cache.Delete(ctx, keys...)
+			idxKey := L1GVRKey(q.gvrKey)
+			_ = q.watcher.cache.Delete(ctx, append(keys, idxKey)...)
 			slog.Debug("resource-watcher: L1 invalidated (no refresher, queued)",
 				slog.String("gvr", q.gvr.String()), slog.Int("count", len(keys)))
 		}
