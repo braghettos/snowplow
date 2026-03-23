@@ -32,125 +32,101 @@ type L1RefreshFunc func(ctx context.Context, triggerGVR schema.GroupVersionResou
 // mass TTL expiry (e.g., after Redis restart or bulk warmup with identical TTLs).
 const expiryRefreshWorkers = 10
 
-// l1CoalescePeriod is the time to wait after the first event before triggering
-// an L1 refresh. This allows burst events (e.g. 10 rapid DELETEs when a namespace
-// is removed) to be coalesced into a single refresh cycle.
-const l1CoalescePeriod = 3 * time.Second
-
-// refreshQueue coalesces L1 refresh requests for a single GVR. Events arriving
-// while a refresh is in-flight are queued for the next cycle — nothing is skipped.
+// refreshQueue is an ordered work queue for L1 refresh requests per GVR.
+// A single worker goroutine processes keys sequentially. Deduplication only
+// suppresses consecutive identical keys — non-consecutive duplicates are kept
+// to ensure dependency chains are refreshed in the correct order.
+//
+// Example: events produce [A, A, B, A]. After consecutive dedup: [A, B, A].
+// Worker refreshes A, then B, then A again. The second A reads L3 after B
+// was refreshed, guaranteeing the final state is consistent.
 type refreshQueue struct {
-	mu        sync.Mutex
-	pending   map[string]bool // deduplicated L1 keys waiting for next refresh
-	timer     *time.Timer     // coalesce timer; nil when no events are pending
-	running   bool            // true while a refresh goroutine is executing
-	gvr       schema.GroupVersionResource
-	gvrKey    string
-	watcher   *ResourceWatcher
+	mu      sync.Mutex
+	queue   []string       // ordered keys, consecutive duplicates suppressed
+	last    string         // last key appended (for consecutive dedup)
+	signal  chan struct{}   // non-blocking signal that queue has items
+	started bool           // true once the worker goroutine is running
+	gvr     schema.GroupVersionResource
+	gvrKey  string
+	watcher *ResourceWatcher
 }
 
-// enqueue adds L1 keys to the pending set and starts the coalesce timer if
-// no refresh is currently in-flight. If a refresh IS running, the keys are
-// queued and will be processed when the current refresh completes.
+// enqueue adds L1 keys to the queue, suppressing consecutive duplicates.
 func (q *refreshQueue) enqueue(keys []string) {
 	q.mu.Lock()
-	defer q.mu.Unlock()
-
 	for _, k := range keys {
-		q.pending[k] = true
-	}
-
-	// If a refresh is running, the completion handler will pick up the
-	// pending keys — no timer needed.
-	if q.running {
-		return
-	}
-
-	// Start or reset the coalesce timer.
-	if q.timer == nil {
-		q.timer = time.AfterFunc(l1CoalescePeriod, q.flush)
-	}
-	// Don't reset the timer — we want to fire l1CoalescePeriod after the
-	// FIRST event, not the last. This prevents unbounded delays during
-	// continuous streams (e.g. deploying 1200 compositions over 25 min).
-}
-
-// flush is called when the coalesce timer fires. It drains the pending set
-// and starts a refresh goroutine.
-func (q *refreshQueue) flush() {
-	fn, ok := q.watcher.l1Refresh.Load().(L1RefreshFunc)
-	if !ok || fn == nil {
-		// No refresher registered — fall back to invalidation.
-		q.mu.Lock()
-		keys := q.drainLocked()
-		q.mu.Unlock()
-		if len(keys) > 0 {
-			ctx := q.watcher.appCtx
-			idxKey := L1GVRKey(q.gvrKey)
-			_ = q.watcher.cache.Delete(ctx, append(keys, idxKey)...)
-			slog.Debug("resource-watcher: L1 invalidated (no refresher, queued)",
-				slog.String("gvr", q.gvr.String()), slog.Int("count", len(keys)))
+		if k == q.last {
+			continue // consecutive duplicate — skip
 		}
-		return
+		q.queue = append(q.queue, k)
+		q.last = k
 	}
-
-	q.mu.Lock()
-	keys := q.drainLocked()
-	if len(keys) == 0 {
-		q.mu.Unlock()
-		return
+	if !q.started {
+		q.started = true
+		q.signal = make(chan struct{}, 1)
+		go q.worker()
 	}
-	q.running = true
 	q.mu.Unlock()
 
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				buf := make([]byte, 4096)
-				n := runtime.Stack(buf, false)
-				slog.Error("resource-watcher: panic in queued L1 refresh",
-					slog.Any("error", r),
-					slog.String("gvr", q.gvr.String()),
-					slog.String("stack", string(buf[:n])))
-			}
-
-			// Check if more events arrived while we were refreshing.
-			q.mu.Lock()
-			q.running = false
-			hasPending := len(q.pending) > 0
-			if hasPending {
-				q.timer = time.AfterFunc(l1CoalescePeriod, q.flush)
-			} else {
-				q.timer = nil
-			}
-			q.mu.Unlock()
-		}()
-
-		// Scale the timeout with the number of keys: 10s base + 3s per key,
-		// capped at 10 minutes. With 512 keys this gives ~25 min (capped to 10),
-		// plenty for concurrent resolution with refreshConcurrency=20.
-		timeout := 10*time.Second + time.Duration(len(keys))*3*time.Second
-		if timeout > 10*time.Minute {
-			timeout = 10 * time.Minute
-		}
-		ctx, cancel := context.WithTimeout(q.watcher.appCtx, timeout)
-		defer cancel()
-		fn(ctx, q.gvr, keys)
-	}()
+	// Non-blocking signal.
+	select {
+	case q.signal <- struct{}{}:
+	default:
+	}
 }
 
-// drainLocked moves all pending keys out and returns them. Caller must hold q.mu.
-func (q *refreshQueue) drainLocked() []string {
-	if len(q.pending) == 0 {
-		return nil
+// worker runs in a single goroutine per queue, processing keys sequentially.
+func (q *refreshQueue) worker() {
+	for {
+		// Wait for signal that the queue has items.
+		select {
+		case <-q.watcher.appCtx.Done():
+			return
+		case <-q.signal:
+		}
+
+		for {
+			// Pop the next key from the queue.
+			q.mu.Lock()
+			if len(q.queue) == 0 {
+				q.last = "" // reset dedup state when queue is empty
+				q.mu.Unlock()
+				break
+			}
+			key := q.queue[0]
+			q.queue = q.queue[1:]
+			q.mu.Unlock()
+
+			fn, ok := q.watcher.l1Refresh.Load().(L1RefreshFunc)
+			if !ok || fn == nil {
+				// No refresher registered — fall back to invalidation.
+				ctx := q.watcher.appCtx
+				idxKey := L1GVRKey(q.gvrKey)
+				_ = q.watcher.cache.Delete(ctx, key, idxKey)
+				slog.Debug("resource-watcher: L1 invalidated (no refresher, queued)",
+					slog.String("gvr", q.gvr.String()), slog.String("key", key))
+				continue
+			}
+
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						buf := make([]byte, 4096)
+						n := runtime.Stack(buf, false)
+						slog.Error("resource-watcher: panic in queued L1 refresh",
+							slog.Any("error", r),
+							slog.String("gvr", q.gvr.String()),
+							slog.String("stack", string(buf[:n])))
+					}
+				}()
+
+				timeout := 30 * time.Second
+				ctx, cancel := context.WithTimeout(q.watcher.appCtx, timeout)
+				defer cancel()
+				fn(ctx, q.gvr, []string{key})
+			}()
+		}
 	}
-	keys := make([]string, 0, len(q.pending))
-	for k := range q.pending {
-		keys = append(keys, k)
-	}
-	q.pending = make(map[string]bool)
-	q.timer = nil
-	return keys
 }
 
 // ResourceWatcher maintains dynamic informers for every GVR in the watched set.
@@ -441,7 +417,6 @@ func (rw *ResourceWatcher) collectAffectedL1Keys(ctx context.Context, gvrKey, ns
 func (rw *ResourceWatcher) enqueueL1Refresh(gvr schema.GroupVersionResource, l1Keys []string) {
 	gvrKey := GVRToKey(gvr)
 	raw, _ := rw.queues.LoadOrStore(gvrKey, &refreshQueue{
-		pending: make(map[string]bool),
 		gvr:     gvr,
 		gvrKey:  gvrKey,
 		watcher: rw,

@@ -292,7 +292,10 @@ func (c *RedisCache) AtomicUpdateJSON(ctx context.Context, key string, fn func([
 	if c == nil {
 		return nil
 	}
-	const maxRetries = 3
+	// High-contention workloads (e.g. 10 compositions/ns deployed rapidly) can
+	// cause repeated WATCH/EXEC failures on the same LIST key. 20 retries with
+	// jitter ensures all patches land even under burst event rates.
+	const maxRetries = 20
 	for i := 0; i < maxRetries; i++ {
 		err := c.client.Watch(ctx, func(tx *redis.Tx) error {
 			val, err := tx.Get(ctx, key).Bytes()
@@ -319,6 +322,8 @@ func (c *RedisCache) AtomicUpdateJSON(ctx context.Context, key string, fn func([
 			return nil
 		}
 		if errors.Is(err, redis.TxFailedErr) {
+			// Brief sleep with jitter to reduce contention on retry.
+			time.Sleep(time.Duration(1+i) * time.Millisecond)
 			continue
 		}
 		return err
