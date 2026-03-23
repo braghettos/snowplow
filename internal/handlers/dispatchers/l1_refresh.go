@@ -167,23 +167,19 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 
 	switch {
 	case info.GVR.Group == widgetGroup:
-		// Use ResolveWidgetDirect which shares the singleflight group with
-		// the HTTP handler — concurrent resolutions are deduplicated.
-		result, err := ResolveWidgetDirect(rctx, c, got, rawKey, authnNS, info.PerPage, info.Page)
+		// Use ResolveWidgetBackground to avoid blocking HTTP requests that
+		// resolve the same key via singleflight.
+		result, err := ResolveWidgetBackground(rctx, c, got, rawKey, authnNS, info.PerPage, info.Page)
 		if err != nil {
 			return false, nil
 		}
-		// preWarmChildWidgets is already called inside resolveWidgetFromObject
-		// (via ResolveWidgetDirect), so newly-discovered child widgets
-		// (e.g. composition-panels) are pre-warmed automatically.
 		_ = result
 		registerApiRefGVRDeps(rctx, c, got.Unstructured, rawKey, nil)
 		return true, nil
 
 	case info.GVR.Group == templatesGroup && info.GVR.Resource == restactionResource:
-		// Use ResolveRESTActionDirect which shares the singleflight group
-		// with the HTTP handler.
-		_, err := ResolveRESTActionDirect(rctx, c, got.Unstructured.Object, rawKey, authnNS, info.PerPage, info.Page)
+		// Use ResolveRESTActionBackground to avoid blocking HTTP requests.
+		_, err := ResolveRESTActionBackground(rctx, c, got.Unstructured.Object, rawKey, authnNS, info.PerPage, info.Page)
 		if err != nil {
 			return false, nil
 		}

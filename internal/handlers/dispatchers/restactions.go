@@ -218,3 +218,10 @@ func ResolveRESTActionDirect(ctx context.Context, c *cache.RedisCache, obj map[s
 	}
 	return result.([]byte), nil
 }
+
+// ResolveRESTActionBackground resolves a RESTAction without joining the shared
+// singleflight group. Used by the background L1 worker to avoid blocking
+// HTTP requests that resolve the same key concurrently.
+func ResolveRESTActionBackground(ctx context.Context, c *cache.RedisCache, obj map[string]interface{}, resolvedKey, authnNS string, perPage, page int) ([]byte, error) {
+	return resolveRESTActionFromObject(ctx, c, obj, resolvedKey, authnNS, perPage, page, nil)
+}
