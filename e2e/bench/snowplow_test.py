@@ -1020,8 +1020,17 @@ def clean_environment():
         log("WARNING: skipping CompositionDefinition deletion — compositions still exist")
     delete_bench_namespaces()
     delete_bench_rbac()
-    log("Waiting 15s for cleanup to propagate ...")
-    time.sleep(15)
+    # Restart snowplow pod to flush Redis (sidecar). This ensures all L3/L1
+    # cache keys from deleted resources are gone. Without this, warmup reads
+    # stale L3 list cache and populates L1 with wrong data.
+    log("Restarting snowplow pod to flush Redis cache ...")
+    rc, _, err = kubectl("rollout", "restart", "deployment/snowplow", "-n", "krateo-system")
+    if rc == 0:
+        kubectl("rollout", "status", "deployment/snowplow", "-n", "krateo-system",
+                "--timeout=120s")
+        log("  Snowplow pod restarted — Redis flushed")
+    else:
+        log(f"  WARNING: failed to restart snowplow: {err[:100]}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1867,27 +1876,40 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, token=None, 
                 f"calls={m['callCount']}")
 
             # On the last warm navigation, verify composition count via both
-            # the piechart widget API and the browser DOM (at every stage,
-            # including 0 compositions).
+            # the piechart widget API and the browser UI fetch.
+            # Poll with retries to allow cascading refresh to propagate.
             if page_name == "Dashboard" and nav_num == num_navs:
-                # Re-count right before verification to minimize race window
+                verify_timeout = 60
+                verify_interval = 3
+                verify_start = time.time()
+                deadline = verify_start + verify_timeout
+                api_count = -1
+                ui_count = -1
                 fresh_comp_count = count_compositions()
-                api_count = _verify_composition_count_api(token) if token else -1
-                ui_count = _verify_composition_count_ui(page)
+                matched = False
+
+                while time.time() < deadline:
+                    fresh_comp_count = count_compositions()
+                    api_count = _verify_composition_count_api(token) if token else -1
+                    ui_count = _verify_composition_count_ui(page)
+                    api_ok = (api_count >= 0 and api_count == fresh_comp_count)
+                    ui_ok = (ui_count >= 0 and ui_count == fresh_comp_count)
+                    if api_ok and ui_ok:
+                        matched = True
+                        break
+                    time.sleep(verify_interval)
+
+                convergence_ms = int((time.time() - verify_start) * 1000)
                 m["verified_api"] = api_count
                 m["verified_ui"] = ui_count
-                # Allow small tolerance for high cardinality stages
-                tol = 10 if fresh_comp_count > 100 else 0
-                api_ok = (api_count >= 0 and
-                          abs(api_count - fresh_comp_count) <= tol)
-                ui_ok = (ui_count >= 0 and
-                         abs(ui_count - fresh_comp_count) <= tol)
+                m["convergence_ms"] = convergence_ms if matched else -1
                 api_str = f"{api_count}" if api_count >= 0 else "?"
                 ui_str = f"{ui_count}" if ui_count >= 0 else "?"
-                status = "\u2713" if (api_ok and ui_ok) else "\u2717"
+                conv_str = f"{convergence_ms}ms" if matched else "TIMEOUT"
+                status = "\u2713" if matched else "\u2717"
                 log(f"    VERIFY {status} api={api_str} ui={ui_str} "
-                    f"cluster={fresh_comp_count}"
-                    + ("" if (api_ok and ui_ok) else " — MISMATCH"))
+                    f"cluster={fresh_comp_count} converged={conv_str}"
+                    + ("" if matched else " — MISMATCH"))
 
         # Compute metrics from navigations:
         # - p50: median of ALL navigations (including cold)
@@ -2065,8 +2087,8 @@ def run_phase_browser_scaling(tokens):
         print(f"  {'Stage':<6s} {'Description':<22s} {'NS':>4s} {'Comp':>5s} "
               f"│ {'ON warm':>9s} {'ON p50':>9s} {'ON#':>4s} "
               f"│ {'OFF warm':>10s} {'OFF p50':>9s} {'OFF#':>5s} "
-              f"│ {'Speedup':>8s}")
-        print(f"  {'─' * 115}")
+              f"│ {'Speedup':>8s} {'Conv':>7s}")
+        print(f"  {'─' * 125}")
 
         for s in sorted(stages.keys()):
             info = stages[s]
@@ -2095,6 +2117,16 @@ def run_phase_browser_scaling(tokens):
                 elif on_calls < off_calls * 0.5:
                     anomaly = " *"  # ON incomplete
 
+            # Convergence time: extract from ON Dashboard last navigation
+            conv_ms = -1
+            if page_name == "Dashboard" and on_e:
+                dash_navs = on_e["pages"].get("Dashboard", {}).get("navigations", [])
+                for nav in reversed(dash_navs):
+                    if "convergence_ms" in nav:
+                        conv_ms = nav["convergence_ms"]
+                        break
+            conv_str = f"{conv_ms}ms" if conv_ms >= 0 else "—"
+
             # Speedup uses best warm metric (most representative of steady-state)
             speedup = off_warm / on_warm if on_warm > 0 and off_warm > 0 else 0
             color = GREEN if speedup > 1.1 else (RED if speedup < 0.9 else YELLOW)
@@ -2102,9 +2134,9 @@ def run_phase_browser_scaling(tokens):
             print(f"  S{s:<5d} {info['desc']:<22s} {ns:>4d} {comp:>5d} "
                   f"│ {on_warm:>7d}ms {on_wf:>7d}ms {on_calls:>4d} "
                   f"│ {off_warm:>8d}ms {off_wf:>7d}ms {off_calls:>5d} "
-                  f"│ {color}{speedup:>6.1f}x{RESET}{anomaly}")
+                  f"│ {color}{speedup:>6.1f}x{RESET}{anomaly} {conv_str:>7s}")
 
-        print(f"  {'':>6s} {'warm=last nav, p50=median all navs, * = incomplete load':>70s}")
+        print(f"  {'':>6s} {'warm=last nav, p50=median all navs, Conv=cache convergence time, * = incomplete load':>100s}")
 
     out_file = "/tmp/browser_scaling_results.json"
     with open(out_file, "w") as f:
