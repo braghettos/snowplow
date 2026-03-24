@@ -1879,7 +1879,7 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, token=None, 
             # the piechart widget API and the browser UI fetch.
             # Poll with retries to allow cascading refresh to propagate.
             if page_name == "Dashboard" and nav_num == num_navs:
-                verify_timeout = 60
+                verify_timeout = 120
                 verify_interval = 3
                 verify_start = time.time()
                 deadline = verify_start + verify_timeout

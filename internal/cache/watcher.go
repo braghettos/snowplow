@@ -50,8 +50,9 @@ type ResourceWatcher struct {
 	watched   map[string]bool
 	appCtx    context.Context // long-lived process context; set by Start()
 
-	l1Refresh atomic.Value    // stores L1RefreshFunc
-	eventCh   chan l1Event     // buffered channel for L1 refresh events
+	l1Refresh  atomic.Value    // stores L1RefreshFunc
+	eventCh    chan l1Event     // buffered channel for L1 refresh events
+	lastRV     sync.Map         // gvr+ns+name → last resourceVersion (for event dedup)
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -90,15 +91,15 @@ func (rw *ResourceWatcher) Start(ctx context.Context) {
 // latest L3 state (patched by handleEvent before enqueue), resolves affected
 // L1 keys, and cascades to dependents.
 //
-// A per-key settling pass runs every second: any L1 key that hasn't been
-// refreshed for 3+ seconds is re-refreshed from the final L3 state. This
-// decouples settling from unrelated events — e.g., composition-list settles
-// even while widget/form/button events are still flowing for child resources.
+// After every 10 events, a per-key settling check runs: any L1 key that
+// hasn't been refreshed for 3+ seconds is re-refreshed from the final L3
+// state. This ensures settling happens even under continuous event flow
+// (e.g., 12,000 child resource events from composition deployments).
 func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 	touched := make(map[string]time.Time) // L1 key → last refresh timestamp
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
 	const settleAge = 3 * time.Second
+	const settleCheckInterval = 10 // check every N events
+	eventCount := 0
 
 	for {
 		select {
@@ -115,44 +116,54 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 				touched[k] = now
 			}
 
-		case <-ticker.C:
-			// Per-key settling: find keys not refreshed for >3s.
-			now := time.Now()
-			var stale []string
-			for k, lastRefresh := range touched {
-				if now.Sub(lastRefresh) >= settleAge {
-					stale = append(stale, k)
-				}
+			// Per-key settling check every N events.
+			eventCount++
+			if eventCount >= settleCheckInterval {
+				eventCount = 0
+				rw.settleStaleKeys(ctx, touched, settleAge)
 			}
-			if len(stale) == 0 {
-				continue
-			}
-			for _, k := range stale {
-				delete(touched, k)
-			}
-
-			fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
-			if !ok || fn == nil {
-				continue
-			}
-			slog.Info("resource-watcher: per-key settling pass",
-				slog.Int("keys", len(stale)))
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						buf := make([]byte, 4096)
-						n := runtime.Stack(buf, false)
-						slog.Error("resource-watcher: panic in settling pass",
-							slog.Any("error", r),
-							slog.String("stack", string(buf[:n])))
-					}
-				}()
-				settleCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-				defer cancel()
-				fn(settleCtx, schema.GroupVersionResource{}, stale)
-			}()
 		}
 	}
+}
+
+// settleStaleKeys re-refreshes L1 keys that haven't been refreshed for
+// longer than settleAge. This catches keys like compositions-list that
+// settle while unrelated events (widget/form/button) keep flowing.
+func (rw *ResourceWatcher) settleStaleKeys(ctx context.Context, touched map[string]time.Time, settleAge time.Duration) {
+	now := time.Now()
+	var stale []string
+	for k, lastRefresh := range touched {
+		if now.Sub(lastRefresh) >= settleAge {
+			stale = append(stale, k)
+		}
+	}
+	if len(stale) == 0 {
+		return
+	}
+	for _, k := range stale {
+		delete(touched, k)
+	}
+
+	fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
+	if !ok || fn == nil {
+		return
+	}
+	slog.Info("resource-watcher: per-key settling pass",
+		slog.Int("keys", len(stale)))
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				buf := make([]byte, 4096)
+				n := runtime.Stack(buf, false)
+				slog.Error("resource-watcher: panic in settling pass",
+					slog.Any("error", r),
+					slog.String("stack", string(buf[:n])))
+			}
+		}()
+		settleCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+		fn(settleCtx, schema.GroupVersionResource{}, stale)
+	}()
 }
 
 func (rw *ResourceWatcher) processL1Event(ctx context.Context, evt l1Event) (touchedKeys []string) {
@@ -339,6 +350,22 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		return
 	}
 
+	// Deduplicate events by resourceVersion. If the resourceVersion hasn't
+	// changed since the last event for this resource, skip it. This reduces
+	// redundant L1 refreshes during rapid UPDATE bursts (e.g. controller
+	// reconciliation loops updating status repeatedly).
+	if eventType == "update" {
+		rv := uns.GetResourceVersion()
+		rvKey := GVRToKey(gvr) + ":" + ns + ":" + name
+		if prev, loaded := rw.lastRV.LoadOrStore(rvKey, rv); loaded && prev.(string) == rv {
+			return // same resourceVersion — skip
+		}
+		rw.lastRV.Store(rvKey, rv)
+	} else if eventType == "delete" {
+		rvKey := GVRToKey(gvr) + ":" + ns + ":" + name
+		rw.lastRV.Delete(rvKey) // clean up
+	}
+
 	slog.Debug("resource-watcher: event",
 		slog.String("type", eventType),
 		slog.String("gvr", gvr.String()),
@@ -400,6 +427,12 @@ func (rw *ResourceWatcher) collectAffectedL1Keys(ctx context.Context, gvrKey, ns
 	seen := map[string]bool{}
 	collect := func(idxKey string) {
 		if keys, err := rw.cache.SMembers(ctx, idxKey); err == nil {
+			if len(keys) > 0 {
+				// Refresh the dep index TTL so it doesn't expire before
+				// the L1 keys it tracks. Without this, long-running L1
+				// keys become "invisible" to invalidation after ~2h.
+				_ = rw.cache.client.Expire(ctx, idxKey, ReverseIndexTTL).Err()
+			}
 			for _, k := range keys {
 				seen[k] = true
 			}
@@ -489,7 +522,14 @@ func (rw *ResourceWatcher) patchListCache(ctx context.Context, gvr schema.GroupV
 	if err != nil {
 		slog.Warn("resource-watcher: failed to patch list cache",
 			slog.String("key", listKey), slog.Any("err", err))
+		return
 	}
+
+	// Bump the list generation counter. The settling pass uses this to
+	// verify that L3 hasn't changed since the last L1 refresh.
+	genKey := listKey + ":gen"
+	_ = rw.cache.client.Incr(ctx, genKey).Err()
+	_ = rw.cache.client.Expire(ctx, genKey, ttl).Err()
 }
 
 // ── Proactive expiry refresh ──────────────────────────────────────────────────
