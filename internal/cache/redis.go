@@ -8,7 +8,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -441,128 +440,6 @@ func (c *RedisCache) GetString(ctx context.Context, key string) (string, bool, e
 		return "", false, err
 	}
 	return val, true, nil
-}
-
-// ── L3 Generation tracking ────────────────────────────────────────────────
-
-// l3GenStaleThreshold is the minimum time since the last L3 gen bump
-// before an L1 entry is considered stale. During active event bursts
-// (e.g. deploying 1200 compositions), the gen keeps advancing and the
-// background worker catches up. Only when events stop for this duration
-// does the HTTP handler trigger inline re-resolution.
-const l3GenStaleThreshold = 3 * time.Second
-
-// IncrL3Gen atomically increments the L3 generation counter for a GVR
-// and records the bump timestamp. Called by the informer after every
-// L3 patch (patchListCache / SetForGVR).
-func (c *RedisCache) IncrL3Gen(ctx context.Context, gvrKey string) {
-	if c == nil {
-		return
-	}
-	pipe := c.client.Pipeline()
-	pipe.Incr(ctx, L3GenKey(gvrKey))
-	pipe.Set(ctx, L3GenKey(gvrKey)+":ts", strconv.FormatInt(time.Now().UnixMilli(), 10), 0)
-	_, _ = pipe.Exec(ctx)
-}
-
-// GetL3Gens reads the current L3 generation counters for the given GVR keys.
-// Returns a map of gvrKey → generation (int64). Missing keys default to 0.
-func (c *RedisCache) GetL3Gens(ctx context.Context, gvrKeys []string) map[string]int64 {
-	result := make(map[string]int64, len(gvrKeys))
-	if c == nil || len(gvrKeys) == 0 {
-		return result
-	}
-	redisKeys := make([]string, len(gvrKeys))
-	for i, k := range gvrKeys {
-		redisKeys[i] = L3GenKey(k)
-	}
-	vals, err := c.client.MGet(ctx, redisKeys...).Result()
-	if err != nil {
-		return result
-	}
-	for i, v := range vals {
-		if v != nil {
-			if s, ok := v.(string); ok {
-				if n, err := strconv.ParseInt(s, 10, 64); err == nil {
-					result[gvrKeys[i]] = n
-				}
-			}
-		}
-	}
-	return result
-}
-
-// SetL1Gens stores the L3 generation snapshot for an L1 resolved key.
-func (c *RedisCache) SetL1Gens(ctx context.Context, l1Key string, gens map[string]int64) {
-	if c == nil || len(gens) == 0 {
-		return
-	}
-	data, err := json.Marshal(gens)
-	if err != nil {
-		return
-	}
-	_ = c.client.Set(ctx, L1GenKey(l1Key), data, ResolvedCacheTTL).Err()
-}
-
-// GetL1Gens reads the stored L3 generation snapshot for an L1 resolved key.
-func (c *RedisCache) GetL1Gens(ctx context.Context, l1Key string) map[string]int64 {
-	if c == nil {
-		return nil
-	}
-	val, err := c.client.Get(ctx, L1GenKey(l1Key)).Bytes()
-	if err != nil {
-		return nil
-	}
-	var gens map[string]int64
-	if err := json.Unmarshal(val, &gens); err != nil {
-		return nil
-	}
-	return gens
-}
-
-// IsL1Stale checks whether an L1 key's stored generations are behind the
-// current L3 generations AND the system is quiescent (no L3 bumps in the
-// last l3GenStaleThreshold). During active event bursts, the background
-// worker keeps L1 reasonably fresh; the inline re-resolve only triggers
-// once events have settled.
-func (c *RedisCache) IsL1Stale(ctx context.Context, l1Key string) bool {
-	storedGens := c.GetL1Gens(ctx, l1Key)
-	if len(storedGens) == 0 {
-		// No generation info stored — treat as fresh (backward compat with
-		// L1 entries created before the generation system was deployed).
-		return false
-	}
-	gvrKeys := make([]string, 0, len(storedGens))
-	for k := range storedGens {
-		gvrKeys = append(gvrKeys, k)
-	}
-	currentGens := c.GetL3Gens(ctx, gvrKeys)
-
-	stale := false
-	for k, stored := range storedGens {
-		if currentGens[k] > stored {
-			stale = true
-			break
-		}
-	}
-	if !stale {
-		return false
-	}
-
-	// Check if events are still flowing. If the last L3 bump was recent,
-	// let the background worker handle it — don't block the HTTP request.
-	now := time.Now().UnixMilli()
-	for _, k := range gvrKeys {
-		tsKey := L3GenKey(k) + ":ts"
-		if tsStr, ok, _ := c.GetString(ctx, tsKey); ok {
-			if ts, err := strconv.ParseInt(tsStr, 10, 64); err == nil {
-				if now-ts < l3GenStaleThreshold.Milliseconds() {
-					return false // events still flowing, not yet quiescent
-				}
-			}
-		}
-	}
-	return true
 }
 
 // ── Expiry notifications ──────────────────────────────────────────────────────

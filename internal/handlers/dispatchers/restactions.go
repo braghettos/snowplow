@@ -57,7 +57,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			user, uerr := xcontext.UserInfo(req.Context())
 			if uerr == nil {
 				resolvedKey = cache.ResolvedKey(user.Username, gvr, nsn.Namespace, nsn.Name, page, perPage)
-				if raw, hit, _ := c.GetRaw(req.Context(), resolvedKey); hit && !c.IsL1Stale(req.Context(), resolvedKey) {
+				if raw, hit, _ := c.GetRaw(req.Context(), resolvedKey); hit {
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 					log.Info("RESTAction resolved from cache",
@@ -174,10 +174,6 @@ func resolveRESTActionFromObject(ctx context.Context, c *cache.RedisCache, obj m
 		// during resolution. This ensures that when any resource in a K8s
 		// API group changes, this RESTAction's L1 key is refreshed.
 		cache.RegisterL1ApiDeps(ctx, c, resolvedKey, extractAPIRequests(raw))
-		// Snapshot L3 generations for staleness detection.
-		if gvrKeys := tracker.GVRKeys(); len(gvrKeys) > 0 {
-			c.SetL1Gens(ctx, resolvedKey, c.GetL3Gens(ctx, gvrKeys))
-		}
 	}
 
 	return raw, nil

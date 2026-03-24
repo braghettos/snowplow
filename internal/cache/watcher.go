@@ -32,83 +32,13 @@ type L1RefreshFunc func(ctx context.Context, triggerGVR schema.GroupVersionResou
 // mass TTL expiry (e.g., after Redis restart or bulk warmup with identical TTLs).
 const expiryRefreshWorkers = 10
 
-// refreshQueue batches L1 refresh requests for a single GVR. Events arriving
-// while a refresh is in-flight are queued for the next cycle — nothing is lost.
-// When a refresh completes and pending keys exist, the next cycle starts
-// immediately (no coalesce delay).
-type refreshQueue struct {
-	mu      sync.Mutex
-	pending map[string]bool
-	timer   *time.Timer
-	running bool
-	gvr     schema.GroupVersionResource
-	gvrKey  string
-	watcher *ResourceWatcher
-}
-
-func (q *refreshQueue) enqueue(keys []string) {
-	q.mu.Lock()
-	if q.pending == nil {
-		q.pending = make(map[string]bool)
-	}
-	for _, k := range keys {
-		q.pending[k] = true
-	}
-	if !q.running && q.timer == nil {
-		q.timer = time.AfterFunc(0, q.flush) // immediate
-	}
-	q.mu.Unlock()
-}
-
-func (q *refreshQueue) flush() {
-	q.mu.Lock()
-	q.timer = nil
-	keys := make([]string, 0, len(q.pending))
-	for k := range q.pending {
-		keys = append(keys, k)
-	}
-	q.pending = make(map[string]bool)
-	q.running = true
-	q.mu.Unlock()
-
-	if len(keys) > 0 {
-		fn, ok := q.watcher.l1Refresh.Load().(L1RefreshFunc)
-		if !ok || fn == nil {
-			ctx := q.watcher.appCtx
-			idxKey := L1GVRKey(q.gvrKey)
-			_ = q.watcher.cache.Delete(ctx, append(keys, idxKey)...)
-			slog.Debug("resource-watcher: L1 invalidated (no refresher, queued)",
-				slog.String("gvr", q.gvr.String()), slog.Int("count", len(keys)))
-		} else {
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						buf := make([]byte, 4096)
-						n := runtime.Stack(buf, false)
-						slog.Error("resource-watcher: panic in queued L1 refresh",
-							slog.Any("error", r),
-							slog.String("gvr", q.gvr.String()),
-							slog.String("stack", string(buf[:n])))
-					}
-				}()
-				timeout := 10*time.Second + time.Duration(len(keys))*3*time.Second
-				if timeout > 10*time.Minute {
-					timeout = 10 * time.Minute
-				}
-				ctx, cancel := context.WithTimeout(q.watcher.appCtx, timeout)
-				defer cancel()
-				fn(ctx, q.gvr, keys)
-			}()
-		}
-	}
-
-	q.mu.Lock()
-	q.running = false
-	hasPending := len(q.pending) > 0
-	if hasPending {
-		q.timer = time.AfterFunc(0, q.flush) // immediate follow-up
-	}
-	q.mu.Unlock()
+// l1Event represents an informer event that needs L1 refresh processing.
+type l1Event struct {
+	gvr       schema.GroupVersionResource
+	gvrKey    string
+	ns        string
+	name      string
+	eventType string
 }
 
 // ResourceWatcher maintains dynamic informers for every GVR in the watched set.
@@ -118,10 +48,10 @@ type ResourceWatcher struct {
 	factory   dynamicinformer.DynamicSharedInformerFactory
 	mu        sync.Mutex
 	watched   map[string]bool
-	queues    map[string]*refreshQueue // per-GVR refresh queues
-	appCtx    context.Context          // long-lived process context; set by Start()
+	appCtx    context.Context // long-lived process context; set by Start()
 
-	l1Refresh atomic.Value // stores L1RefreshFunc
+	l1Refresh atomic.Value    // stores L1RefreshFunc
+	eventCh   chan l1Event     // buffered channel for L1 refresh events
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -134,7 +64,7 @@ func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error
 		dynClient: dynClient,
 		factory:   dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 0),
 		watched:   make(map[string]bool),
-		queues:    make(map[string]*refreshQueue),
+		eventCh:   make(chan l1Event, 10000),
 	}, nil
 }
 
@@ -153,19 +83,113 @@ func (rw *ResourceWatcher) Start(ctx context.Context) {
 			}
 		}
 	}()
+	go rw.l1Worker(ctx)
 }
 
-// enqueueL1Refresh adds the affected L1 keys to the per-GVR refresh queue.
-func (rw *ResourceWatcher) enqueueL1Refresh(gvr schema.GroupVersionResource, l1Keys []string) {
-	gvrKey := GVRToKey(gvr)
-	rw.mu.Lock()
-	q, ok := rw.queues[gvrKey]
-	if !ok {
-		q = &refreshQueue{gvr: gvr, gvrKey: gvrKey, watcher: rw}
-		rw.queues[gvrKey] = q
+// l1Worker processes L1 refresh events sequentially. Each event reads the
+// latest L3 state (patched by handleEvent before enqueue), resolves affected
+// L1 keys, and cascades to dependents.
+//
+// After 3 seconds of idle (no new events), a settling pass re-refreshes all
+// L1 keys that were touched during the recent burst. This guarantees that L1
+// converges to the final L3 state after events stop flowing.
+func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
+	touched := make(map[string]bool) // L1 keys refreshed during recent events
+	settleTimer := time.NewTimer(3 * time.Second)
+	settleTimer.Stop() // don't fire until first event
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case evt, ok := <-rw.eventCh:
+			if !ok {
+				return
+			}
+			keys := rw.processL1Event(ctx, evt)
+			for _, k := range keys {
+				touched[k] = true
+			}
+			// Reset the settle timer — more events may follow.
+			settleTimer.Stop()
+			settleTimer.Reset(3 * time.Second)
+
+		case <-settleTimer.C:
+			// No events for 3s — re-refresh all touched keys for final consistency.
+			if len(touched) == 0 {
+				continue
+			}
+			keys := make([]string, 0, len(touched))
+			for k := range touched {
+				keys = append(keys, k)
+			}
+			touched = make(map[string]bool) // clear
+
+			fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
+			if !ok || fn == nil {
+				continue
+			}
+			slog.Info("resource-watcher: settling pass",
+				slog.Int("keys", len(keys)))
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						buf := make([]byte, 4096)
+						n := runtime.Stack(buf, false)
+						slog.Error("resource-watcher: panic in settling pass",
+							slog.Any("error", r),
+							slog.String("stack", string(buf[:n])))
+					}
+				}()
+				settleCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+				defer cancel()
+				fn(settleCtx, schema.GroupVersionResource{}, keys)
+			}()
+		}
 	}
-	rw.mu.Unlock()
-	q.enqueue(l1Keys)
+}
+
+func (rw *ResourceWatcher) processL1Event(ctx context.Context, evt l1Event) (touchedKeys []string) {
+	defer func() {
+		if r := recover(); r != nil {
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			slog.Error("resource-watcher: panic in L1 worker",
+				slog.Any("error", r),
+				slog.String("gvr", evt.gvr.String()),
+				slog.String("stack", string(buf[:n])))
+		}
+	}()
+
+	l1Keys := rw.collectAffectedL1Keys(ctx, evt.gvrKey, evt.ns, evt.name)
+	if len(l1Keys) == 0 {
+		return nil
+	}
+
+	if evt.eventType == "delete" {
+		resDepKey := L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)
+		_ = rw.cache.Delete(ctx, append(l1Keys, resDepKey)...)
+	}
+
+	fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
+	if !ok || fn == nil {
+		idxKey := L1GVRKey(evt.gvrKey)
+		_ = rw.cache.Delete(ctx, append(l1Keys, idxKey)...)
+		return l1Keys
+	}
+
+	slog.Debug("resource-watcher: L1 refresh",
+		slog.String("event", evt.eventType),
+		slog.String("gvr", evt.gvr.String()),
+		slog.String("ns", evt.ns),
+		slog.String("name", evt.name),
+		slog.Int("affected", len(l1Keys)))
+
+	refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	fn(refreshCtx, evt.gvr, l1Keys)
+	return l1Keys
 }
 
 // WaitForSync blocks until all started informers have completed their initial sync.
@@ -319,8 +343,6 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	nsListKey := ListKey(gvr, ns)
 	clusterListKey := ListKey(gvr, "")
 
-	gvrKey := GVRToKey(gvr)
-
 	switch eventType {
 	case "delete":
 		_ = rw.cache.Delete(ctx, getKey)
@@ -343,22 +365,25 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		}
 	}
 
-	// Bump the L3 generation counter for this GVR so HTTP handlers can
-	// detect stale L1 entries without re-resolving.
-	rw.cache.IncrL3Gen(ctx, gvrKey)
-
-	// ── Targeted L1 refresh ──────────────────────────────────────────────────
-	l1Keys := rw.collectAffectedL1Keys(ctx, gvrKey, ns, name)
-	if len(l1Keys) == 0 {
-		return
+	// ── Enqueue L1 refresh event ─────────────────────────────────────────────
+	// L3 was just patched above. Enqueue the event for the L1 worker to
+	// process sequentially. The worker will read the latest L3 state.
+	// Non-blocking: if the channel is full, drop the event (L3 is already
+	// updated; the next event for this GVR will trigger a refresh).
+	select {
+	case rw.eventCh <- l1Event{
+		gvr:       gvr,
+		gvrKey:    GVRToKey(gvr),
+		ns:        ns,
+		name:      name,
+		eventType: eventType,
+	}:
+	default:
+		slog.Warn("resource-watcher: L1 event queue full, dropping event",
+			slog.String("gvr", gvr.String()),
+			slog.String("ns", ns),
+			slog.String("name", name))
 	}
-
-	if eventType == "delete" {
-		resDepKey := L1ResourceDepKey(gvrKey, ns, name)
-		_ = rw.cache.Delete(ctx, append(l1Keys, resDepKey)...)
-	}
-
-	rw.enqueueL1Refresh(gvr, l1Keys)
 }
 
 // collectAffectedL1Keys returns the deduplicated set of L1 resolved keys that

@@ -60,7 +60,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			user, uerr := xcontext.UserInfo(req.Context())
 			if uerr == nil {
 				resolvedKey = cache.ResolvedKey(user.Username, gvr, nsn.Namespace, nsn.Name, page, perPage)
-				if raw, hit, _ := c.GetRaw(req.Context(), resolvedKey); hit && !c.IsL1Stale(req.Context(), resolvedKey) {
+				if raw, hit, _ := c.GetRaw(req.Context(), resolvedKey); hit {
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 					log.Info("Widget resolved from cache",
@@ -177,11 +177,6 @@ func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objec
 	if c != nil && resolvedKey != "" {
 		_ = c.SetResolvedRaw(ctx, resolvedKey, raw)
 		cache.RegisterL1Dependencies(ctx, c, tracker, resolvedKey)
-		// Snapshot the current L3 generation for each GVR this resolution touched.
-		// The HTTP handler compares these with the live L3 gens to detect staleness.
-		if gvrKeys := tracker.GVRKeys(); len(gvrKeys) > 0 {
-			c.SetL1Gens(ctx, resolvedKey, c.GetL3Gens(ctx, gvrKeys))
-		}
 		preWarmChildWidgets(ctx, c, res, authnNS)
 	}
 
