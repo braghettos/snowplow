@@ -60,7 +60,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			user, uerr := xcontext.UserInfo(req.Context())
 			if uerr == nil {
 				resolvedKey = cache.ResolvedKey(user.Username, gvr, nsn.Namespace, nsn.Name, page, perPage)
-				if raw, hit, _ := c.GetRaw(req.Context(), resolvedKey); hit {
+				if raw, hit, _ := c.GetRaw(req.Context(), resolvedKey); hit && cache.CheckL1Freshness(req.Context(), c, resolvedKey) {
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 					log.Info("Widget resolved from cache",

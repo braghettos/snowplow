@@ -25,6 +25,7 @@ type DependencyTracker struct {
 	gvrs      map[string]bool
 	resources []ResourceRef
 	resSeen   map[string]bool
+	l1Deps    map[string]bool // L1 resolved keys accessed via /call during resolution
 }
 
 func NewDependencyTracker() *DependencyTracker {
@@ -77,6 +78,32 @@ func (t *DependencyTracker) ResourceRefs() []ResourceRef {
 	out := make([]ResourceRef, len(t.resources))
 	copy(out, t.resources)
 	return out
+}
+
+// AddL1Dep records an L1 resolved key that was accessed during resolution
+// (e.g., via a /call path to another RESTAction). At serve time, if any of
+// these L1 keys no longer exist, the parent L1 key is considered stale.
+func (t *DependencyTracker) AddL1Dep(l1Key string) {
+	if l1Key == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.l1Deps == nil {
+		t.l1Deps = make(map[string]bool)
+	}
+	t.l1Deps[l1Key] = true
+}
+
+// L1DepKeys returns the L1 resolved keys accessed during resolution.
+func (t *DependencyTracker) L1DepKeys() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	keys := make([]string, 0, len(t.l1Deps))
+	for k := range t.l1Deps {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func WithDependencyTracker(ctx context.Context, t *DependencyTracker) context.Context {
