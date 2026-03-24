@@ -50,9 +50,8 @@ type ResourceWatcher struct {
 	watched   map[string]bool
 	appCtx    context.Context // long-lived process context; set by Start()
 
-	l1Refresh  atomic.Value    // stores L1RefreshFunc
-	eventCh    chan l1Event     // buffered channel for L1 refresh events
-	lastRV     sync.Map         // gvr+ns+name → last resourceVersion (for event dedup)
+	l1Refresh  atomic.Value    // stores L1RefreshFunc (kept for Step 2: pre-warming)
+	eventCh    chan l1Event     // buffered channel for L1 invalidation events
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -87,91 +86,31 @@ func (rw *ResourceWatcher) Start(ctx context.Context) {
 	go rw.l1Worker(ctx)
 }
 
-// l1Worker processes L1 refresh events sequentially. Each event reads the
-// latest L3 state (patched by handleEvent before enqueue), resolves affected
-// L1 keys, and cascades to dependents.
-//
-// After every 10 events, a per-key settling check runs: any L1 key that
-// hasn't been refreshed for 3+ seconds is re-refreshed from the final L3
-// state. This ensures settling happens even under continuous event flow
-// (e.g., 12,000 child resource events from composition deployments).
+// l1Worker processes L1 invalidation events. On each event, it finds
+// the affected L1 keys via dependency indexes and deletes them from Redis.
+// The next HTTP request for a deleted key will miss L1, resolve fresh
+// from L3, and re-cache the result. Simple, no race conditions.
 func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
-	touched := make(map[string]time.Time) // L1 key → last refresh timestamp
-	const settleAge = 3 * time.Second
-	const settleCheckInterval = 10 // check every N events
-	eventCount := 0
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
-
 		case evt, ok := <-rw.eventCh:
 			if !ok {
 				return
 			}
-			keys := rw.processL1Event(ctx, evt)
-			now := time.Now()
-			for _, k := range keys {
-				touched[k] = now
-			}
-
-			// Per-key settling check every N events.
-			eventCount++
-			if eventCount >= settleCheckInterval {
-				eventCount = 0
-				rw.settleStaleKeys(ctx, touched, settleAge)
-			}
+			rw.invalidateL1Keys(ctx, evt)
 		}
 	}
 }
 
-// settleStaleKeys re-refreshes L1 keys that haven't been refreshed for
-// longer than settleAge. This catches keys like compositions-list that
-// settle while unrelated events (widget/form/button) keep flowing.
-func (rw *ResourceWatcher) settleStaleKeys(ctx context.Context, touched map[string]time.Time, settleAge time.Duration) {
-	now := time.Now()
-	var stale []string
-	for k, lastRefresh := range touched {
-		if now.Sub(lastRefresh) >= settleAge {
-			stale = append(stale, k)
-		}
-	}
-	if len(stale) == 0 {
-		return
-	}
-	for _, k := range stale {
-		delete(touched, k)
-	}
-
-	fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
-	if !ok || fn == nil {
-		return
-	}
-	slog.Info("resource-watcher: per-key settling pass",
-		slog.Int("keys", len(stale)))
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				buf := make([]byte, 4096)
-				n := runtime.Stack(buf, false)
-				slog.Error("resource-watcher: panic in settling pass",
-					slog.Any("error", r),
-					slog.String("stack", string(buf[:n])))
-			}
-		}()
-		settleCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-		defer cancel()
-		fn(settleCtx, schema.GroupVersionResource{}, stale)
-	}()
-}
-
-func (rw *ResourceWatcher) processL1Event(ctx context.Context, evt l1Event) (touchedKeys []string) {
+// invalidateL1Keys deletes all L1 resolved keys affected by the given event.
+func (rw *ResourceWatcher) invalidateL1Keys(ctx context.Context, evt l1Event) {
 	defer func() {
 		if r := recover(); r != nil {
 			buf := make([]byte, 4096)
 			n := runtime.Stack(buf, false)
-			slog.Error("resource-watcher: panic in L1 worker",
+			slog.Error("resource-watcher: panic in L1 invalidation",
 				slog.Any("error", r),
 				slog.String("gvr", evt.gvr.String()),
 				slog.String("stack", string(buf[:n])))
@@ -180,32 +119,26 @@ func (rw *ResourceWatcher) processL1Event(ctx context.Context, evt l1Event) (tou
 
 	l1Keys := rw.collectAffectedL1Keys(ctx, evt.gvrKey, evt.ns, evt.name)
 	if len(l1Keys) == 0 {
-		return nil
+		return
 	}
 
+	// For deletes, also clean up the per-resource dep index entry.
 	if evt.eventType == "delete" {
 		resDepKey := L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)
-		_ = rw.cache.Delete(ctx, append(l1Keys, resDepKey)...)
+		l1Keys = append(l1Keys, resDepKey)
 	}
 
-	fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
-	if !ok || fn == nil {
-		idxKey := L1GVRKey(evt.gvrKey)
-		_ = rw.cache.Delete(ctx, append(l1Keys, idxKey)...)
-		return l1Keys
-	}
+	_ = rw.cache.Delete(ctx, l1Keys...)
 
-	slog.Debug("resource-watcher: L1 refresh",
+	slog.Debug("resource-watcher: L1 invalidated",
 		slog.String("event", evt.eventType),
 		slog.String("gvr", evt.gvr.String()),
 		slog.String("ns", evt.ns),
 		slog.String("name", evt.name),
-		slog.Int("affected", len(l1Keys)))
+		slog.Int("deleted", len(l1Keys)))
 
-	refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	fn(refreshCtx, evt.gvr, l1Keys)
-	return l1Keys
+	// Update sentinel so external consumers know cache state changed.
+	MarkL1Ready(ctx, rw.cache)
 }
 
 // WaitForSync blocks until all started informers have completed their initial sync.
@@ -348,22 +281,6 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	// L3 cache churn with no benefit.
 	if gvr.Resource == "configmaps" && noisyConfigMapNamespaces[ns] {
 		return
-	}
-
-	// Deduplicate events by resourceVersion. If the resourceVersion hasn't
-	// changed since the last event for this resource, skip it. This reduces
-	// redundant L1 refreshes during rapid UPDATE bursts (e.g. controller
-	// reconciliation loops updating status repeatedly).
-	if eventType == "update" {
-		rv := uns.GetResourceVersion()
-		rvKey := GVRToKey(gvr) + ":" + ns + ":" + name
-		if prev, loaded := rw.lastRV.LoadOrStore(rvKey, rv); loaded && prev.(string) == rv {
-			return // same resourceVersion — skip
-		}
-		rw.lastRV.Store(rvKey, rv)
-	} else if eventType == "delete" {
-		rvKey := GVRToKey(gvr) + ":" + ns + ":" + name
-		rw.lastRV.Delete(rvKey) // clean up
 	}
 
 	slog.Debug("resource-watcher: event",
