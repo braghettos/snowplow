@@ -32,13 +32,83 @@ type L1RefreshFunc func(ctx context.Context, triggerGVR schema.GroupVersionResou
 // mass TTL expiry (e.g., after Redis restart or bulk warmup with identical TTLs).
 const expiryRefreshWorkers = 10
 
-// l1Event represents an informer event that needs L1 refresh processing.
-type l1Event struct {
-	gvr       schema.GroupVersionResource
-	gvrKey    string
-	ns        string
-	name      string
-	eventType string
+// refreshQueue batches L1 refresh requests for a single GVR. Events arriving
+// while a refresh is in-flight are queued for the next cycle — nothing is lost.
+// When a refresh completes and pending keys exist, the next cycle starts
+// immediately (no coalesce delay).
+type refreshQueue struct {
+	mu      sync.Mutex
+	pending map[string]bool
+	timer   *time.Timer
+	running bool
+	gvr     schema.GroupVersionResource
+	gvrKey  string
+	watcher *ResourceWatcher
+}
+
+func (q *refreshQueue) enqueue(keys []string) {
+	q.mu.Lock()
+	if q.pending == nil {
+		q.pending = make(map[string]bool)
+	}
+	for _, k := range keys {
+		q.pending[k] = true
+	}
+	if !q.running && q.timer == nil {
+		q.timer = time.AfterFunc(0, q.flush) // immediate
+	}
+	q.mu.Unlock()
+}
+
+func (q *refreshQueue) flush() {
+	q.mu.Lock()
+	q.timer = nil
+	keys := make([]string, 0, len(q.pending))
+	for k := range q.pending {
+		keys = append(keys, k)
+	}
+	q.pending = make(map[string]bool)
+	q.running = true
+	q.mu.Unlock()
+
+	if len(keys) > 0 {
+		fn, ok := q.watcher.l1Refresh.Load().(L1RefreshFunc)
+		if !ok || fn == nil {
+			ctx := q.watcher.appCtx
+			idxKey := L1GVRKey(q.gvrKey)
+			_ = q.watcher.cache.Delete(ctx, append(keys, idxKey)...)
+			slog.Debug("resource-watcher: L1 invalidated (no refresher, queued)",
+				slog.String("gvr", q.gvr.String()), slog.Int("count", len(keys)))
+		} else {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						buf := make([]byte, 4096)
+						n := runtime.Stack(buf, false)
+						slog.Error("resource-watcher: panic in queued L1 refresh",
+							slog.Any("error", r),
+							slog.String("gvr", q.gvr.String()),
+							slog.String("stack", string(buf[:n])))
+					}
+				}()
+				timeout := 10*time.Second + time.Duration(len(keys))*3*time.Second
+				if timeout > 10*time.Minute {
+					timeout = 10 * time.Minute
+				}
+				ctx, cancel := context.WithTimeout(q.watcher.appCtx, timeout)
+				defer cancel()
+				fn(ctx, q.gvr, keys)
+			}()
+		}
+	}
+
+	q.mu.Lock()
+	q.running = false
+	hasPending := len(q.pending) > 0
+	if hasPending {
+		q.timer = time.AfterFunc(0, q.flush) // immediate follow-up
+	}
+	q.mu.Unlock()
 }
 
 // ResourceWatcher maintains dynamic informers for every GVR in the watched set.
@@ -48,10 +118,10 @@ type ResourceWatcher struct {
 	factory   dynamicinformer.DynamicSharedInformerFactory
 	mu        sync.Mutex
 	watched   map[string]bool
-	appCtx    context.Context // long-lived process context; set by Start()
+	queues    map[string]*refreshQueue // per-GVR refresh queues
+	appCtx    context.Context          // long-lived process context; set by Start()
 
-	l1Refresh atomic.Value    // stores L1RefreshFunc
-	eventCh   chan l1Event     // buffered channel for L1 refresh events
+	l1Refresh atomic.Value // stores L1RefreshFunc
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -64,7 +134,7 @@ func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error
 		dynClient: dynClient,
 		factory:   dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 0),
 		watched:   make(map[string]bool),
-		eventCh:   make(chan l1Event, 10000),
+		queues:    make(map[string]*refreshQueue),
 	}, nil
 }
 
@@ -83,84 +153,19 @@ func (rw *ResourceWatcher) Start(ctx context.Context) {
 			}
 		}
 	}()
-	go rw.l1Worker(ctx)
 }
 
-// l1Worker processes L1 refresh events sequentially. Each event reads the
-// latest L3 state (patched by handleEvent before enqueue), resolves affected
-// L1 keys, and cascades to dependents.
-func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case evt, ok := <-rw.eventCh:
-			if !ok {
-				return
-			}
-			rw.processL1Event(ctx, evt)
-		}
+// enqueueL1Refresh adds the affected L1 keys to the per-GVR refresh queue.
+func (rw *ResourceWatcher) enqueueL1Refresh(gvr schema.GroupVersionResource, l1Keys []string) {
+	gvrKey := GVRToKey(gvr)
+	rw.mu.Lock()
+	q, ok := rw.queues[gvrKey]
+	if !ok {
+		q = &refreshQueue{gvr: gvr, gvrKey: gvrKey, watcher: rw}
+		rw.queues[gvrKey] = q
 	}
-}
-
-func (rw *ResourceWatcher) processL1Event(ctx context.Context, evt l1Event) {
-	defer func() {
-		if r := recover(); r != nil {
-			buf := make([]byte, 4096)
-			n := runtime.Stack(buf, false)
-			slog.Error("resource-watcher: panic in L1 worker",
-				slog.Any("error", r),
-				slog.String("gvr", evt.gvr.String()),
-				slog.String("stack", string(buf[:n])))
-		}
-	}()
-
-	queueLen := len(rw.eventCh)
-	slog.Info("L1 worker: processing event",
-		slog.String("event", evt.eventType),
-		slog.String("gvr", evt.gvr.String()),
-		slog.String("ns", evt.ns),
-		slog.String("name", evt.name),
-		slog.Int("queueDepth", queueLen))
-
-	l1Keys := rw.collectAffectedL1Keys(ctx, evt.gvrKey, evt.ns, evt.name)
-	if len(l1Keys) == 0 {
-		slog.Debug("L1 worker: no affected L1 keys, skipping",
-			slog.String("gvr", evt.gvr.String()),
-			slog.String("ns", evt.ns),
-			slog.String("name", evt.name))
-		return
-	}
-	slog.Info("L1 worker: found affected L1 keys",
-		slog.String("event", evt.eventType),
-		slog.String("gvr", evt.gvr.String()),
-		slog.String("ns", evt.ns),
-		slog.String("name", evt.name),
-		slog.Int("affected", len(l1Keys)),
-		slog.Any("keys", l1Keys))
-
-	if evt.eventType == "delete" {
-		resDepKey := L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)
-		_ = rw.cache.Delete(ctx, append(l1Keys, resDepKey)...)
-	}
-
-	fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
-	if !ok || fn == nil {
-		idxKey := L1GVRKey(evt.gvrKey)
-		_ = rw.cache.Delete(ctx, append(l1Keys, idxKey)...)
-		return
-	}
-
-	slog.Debug("resource-watcher: L1 refresh",
-		slog.String("event", evt.eventType),
-		slog.String("gvr", evt.gvr.String()),
-		slog.String("ns", evt.ns),
-		slog.String("name", evt.name),
-		slog.Int("affected", len(l1Keys)))
-
-	refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	fn(refreshCtx, evt.gvr, l1Keys)
+	rw.mu.Unlock()
+	q.enqueue(l1Keys)
 }
 
 // WaitForSync blocks until all started informers have completed their initial sync.
@@ -314,6 +319,8 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	nsListKey := ListKey(gvr, ns)
 	clusterListKey := ListKey(gvr, "")
 
+	gvrKey := GVRToKey(gvr)
+
 	switch eventType {
 	case "delete":
 		_ = rw.cache.Delete(ctx, getKey)
@@ -336,25 +343,22 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		}
 	}
 
-	// ── Enqueue L1 refresh event ─────────────────────────────────────────────
-	// L3 was just patched above. Enqueue the event for the L1 worker to
-	// process sequentially. The worker will read the latest L3 state.
-	// Non-blocking: if the channel is full, drop the event (L3 is already
-	// updated; the next event for this GVR will trigger a refresh).
-	select {
-	case rw.eventCh <- l1Event{
-		gvr:       gvr,
-		gvrKey:    GVRToKey(gvr),
-		ns:        ns,
-		name:      name,
-		eventType: eventType,
-	}:
-	default:
-		slog.Warn("resource-watcher: L1 event queue full, dropping event",
-			slog.String("gvr", gvr.String()),
-			slog.String("ns", ns),
-			slog.String("name", name))
+	// Bump the L3 generation counter for this GVR so HTTP handlers can
+	// detect stale L1 entries without re-resolving.
+	rw.cache.IncrL3Gen(ctx, gvrKey)
+
+	// ── Targeted L1 refresh ──────────────────────────────────────────────────
+	l1Keys := rw.collectAffectedL1Keys(ctx, gvrKey, ns, name)
+	if len(l1Keys) == 0 {
+		return
 	}
+
+	if eventType == "delete" {
+		resDepKey := L1ResourceDepKey(gvrKey, ns, name)
+		_ = rw.cache.Delete(ctx, append(l1Keys, resDepKey)...)
+	}
+
+	rw.enqueueL1Refresh(gvr, l1Keys)
 }
 
 // collectAffectedL1Keys returns the deduplicated set of L1 resolved keys that

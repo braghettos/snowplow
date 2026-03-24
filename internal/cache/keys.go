@@ -148,6 +148,22 @@ func L1ResourceDepKey(gvrKey, ns, name string) string {
 	return "snowplow:l1dep:" + gvrKey + ":" + ns + ":" + name
 }
 
+// L3GenKey returns the Redis key for the per-GVR L3 generation counter.
+// Incremented by INCR on every patchListCache call. Used by the HTTP handler
+// to detect whether the L1 resolved cache is stale (L3 changed since L1 was
+// last written).
+func L3GenKey(gvrKey string) string {
+	return "snowplow:l3gen:" + gvrKey
+}
+
+// L1GenKey returns the Redis key that stores the L3 generation snapshot
+// for a given L1 resolved key. The value is a JSON map of GVR→generation
+// captured at the time the L1 key was written. On L1 cache hit, compare
+// these stored generations with the current L3 generations to detect staleness.
+func L1GenKey(l1Key string) string {
+	return "snowplow:l1gen:" + l1Key
+}
+
 // L1ApiDepKey builds the Redis key for the API-level dependency index.
 // It maps a GVR key (e.g. "composition.krateo.io/v1-2-2/githubscaffoldingwithcompositionpages")
 // to L1 resolved keys that depend on that resource type.

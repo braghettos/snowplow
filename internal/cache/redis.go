@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -440,6 +441,94 @@ func (c *RedisCache) GetString(ctx context.Context, key string) (string, bool, e
 		return "", false, err
 	}
 	return val, true, nil
+}
+
+// ── L3 Generation tracking ────────────────────────────────────────────────
+
+// IncrL3Gen atomically increments the L3 generation counter for a GVR.
+// Called by the informer after every L3 patch (patchListCache / SetForGVR).
+func (c *RedisCache) IncrL3Gen(ctx context.Context, gvrKey string) {
+	if c == nil {
+		return
+	}
+	_ = c.client.Incr(ctx, L3GenKey(gvrKey)).Err()
+}
+
+// GetL3Gens reads the current L3 generation counters for the given GVR keys.
+// Returns a map of gvrKey → generation (int64). Missing keys default to 0.
+func (c *RedisCache) GetL3Gens(ctx context.Context, gvrKeys []string) map[string]int64 {
+	result := make(map[string]int64, len(gvrKeys))
+	if c == nil || len(gvrKeys) == 0 {
+		return result
+	}
+	redisKeys := make([]string, len(gvrKeys))
+	for i, k := range gvrKeys {
+		redisKeys[i] = L3GenKey(k)
+	}
+	vals, err := c.client.MGet(ctx, redisKeys...).Result()
+	if err != nil {
+		return result
+	}
+	for i, v := range vals {
+		if v != nil {
+			if s, ok := v.(string); ok {
+				if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+					result[gvrKeys[i]] = n
+				}
+			}
+		}
+	}
+	return result
+}
+
+// SetL1Gens stores the L3 generation snapshot for an L1 resolved key.
+func (c *RedisCache) SetL1Gens(ctx context.Context, l1Key string, gens map[string]int64) {
+	if c == nil || len(gens) == 0 {
+		return
+	}
+	data, err := json.Marshal(gens)
+	if err != nil {
+		return
+	}
+	_ = c.client.Set(ctx, L1GenKey(l1Key), data, ResolvedCacheTTL).Err()
+}
+
+// GetL1Gens reads the stored L3 generation snapshot for an L1 resolved key.
+func (c *RedisCache) GetL1Gens(ctx context.Context, l1Key string) map[string]int64 {
+	if c == nil {
+		return nil
+	}
+	val, err := c.client.Get(ctx, L1GenKey(l1Key)).Bytes()
+	if err != nil {
+		return nil
+	}
+	var gens map[string]int64
+	if err := json.Unmarshal(val, &gens); err != nil {
+		return nil
+	}
+	return gens
+}
+
+// IsL1Stale checks whether an L1 key's stored generations are behind the
+// current L3 generations. Returns true if ANY tracked GVR has a newer L3 gen.
+func (c *RedisCache) IsL1Stale(ctx context.Context, l1Key string) bool {
+	storedGens := c.GetL1Gens(ctx, l1Key)
+	if len(storedGens) == 0 {
+		// No generation info stored — treat as fresh (backward compat with
+		// L1 entries created before the generation system was deployed).
+		return false
+	}
+	gvrKeys := make([]string, 0, len(storedGens))
+	for k := range storedGens {
+		gvrKeys = append(gvrKeys, k)
+	}
+	currentGens := c.GetL3Gens(ctx, gvrKeys)
+	for k, stored := range storedGens {
+		if currentGens[k] > stored {
+			return true
+		}
+	}
+	return false
 }
 
 // ── Expiry notifications ──────────────────────────────────────────────────────
