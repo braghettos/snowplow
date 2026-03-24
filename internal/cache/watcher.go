@@ -90,13 +90,15 @@ func (rw *ResourceWatcher) Start(ctx context.Context) {
 // latest L3 state (patched by handleEvent before enqueue), resolves affected
 // L1 keys, and cascades to dependents.
 //
-// After 3 seconds of idle (no new events), a settling pass re-refreshes all
-// L1 keys that were touched during the recent burst. This guarantees that L1
-// converges to the final L3 state after events stop flowing.
+// A per-key settling pass runs every second: any L1 key that hasn't been
+// refreshed for 3+ seconds is re-refreshed from the final L3 state. This
+// decouples settling from unrelated events — e.g., composition-list settles
+// even while widget/form/button events are still flowing for child resources.
 func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
-	touched := make(map[string]bool) // L1 keys refreshed during recent events
-	settleTimer := time.NewTimer(3 * time.Second)
-	settleTimer.Stop() // don't fire until first event
+	touched := make(map[string]time.Time) // L1 key → last refresh timestamp
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	const settleAge = 3 * time.Second
 
 	for {
 		select {
@@ -108,30 +110,33 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 				return
 			}
 			keys := rw.processL1Event(ctx, evt)
+			now := time.Now()
 			for _, k := range keys {
-				touched[k] = true
+				touched[k] = now
 			}
-			// Reset the settle timer — more events may follow.
-			settleTimer.Stop()
-			settleTimer.Reset(3 * time.Second)
 
-		case <-settleTimer.C:
-			// No events for 3s — re-refresh all touched keys for final consistency.
-			if len(touched) == 0 {
+		case <-ticker.C:
+			// Per-key settling: find keys not refreshed for >3s.
+			now := time.Now()
+			var stale []string
+			for k, lastRefresh := range touched {
+				if now.Sub(lastRefresh) >= settleAge {
+					stale = append(stale, k)
+				}
+			}
+			if len(stale) == 0 {
 				continue
 			}
-			keys := make([]string, 0, len(touched))
-			for k := range touched {
-				keys = append(keys, k)
+			for _, k := range stale {
+				delete(touched, k)
 			}
-			touched = make(map[string]bool) // clear
 
 			fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
 			if !ok || fn == nil {
 				continue
 			}
-			slog.Info("resource-watcher: settling pass",
-				slog.Int("keys", len(keys)))
+			slog.Info("resource-watcher: per-key settling pass",
+				slog.Int("keys", len(stale)))
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
@@ -144,7 +149,7 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 				}()
 				settleCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 				defer cancel()
-				fn(settleCtx, schema.GroupVersionResource{}, keys)
+				fn(settleCtx, schema.GroupVersionResource{}, stale)
 			}()
 		}
 	}
