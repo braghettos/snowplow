@@ -165,6 +165,41 @@ func L1DepsKey(l1Key string) string {
 	return l1Key + ":deps"
 }
 
+// L1StaleKey returns the Redis key used to mark an L1 resolved key as stale.
+// When set, the HTTP handler serves the current (stale) value but triggers
+// a background re-resolve. The next request gets the fresh value.
+func L1StaleKey(l1Key string) string {
+	return l1Key + ":stale"
+}
+
+// MarkL1Stale marks one or more L1 keys as needing background re-resolve.
+// The keys are NOT deleted — they continue to serve stale data until the
+// background re-resolve overwrites them with fresh values.
+func MarkL1Stale(ctx context.Context, c *RedisCache, keys ...string) {
+	if c == nil {
+		return
+	}
+	for _, k := range keys {
+		_ = c.client.Set(ctx, L1StaleKey(k), "1", ResolvedCacheTTL).Err()
+	}
+}
+
+// IsL1Stale checks whether an L1 key has been marked as stale by an event.
+func IsL1Stale(ctx context.Context, c *RedisCache, l1Key string) bool {
+	if c == nil {
+		return false
+	}
+	return c.Exists(ctx, L1StaleKey(l1Key))
+}
+
+// ClearL1Stale removes the stale flag after a successful re-resolve.
+func ClearL1Stale(ctx context.Context, c *RedisCache, l1Key string) {
+	if c == nil {
+		return
+	}
+	_ = c.client.Del(ctx, L1StaleKey(l1Key)).Err()
+}
+
 // RegisterL1Dependencies registers the L1 resolved key in both the GVR-level
 // and per-resource reverse indexes based on dependencies captured by the tracker.
 // Also stores the L1-to-L1 dependency chain for freshness checks at serve time.

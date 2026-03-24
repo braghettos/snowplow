@@ -9,4 +9,8 @@ import "golang.org/x/sync/singleflight"
 var (
 	widgetFlight     singleflight.Group
 	restactionFlight singleflight.Group
+	// Background re-resolve groups — separate from HTTP singleflight
+	// so background re-resolves don't block HTTP requests.
+	widgetBgFlight     singleflight.Group
+	restactionBgFlight singleflight.Group
 )

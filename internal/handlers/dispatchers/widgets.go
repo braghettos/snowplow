@@ -60,9 +60,17 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			user, uerr := xcontext.UserInfo(req.Context())
 			if uerr == nil {
 				resolvedKey = cache.ResolvedKey(user.Username, gvr, nsn.Namespace, nsn.Name, page, perPage)
-				if raw, hit, _ := c.GetRaw(req.Context(), resolvedKey); hit && cache.CheckL1Freshness(req.Context(), c, resolvedKey) {
-				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
-				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
+				if raw, hit, _ := c.GetRaw(req.Context(), resolvedKey); hit {
+					// Check freshness: deps still exist? (zero-state detection)
+					if !cache.CheckL1Freshness(req.Context(), c, resolvedKey) {
+						// Dependency chain broken (zero-state) — treat as miss.
+						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawMisses, "raw_misses")
+						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Misses, "l1_misses")
+						log.Info("widget: L1 stale (deps missing)", slog.String("key", resolvedKey))
+						goto miss
+					}
+					cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
+					cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 					log.Info("Widget resolved from cache",
 						slog.String("key", resolvedKey),
 						slog.String("user", user.Username),
@@ -75,11 +83,16 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 					wri.Header().Set("Cache-Control", "public, max-age=15")
 					wri.WriteHeader(http.StatusOK)
 					_, _ = wri.Write(raw)
+					// If marked stale by an event, trigger background re-resolve.
+					if cache.IsL1Stale(req.Context(), c, resolvedKey) {
+						go r.backgroundReResolve(req.Context(), c, resolvedKey, fetchObject(req), perPage, page)
+					}
 					return
 				}
 		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawMisses, "raw_misses")
 		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Misses, "l1_misses")
 				log.Info("widget: L1 miss", slog.String("key", resolvedKey))
+			miss:
 			}
 		}
 	}
@@ -201,6 +214,31 @@ func ResolveWidgetDirect(ctx context.Context, c *cache.RedisCache, got objects.R
 // HTTP requests that resolve the same key concurrently.
 func ResolveWidgetBackground(ctx context.Context, c *cache.RedisCache, got objects.Result, resolvedKey, authnNS string, perPage, page int) (*ResolveWidgetResult, error) {
 	return resolveWidgetFromObject(ctx, c, got, resolvedKey, authnNS, perPage, page, nil)
+}
+
+// backgroundReResolve re-resolves a widget in the background after serving
+// a stale L1 value. Uses its own singleflight group to dedup concurrent
+// re-resolves for the same key without blocking HTTP requests.
+func (r *widgetsHandler) backgroundReResolve(ctx context.Context, c *cache.RedisCache, resolvedKey string, got objects.Result, perPage, page int) {
+	defer func() {
+		if rv := recover(); rv != nil {
+			slog.Error("widget: panic in background re-resolve", slog.Any("error", rv))
+		}
+	}()
+
+	bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+
+	_, _, shared := widgetBgFlight.Do(resolvedKey, func() (interface{}, error) {
+		result, err := resolveWidgetFromObject(bgCtx, c, got, resolvedKey, r.authnNS, perPage, page, nil)
+		if err == nil {
+			cache.ClearL1Stale(bgCtx, c, resolvedKey)
+		}
+		return result, err
+	})
+	if shared {
+		slog.Debug("widget: background re-resolve shared", slog.String("key", resolvedKey))
+	}
 }
 
 func writeWidgetError(wri http.ResponseWriter, err error) {

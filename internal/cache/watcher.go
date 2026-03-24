@@ -104,7 +104,16 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 	}
 }
 
-// invalidateL1Keys deletes all L1 resolved keys affected by the given event.
+// invalidateL1Keys handles L1 cache coherence for informer events.
+//
+// DELETE events: cascade-delete all affected L1 keys and their dependents.
+// The resource is gone — stale data must not be served.
+//
+// ADD/UPDATE events: mark affected L1 keys as stale (don't delete them).
+// The HTTP handler serves the stale value immediately (~60ms), then triggers
+// a background re-resolve. The next request gets the fresh value.
+const maxCascadeDepth = 5
+
 func (rw *ResourceWatcher) invalidateL1Keys(ctx context.Context, evt l1Event) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -118,27 +127,84 @@ func (rw *ResourceWatcher) invalidateL1Keys(ctx context.Context, evt l1Event) {
 	}()
 
 	l1Keys := rw.collectAffectedL1Keys(ctx, evt.gvrKey, evt.ns, evt.name)
+
+	// If per-resource/API deps found nothing, fall back to the GVR-level
+	// index. This handles the zero-state case.
+	if len(l1Keys) == 0 {
+		if gvrKeys, err := rw.cache.SMembers(ctx, L1GVRKey(evt.gvrKey)); err == nil {
+			l1Keys = gvrKeys
+		}
+	}
 	if len(l1Keys) == 0 {
 		return
 	}
 
-	// For deletes, also clean up the per-resource dep index entry.
 	if evt.eventType == "delete" {
-		resDepKey := L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)
-		l1Keys = append(l1Keys, resDepKey)
+		rw.cascadeDeleteL1Keys(ctx, evt, l1Keys)
+	} else {
+		// ADD/UPDATE: mark as stale, don't delete.
+		MarkL1Stale(ctx, rw.cache, l1Keys...)
+		slog.Debug("resource-watcher: L1 marked stale",
+			slog.String("event", evt.eventType),
+			slog.String("gvr", evt.gvr.String()),
+			slog.String("ns", evt.ns),
+			slog.String("name", evt.name),
+			slog.Int("marked", len(l1Keys)))
+	}
+}
+
+// cascadeDeleteL1Keys walks the dependency tree and deletes all affected L1
+// keys plus their dependents. Used for DELETE events only.
+func (rw *ResourceWatcher) cascadeDeleteL1Keys(ctx context.Context, evt l1Event, l1Keys []string) {
+	// Clean up the per-resource dep index entry for the deleted resource.
+	resDepKey := L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)
+	l1Keys = append(l1Keys, resDepKey)
+
+	// Walk the dependency tree.
+	allKeys := make(map[string]bool)
+	for _, k := range l1Keys {
+		allKeys[k] = true
 	}
 
-	_ = rw.cache.Delete(ctx, l1Keys...)
+	pending := l1Keys
+	for depth := 0; depth < maxCascadeDepth && len(pending) > 0; depth++ {
+		var nextPending []string
+		for _, key := range pending {
+			info, ok := ParseResolvedKey(key)
+			if !ok {
+				continue
+			}
+			depKey := L1ResourceDepKey(GVRToKey(info.GVR), info.NS, info.Name)
+			dependents, err := rw.cache.SMembers(ctx, depKey)
+			if err != nil || len(dependents) == 0 {
+				continue
+			}
+			for _, dep := range dependents {
+				if !allKeys[dep] {
+					allKeys[dep] = true
+					nextPending = append(nextPending, dep)
+				}
+			}
+		}
+		pending = nextPending
+	}
 
-	slog.Debug("resource-watcher: L1 invalidated",
+	// Delete all collected keys, their :deps keys, and their :stale keys.
+	toDelete := make([]string, 0, len(allKeys)*3)
+	for k := range allKeys {
+		toDelete = append(toDelete, k)
+		if strings.HasPrefix(k, "snowplow:resolved:") {
+			toDelete = append(toDelete, L1DepsKey(k), L1StaleKey(k))
+		}
+	}
+	_ = rw.cache.Delete(ctx, toDelete...)
+
+	slog.Debug("resource-watcher: L1 cascade delete",
 		slog.String("event", evt.eventType),
 		slog.String("gvr", evt.gvr.String()),
 		slog.String("ns", evt.ns),
 		slog.String("name", evt.name),
-		slog.Int("deleted", len(l1Keys)))
-
-	// Update sentinel so external consumers know cache state changed.
-	MarkL1Ready(ctx, rw.cache)
+		slog.Int("deleted", len(toDelete)))
 }
 
 // WaitForSync blocks until all started informers have completed their initial sync.

@@ -14,6 +14,7 @@ import (
 	v1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
+	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -57,7 +58,13 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			user, uerr := xcontext.UserInfo(req.Context())
 			if uerr == nil {
 				resolvedKey = cache.ResolvedKey(user.Username, gvr, nsn.Namespace, nsn.Name, page, perPage)
-				if raw, hit, _ := c.GetRaw(req.Context(), resolvedKey); hit && cache.CheckL1Freshness(req.Context(), c, resolvedKey) {
+				if raw, hit, _ := c.GetRaw(req.Context(), resolvedKey); hit {
+					if !cache.CheckL1Freshness(req.Context(), c, resolvedKey) {
+						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawMisses, "raw_misses")
+						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Misses, "l1_misses")
+						log.Info("restaction: L1 stale (deps missing)", slog.String("key", resolvedKey))
+						goto ramiss
+					}
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 					log.Info("RESTAction resolved from cache",
@@ -72,11 +79,15 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 					wri.Header().Set("Cache-Control", "public, max-age=15")
 					wri.WriteHeader(http.StatusOK)
 					_, _ = wri.Write(raw)
+					if cache.IsL1Stale(req.Context(), c, resolvedKey) {
+						go r.backgroundReResolveRA(req.Context(), c, resolvedKey, fetchObject(req), perPage, page)
+					}
 					return
 				}
 		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawMisses, "raw_misses")
 		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Misses, "l1_misses")
 				log.Info("restaction: L1 miss", slog.String("key", resolvedKey))
+			ramiss:
 			}
 		}
 	}
@@ -224,4 +235,25 @@ func ResolveRESTActionDirect(ctx context.Context, c *cache.RedisCache, obj map[s
 // HTTP requests that resolve the same key concurrently.
 func ResolveRESTActionBackground(ctx context.Context, c *cache.RedisCache, obj map[string]interface{}, resolvedKey, authnNS string, perPage, page int) ([]byte, error) {
 	return resolveRESTActionFromObject(ctx, c, obj, resolvedKey, authnNS, perPage, page, nil)
+}
+
+// backgroundReResolveRA re-resolves a RESTAction in the background after
+// serving a stale L1 value.
+func (r *restActionHandler) backgroundReResolveRA(ctx context.Context, c *cache.RedisCache, resolvedKey string, got objects.Result, perPage, page int) {
+	defer func() {
+		if rv := recover(); rv != nil {
+			slog.Error("restaction: panic in background re-resolve", slog.Any("error", rv))
+		}
+	}()
+
+	bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+
+	restactionBgFlight.Do(resolvedKey, func() (interface{}, error) {
+		raw, err := resolveRESTActionFromObject(bgCtx, c, got.Unstructured.Object, resolvedKey, r.authnNS, perPage, page, nil)
+		if err == nil {
+			cache.ClearL1Stale(bgCtx, c, resolvedKey)
+		}
+		return raw, err
+	})
 }
