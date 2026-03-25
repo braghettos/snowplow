@@ -50,8 +50,8 @@ type ResourceWatcher struct {
 	watched   map[string]bool
 	appCtx    context.Context // long-lived process context; set by Start()
 
-	l1Refresh  atomic.Value    // stores L1RefreshFunc (kept for Step 2: pre-warming)
-	eventCh    chan l1Event     // buffered channel for L1 invalidation events
+	l1Refresh atomic.Value    // stores L1RefreshFunc
+	eventCh   chan l1Event     // buffered channel for L1 refresh events
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -86,10 +86,9 @@ func (rw *ResourceWatcher) Start(ctx context.Context) {
 	go rw.l1Worker(ctx)
 }
 
-// l1Worker processes L1 invalidation events. On each event, it finds
-// the affected L1 keys via dependency indexes and deletes them from Redis.
-// The next HTTP request for a deleted key will miss L1, resolve fresh
-// from L3, and re-cache the result. Simple, no race conditions.
+// l1Worker processes L1 refresh events sequentially. Each event reads the
+// latest L3 state (patched by handleEvent before enqueue), resolves affected
+// L1 keys, and cascades to dependents.
 func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 	for {
 		select {
@@ -99,27 +98,17 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 			if !ok {
 				return
 			}
-			rw.invalidateL1Keys(ctx, evt)
+			rw.processL1Event(ctx, evt)
 		}
 	}
 }
 
-// invalidateL1Keys handles L1 cache coherence for informer events.
-//
-// DELETE events: cascade-delete all affected L1 keys and their dependents.
-// The resource is gone — stale data must not be served.
-//
-// ADD/UPDATE events: mark affected L1 keys as stale (don't delete them).
-// The HTTP handler serves the stale value immediately (~60ms), then triggers
-// a background re-resolve. The next request gets the fresh value.
-const maxCascadeDepth = 5
-
-func (rw *ResourceWatcher) invalidateL1Keys(ctx context.Context, evt l1Event) {
+func (rw *ResourceWatcher) processL1Event(ctx context.Context, evt l1Event) {
 	defer func() {
 		if r := recover(); r != nil {
 			buf := make([]byte, 4096)
 			n := runtime.Stack(buf, false)
-			slog.Error("resource-watcher: panic in L1 invalidation",
+			slog.Error("resource-watcher: panic in L1 worker",
 				slog.Any("error", r),
 				slog.String("gvr", evt.gvr.String()),
 				slog.String("stack", string(buf[:n])))
@@ -127,112 +116,32 @@ func (rw *ResourceWatcher) invalidateL1Keys(ctx context.Context, evt l1Event) {
 	}()
 
 	l1Keys := rw.collectAffectedL1Keys(ctx, evt.gvrKey, evt.ns, evt.name)
-
-	// If per-resource/API deps found nothing, fall back to the GVR-level
-	// index.
-	if len(l1Keys) == 0 {
-		if gvrKeys, err := rw.cache.SMembers(ctx, L1GVRKey(evt.gvrKey)); err == nil {
-			l1Keys = gvrKeys
-		}
-	}
-
-	// CRD-based invalidation: when a CR is created/updated/deleted, find
-	// L1 keys that depend on this CR's CRD. This handles the zero-state
-	// scenario: compositions-list has no dep on composition GVR, but
-	// compositions-get-ns-and-crd depends on the CRD that defines
-	// compositions. Invalidating via the CRD cascades through:
-	// CRD dep → compositions-get-ns-and-crd → compositions-list → piechart.
-	// Always runs regardless of whether per-resource deps were found.
-	if evt.gvr.Group != "" && evt.gvr.Group != "apiextensions.k8s.io" {
-		crdName := evt.gvr.Resource + "." + evt.gvr.Group
-		crdGVRKey := "apiextensions.k8s.io/v1/customresourcedefinitions"
-		crdL1Keys := rw.collectAffectedL1Keys(ctx, crdGVRKey, "", crdName)
-		if len(crdL1Keys) == 0 {
-			// Also try cluster-wide LIST dep (compositions-get-ns-and-crd LISTs all CRDs)
-			if keys, err := rw.cache.SMembers(ctx, L1ResourceDepKey(crdGVRKey, "", "")); err == nil {
-				crdL1Keys = keys
-			}
-		}
-		if len(crdL1Keys) > 0 {
-			l1Keys = append(l1Keys, crdL1Keys...)
-			slog.Info("resource-watcher: CRD-based invalidation",
-				slog.String("event", evt.eventType),
-				slog.String("gvr", evt.gvr.String()),
-				slog.String("crd", crdName),
-				slog.Int("affected", len(l1Keys)))
-		}
-	}
-
 	if len(l1Keys) == 0 {
 		return
 	}
 
 	if evt.eventType == "delete" {
-		rw.cascadeDeleteL1Keys(ctx, evt, l1Keys)
-	} else {
-		// ADD/UPDATE: mark as stale for background re-resolve.
-		MarkL1Stale(ctx, rw.cache, l1Keys...)
-		slog.Debug("resource-watcher: L1 marked stale",
-			slog.String("event", evt.eventType),
-			slog.String("gvr", evt.gvr.String()),
-			slog.String("ns", evt.ns),
-			slog.String("name", evt.name),
-			slog.Int("marked", len(l1Keys)))
-	}
-}
-
-// cascadeDeleteL1Keys walks the dependency tree and deletes all affected L1
-// keys plus their dependents. Used for DELETE events only.
-func (rw *ResourceWatcher) cascadeDeleteL1Keys(ctx context.Context, evt l1Event, l1Keys []string) {
-	// Clean up the per-resource dep index entry for the deleted resource.
-	resDepKey := L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)
-	l1Keys = append(l1Keys, resDepKey)
-
-	// Walk the dependency tree.
-	allKeys := make(map[string]bool)
-	for _, k := range l1Keys {
-		allKeys[k] = true
+		resDepKey := L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)
+		_ = rw.cache.Delete(ctx, append(l1Keys, resDepKey)...)
 	}
 
-	pending := l1Keys
-	for depth := 0; depth < maxCascadeDepth && len(pending) > 0; depth++ {
-		var nextPending []string
-		for _, key := range pending {
-			info, ok := ParseResolvedKey(key)
-			if !ok {
-				continue
-			}
-			depKey := L1ResourceDepKey(GVRToKey(info.GVR), info.NS, info.Name)
-			dependents, err := rw.cache.SMembers(ctx, depKey)
-			if err != nil || len(dependents) == 0 {
-				continue
-			}
-			for _, dep := range dependents {
-				if !allKeys[dep] {
-					allKeys[dep] = true
-					nextPending = append(nextPending, dep)
-				}
-			}
-		}
-		pending = nextPending
+	fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
+	if !ok || fn == nil {
+		idxKey := L1GVRKey(evt.gvrKey)
+		_ = rw.cache.Delete(ctx, append(l1Keys, idxKey)...)
+		return
 	}
 
-	// Delete all collected keys and their :stale flags.
-	toDelete := make([]string, 0, len(allKeys)*2)
-	for k := range allKeys {
-		toDelete = append(toDelete, k)
-		if strings.HasPrefix(k, "snowplow:resolved:") {
-			toDelete = append(toDelete, L1StaleKey(k))
-		}
-	}
-	_ = rw.cache.Delete(ctx, toDelete...)
-
-	slog.Debug("resource-watcher: L1 cascade delete",
+	slog.Debug("resource-watcher: L1 refresh",
 		slog.String("event", evt.eventType),
 		slog.String("gvr", evt.gvr.String()),
 		slog.String("ns", evt.ns),
 		slog.String("name", evt.name),
-		slog.Int("deleted", len(toDelete)))
+		slog.Int("affected", len(l1Keys)))
+
+	refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	fn(refreshCtx, evt.gvr, l1Keys)
 }
 
 // WaitForSync blocks until all started informers have completed their initial sync.
@@ -438,12 +347,6 @@ func (rw *ResourceWatcher) collectAffectedL1Keys(ctx context.Context, gvrKey, ns
 	seen := map[string]bool{}
 	collect := func(idxKey string) {
 		if keys, err := rw.cache.SMembers(ctx, idxKey); err == nil {
-			if len(keys) > 0 {
-				// Refresh the dep index TTL so it doesn't expire before
-				// the L1 keys it tracks. Without this, long-running L1
-				// keys become "invisible" to invalidation after ~2h.
-				_ = rw.cache.client.Expire(ctx, idxKey, ReverseIndexTTL).Err()
-			}
 			for _, k := range keys {
 				seen[k] = true
 			}
@@ -533,14 +436,7 @@ func (rw *ResourceWatcher) patchListCache(ctx context.Context, gvr schema.GroupV
 	if err != nil {
 		slog.Warn("resource-watcher: failed to patch list cache",
 			slog.String("key", listKey), slog.Any("err", err))
-		return
 	}
-
-	// Bump the list generation counter. The settling pass uses this to
-	// verify that L3 hasn't changed since the last L1 refresh.
-	genKey := listKey + ":gen"
-	_ = rw.cache.client.Incr(ctx, genKey).Err()
-	_ = rw.cache.client.Expire(ctx, genKey, ttl).Err()
 }
 
 // ── Proactive expiry refresh ──────────────────────────────────────────────────

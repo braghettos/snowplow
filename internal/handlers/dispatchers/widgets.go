@@ -61,8 +61,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			if uerr == nil {
 				resolvedKey = cache.ResolvedKey(user.Username, gvr, nsn.Namespace, nsn.Name, page, perPage)
 				if raw, hit, _ := c.GetRaw(req.Context(), resolvedKey); hit {
-					cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
-					cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
+				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
+				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 					log.Info("Widget resolved from cache",
 						slog.String("key", resolvedKey),
 						slog.String("user", user.Username),
@@ -75,10 +75,6 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 					wri.Header().Set("Cache-Control", "public, max-age=15")
 					wri.WriteHeader(http.StatusOK)
 					_, _ = wri.Write(raw)
-					// If marked stale by an event, trigger background re-resolve.
-					if cache.IsL1Stale(req.Context(), c, resolvedKey) {
-						go r.backgroundReResolve(req.Context(), c, resolvedKey, fetchObject(req), perPage, page)
-					}
 					return
 				}
 		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawMisses, "raw_misses")
@@ -205,34 +201,6 @@ func ResolveWidgetDirect(ctx context.Context, c *cache.RedisCache, got objects.R
 // HTTP requests that resolve the same key concurrently.
 func ResolveWidgetBackground(ctx context.Context, c *cache.RedisCache, got objects.Result, resolvedKey, authnNS string, perPage, page int) (*ResolveWidgetResult, error) {
 	return resolveWidgetFromObject(ctx, c, got, resolvedKey, authnNS, perPage, page, nil)
-}
-
-// backgroundReResolve re-resolves a widget in the background after serving
-// a stale L1 value. Uses its own singleflight group to dedup concurrent
-// re-resolves for the same key without blocking HTTP requests.
-func (r *widgetsHandler) backgroundReResolve(ctx context.Context, c *cache.RedisCache, resolvedKey string, got objects.Result, perPage, page int) {
-	defer func() {
-		if rv := recover(); rv != nil {
-			slog.Error("widget: panic in background re-resolve", slog.Any("error", rv))
-		}
-	}()
-
-	bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	defer cancel()
-
-	_, _, shared := widgetBgFlight.Do(resolvedKey, func() (interface{}, error) {
-		result, err := resolveWidgetFromObject(bgCtx, c, got, resolvedKey, r.authnNS, perPage, page, nil)
-		if err == nil {
-			cache.ClearL1Stale(bgCtx, c, resolvedKey)
-			// Cascade: mark dependents of this key as stale so they
-			// re-resolve on next request.
-			cache.CascadeMarkStale(bgCtx, c, resolvedKey)
-		}
-		return result, err
-	})
-	if shared {
-		slog.Debug("widget: background re-resolve shared", slog.String("key", resolvedKey))
-	}
 }
 
 func writeWidgetError(wri http.ResponseWriter, err error) {

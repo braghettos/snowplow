@@ -14,7 +14,6 @@ import (
 	v1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
-	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -73,9 +72,6 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 					wri.Header().Set("Cache-Control", "public, max-age=15")
 					wri.WriteHeader(http.StatusOK)
 					_, _ = wri.Write(raw)
-					if cache.IsL1Stale(req.Context(), c, resolvedKey) {
-						go r.backgroundReResolveRA(req.Context(), c, resolvedKey, fetchObject(req), perPage, page)
-					}
 					return
 				}
 		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawMisses, "raw_misses")
@@ -164,7 +160,7 @@ func resolveRESTActionFromObject(ctx context.Context, c *cache.RedisCache, obj m
 		slog.String("name", cr.Name),
 		slog.String("namespace", cr.Namespace))
 
-	raw, merr := json.Marshal(res.Action)
+	raw, merr := json.Marshal(res)
 	if merr != nil {
 		return nil, merr
 	}
@@ -174,9 +170,10 @@ func resolveRESTActionFromObject(ctx context.Context, c *cache.RedisCache, obj m
 	if c != nil && resolvedKey != "" {
 		_ = c.SetResolvedRaw(ctx, resolvedKey, raw)
 		cache.RegisterL1Dependencies(ctx, c, tracker, resolvedKey)
-		// Register API-level deps from the paths collected during resolution
-		// (extracted before the JQ filter strips them).
-		cache.RegisterL1ApiDeps(ctx, c, resolvedKey, res.APIRequests)
+		// Register group-level deps from the API request paths collected
+		// during resolution. This ensures that when any resource in a K8s
+		// API group changes, this RESTAction's L1 key is refreshed.
+		cache.RegisterL1ApiDeps(ctx, c, resolvedKey, extractAPIRequests(raw))
 	}
 
 	return raw, nil
@@ -227,28 +224,4 @@ func ResolveRESTActionDirect(ctx context.Context, c *cache.RedisCache, obj map[s
 // HTTP requests that resolve the same key concurrently.
 func ResolveRESTActionBackground(ctx context.Context, c *cache.RedisCache, obj map[string]interface{}, resolvedKey, authnNS string, perPage, page int) ([]byte, error) {
 	return resolveRESTActionFromObject(ctx, c, obj, resolvedKey, authnNS, perPage, page, nil)
-}
-
-// backgroundReResolveRA re-resolves a RESTAction in the background after
-// serving a stale L1 value.
-func (r *restActionHandler) backgroundReResolveRA(ctx context.Context, c *cache.RedisCache, resolvedKey string, got objects.Result, perPage, page int) {
-	defer func() {
-		if rv := recover(); rv != nil {
-			slog.Error("restaction: panic in background re-resolve", slog.Any("error", rv))
-		}
-	}()
-
-	bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	defer cancel()
-
-	restactionBgFlight.Do(resolvedKey, func() (interface{}, error) {
-		raw, err := resolveRESTActionFromObject(bgCtx, c, got.Unstructured.Object, resolvedKey, r.authnNS, perPage, page, nil)
-		if err == nil {
-			cache.ClearL1Stale(bgCtx, c, resolvedKey)
-			// Cascade: mark dependents of this key as stale so they
-			// re-resolve on next request.
-			cache.CascadeMarkStale(bgCtx, c, resolvedKey)
-		}
-		return raw, err
-	})
 }

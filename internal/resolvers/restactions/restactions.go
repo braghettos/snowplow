@@ -32,14 +32,7 @@ type ResolveOptions struct {
 	Extras  map[string]any
 }
 
-// ResolveResult carries the resolved RESTAction along with the raw API
-// request paths collected during resolution (before the JQ filter strips them).
-type ResolveResult struct {
-	Action      *templates.RESTAction
-	APIRequests []string
-}
-
-func Resolve(ctx context.Context, opts ResolveOptions) (*ResolveResult, error) {
+func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, error) {
 	dict := api.Resolve(ctx, api.ResolveOptions{
 		RC:      opts.SArc,
 		AuthnNS: opts.AuthnNS,
@@ -56,18 +49,6 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*ResolveResult, error) {
 	log := xcontext.Logger(ctx)
 	log.Debug("resolved api", slog.Any("dict", dict))
 
-	// Extract apiRequests BEFORE the JQ filter strips them.
-	var apiRequests []string
-	if reqs, ok := dict["apiRequests"]; ok {
-		if arr, ok := reqs.([]any); ok {
-			for _, v := range arr {
-				if s, ok := v.(string); ok {
-					apiRequests = append(apiRequests, s)
-				}
-			}
-		}
-	}
-
 	var raw []byte
 	if opts.In.Spec.Filter != nil {
 		q := ptr.Deref(opts.In.Spec.Filter, "")
@@ -76,7 +57,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*ResolveResult, error) {
 			ModuleLoader: jqsupport.ModuleLoader(),
 		})
 		if err != nil {
-			return &ResolveResult{Action: opts.In}, fmt.Errorf("unable to resolve filter: %w", err)
+			return opts.In, fmt.Errorf("unable to resolve filter: %w", err)
 		}
 
 		raw = []byte(s)
@@ -84,7 +65,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*ResolveResult, error) {
 		var err error
 		raw, err = json.Marshal(dict)
 		if err != nil {
-			return &ResolveResult{Action: opts.In}, err
+			return opts.In, err
 		}
 	}
 
@@ -99,7 +80,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*ResolveResult, error) {
 		opts.In.ManagedFields = nil
 	}
 
-	return &ResolveResult{Action: opts.In, APIRequests: apiRequests}, nil
+	return opts.In, nil
 }
 
 // IsVerbose returns true if the object has the AnnotationKeyConnectorVerbose
