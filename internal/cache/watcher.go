@@ -129,31 +129,47 @@ func (rw *ResourceWatcher) invalidateL1Keys(ctx context.Context, evt l1Event) {
 	l1Keys := rw.collectAffectedL1Keys(ctx, evt.gvrKey, evt.ns, evt.name)
 
 	// If per-resource/API deps found nothing, fall back to the GVR-level
-	// index. This handles the zero-state case.
+	// index.
 	if len(l1Keys) == 0 {
 		if gvrKeys, err := rw.cache.SMembers(ctx, L1GVRKey(evt.gvrKey)); err == nil {
 			l1Keys = gvrKeys
 		}
 	}
+
+	// CRD-based invalidation: when a CR is created/updated/deleted and no
+	// direct L1 deps exist, find L1 keys that depend on this CR's CRD.
+	// This handles the zero-state scenario: compositions-list has no dep
+	// on composition GVR, but compositions-get-ns-and-crd depends on the
+	// CRD that defines compositions. Invalidating via the CRD cascades
+	// through: CRD dep → compositions-get-ns-and-crd → compositions-list → piechart.
+	if len(l1Keys) == 0 && evt.gvr.Group != "" && evt.gvr.Group != "apiextensions.k8s.io" {
+		crdName := evt.gvr.Resource + "." + evt.gvr.Group
+		crdGVRKey := "apiextensions.k8s.io/v1/customresourcedefinitions"
+		crdL1Keys := rw.collectAffectedL1Keys(ctx, crdGVRKey, "", crdName)
+		if len(crdL1Keys) == 0 {
+			// Also try cluster-wide LIST dep (compositions-get-ns-and-crd LISTs all CRDs)
+			if keys, err := rw.cache.SMembers(ctx, L1ResourceDepKey(crdGVRKey, "", "")); err == nil {
+				crdL1Keys = keys
+			}
+		}
+		if len(crdL1Keys) > 0 {
+			l1Keys = crdL1Keys
+			slog.Info("resource-watcher: CRD-based invalidation",
+				slog.String("event", evt.eventType),
+				slog.String("gvr", evt.gvr.String()),
+				slog.String("crd", crdName),
+				slog.Int("affected", len(l1Keys)))
+		}
+	}
+
 	if len(l1Keys) == 0 {
-		// Nuclear fallback: no L1 key claims dependency on this GVR.
-		// This is the zero-state scenario — e.g. first composition created
-		// when no L1 key has ever seen the composition GVR.
-		// Bump the global stale epoch so ALL L1 keys are treated as
-		// potentially stale on their next serve-time freshness check.
-		BumpStaleEpoch(ctx, rw.cache)
-		slog.Info("resource-watcher: bumped global stale epoch (zero-state)",
-			slog.String("event", evt.eventType),
-			slog.String("gvr", evt.gvr.String()),
-			slog.String("ns", evt.ns),
-			slog.String("name", evt.name))
 		return
 	}
 
 	if evt.eventType == "delete" {
 		rw.cascadeDeleteL1Keys(ctx, evt, l1Keys)
 	} else {
-		// ADD/UPDATE: mark as stale, don't delete.
+		// ADD/UPDATE: mark as stale for background re-resolve.
 		MarkL1Stale(ctx, rw.cache, l1Keys...)
 		slog.Debug("resource-watcher: L1 marked stale",
 			slog.String("event", evt.eventType),

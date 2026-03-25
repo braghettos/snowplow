@@ -1983,16 +1983,10 @@ def run_phase_browser_scaling(tokens):
                 return _read_l1_ready_ts() if cache_mode == "ON" else 0
 
             def _stabilize(before_ts, quiesce=False, quiesce_secs=15):
-                """Wait for L1 ready sentinel to advance past before_ts.
-
-                If quiesce=True, also wait for the sentinel to stop changing
-                (informer churn settled).  Use for large mutations like S6.
-                quiesce_secs can be increased for very large mutations.
-                """
+                """Give events time to propagate. The VERIFY polling loop
+                handles convergence checking — no sentinel needed."""
                 if cache_mode == "ON":
-                    wait_for_l1_ready(since_epoch=before_ts)
-                    if quiesce:
-                        wait_for_l1_quiescent(stable_secs=quiesce_secs, timeout=300)
+                    time.sleep(5)  # brief pause for informer events to fire
 
             # S1 — Zero state
             r = _browser_measure_stage(page, 1, "Zero state", cache_mode, token=admin_token)

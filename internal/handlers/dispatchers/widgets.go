@@ -68,13 +68,6 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 						log.Info("widget: L1 stale (deps missing)", slog.String("key", resolvedKey))
 						goto miss
 					}
-					// Check global epoch: nuclear stale from zero-state event.
-					if cache.IsL1EpochStale(req.Context(), c, resolvedKey) {
-						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawMisses, "raw_misses")
-						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Misses, "l1_misses")
-						log.Info("widget: L1 stale (epoch)", slog.String("key", resolvedKey))
-						goto miss
-					}
 					cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
 					cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 					log.Info("Widget resolved from cache",
@@ -195,7 +188,6 @@ func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objec
 	// informer events can do targeted invalidation instead of bulk deletes.
 	if c != nil && resolvedKey != "" {
 		_ = c.SetResolvedRaw(ctx, resolvedKey, raw)
-		cache.StampL1Epoch(ctx, c, resolvedKey)
 		cache.RegisterL1Dependencies(ctx, c, tracker, resolvedKey)
 		preWarmChildWidgets(ctx, c, res, authnNS)
 	}

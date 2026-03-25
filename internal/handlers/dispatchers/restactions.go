@@ -65,12 +65,6 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 						log.Info("restaction: L1 stale (deps missing)", slog.String("key", resolvedKey))
 						goto ramiss
 					}
-					if cache.IsL1EpochStale(req.Context(), c, resolvedKey) {
-						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawMisses, "raw_misses")
-						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Misses, "l1_misses")
-						log.Info("restaction: L1 stale (epoch)", slog.String("key", resolvedKey))
-						goto ramiss
-					}
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 					log.Info("RESTAction resolved from cache",
@@ -177,7 +171,7 @@ func resolveRESTActionFromObject(ctx context.Context, c *cache.RedisCache, obj m
 		slog.String("name", cr.Name),
 		slog.String("namespace", cr.Namespace))
 
-	raw, merr := json.Marshal(res)
+	raw, merr := json.Marshal(res.Action)
 	if merr != nil {
 		return nil, merr
 	}
@@ -186,12 +180,10 @@ func resolveRESTActionFromObject(ctx context.Context, c *cache.RedisCache, obj m
 
 	if c != nil && resolvedKey != "" {
 		_ = c.SetResolvedRaw(ctx, resolvedKey, raw)
-		cache.StampL1Epoch(ctx, c, resolvedKey)
 		cache.RegisterL1Dependencies(ctx, c, tracker, resolvedKey)
-		// Register group-level deps from the API request paths collected
-		// during resolution. This ensures that when any resource in a K8s
-		// API group changes, this RESTAction's L1 key is refreshed.
-		cache.RegisterL1ApiDeps(ctx, c, resolvedKey, extractAPIRequests(raw))
+		// Register API-level deps from the paths collected during resolution
+		// (extracted before the JQ filter strips them).
+		cache.RegisterL1ApiDeps(ctx, c, resolvedKey, res.APIRequests)
 	}
 
 	return raw, nil

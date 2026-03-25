@@ -200,63 +200,6 @@ func ClearL1Stale(ctx context.Context, c *RedisCache, l1Key string) {
 	_ = c.client.Del(ctx, L1StaleKey(l1Key)).Err()
 }
 
-const staleEpochKey = "snowplow:l1:stale-epoch"
-
-// BumpStaleEpoch increments the global stale epoch. All L1 keys cached before
-// this epoch are considered stale on their next freshness check.
-// This is the nuclear fallback for the zero-state scenario where no L1 key
-// has a dependency on a GVR that just received its first resource.
-func BumpStaleEpoch(ctx context.Context, c *RedisCache) {
-	if c == nil {
-		return
-	}
-	_ = c.client.Incr(ctx, staleEpochKey).Err()
-}
-
-// GetStaleEpoch returns the current global stale epoch.
-func GetStaleEpoch(ctx context.Context, c *RedisCache) int64 {
-	if c == nil {
-		return 0
-	}
-	v, err := c.client.Get(ctx, staleEpochKey).Int64()
-	if err != nil {
-		return 0
-	}
-	return v
-}
-
-// L1EpochKey stores the epoch at which an L1 key was cached.
-func L1EpochKey(l1Key string) string {
-	return l1Key + ":epoch"
-}
-
-// StampL1Epoch stores the current global epoch alongside an L1 key.
-// Called when caching a resolved L1 entry.
-func StampL1Epoch(ctx context.Context, c *RedisCache, l1Key string) {
-	if c == nil {
-		return
-	}
-	epoch := GetStaleEpoch(ctx, c)
-	_ = c.client.Set(ctx, L1EpochKey(l1Key), epoch, ResolvedCacheTTL).Err()
-}
-
-// IsL1EpochStale returns true if the L1 key was cached at an older epoch
-// than the current global epoch.
-func IsL1EpochStale(ctx context.Context, c *RedisCache, l1Key string) bool {
-	if c == nil {
-		return false
-	}
-	currentEpoch := GetStaleEpoch(ctx, c)
-	if currentEpoch == 0 {
-		return false
-	}
-	cachedEpoch, err := c.client.Get(ctx, L1EpochKey(l1Key)).Int64()
-	if err != nil {
-		return true // no epoch stamped → treat as stale (pre-epoch key)
-	}
-	return cachedEpoch < currentEpoch
-}
-
 // RegisterL1Dependencies registers the L1 resolved key in both the GVR-level
 // and per-resource reverse indexes based on dependencies captured by the tracker.
 // Also stores the L1-to-L1 dependency chain for freshness checks at serve time.
