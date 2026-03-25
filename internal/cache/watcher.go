@@ -42,12 +42,13 @@ type l1Event struct {
 	resourceVersion string // K8s resourceVersion of the object that triggered this event
 }
 
-// dirtyEntry tracks the target L3 generations that must be reached before
-// an L1 key's refresh is meaningful. Each GVR+ns that triggered the dirty
-// marking stores its resourceVersion — the refresh only proceeds when ALL
-// L3 gens are >= their targets.
+// dirtyEntry tracks L3 generations for an L1 key. The ticker refreshes
+// whenever ANY L3 gen has changed since the last refresh (progressive
+// convergence during burst). After events stop, gens stabilize and the
+// ticker skips (no redundant work).
 type dirtyEntry struct {
-	targetGens map[string]string // "gvrKey:ns" → resourceVersion
+	targetGens map[string]string // "gvrKey:ns" → latest resourceVersion seen
+	lastSeen   map[string]string // "gvrKey:ns" → gen value at last refresh
 }
 
 // ResourceWatcher maintains dynamic informers for every GVR in the watched set.
@@ -124,22 +125,47 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 				continue
 			}
 
-			// For each dirty L1 key, check if ALL target L3 gens have been
-			// reached. Only refresh keys whose targets are met — meaning
-			// the L3 includes all the patches that triggered the dirty marking.
+			// For each dirty L1 key, check if ANY L3 gen changed since the
+			// last refresh. This gives progressive convergence during burst
+			// (refresh every 3s with latest data) and skips when stable.
 			var ready []string
 			for l1Key, entry := range dirty {
-				allMet := true
-				for gvrNS, targetRV := range entry.targetGens {
+				anyChanged := false
+				for gvrNS := range entry.targetGens {
 					curRV, _ := rw.cache.client.Get(ctx, "snowplow:l3gen:"+gvrNS).Result()
-					if curRV < targetRV {
-						allMet = false
+					if curRV != entry.lastSeen[gvrNS] {
+						anyChanged = true
+						entry.lastSeen[gvrNS] = curRV
+					}
+				}
+				if anyChanged {
+					ready = append(ready, l1Key)
+				}
+			}
+			// Remove dirty entries only when their gens haven't changed
+			// (no more events flowing for this key).
+			for l1Key, entry := range dirty {
+				stale := false
+				for gvrNS := range entry.targetGens {
+					curRV, _ := rw.cache.client.Get(ctx, "snowplow:l3gen:"+gvrNS).Result()
+					if curRV != entry.lastSeen[gvrNS] {
+						stale = true
 						break
 					}
 				}
-				if allMet {
-					ready = append(ready, l1Key)
-					delete(dirty, l1Key)
+				if !stale {
+					// Check if this entry was just refreshed — if so, keep it
+					// for one more tick to confirm stability.
+					found := false
+					for _, k := range ready {
+						if k == l1Key {
+							found = true
+							break
+						}
+					}
+					if !found {
+						delete(dirty, l1Key)
+					}
 				}
 			}
 
@@ -227,7 +253,10 @@ func (rw *ResourceWatcher) processL1Event(ctx context.Context, evt l1Event, dirt
 	for _, k := range l1Keys {
 		entry := dirty[k]
 		if entry == nil {
-			entry = &dirtyEntry{targetGens: make(map[string]string)}
+			entry = &dirtyEntry{
+				targetGens: make(map[string]string),
+				lastSeen:   make(map[string]string),
+			}
 			dirty[k] = entry
 		}
 		// Update target gen: always store the latest resourceVersion
