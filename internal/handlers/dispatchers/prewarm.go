@@ -485,6 +485,13 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			defer wg.Done()
 			defer func() { <-sem }()
 
+			// Skip if L1 key already exists — pre-warmer only populates cold slots.
+			// Event-driven dirty+ticker handles updates to existing keys.
+			rKey := cache.ResolvedKey(user.Username, r.gvr, r.ns, r.name, -1, -1)
+			if c != nil && c.Exists(ctx, rKey) {
+				return
+			}
+
 			rctx := xcontext.BuildContext(ctx,
 				xcontext.WithUserConfig(ep),
 				xcontext.WithUserInfo(user),
@@ -523,7 +530,6 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 				return
 			}
 
-			rKey := cache.ResolvedKey(user.Username, r.gvr, r.ns, r.name, -1, -1)
 			_ = c.SetResolvedRaw(rctx, rKey, raw)
 			cache.RegisterL1Dependencies(rctx, c, tracker, rKey)
 
@@ -562,6 +568,12 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			defer wg.Done()
 			defer func() { <-sem }()
 
+			// Skip if L1 key already exists — pre-warmer only populates cold slots.
+			rKey := cache.ResolvedKey(user.Username, r.gvr, r.ns, r.name, -1, -1)
+			if c != nil && c.Exists(ctx, rKey) {
+				return
+			}
+
 			rctx := xcontext.BuildContext(ctx,
 				xcontext.WithUserConfig(ep),
 				xcontext.WithUserInfo(user),
@@ -600,7 +612,6 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 				return
 			}
 
-			rKey := cache.ResolvedKey(user.Username, r.gvr, r.ns, r.name, -1, -1)
 			_ = c.SetResolvedRaw(rctx, rKey, raw)
 			cache.RegisterL1Dependencies(rctx, c, tracker, rKey)
 
