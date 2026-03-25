@@ -7,6 +7,7 @@ import (
 	"github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/kubeutil"
+	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
 	"k8s.io/client-go/rest"
 )
 
@@ -40,6 +41,21 @@ func HealthCheck(serviceName, build string, nsgetter func() (string, error)) htt
 		wri.Header().Set("Content-Type", "application/json")
 		wri.WriteHeader(http.StatusOK)
 		json.NewEncoder(wri).Encode(data)
+	}
+}
+
+// ReadinessCheck returns 200 only after the initial L1 pre-warm is complete.
+// Used as the Kubernetes readiness probe so traffic isn't routed to a pod
+// with a cold cache.
+func ReadinessCheck() http.HandlerFunc {
+	return func(wri http.ResponseWriter, req *http.Request) {
+		if !dispatchers.IsPreWarmComplete() {
+			http.Error(wri, `{"status":"warming up"}`, http.StatusServiceUnavailable)
+			return
+		}
+		wri.Header().Set("Content-Type", "application/json")
+		wri.WriteHeader(http.StatusOK)
+		wri.Write([]byte(`{"status":"ready"}`))
 	}
 }
 

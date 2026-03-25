@@ -39,6 +39,21 @@ const (
 )
 
 // ---------------------------------------------------------------------------
+// Pre-warm lifecycle control
+// ---------------------------------------------------------------------------
+
+// preWarmComplete is set to true after the initial L1 warmup finishes.
+// Once set, preWarmChildWidgets becomes a no-op — runtime L1 updates
+// are handled exclusively by the event-driven dirty+ticker system.
+var preWarmComplete atomic.Bool
+
+// IsPreWarmComplete returns true if the initial L1 warmup has finished.
+// Used by the readiness probe to gate traffic until cache is warm.
+func IsPreWarmComplete() bool {
+	return preWarmComplete.Load()
+}
+
+// ---------------------------------------------------------------------------
 // Request-time child pre-warming
 // ---------------------------------------------------------------------------
 
@@ -47,6 +62,12 @@ const (
 // entire widget tree (up to preWarmMaxDepth levels) so that all descendants
 // are cached before the frontend requests them.
 func preWarmChildWidgets(parentCtx context.Context, c *cache.RedisCache, resolved *unstructured.Unstructured, authnNS string) {
+	// After initial warmup completes, pre-warming is disabled.
+	// Runtime L1 updates are handled by the event-driven dirty+ticker system.
+	if preWarmComplete.Load() {
+		return
+	}
+
 	items, found, err := unstructured.NestedSlice(resolved.Object, "status", "resourcesRefs", "items")
 	if err != nil || !found || len(items) == 0 {
 		return
@@ -164,6 +185,11 @@ func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config
 		slog.Int64("totalWarmed", totalWarmed),
 	)
 	cache.MarkL1Ready(ctx, c)
+
+	// Mark pre-warm phase as complete. From this point, preWarmChildWidgets
+	// becomes a no-op and all L1 updates are event-driven.
+	preWarmComplete.Store(true)
+	log.Info("L1 warmup: pre-warm disabled, switching to event-driven updates")
 }
 
 // FilterWidgetGVRs returns only the GVRs from the warmup config whose group

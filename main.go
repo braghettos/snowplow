@@ -151,6 +151,7 @@ func main() {
 	mux.Handle("GET /swagger/", httpSwagger.WrapHandler)
 
 	mux.Handle("GET /health", handlers.HealthCheck(serviceName, build, kubeutil.ServiceAccountNamespace))
+	mux.Handle("GET /ready", handlers.ReadinessCheck())
 	mux.Handle("GET /metrics/cache", chain.Then(handlers.CacheMetrics()))
 	mux.Handle("GET /api-info/names", chain.Then(handlers.Plurals()))
 	userCfg := handlers.CachedUserConfig(*signKey, *authnNS, sarc, redisCache)
