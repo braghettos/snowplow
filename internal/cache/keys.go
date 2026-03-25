@@ -158,13 +158,6 @@ func L1ApiDepKey(gvrKey string) string {
 	return "snowplow:l1api:" + gvrKey
 }
 
-// L1DepsKey returns the Redis SET key that stores the L1 resolved keys that
-// a given L1 key accessed during resolution (via /call paths). At serve time,
-// if any of these dependency L1 keys no longer exist, the parent is stale.
-func L1DepsKey(l1Key string) string {
-	return l1Key + ":deps"
-}
-
 // L1StaleKey returns the Redis key used to mark an L1 resolved key as stale.
 // When set, the HTTP handler serves the current (stale) value but triggers
 // a background re-resolve. The next request gets the fresh value.
@@ -202,7 +195,6 @@ func ClearL1Stale(ctx context.Context, c *RedisCache, l1Key string) {
 
 // RegisterL1Dependencies registers the L1 resolved key in both the GVR-level
 // and per-resource reverse indexes based on dependencies captured by the tracker.
-// Also stores the L1-to-L1 dependency chain for freshness checks at serve time.
 func RegisterL1Dependencies(ctx context.Context, c *RedisCache, tracker *DependencyTracker, l1Key string) {
 	if c == nil || tracker == nil {
 		return
@@ -214,52 +206,6 @@ func RegisterL1Dependencies(ctx context.Context, c *RedisCache, tracker *Depende
 		depKey := L1ResourceDepKey(ref.GVRKey, ref.NS, ref.Name)
 		_ = c.SAddWithTTL(ctx, depKey, l1Key, ReverseIndexTTL)
 	}
-	// Store L1-to-L1 deps for freshness check at serve time.
-	if l1Deps := tracker.L1DepKeys(); len(l1Deps) > 0 {
-		depsKey := L1DepsKey(l1Key)
-		_ = c.SAddWithTTL(ctx, depsKey, l1Deps[0], ReverseIndexTTL)
-		for _, dep := range l1Deps[1:] {
-			_ = c.SAddWithTTL(ctx, depsKey, dep, ReverseIndexTTL)
-		}
-	}
-}
-
-// CheckL1Freshness verifies that all L1 dependency keys for a given L1 key
-// still exist. If any dependency was invalidated (deleted), the L1 key is
-// stale and should be re-resolved. Returns true if fresh, false if stale.
-// Walks the dependency chain recursively up to 5 levels.
-func CheckL1Freshness(ctx context.Context, c *RedisCache, l1Key string) bool {
-	if c == nil {
-		return true
-	}
-	return checkL1FreshnessRecursive(ctx, c, l1Key, make(map[string]bool), 0)
-}
-
-func checkL1FreshnessRecursive(ctx context.Context, c *RedisCache, l1Key string, visited map[string]bool, depth int) bool {
-	if depth >= 5 {
-		return true
-	}
-	if visited[l1Key] {
-		return true
-	}
-	visited[l1Key] = true
-
-	depsKey := L1DepsKey(l1Key)
-	deps, err := c.SMembers(ctx, depsKey)
-	if err != nil || len(deps) == 0 {
-		return true // no deps → fresh by definition
-	}
-
-	for _, dep := range deps {
-		if !c.Exists(ctx, dep) {
-			return false // dependency missing → stale
-		}
-		// Recursively check the dependency's deps
-		if !checkL1FreshnessRecursive(ctx, c, dep, visited, depth+1) {
-			return false
-		}
-	}
-	return true
 }
 
 // RegisterL1ApiDeps extracts K8s API GVRs from a list of resolved API request

@@ -61,13 +61,6 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			if uerr == nil {
 				resolvedKey = cache.ResolvedKey(user.Username, gvr, nsn.Namespace, nsn.Name, page, perPage)
 				if raw, hit, _ := c.GetRaw(req.Context(), resolvedKey); hit {
-					// Check freshness: deps still exist? (zero-state detection)
-					if !cache.CheckL1Freshness(req.Context(), c, resolvedKey) {
-						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawMisses, "raw_misses")
-						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Misses, "l1_misses")
-						log.Info("widget: L1 stale (deps missing)", slog.String("key", resolvedKey))
-						goto miss
-					}
 					cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
 					cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 					log.Info("Widget resolved from cache",
@@ -91,7 +84,6 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawMisses, "raw_misses")
 		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Misses, "l1_misses")
 				log.Info("widget: L1 miss", slog.String("key", resolvedKey))
-			miss:
 			}
 		}
 	}

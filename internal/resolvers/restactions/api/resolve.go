@@ -226,11 +226,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 
 				if callGVR, callNS, callName := cache.ParseCallPath(call.Path); callGVR.Resource != "" && callName != "" {
 					l1Key := cache.ResolvedKey(user.Username, callGVR, callNS, callName, 0, 0)
-					// Record this L1 key as a dependency for freshness checks.
-					if tracker := cache.TrackerFromContext(ctx); tracker != nil {
-						tracker.AddL1Dep(l1Key)
-					}
-					if l1Raw, l1Hit, _ := c.GetRaw(ctx, l1Key); l1Hit && cache.CheckL1Freshness(ctx, c, l1Key) {
+					if l1Raw, l1Hit, _ := c.GetRaw(ctx, l1Key); l1Hit {
 						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 						handler := jsonHandler(ctx, jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter})
 						if mu != nil {

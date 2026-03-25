@@ -136,13 +136,14 @@ func (rw *ResourceWatcher) invalidateL1Keys(ctx context.Context, evt l1Event) {
 		}
 	}
 
-	// CRD-based invalidation: when a CR is created/updated/deleted and no
-	// direct L1 deps exist, find L1 keys that depend on this CR's CRD.
-	// This handles the zero-state scenario: compositions-list has no dep
-	// on composition GVR, but compositions-get-ns-and-crd depends on the
-	// CRD that defines compositions. Invalidating via the CRD cascades
-	// through: CRD dep → compositions-get-ns-and-crd → compositions-list → piechart.
-	if len(l1Keys) == 0 && evt.gvr.Group != "" && evt.gvr.Group != "apiextensions.k8s.io" {
+	// CRD-based invalidation: when a CR is created/updated/deleted, find
+	// L1 keys that depend on this CR's CRD. This handles the zero-state
+	// scenario: compositions-list has no dep on composition GVR, but
+	// compositions-get-ns-and-crd depends on the CRD that defines
+	// compositions. Invalidating via the CRD cascades through:
+	// CRD dep → compositions-get-ns-and-crd → compositions-list → piechart.
+	// Always runs regardless of whether per-resource deps were found.
+	if evt.gvr.Group != "" && evt.gvr.Group != "apiextensions.k8s.io" {
 		crdName := evt.gvr.Resource + "." + evt.gvr.Group
 		crdGVRKey := "apiextensions.k8s.io/v1/customresourcedefinitions"
 		crdL1Keys := rw.collectAffectedL1Keys(ctx, crdGVRKey, "", crdName)
@@ -153,7 +154,7 @@ func (rw *ResourceWatcher) invalidateL1Keys(ctx context.Context, evt l1Event) {
 			}
 		}
 		if len(crdL1Keys) > 0 {
-			l1Keys = crdL1Keys
+			l1Keys = append(l1Keys, crdL1Keys...)
 			slog.Info("resource-watcher: CRD-based invalidation",
 				slog.String("event", evt.eventType),
 				slog.String("gvr", evt.gvr.String()),
@@ -216,12 +217,12 @@ func (rw *ResourceWatcher) cascadeDeleteL1Keys(ctx context.Context, evt l1Event,
 		pending = nextPending
 	}
 
-	// Delete all collected keys, their :deps keys, and their :stale keys.
-	toDelete := make([]string, 0, len(allKeys)*3)
+	// Delete all collected keys and their :stale flags.
+	toDelete := make([]string, 0, len(allKeys)*2)
 	for k := range allKeys {
 		toDelete = append(toDelete, k)
 		if strings.HasPrefix(k, "snowplow:resolved:") {
-			toDelete = append(toDelete, L1DepsKey(k), L1StaleKey(k))
+			toDelete = append(toDelete, L1StaleKey(k))
 		}
 	}
 	_ = rw.cache.Delete(ctx, toDelete...)
