@@ -158,6 +158,13 @@ func L1ApiDepKey(gvrKey string) string {
 	return "snowplow:l1api:" + gvrKey
 }
 
+// L3GenKey returns the Redis key that stores the latest K8s resourceVersion
+// for a GVR+namespace combination. Used by the dirty refresh ticker to detect
+// whether L3 changed since the last refresh without re-reading the full list.
+func L3GenKey(gvrKey, ns string) string {
+	return "snowplow:l3gen:" + gvrKey + ":" + ns
+}
+
 // RegisterL1Dependencies registers the L1 resolved key in both the GVR-level
 // and per-resource reverse indexes based on dependencies captured by the tracker.
 func RegisterL1Dependencies(ctx context.Context, c *RedisCache, tracker *DependencyTracker, l1Key string) {

@@ -34,11 +34,20 @@ const expiryRefreshWorkers = 10
 
 // l1Event represents an informer event that needs L1 refresh processing.
 type l1Event struct {
-	gvr       schema.GroupVersionResource
-	gvrKey    string
-	ns        string
-	name      string
-	eventType string
+	gvr             schema.GroupVersionResource
+	gvrKey          string
+	ns              string
+	name            string
+	eventType       string
+	resourceVersion string // K8s resourceVersion of the object that triggered this event
+}
+
+// dirtyEntry tracks the target L3 generations that must be reached before
+// an L1 key's refresh is meaningful. Each GVR+ns that triggered the dirty
+// marking stores its resourceVersion — the refresh only proceeds when ALL
+// L3 gens are >= their targets.
+type dirtyEntry struct {
+	targetGens map[string]string // "gvrKey:ns" → resourceVersion
 }
 
 // ResourceWatcher maintains dynamic informers for every GVR in the watched set.
@@ -86,10 +95,21 @@ func (rw *ResourceWatcher) Start(ctx context.Context) {
 	go rw.l1Worker(ctx)
 }
 
-// l1Worker processes L1 refresh events sequentially. Each event reads the
-// latest L3 state (patched by handleEvent before enqueue), resolves affected
-// L1 keys, and cascades to dependents.
+// l1Worker processes L1 refresh events. All events (ADD/UPDATE/DELETE) mark
+// affected L1 keys as dirty. A periodic 3s ticker re-resolves dirty keys,
+// but only when L3 generation (resourceVersion) has changed since the last
+// refresh — avoiding redundant work when L3 is stable.
+//
+// This gives:
+// - Fast HTTP responses: L1 is never deleted, always serves from cache (~60ms)
+// - Progressive convergence: dirty keys re-resolved every 3s during burst
+// - Exact values: after events stop, L3 gens stabilize, final refresh is exact
+// - No redundant work: ticker skips refresh when no L3 gen changed
 func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
+	dirty := make(map[string]*dirtyEntry) // L1 key → target gens
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -98,12 +118,62 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 			if !ok {
 				return
 			}
-			rw.processL1Event(ctx, evt)
+			rw.processL1Event(ctx, evt, dirty)
+		case <-ticker.C:
+			if len(dirty) == 0 {
+				continue
+			}
+
+			// For each dirty L1 key, check if ALL target L3 gens have been
+			// reached. Only refresh keys whose targets are met — meaning
+			// the L3 includes all the patches that triggered the dirty marking.
+			var ready []string
+			for l1Key, entry := range dirty {
+				allMet := true
+				for gvrNS, targetRV := range entry.targetGens {
+					curRV, _ := rw.cache.client.Get(ctx, "snowplow:l3gen:"+gvrNS).Result()
+					if curRV < targetRV {
+						allMet = false
+						break
+					}
+				}
+				if allMet {
+					ready = append(ready, l1Key)
+					delete(dirty, l1Key)
+				}
+			}
+
+			if len(ready) == 0 {
+				continue
+			}
+
+			fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
+			if !ok || fn == nil {
+				continue
+			}
+			slog.Info("resource-watcher: periodic dirty refresh",
+				slog.Int("keys", len(ready)),
+				slog.Int("remaining", len(dirty)))
+
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						buf := make([]byte, 4096)
+						n := runtime.Stack(buf, false)
+						slog.Error("resource-watcher: panic in dirty refresh",
+							slog.Any("error", r),
+							slog.String("stack", string(buf[:n])))
+					}
+				}()
+				refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				defer cancel()
+				fn(refreshCtx, schema.GroupVersionResource{}, ready)
+			}()
 		}
 	}
 }
 
-func (rw *ResourceWatcher) processL1Event(ctx context.Context, evt l1Event) {
+func (rw *ResourceWatcher) processL1Event(ctx context.Context, evt l1Event, dirty map[string]*dirtyEntry) {
 	defer func() {
 		if r := recover(); r != nil {
 			buf := make([]byte, 4096)
@@ -116,32 +186,63 @@ func (rw *ResourceWatcher) processL1Event(ctx context.Context, evt l1Event) {
 	}()
 
 	l1Keys := rw.collectAffectedL1Keys(ctx, evt.gvrKey, evt.ns, evt.name)
+
+	// CRD-based invalidation: when a CR is created/deleted, also find L1 keys
+	// that depend on its CRD (e.g. compositions-get-ns-and-crd depends on the
+	// CRD LIST). This handles the zero-state problem agnostically.
+	crdGVRKey := GVRToKey(schema.GroupVersionResource{
+		Group:    "apiextensions.k8s.io",
+		Version:  "v1",
+		Resource: "customresourcedefinitions",
+	})
+	crdName := evt.gvr.Resource + "." + evt.gvr.Group
+	crdL1Keys := rw.collectAffectedL1Keys(ctx, crdGVRKey, "", crdName)
+	for _, k := range crdL1Keys {
+		found := false
+		for _, existing := range l1Keys {
+			if existing == k {
+				found = true
+				break
+			}
+		}
+		if !found {
+			l1Keys = append(l1Keys, k)
+		}
+	}
+
 	if len(l1Keys) == 0 {
 		return
 	}
 
+	// All events (ADD/UPDATE/DELETE): mark affected L1 keys as dirty.
+	// Don't delete — serve stale. The periodic 3s ticker re-resolves them.
+	// For DELETE: the per-resource dep index entry is cleaned up, but the
+	// L1 key stays cached (stale for up to 3-6s) until the ticker refreshes it.
 	if evt.eventType == "delete" {
 		resDepKey := L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)
-		_ = rw.cache.Delete(ctx, append(l1Keys, resDepKey)...)
+		_ = rw.cache.Delete(ctx, resDepKey)
 	}
 
-	fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
-	if !ok || fn == nil {
-		idxKey := L1GVRKey(evt.gvrKey)
-		_ = rw.cache.Delete(ctx, append(l1Keys, idxKey)...)
-		return
+	gvrNS := evt.gvrKey + ":" + evt.ns
+	for _, k := range l1Keys {
+		entry := dirty[k]
+		if entry == nil {
+			entry = &dirtyEntry{targetGens: make(map[string]string)}
+			dirty[k] = entry
+		}
+		// Update target gen: always store the latest resourceVersion
+		// for this GVR+ns so the ticker waits for L3 to catch up.
+		if evt.resourceVersion > entry.targetGens[gvrNS] {
+			entry.targetGens[gvrNS] = evt.resourceVersion
+		}
 	}
 
-	slog.Debug("resource-watcher: L1 refresh",
+	slog.Debug("resource-watcher: L1 marked dirty",
 		slog.String("event", evt.eventType),
 		slog.String("gvr", evt.gvr.String()),
 		slog.String("ns", evt.ns),
 		slog.String("name", evt.name),
-		slog.Int("affected", len(l1Keys)))
-
-	refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	fn(refreshCtx, evt.gvr, l1Keys)
+		slog.Int("dirty", len(l1Keys)))
 }
 
 // WaitForSync blocks until all started informers have completed their initial sync.
@@ -317,6 +418,16 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		}
 	}
 
+	// ── Update L3 generation (resourceVersion) ──────────────────────────────
+	// Store the latest resourceVersion for this GVR+ns so the dirty refresh
+	// ticker can detect L3 changes without re-reading the full list.
+	gvrKey := GVRToKey(gvr)
+	l3GenKey := L3GenKey(gvrKey, ns)
+	rv := uns.GetResourceVersion()
+	if rv != "" {
+		_ = rw.cache.client.Set(ctx, l3GenKey, rv, rw.cache.TTLForGVR(gvr)).Err()
+	}
+
 	// ── Enqueue L1 refresh event ─────────────────────────────────────────────
 	// L3 was just patched above. Enqueue the event for the L1 worker to
 	// process sequentially. The worker will read the latest L3 state.
@@ -324,11 +435,12 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	// updated; the next event for this GVR will trigger a refresh).
 	select {
 	case rw.eventCh <- l1Event{
-		gvr:       gvr,
-		gvrKey:    GVRToKey(gvr),
-		ns:        ns,
-		name:      name,
-		eventType: eventType,
+		gvr:             gvr,
+		gvrKey:          gvrKey,
+		ns:              ns,
+		name:            name,
+		eventType:       eventType,
+		resourceVersion: rv,
 	}:
 	default:
 		slog.Warn("resource-watcher: L1 event queue full, dropping event",
@@ -375,7 +487,6 @@ func (rw *ResourceWatcher) collectAffectedL1Keys(ctx context.Context, gvrKey, ns
 	}
 	return out
 }
-
 
 // patchListCache atomically patches the cached list in-place using WATCH/MULTI/EXEC.
 func (rw *ResourceWatcher) patchListCache(ctx context.Context, gvr schema.GroupVersionResource, listKey string, uns *unstructured.Unstructured, eventType string) {
