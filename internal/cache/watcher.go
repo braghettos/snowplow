@@ -136,6 +136,17 @@ func (rw *ResourceWatcher) invalidateL1Keys(ctx context.Context, evt l1Event) {
 		}
 	}
 	if len(l1Keys) == 0 {
+		// Nuclear fallback: no L1 key claims dependency on this GVR.
+		// This is the zero-state scenario — e.g. first composition created
+		// when no L1 key has ever seen the composition GVR.
+		// Bump the global stale epoch so ALL L1 keys are treated as
+		// potentially stale on their next serve-time freshness check.
+		BumpStaleEpoch(ctx, rw.cache)
+		slog.Info("resource-watcher: bumped global stale epoch (zero-state)",
+			slog.String("event", evt.eventType),
+			slog.String("gvr", evt.gvr.String()),
+			slog.String("ns", evt.ns),
+			slog.String("name", evt.name))
 		return
 	}
 
