@@ -224,6 +224,9 @@ func (r *widgetsHandler) backgroundReResolve(ctx context.Context, c *cache.Redis
 		result, err := resolveWidgetFromObject(bgCtx, c, got, resolvedKey, r.authnNS, perPage, page, nil)
 		if err == nil {
 			cache.ClearL1Stale(bgCtx, c, resolvedKey)
+			// Cascade: mark dependents of this key as stale so they
+			// re-resolve on next request.
+			cache.CascadeMarkStale(bgCtx, c, resolvedKey)
 		}
 		return result, err
 	})

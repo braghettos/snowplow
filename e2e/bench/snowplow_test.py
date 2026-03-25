@@ -1888,10 +1888,16 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, token=None, 
                 fresh_comp_count = count_compositions()
                 matched = False
 
+                poll_num = 0
                 while time.time() < deadline:
+                    poll_num += 1
                     fresh_comp_count = count_compositions()
                     api_count = _verify_composition_count_api(token) if token else -1
                     ui_count = _verify_composition_count_ui(page)
+                    elapsed_ms = int((time.time() - verify_start) * 1000)
+                    api_str_p = f"{api_count}" if api_count >= 0 else "?"
+                    ui_str_p = f"{ui_count}" if ui_count >= 0 else "?"
+                    log(f"    VERIFY poll {poll_num}: api={api_str_p} ui={ui_str_p} cluster={fresh_comp_count} ({elapsed_ms}ms)")
                     api_ok = (api_count >= 0 and api_count == fresh_comp_count)
                     ui_ok = (ui_count >= 0 and ui_count == fresh_comp_count)
                     if api_ok and ui_ok:

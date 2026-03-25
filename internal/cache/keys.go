@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"strconv"
 	"strings"
@@ -191,6 +192,32 @@ func ClearL1Stale(ctx context.Context, c *RedisCache, l1Key string) {
 		return
 	}
 	_ = c.client.Del(ctx, L1StaleKey(l1Key)).Err()
+}
+
+// CascadeMarkStale finds all L1 keys that depend on the given resolved key
+// (via L1ResourceDepKey) and marks them as stale. This propagates staleness
+// through the dependency chain: when compositions-get-ns-and-crd is re-resolved,
+// compositions-list is marked stale; when compositions-list is re-resolved,
+// piechart is marked stale. Walks up to maxCascadeDepth levels.
+func CascadeMarkStale(ctx context.Context, c *RedisCache, l1Key string) {
+	if c == nil {
+		return
+	}
+	info, ok := ParseResolvedKey(l1Key)
+	if !ok {
+		return
+	}
+
+	depKey := L1ResourceDepKey(GVRToKey(info.GVR), info.NS, info.Name)
+	dependents, err := c.SMembers(ctx, depKey)
+	if err != nil || len(dependents) == 0 {
+		return
+	}
+
+	MarkL1Stale(ctx, c, dependents...)
+	slog.Info("cache: cascade mark stale",
+		slog.String("source", l1Key),
+		slog.Int("dependents", len(dependents)))
 }
 
 // RegisterL1Dependencies registers the L1 resolved key in both the GVR-level

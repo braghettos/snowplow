@@ -245,6 +245,9 @@ func (r *restActionHandler) backgroundReResolveRA(ctx context.Context, c *cache.
 		raw, err := resolveRESTActionFromObject(bgCtx, c, got.Unstructured.Object, resolvedKey, r.authnNS, perPage, page, nil)
 		if err == nil {
 			cache.ClearL1Stale(bgCtx, c, resolvedKey)
+			// Cascade: mark dependents of this key as stale so they
+			// re-resolve on next request.
+			cache.CascadeMarkStale(bgCtx, c, resolvedKey)
 		}
 		return raw, err
 	})
