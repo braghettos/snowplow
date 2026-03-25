@@ -425,7 +425,17 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	l3GenKey := L3GenKey(gvrKey, ns)
 	rv := uns.GetResourceVersion()
 	if rv != "" {
-		_ = rw.cache.client.Set(ctx, l3GenKey, rv, rw.cache.TTLForGVR(gvr)).Err()
+		// Only update if new rv is greater (monotonic). Prevents out-of-order
+		// events from lowering the generation, which would block the dirty ticker.
+		luaMaxSet := `
+			local cur = redis.call('GET', KEYS[1])
+			if not cur or ARGV[1] > cur then
+				redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+				return 1
+			end
+			return 0`
+		ttlSec := int(rw.cache.TTLForGVR(gvr).Seconds())
+		_ = rw.cache.client.Eval(ctx, luaMaxSet, []string{l3GenKey}, rv, ttlSec).Err()
 	}
 
 	// ── Enqueue L1 refresh event ─────────────────────────────────────────────
