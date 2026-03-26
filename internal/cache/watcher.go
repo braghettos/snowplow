@@ -140,6 +140,7 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]string) {
 	fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
 	if !ok || fn == nil {
+		// Don't update lastSeen — accumulate changes until fn is available.
 		return
 	}
 
@@ -239,7 +240,9 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 		slog.Int("changed_gvr_ns", len(changedGVRNS)),
 		slog.Int("l1_keys", len(keys)))
 
-	func() {
+	// Run refresh asynchronously so it doesn't block the 3s ticker.
+	// The refresh may take 30s+ due to RBAC rate limiting or slow resolution.
+	go func() {
 		defer func() {
 			if r := recover(); r != nil {
 				buf := make([]byte, 4096)
