@@ -119,6 +119,9 @@ func main() {
 	sarc, sarcErr := rest.InClusterConfig()
 	if sarcErr != nil {
 		log.Warn("not running in-cluster; some features disabled", slog.Any("err", sarcErr))
+	} else {
+		sarc.QPS = 100
+		sarc.Burst = 200
 	}
 
 	if redisCache != nil {
@@ -253,6 +256,8 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 		log.Warn("not running in-cluster; background cache services disabled", slog.Any("err", err))
 		return
 	}
+	rc.QPS = 100
+	rc.Burst = 200
 
 	// Phase 1: Start long-running watchers bound to the process lifetime (signal ctx).
 	resourceWatcher, err := cache.NewResourceWatcher(c, rc)
