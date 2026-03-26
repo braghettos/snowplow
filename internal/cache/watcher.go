@@ -57,7 +57,15 @@ type ResourceWatcher struct {
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
-	dynClient, err := k8sdynamic.NewForConfig(rc)
+	// Create a dedicated rest.Config for informers with its own rate limiter.
+	// This prevents L1 refresh API calls (RBAC, objects.Get) from starving
+	// informer WATCH streams. Without this, the shared rate limiter at QPS=100
+	// is consumed by refresh bursts, causing informers to miss events.
+	informerRC := rest.CopyConfig(rc)
+	informerRC.QPS = 50
+	informerRC.Burst = 100
+
+	dynClient, err := k8sdynamic.NewForConfig(informerRC)
 	if err != nil {
 		return nil, err
 	}
