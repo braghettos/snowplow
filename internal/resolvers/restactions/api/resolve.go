@@ -180,6 +180,56 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				if c != nil {
 					_ = c.SAddGVR(ctx, pathGVR)
 				}
+
+				// ── L3 cache intercept for K8s API GET calls ──────────────
+				// If this is a read (GET) and we have a cache, try to serve
+				// from L3 instead of hitting the K8s API. The informer keeps
+				// L3 up-to-date via patchListCache / SetForGVR.
+				if c != nil && verb == http.MethodGet {
+					var cacheKey string
+					if pathName == "" {
+						cacheKey = cache.ListKey(pathGVR, pathNS)
+					} else {
+						cacheKey = cache.GetKey(pathGVR, pathNS, pathName)
+					}
+					if raw, hit, _ := c.GetRaw(ctx, cacheKey); hit {
+						log.Debug("L3 cache hit for K8s API path",
+							slog.String("name", id),
+							slog.String("path", call.Path),
+							slog.String("cacheKey", cacheKey))
+						// Feed the cached JSON through the response handler
+						// as if it came from the K8s API.
+						handler := call.ResponseHandler
+						if handler == nil {
+							handler = jsonHandler(ctx, jsonHandlerOptions{
+								key: id, out: dict, filter: apiCall.Filter,
+							})
+							if mu != nil {
+								origHandler := handler
+								handler = func(r io.ReadCloser) error {
+									data, rerr := io.ReadAll(r)
+									if rerr != nil {
+										return rerr
+									}
+									mu.Lock()
+									defer mu.Unlock()
+									return origHandler(io.NopCloser(bytes.NewReader(data)))
+								}
+							}
+						}
+						if herr := handler(io.NopCloser(bytes.NewReader(raw))); herr == nil {
+							return true // L3 cache hit — skip httpcall.Do
+						}
+						log.Debug("L3 cache hit but handler failed, falling through to API",
+							slog.String("name", id),
+							slog.String("path", call.Path))
+					} else {
+						log.Debug("L3 cache miss for K8s API path",
+							slog.String("name", id),
+							slog.String("path", call.Path),
+							slog.String("cacheKey", cacheKey))
+					}
+				}
 			} else if callGVR, callNS, callName := cache.ParseCallPath(call.Path); callGVR.Resource != "" {
 				if tracker := cache.TrackerFromContext(ctx); tracker != nil {
 					tracker.AddGVR(callGVR)
