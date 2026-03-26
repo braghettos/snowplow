@@ -492,6 +492,15 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		_ = rw.cache.client.Eval(ctx, luaMaxSet, []string{l3GenKey}, rv, ttlSec).Err()
 	}
 
+	// ── Auto-register informers for new CRDs ────────────────────────────────
+	// When the CRD informer fires an ADD event for a new CustomResourceDefinition,
+	// extract the GVR from the CRD spec and register an informer for it.
+	// This ensures snowplow watches new CR types immediately when the CRD
+	// appears — e.g. when a CompositionDefinition creates a new CRD.
+	if gvr.Resource == "customresourcedefinitions" && gvr.Group == "apiextensions.k8s.io" && eventType == "add" {
+		rw.autoRegisterCRDInformer(uns)
+	}
+
 	// ── Enqueue L1 refresh event ─────────────────────────────────────────────
 	// L3 was just patched above. Enqueue the event for the L1 worker to
 	// process sequentially. The worker will read the latest L3 state.
@@ -511,6 +520,52 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 			slog.String("gvr", gvr.String()),
 			slog.String("ns", ns),
 			slog.String("name", name))
+	}
+}
+
+// autoRegisterCRDInformer extracts the GVR from a CustomResourceDefinition
+// unstructured object and registers an informer for it. This ensures snowplow
+// watches new CR types as soon as their CRD appears.
+func (rw *ResourceWatcher) autoRegisterCRDInformer(uns *unstructured.Unstructured) {
+	// Extract group from spec.group
+	group, _, _ := unstructured.NestedString(uns.Object, "spec", "group")
+	if group == "" {
+		return
+	}
+	// Extract resource (plural) from spec.names.plural
+	plural, _, _ := unstructured.NestedString(uns.Object, "spec", "names", "plural")
+	if plural == "" {
+		return
+	}
+	// Extract the served version from spec.versions
+	versions, found, _ := unstructured.NestedSlice(uns.Object, "spec", "versions")
+	if !found || len(versions) == 0 {
+		return
+	}
+	var version string
+	for _, v := range versions {
+		vm, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		served, _, _ := unstructured.NestedBool(vm, "served")
+		if served {
+			version, _, _ = unstructured.NestedString(vm, "name")
+			break
+		}
+	}
+	if version == "" {
+		return
+	}
+
+	newGVR := schema.GroupVersionResource{Group: group, Version: version, Resource: plural}
+	rw.startInformer(newGVR)
+	slog.Info("resource-watcher: auto-registered informer for new CRD",
+		slog.String("crd", uns.GetName()),
+		slog.String("gvr", newGVR.String()))
+	// Also register in Redis so warmup can discover it next restart.
+	if rw.cache != nil {
+		_ = rw.cache.SAddGVR(context.Background(), newGVR)
 	}
 }
 
