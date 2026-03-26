@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -42,15 +43,6 @@ type l1Event struct {
 	resourceVersion string // K8s resourceVersion of the object that triggered this event
 }
 
-// dirtyEntry tracks L3 generations for an L1 key. The ticker refreshes
-// whenever ANY L3 gen has changed since the last refresh (progressive
-// convergence during burst). After events stop, gens stabilize and the
-// ticker skips (no redundant work).
-type dirtyEntry struct {
-	targetGens map[string]string // "gvrKey:ns" → latest resourceVersion seen
-	lastSeen   map[string]string // "gvrKey:ns" → gen value at last refresh
-}
-
 // ResourceWatcher maintains dynamic informers for every GVR in the watched set.
 type ResourceWatcher struct {
 	cache     *RedisCache
@@ -61,7 +53,7 @@ type ResourceWatcher struct {
 	appCtx    context.Context // long-lived process context; set by Start()
 
 	l1Refresh atomic.Value    // stores L1RefreshFunc
-	eventCh   chan l1Event     // buffered channel for L1 refresh events
+	eventCh   chan l1Event     // buffered channel for L1 refresh events (100k)
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -74,7 +66,7 @@ func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error
 		dynClient: dynClient,
 		factory:   dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 0),
 		watched:   make(map[string]bool),
-		eventCh:   make(chan l1Event, 10000),
+		eventCh:   make(chan l1Event, 100000),
 	}, nil
 }
 
@@ -96,18 +88,19 @@ func (rw *ResourceWatcher) Start(ctx context.Context) {
 	go rw.l1Worker(ctx)
 }
 
-// l1Worker processes L1 refresh events. All events (ADD/UPDATE/DELETE) mark
-// affected L1 keys as dirty. A periodic 3s ticker re-resolves dirty keys,
-// but only when L3 generation (resourceVersion) has changed since the last
-// refresh — avoiding redundant work when L3 is stable.
+// l1Worker has two responsibilities:
 //
-// This gives:
-// - Fast HTTP responses: L1 is never deleted, always serves from cache (~60ms)
-// - Progressive convergence: dirty keys re-resolved every 3s during burst
-// - Exact values: after events stop, L3 gens stabilize, final refresh is exact
-// - No redundant work: ticker skips refresh when no L3 gen changed
+//  1. Consume events from eventCh so handleEvent doesn't block. Events are
+//     currently only used for delete-related L1 dep cleanup.
+//
+//  2. Every 3s, scan all snowplow:l3gen:* keys in Redis. If any generation
+//     changed since the last scan, find ALL L1 keys that depend on that
+//     GVR+ns via the reverse dependency indexes and refresh them.
+//
+// This is fully agnostic — no GVR-specific logic. Any L3 change triggers
+// the corresponding L1 refresh automatically.
 func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
-	dirty := make(map[string]*dirtyEntry) // L1 key → target gens
+	lastSeen := make(map[string]string) // "snowplow:l3gen:..." → last known value
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
@@ -119,166 +112,150 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 			if !ok {
 				return
 			}
-			rw.processL1Event(ctx, evt, dirty)
+			// On DELETE: clean up the per-resource dep index entry (resource is gone).
+			if evt.eventType == "delete" {
+				resDepKey := L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)
+				_ = rw.cache.Delete(ctx, resDepKey)
+			}
 		case <-ticker.C:
-			if len(dirty) == 0 {
-				continue
-			}
-
-			// For each dirty L1 key, check if ANY L3 gen changed since the
-			// last refresh. This gives progressive convergence during burst
-			// (refresh every 3s with latest data) and skips when stable.
-			var ready []string
-			for l1Key, entry := range dirty {
-				anyChanged := false
-				for gvrNS := range entry.targetGens {
-					curRV, _ := rw.cache.client.Get(ctx, "snowplow:l3gen:"+gvrNS).Result()
-					if curRV != entry.lastSeen[gvrNS] {
-						anyChanged = true
-						entry.lastSeen[gvrNS] = curRV
-					}
-				}
-				if anyChanged {
-					ready = append(ready, l1Key)
-				}
-			}
-			// Remove dirty entries only when their gens haven't changed
-			// (no more events flowing for this key).
-			for l1Key, entry := range dirty {
-				stale := false
-				for gvrNS := range entry.targetGens {
-					curRV, _ := rw.cache.client.Get(ctx, "snowplow:l3gen:"+gvrNS).Result()
-					if curRV != entry.lastSeen[gvrNS] {
-						stale = true
-						break
-					}
-				}
-				if !stale {
-					// Check if this entry was just refreshed — if so, keep it
-					// for one more tick to confirm stability.
-					found := false
-					for _, k := range ready {
-						if k == l1Key {
-							found = true
-							break
-						}
-					}
-					if !found {
-						delete(dirty, l1Key)
-					}
-				}
-			}
-
-			if len(ready) == 0 {
-				continue
-			}
-
-			fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
-			if !ok || fn == nil {
-				continue
-			}
-			slog.Info("resource-watcher: periodic dirty refresh",
-				slog.Int("keys", len(ready)),
-				slog.Int("remaining", len(dirty)))
-
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						buf := make([]byte, 4096)
-						n := runtime.Stack(buf, false)
-						slog.Error("resource-watcher: panic in dirty refresh",
-							slog.Any("error", r),
-							slog.String("stack", string(buf[:n])))
-					}
-				}()
-				refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				defer cancel()
-				fn(refreshCtx, schema.GroupVersionResource{}, ready)
-			}()
+			rw.scanL3Gens(ctx, lastSeen)
 		}
 	}
 }
 
-func (rw *ResourceWatcher) processL1Event(ctx context.Context, evt l1Event, dirty map[string]*dirtyEntry) {
-	defer func() {
-		if r := recover(); r != nil {
-			buf := make([]byte, 4096)
-			n := runtime.Stack(buf, false)
-			slog.Error("resource-watcher: panic in L1 worker",
-				slog.Any("error", r),
-				slog.String("gvr", evt.gvr.String()),
-				slog.String("stack", string(buf[:n])))
-		}
-	}()
-
-	l1Keys := rw.collectAffectedL1Keys(ctx, evt.gvrKey, evt.ns, evt.name)
-
-	// CRD-based invalidation: when a CR is created/deleted, also find L1 keys
-	// that depend on its CRD (e.g. compositions-get-ns-and-crd depends on the
-	// CRD LIST). This handles the zero-state problem agnostically.
-	crdGVRKey := GVRToKey(schema.GroupVersionResource{
-		Group:    "apiextensions.k8s.io",
-		Version:  "v1",
-		Resource: "customresourcedefinitions",
-	})
-	crdName := evt.gvr.Resource + "." + evt.gvr.Group
-	crdL1Keys := rw.collectAffectedL1Keys(ctx, crdGVRKey, "", crdName)
-	for _, k := range crdL1Keys {
-		found := false
-		for _, existing := range l1Keys {
-			if existing == k {
-				found = true
-				break
-			}
-		}
-		if !found {
-			l1Keys = append(l1Keys, k)
-		}
-	}
-
-	// Walk the dependency tree to find transitively-dependent L1 keys.
-	// Example: CRD lookup finds compositions-get-ns-and-crd → expand finds
-	// compositions-list → expand finds piechart, table.
-	if len(l1Keys) > 0 {
-		l1Keys = rw.expandDependents(ctx, l1Keys, 5)
-	}
-
-	if len(l1Keys) == 0 {
+// scanL3Gens scans all snowplow:l3gen:* keys, detects changes since the last
+// scan, and refreshes affected L1 keys via the dependency indexes.
+func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]string) {
+	fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
+	if !ok || fn == nil {
 		return
 	}
 
-	// All events (ADD/UPDATE/DELETE): mark affected L1 keys as dirty.
-	// Don't delete — serve stale. The periodic 3s ticker re-resolves them.
-	// For DELETE: the per-resource dep index entry is cleaned up, but the
-	// L1 key stays cached (stale for up to 3-6s) until the ticker refreshes it.
-	if evt.eventType == "delete" {
-		resDepKey := L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)
-		_ = rw.cache.Delete(ctx, resDepKey)
+	// Scan all l3gen keys.
+	genKeys, err := rw.cache.client.Keys(ctx, "snowplow:l3gen:*").Result()
+	if err != nil || len(genKeys) == 0 {
+		return
 	}
 
-	gvrNS := evt.gvrKey + ":" + evt.ns
-	for _, k := range l1Keys {
-		entry := dirty[k]
-		if entry == nil {
-			entry = &dirtyEntry{
-				targetGens: make(map[string]string),
-				lastSeen:   make(map[string]string),
+	// Read current values in a pipeline for efficiency.
+	pipe := rw.cache.client.Pipeline()
+	cmds := make(map[string]*redis.StringCmd, len(genKeys))
+	for _, gk := range genKeys {
+		cmds[gk] = pipe.Get(ctx, gk)
+	}
+	_, _ = pipe.Exec(ctx)
+
+	// Find which GVR+ns changed.
+	changedGVRNS := make(map[string]bool)
+	for gk, cmd := range cmds {
+		curVal, _ := cmd.Result()
+		if curVal == "" {
+			continue
+		}
+		if lastSeen[gk] != curVal {
+			lastSeen[gk] = curVal
+			// Extract GVR+ns from key: "snowplow:l3gen:{gvrKey}:{ns}"
+			// The gvrKey is "group/version/resource", ns is the namespace.
+			suffix := strings.TrimPrefix(gk, "snowplow:l3gen:")
+			changedGVRNS[suffix] = true
+		}
+	}
+
+	if len(changedGVRNS) == 0 {
+		return
+	}
+
+	// For each changed GVR+ns, find affected L1 keys via dependency indexes.
+	affected := make(map[string]bool)
+	for gvrNS := range changedGVRNS {
+		// Parse "group/version/resource:namespace" into gvrKey and ns.
+		// The gvrKey contains slashes, ns is after the last colon.
+		lastColon := strings.LastIndex(gvrNS, ":")
+		if lastColon < 0 {
+			continue
+		}
+		gvrKey := gvrNS[:lastColon]
+		ns := gvrNS[lastColon+1:]
+
+		// Collect L1 keys that depend on this GVR+ns:
+		// - LIST dep for this namespace (name="")
+		collect := func(idxKey string) {
+			if keys, err := rw.cache.SMembers(ctx, idxKey); err == nil {
+				for _, k := range keys {
+					affected[k] = true
+				}
 			}
-			dirty[k] = entry
 		}
-		// Update target gen: always store the latest resourceVersion
-		// for this GVR+ns so the ticker waits for L3 to catch up.
-		if evt.resourceVersion > entry.targetGens[gvrNS] {
-			entry.targetGens[gvrNS] = evt.resourceVersion
-		}
+		collect(L1ResourceDepKey(gvrKey, ns, ""))   // namespaced LIST
+		collect(L1ResourceDepKey(gvrKey, "", ""))    // cluster-wide LIST
+		collect(L1ApiDepKey(gvrKey))                 // API-level dep
+		collect(L1GVRKey(gvrKey))                    // GVR-level broad index
 	}
 
-	slog.Debug("resource-watcher: L1 marked dirty",
-		slog.String("event", evt.eventType),
-		slog.String("gvr", evt.gvr.String()),
-		slog.String("ns", evt.ns),
-		slog.String("name", evt.name),
-		slog.Int("dirty", len(l1Keys)))
+	if len(affected) == 0 {
+		return
+	}
+
+	// Walk dependency tree to find transitively affected L1 keys.
+	// e.g. compositions-list refresh → piechart depends on it → refresh too.
+	rw.expandDependents(ctx, affected, 5)
+
+	keys := make([]string, 0, len(affected))
+	for k := range affected {
+		keys = append(keys, k)
+	}
+
+	slog.Info("resource-watcher: l3gen scan refresh",
+		slog.Int("changed_gvr_ns", len(changedGVRNS)),
+		slog.Int("l1_keys", len(keys)))
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				buf := make([]byte, 4096)
+				n := runtime.Stack(buf, false)
+				slog.Error("resource-watcher: panic in l3gen refresh",
+					slog.Any("error", r),
+					slog.String("stack", string(buf[:n])))
+			}
+		}()
+		refreshCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+		fn(refreshCtx, schema.GroupVersionResource{}, keys)
+	}()
+}
+
+// expandDependents walks the L1 dependency tree and adds all transitively
+// dependent keys to the affected set. For example, refreshing compositions-list
+// also needs to refresh piechart which depends on it.
+func (rw *ResourceWatcher) expandDependents(ctx context.Context, affected map[string]bool, maxDepth int) {
+	pending := make([]string, 0, len(affected))
+	for k := range affected {
+		pending = append(pending, k)
+	}
+
+	for depth := 0; depth < maxDepth && len(pending) > 0; depth++ {
+		var nextPending []string
+		for _, l1Key := range pending {
+			info, ok := ParseResolvedKey(l1Key)
+			if !ok {
+				continue
+			}
+			gvrKey := GVRToKey(info.GVR)
+			depKey := L1ResourceDepKey(gvrKey, info.NS, info.Name)
+			dependents, err := rw.cache.SMembers(ctx, depKey)
+			if err != nil || len(dependents) == 0 {
+				continue
+			}
+			for _, dep := range dependents {
+				if !affected[dep] {
+					affected[dep] = true
+					nextPending = append(nextPending, dep)
+				}
+			}
+		}
+		pending = nextPending
+	}
 }
 
 // WaitForSync blocks until all started informers have completed their initial sync.
@@ -540,43 +517,6 @@ func (rw *ResourceWatcher) collectAffectedL1Keys(ctx context.Context, gvrKey, ns
 // Repeats up to maxDepth levels. Returns all keys (input + discovered).
 //
 // Example: compositions-get-ns-and-crd → compositions-list → piechart
-func (rw *ResourceWatcher) expandDependents(ctx context.Context, l1Keys []string, maxDepth int) []string {
-	seen := make(map[string]bool, len(l1Keys))
-	for _, k := range l1Keys {
-		seen[k] = true
-	}
-
-	pending := l1Keys
-	for depth := 0; depth < maxDepth && len(pending) > 0; depth++ {
-		var nextPending []string
-		for _, l1Key := range pending {
-			info, ok := ParseResolvedKey(l1Key)
-			if !ok {
-				continue
-			}
-			gvrKey := GVRToKey(info.GVR)
-			depKey := L1ResourceDepKey(gvrKey, info.NS, info.Name)
-			dependents, err := rw.cache.SMembers(ctx, depKey)
-			if err != nil || len(dependents) == 0 {
-				continue
-			}
-			for _, dep := range dependents {
-				if !seen[dep] {
-					seen[dep] = true
-					nextPending = append(nextPending, dep)
-				}
-			}
-		}
-		pending = nextPending
-	}
-
-	out := make([]string, 0, len(seen))
-	for k := range seen {
-		out = append(out, k)
-	}
-	return out
-}
-
 // patchListCache atomically patches the cached list in-place using WATCH/MULTI/EXEC.
 func (rw *ResourceWatcher) patchListCache(ctx context.Context, gvr schema.GroupVersionResource, listKey string, uns *unstructured.Unstructured, eventType string) {
 	ttl := rw.cache.TTLForGVR(gvr)

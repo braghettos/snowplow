@@ -1959,7 +1959,7 @@ def run_phase_browser_scaling(tokens):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
 
-        for cache_mode in ("ON", "OFF"):
+        for cache_mode in ("ON",):  # Skip cache OFF for debugging
             section(f"BROWSER MATRIX: cache={cache_mode}")
             clean_environment()
             if cache_mode == "ON":
@@ -2223,6 +2223,21 @@ def main():
     with open(out_file, "w") as f:
         json.dump(test_results, f, indent=2, default=str)
     log(f"Results saved to {out_file}")
+
+    # Capture pod logs for post-mortem analysis.
+    tag = os.environ.get("EXPECTED_IMAGE_TAG", "unknown")
+    pod_log_file = f"/tmp/snowplow_pod_logs_{tag}.txt"
+    try:
+        result = subprocess.run(
+            ["kubectl", "logs", "-n", "krateo-system", "-l", "app=snowplow",
+             "-c", "snowplow", "--tail=50000"],
+            capture_output=True, text=True, timeout=30)
+        if result.returncode == 0 and result.stdout:
+            with open(pod_log_file, "w") as f:
+                f.write(result.stdout)
+            log(f"Pod logs saved to {pod_log_file}")
+    except Exception as e:
+        log(f"WARNING: could not capture pod logs: {e}")
 
     print(f"\n{BOLD}{DSEP}{RESET}")
     print(f"{BOLD}  Test complete — {'ALL PASSED' if all_passed else 'SOME FAILED'}{RESET}")
