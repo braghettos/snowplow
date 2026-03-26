@@ -497,7 +497,7 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	// extract the GVR from the CRD spec and register an informer for it.
 	// This ensures snowplow watches new CR types immediately when the CRD
 	// appears — e.g. when a CompositionDefinition creates a new CRD.
-	if gvr.Resource == "customresourcedefinitions" && gvr.Group == "apiextensions.k8s.io" && eventType == "add" {
+	if gvr.Resource == "customresourcedefinitions" && gvr.Group == "apiextensions.k8s.io" && (eventType == "add" || eventType == "update") {
 		rw.autoRegisterCRDInformer(uns)
 	}
 
