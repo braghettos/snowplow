@@ -538,10 +538,14 @@ func (rw *ResourceWatcher) autoRegisterCRDInformer(uns *unstructured.Unstructure
 	// Extract group from spec.group
 	group, _, _ := unstructured.NestedString(uns.Object, "spec", "group")
 	if group == "" {
+		slog.Debug("resource-watcher: CRD auto-register: empty group", slog.String("crd", uns.GetName()))
 		return
 	}
 	// Check if the group matches any configured autoDiscoverGroups pattern.
 	if !rw.matchesAutoDiscoverGroup(group) {
+		slog.Debug("resource-watcher: CRD auto-register: group not in autoDiscoverGroups",
+			slog.String("crd", uns.GetName()), slog.String("group", group),
+			slog.Int("patterns", len(rw.autoDiscoverGroups)))
 		return
 	}
 	// Extract resource (plural) from spec.names.plural
