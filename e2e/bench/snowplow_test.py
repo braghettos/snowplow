@@ -724,9 +724,9 @@ def delete_bench_namespaces():
                             "--type=merge", f"-p={FINALIZER_PATCH}")
                 with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
                     list(ex.map(patch, items))
-    for ns_name in bench_ns:
-        kubectl("delete", "ns", ns_name, "--ignore-not-found", "--wait=false",
-                "--force", "--grace-period=0")
+    # Batch delete all bench namespaces in one kubectl call
+    kubectl("delete", "ns", *bench_ns, "--ignore-not-found", "--wait=false",
+            "--force", "--grace-period=0")
     log(f"Triggered deletion of {len(bench_ns)} bench namespaces")
     deadline = time.time() + 600
     while time.time() < deadline:
@@ -735,7 +735,7 @@ def delete_bench_namespaces():
         if not remaining:
             log("All bench namespaces deleted")
             return
-        time.sleep(10)
+        time.sleep(5)
     log("WARNING: bench namespace deletion timed out")
 
 
@@ -957,8 +957,8 @@ def delete_all_clientconfigs():
     rc, out, _ = kubectl("get", "secrets", "-n", NS, "-o", "name")
     secrets = [s.replace("secret/", "") for s in out.split("\n")
                if s.strip() and "-clientconfig" in s]
-    for name in secrets:
-        kubectl("delete", "secret", name, "-n", NS, "--ignore-not-found")
+    if secrets:
+        kubectl("delete", "secret", *secrets, "-n", NS, "--ignore-not-found")
     log(f"Deleted {len(secrets)} clientconfig secrets")
 
 
