@@ -177,8 +177,8 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 		gvrKey := gvrNS[:lastColon]
 		ns := gvrNS[lastColon+1:]
 
-		// Collect L1 keys that depend on this GVR+ns:
-		// - LIST dep for this namespace (name="")
+		// Collect L1 keys that depend on this GVR+ns via precise indexes only.
+		// Deliberately excludes L1GVRKey (too broad — 5000+ keys for popular GVRs).
 		collect := func(idxKey string) {
 			if keys, err := rw.cache.SMembers(ctx, idxKey); err == nil {
 				for _, k := range keys {
@@ -189,7 +189,24 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 		collect(L1ResourceDepKey(gvrKey, ns, ""))   // namespaced LIST
 		collect(L1ResourceDepKey(gvrKey, "", ""))    // cluster-wide LIST
 		collect(L1ApiDepKey(gvrKey))                 // API-level dep
-		collect(L1GVRKey(gvrKey))                    // GVR-level broad index
+
+		// CRD-based chain: for any GVR, also look up L1 keys that depend on
+		// the CRD for this GVR. This handles zero-state agnostically —
+		// e.g. composition ADD → CRD dep → compositions-get-ns-and-crd.
+		// CRD name is a K8s convention: resource + "." + group.
+		gvr := ParseGVRKey(gvrKey)
+		if gvr.Group != "" && gvr.Resource != "" {
+			crdGVRKey := GVRToKey(schema.GroupVersionResource{
+				Group:    "apiextensions.k8s.io",
+				Version:  "v1",
+				Resource: "customresourcedefinitions",
+			})
+			crdName := gvr.Resource + "." + gvr.Group
+			// GET dep on specific CRD
+			collect(L1ResourceDepKey(crdGVRKey, "", crdName))
+			// LIST dep on all CRDs (compositions-get-ns-and-crd does LIST)
+			collect(L1ResourceDepKey(crdGVRKey, "", ""))
+		}
 	}
 
 	if len(affected) == 0 {
@@ -197,7 +214,8 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 	}
 
 	// Walk dependency tree to find transitively affected L1 keys.
-	// e.g. compositions-list refresh → piechart depends on it → refresh too.
+	// Starting from ~2-6 keys (e.g. compositions-get-ns-and-crd),
+	// expand to compositions-list → piechart → table (~10 keys total).
 	rw.expandDependents(ctx, affected, 5)
 
 	keys := make([]string, 0, len(affected))
