@@ -236,6 +236,13 @@ func (rw *ResourceWatcher) processL1Event(ctx context.Context, evt l1Event, dirt
 		}
 	}
 
+	// Walk the dependency tree to find transitively-dependent L1 keys.
+	// Example: CRD lookup finds compositions-get-ns-and-crd → expand finds
+	// compositions-list → expand finds piechart, table.
+	if len(l1Keys) > 0 {
+		l1Keys = rw.expandDependents(ctx, l1Keys, 5)
+	}
+
 	if len(l1Keys) == 0 {
 		return
 	}
@@ -520,6 +527,49 @@ func (rw *ResourceWatcher) collectAffectedL1Keys(ctx context.Context, gvrKey, ns
 	if len(seen) == 0 {
 		return nil
 	}
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	return out
+}
+
+// expandDependents walks the L1 dependency tree starting from the given keys.
+// For each L1 key, it parses the key to extract GVR/ns/name, looks up
+// L1ResourceDepKey to find L1 keys that depend on it, and adds them.
+// Repeats up to maxDepth levels. Returns all keys (input + discovered).
+//
+// Example: compositions-get-ns-and-crd → compositions-list → piechart
+func (rw *ResourceWatcher) expandDependents(ctx context.Context, l1Keys []string, maxDepth int) []string {
+	seen := make(map[string]bool, len(l1Keys))
+	for _, k := range l1Keys {
+		seen[k] = true
+	}
+
+	pending := l1Keys
+	for depth := 0; depth < maxDepth && len(pending) > 0; depth++ {
+		var nextPending []string
+		for _, l1Key := range pending {
+			info, ok := ParseResolvedKey(l1Key)
+			if !ok {
+				continue
+			}
+			gvrKey := GVRToKey(info.GVR)
+			depKey := L1ResourceDepKey(gvrKey, info.NS, info.Name)
+			dependents, err := rw.cache.SMembers(ctx, depKey)
+			if err != nil || len(dependents) == 0 {
+				continue
+			}
+			for _, dep := range dependents {
+				if !seen[dep] {
+					seen[dep] = true
+					nextPending = append(nextPending, dep)
+				}
+			}
+		}
+		pending = nextPending
+	}
+
 	out := make([]string, 0, len(seen))
 	for k := range seen {
 		out = append(out, k)
