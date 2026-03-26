@@ -100,7 +100,28 @@ func (rw *ResourceWatcher) Start(ctx context.Context) {
 // This is fully agnostic — no GVR-specific logic. Any L3 change triggers
 // the corresponding L1 refresh automatically.
 func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
-	lastSeen := make(map[string]string) // "snowplow:l3gen:..." → last known value
+	// Event consumer goroutine: handles DELETE dep index cleanup.
+	// Runs independently so the event channel doesn't starve the ticker.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case evt, ok := <-rw.eventCh:
+				if !ok {
+					return
+				}
+				if evt.eventType == "delete" {
+					resDepKey := L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)
+					_ = rw.cache.Delete(ctx, resDepKey)
+				}
+			}
+		}
+	}()
+
+	// L3gen scanner: runs every 3s independently of event volume.
+	// Detects L3 changes via generation keys and refreshes affected L1 keys.
+	lastSeen := make(map[string]string)
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
@@ -108,15 +129,6 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case evt, ok := <-rw.eventCh:
-			if !ok {
-				return
-			}
-			// On DELETE: clean up the per-resource dep index entry (resource is gone).
-			if evt.eventType == "delete" {
-				resDepKey := L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)
-				_ = rw.cache.Delete(ctx, resDepKey)
-			}
 		case <-ticker.C:
 			rw.scanL3Gens(ctx, lastSeen)
 		}
