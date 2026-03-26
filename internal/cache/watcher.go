@@ -52,8 +52,9 @@ type ResourceWatcher struct {
 	watched   map[string]bool
 	appCtx    context.Context // long-lived process context; set by Start()
 
-	l1Refresh atomic.Value    // stores L1RefreshFunc
-	eventCh   chan l1Event     // buffered channel for L1 refresh events (100k)
+	l1Refresh          atomic.Value // stores L1RefreshFunc
+	eventCh            chan l1Event  // buffered channel for L1 refresh events (100k)
+	autoDiscoverGroups []string     // CRD group suffix patterns for auto-registration
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -344,6 +345,13 @@ func (rw *ResourceWatcher) StartExpiryRefresh(ctx context.Context) {
 
 // SetL1Refresher registers a callback that will be used to proactively
 // re-resolve L1 entries in the background instead of deleting them.
+// SetAutoDiscoverGroups configures which CRD groups trigger automatic informer
+// registration. Patterns use suffix matching: "*.krateo.io" matches any group
+// ending in ".krateo.io".
+func (rw *ResourceWatcher) SetAutoDiscoverGroups(patterns []string) {
+	rw.autoDiscoverGroups = patterns
+}
+
 func (rw *ResourceWatcher) SetL1Refresher(fn L1RefreshFunc) {
 	rw.l1Refresh.Store(fn)
 }
@@ -532,6 +540,10 @@ func (rw *ResourceWatcher) autoRegisterCRDInformer(uns *unstructured.Unstructure
 	if group == "" {
 		return
 	}
+	// Check if the group matches any configured autoDiscoverGroups pattern.
+	if !rw.matchesAutoDiscoverGroup(group) {
+		return
+	}
 	// Extract resource (plural) from spec.names.plural
 	plural, _, _ := unstructured.NestedString(uns.Object, "spec", "names", "plural")
 	if plural == "" {
@@ -567,6 +579,25 @@ func (rw *ResourceWatcher) autoRegisterCRDInformer(uns *unstructured.Unstructure
 	if rw.cache != nil {
 		_ = rw.cache.SAddGVR(context.Background(), newGVR)
 	}
+}
+
+// matchesAutoDiscoverGroup checks if a CRD group matches any configured
+// autoDiscoverGroups pattern. Patterns support suffix matching with "*." prefix.
+func (rw *ResourceWatcher) matchesAutoDiscoverGroup(group string) bool {
+	if len(rw.autoDiscoverGroups) == 0 {
+		return false
+	}
+	for _, pattern := range rw.autoDiscoverGroups {
+		if strings.HasPrefix(pattern, "*.") {
+			suffix := pattern[1:] // e.g. ".krateo.io"
+			if strings.HasSuffix(group, suffix) {
+				return true
+			}
+		} else if group == pattern {
+			return true
+		}
+	}
+	return false
 }
 
 // collectAffectedL1Keys returns the deduplicated set of L1 resolved keys that

@@ -145,6 +145,14 @@ warmup:
     - name: sidebar-nav-menu-items
       namespace: krateo-system
 
+  # When a new CRD appears, auto-register an informer for it IF the CRD's
+  # group matches one of these suffix patterns. This ensures snowplow watches
+  # new CR types (e.g. from CompositionDefinitions) without restarting.
+  # Only krateo-related groups should be listed here to avoid registering
+  # informers for GKE, cert-manager, etc.
+  autoDiscoverGroups:
+    - "*.krateo.io"
+
   # Discovery categories to pre-cache for the /list endpoint.
   categories:
     - krateoplatformops

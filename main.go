@@ -269,6 +269,15 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 	c.SetGVRNotifier(resourceWatcher.AddGVR)
 	resourceWatcher.SetL1Refresher(dispatchers.MakeL1Refresher(c, rc, authnNS, signKey))
 
+	// Load warmup config early to get autoDiscoverGroups for CRD informer filtering.
+	warmupCfg, err := cache.LoadWarmupConfig(warmupConfigPath)
+	if err != nil {
+		log.Warn("failed to load warmup config", slog.Any("err", err))
+	}
+	if warmupCfg != nil {
+		resourceWatcher.SetAutoDiscoverGroups(warmupCfg.Warmup.AutoDiscoverGroups)
+	}
+
 	resourceWatcher.StartExpiryRefresh(ctx)
 	resourceWatcher.Start(ctx)
 
@@ -290,11 +299,15 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 	defer warmupCancel()
 
 	warmer := cache.NewWarmer(c, rc)
-	warmupCfg, err := cache.LoadWarmupConfig(warmupConfigPath)
-	if err != nil {
-		log.Warn("warmup config not loaded; using empty config",
-			slog.String("path", warmupConfigPath), slog.Any("err", err))
-	} else {
+	if warmupCfg == nil {
+		// Retry loading if it failed earlier (shouldn't happen but be safe).
+		warmupCfg, err = cache.LoadWarmupConfig(warmupConfigPath)
+		if err != nil {
+			log.Warn("warmup config not loaded; using empty config",
+				slog.String("path", warmupConfigPath), slog.Any("err", err))
+		}
+	}
+	if warmupCfg != nil {
 		warmer.SetWarmupConfig(warmupCfg)
 		warmer.DiscoverCompositionGVRs(warmupCtx)
 		warmer.PreRegisterGVRs(warmupCtx)

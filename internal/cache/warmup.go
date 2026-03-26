@@ -34,9 +34,10 @@ type WarmupRestAction struct {
 
 type WarmupConfig struct {
 	Warmup struct {
-		GVRs           []WarmupGVR        `yaml:"gvrs"`
-		L1RestActions  []WarmupRestAction  `yaml:"l1RestActions,omitempty"`
-		Categories     []string            `yaml:"categories,omitempty"`
+		GVRs               []WarmupGVR        `yaml:"gvrs"`
+		L1RestActions      []WarmupRestAction  `yaml:"l1RestActions,omitempty"`
+		AutoDiscoverGroups []string            `yaml:"autoDiscoverGroups,omitempty"`
+		Categories         []string            `yaml:"categories,omitempty"`
 	} `yaml:"warmup"`
 }
 
