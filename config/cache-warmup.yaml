@@ -151,7 +151,7 @@ warmup:
   # Only krateo-related groups should be listed here to avoid registering
   # informers for GKE, cert-manager, etc.
   autoDiscoverGroups:
-    - "*.krateo.io"
+    - "composition.krateo.io"
 
   # Discovery categories to pre-cache for the /list endpoint.
   categories:

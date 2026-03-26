@@ -54,11 +54,27 @@ func LoadWarmupConfig(path string) (*WarmupConfig, error) {
 }
 
 type Warmer struct {
-	cache      *RedisCache
-	rc         *rest.Config
-	gvrs       []schema.GroupVersionResource
-	gvrTTLs    map[schema.GroupVersionResource]time.Duration
-	categories []string
+	cache              *RedisCache
+	rc                 *rest.Config
+	gvrs               []schema.GroupVersionResource
+	gvrTTLs            map[schema.GroupVersionResource]time.Duration
+	categories         []string
+	autoDiscoverGroups []string
+}
+
+// matchesGroupPatterns checks if a group matches any pattern. Supports
+// exact match ("composition.krateo.io") and suffix match ("*.krateo.io").
+func matchesGroupPatterns(group string, patterns []string) bool {
+	for _, p := range patterns {
+		if strings.HasPrefix(p, "*.") {
+			if strings.HasSuffix(group, p[1:]) {
+				return true
+			}
+		} else if group == p {
+			return true
+		}
+	}
+	return false
 }
 
 func NewWarmer(c *RedisCache, rc *rest.Config) *Warmer {
@@ -71,6 +87,7 @@ func (w *Warmer) SetWarmupConfig(cfg *WarmupConfig) {
 		return
 	}
 	w.categories = cfg.Warmup.Categories
+	w.autoDiscoverGroups = cfg.Warmup.AutoDiscoverGroups
 	for _, entry := range cfg.Warmup.GVRs {
 		gvr := schema.GroupVersionResource{Group: entry.Group, Version: entry.Version, Resource: entry.Resource}
 		w.gvrs = append(w.gvrs, gvr)
@@ -88,11 +105,14 @@ func (w *Warmer) SetWarmupConfig(cfg *WarmupConfig) {
 
 func (w *Warmer) SetGVRs(gvrs []schema.GroupVersionResource) { w.gvrs = gvrs }
 
-// DiscoverCompositionGVRs finds all CRDs in the composition.krateo.io group
+// DiscoverCompositionGVRs finds CRDs matching the autoDiscoverGroups patterns
 // and adds them to the warmup set. These are dynamic CRDs created by
 // CompositionDefinitions — they can't be hardcoded in the warmup config
 // because they vary per cluster.
 func (w *Warmer) DiscoverCompositionGVRs(ctx context.Context) {
+	if len(w.autoDiscoverGroups) == 0 {
+		return
+	}
 	dc, err := discovery.NewDiscoveryClientForConfig(w.rc)
 	if err != nil {
 		slog.Warn("warmup: failed to create discovery client for composition GVRs",
@@ -113,7 +133,7 @@ func (w *Warmer) DiscoverCompositionGVRs(ctx context.Context) {
 			continue
 		}
 		g := gv.Group
-		if !strings.HasSuffix(g, ".krateo.io") || g == "core.krateo.io" || g == "templates.krateo.io" || g == "widgets.templates.krateo.io" {
+		if !matchesGroupPatterns(g, w.autoDiscoverGroups) {
 			continue
 		}
 		for _, res := range list.APIResources {
