@@ -12,6 +12,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/labels"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -701,6 +702,212 @@ func (rw *ResourceWatcher) collectAffectedL1Keys(ctx context.Context, gvrKey, ns
 // Repeats up to maxDepth levels. Returns all keys (input + discovered).
 //
 // Example: compositions-get-ns-and-crd → compositions-list → piechart
+// ReconcileStats holds aggregate results from a startup reconciliation pass.
+type ReconcileStats struct {
+	GVRs     int
+	Added    int
+	Removed  int
+	Updated  int
+	Errors   int
+	Duration time.Duration
+}
+
+// Reconcile compares L3 cache (Redis) with informer stores (in-memory, authoritative)
+// for every watched GVR. Any differences — ghost objects from missed DELETEs during
+// pod downtime, missing objects, stale versions — are patched in L3. This ensures the
+// cache is correct even when events were lost between restarts.
+//
+// Must be called after WaitForSync (informers have completed initial LIST/WATCH) and
+// after L3 warmup (baseline data exists in Redis).
+func (rw *ResourceWatcher) Reconcile(ctx context.Context) ReconcileStats {
+	start := time.Now()
+	var stats ReconcileStats
+
+	// Snapshot watched GVRs.
+	rw.mu.Lock()
+	gvrKeys := make([]string, 0, len(rw.watched))
+	for k := range rw.watched {
+		gvrKeys = append(gvrKeys, k)
+	}
+	rw.mu.Unlock()
+
+	for _, key := range gvrKeys {
+		gvr := ParseGVRKey(key)
+		if gvr.Resource == "" {
+			continue
+		}
+		added, removed, updated, errs := rw.reconcileGVR(ctx, gvr)
+		stats.GVRs++
+		stats.Added += added
+		stats.Removed += removed
+		stats.Updated += updated
+		stats.Errors += errs
+
+		if added+removed+updated > 0 {
+			slog.Info("reconcile: patched L3",
+				slog.String("gvr", gvr.String()),
+				slog.Int("added", added),
+				slog.Int("removed", removed),
+				slog.Int("updated", updated))
+		}
+	}
+
+	stats.Duration = time.Since(start)
+	return stats
+}
+
+func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVersionResource) (added, removed, updated, errs int) {
+	// 1. Read authoritative state from informer store (in-memory, no API call).
+	lister := rw.factory.ForResource(gvr).Lister()
+	objects, err := lister.List(labels.Everything())
+	if err != nil {
+		slog.Warn("reconcile: failed to list informer store",
+			slog.String("gvr", gvr.String()), slog.Any("err", err))
+		errs++
+		return
+	}
+
+	// Build map of informer objects keyed by ns/name.
+	type objEntry struct {
+		uns *unstructured.Unstructured
+		rv  string
+	}
+	informerMap := make(map[string]objEntry, len(objects))
+	for _, obj := range objects {
+		uns, ok := obj.(*unstructured.Unstructured)
+		if !ok {
+			continue
+		}
+		k := uns.GetNamespace() + "/" + uns.GetName()
+		informerMap[k] = objEntry{uns: uns, rv: uns.GetResourceVersion()}
+	}
+
+	// 2. Read current L3 cluster-wide list from Redis.
+	var l3List unstructured.UnstructuredList
+	clusterListKey := ListKey(gvr, "")
+	if raw, hit, gerr := rw.cache.GetRaw(ctx, clusterListKey); gerr != nil {
+		slog.Warn("reconcile: failed to read L3 list",
+			slog.String("gvr", gvr.String()), slog.Any("err", gerr))
+		errs++
+		return
+	} else if hit && raw != nil {
+		if uerr := json.Unmarshal(raw, &l3List); uerr != nil {
+			slog.Warn("reconcile: failed to unmarshal L3 list",
+				slog.String("gvr", gvr.String()), slog.Any("err", uerr))
+			errs++
+			return
+		}
+	}
+
+	// Build map of L3 objects.
+	l3Map := make(map[string]string, len(l3List.Items)) // ns/name → resourceVersion
+	for i := range l3List.Items {
+		item := &l3List.Items[i]
+		k := item.GetNamespace() + "/" + item.GetName()
+		l3Map[k] = item.GetResourceVersion()
+	}
+
+	// 3. Diff: find additions, removals, and updates.
+	var keysToDelete []string
+
+	// Objects in L3 but NOT in informer → ghost objects (missed DELETEs).
+	for k := range l3Map {
+		if _, exists := informerMap[k]; !exists {
+			parts := strings.SplitN(k, "/", 2)
+			ns, name := parts[0], parts[1]
+			keysToDelete = append(keysToDelete, GetKey(gvr, ns, name))
+			removed++
+		}
+	}
+
+	// Objects in informer but NOT in L3, or with different resourceVersion.
+	for k, entry := range informerMap {
+		l3RV, inL3 := l3Map[k]
+		if !inL3 {
+			added++
+		} else if l3RV != entry.rv {
+			updated++
+		} else {
+			continue // identical, skip
+		}
+		stripped := entry.uns.DeepCopy()
+		StripAnnotationsFromUnstructured(stripped)
+		getKey := GetKey(gvr, stripped.GetNamespace(), stripped.GetName())
+		if serr := rw.cache.SetForGVR(ctx, gvr, getKey, stripped); serr != nil {
+			errs++
+		}
+	}
+
+	// 4. Delete orphaned GET keys.
+	if len(keysToDelete) > 0 {
+		if derr := rw.cache.Delete(ctx, keysToDelete...); derr != nil {
+			slog.Warn("reconcile: failed to delete orphaned GET keys",
+				slog.String("gvr", gvr.String()), slog.Any("err", derr))
+			errs++
+		}
+	}
+
+	// 5. Rebuild list caches from informer state if anything changed.
+	if added+removed+updated > 0 {
+		var allItems []unstructured.Unstructured
+		for _, entry := range informerMap {
+			stripped := entry.uns.DeepCopy()
+			StripAnnotationsFromUnstructured(stripped)
+			allItems = append(allItems, *stripped)
+		}
+		rw.rebuildListCaches(ctx, gvr, allItems)
+
+		// Trigger L1 refresh for this GVR.
+		gvrKey := GVRToKey(gvr)
+		l1IdxKey := L1GVRKey(gvrKey)
+		if l1Keys, serr := rw.cache.SMembers(ctx, l1IdxKey); serr == nil && len(l1Keys) > 0 {
+			if fn, ok := rw.l1Refresh.Load().(L1RefreshFunc); ok && fn != nil {
+				go func() {
+					refreshCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+					defer cancel()
+					fn(refreshCtx, gvr, l1Keys)
+				}()
+			} else {
+				_ = rw.cache.Delete(ctx, append(l1Keys, l1IdxKey)...)
+			}
+		}
+	}
+
+	return
+}
+
+// rebuildListCaches writes namespace-scoped and cluster-wide LIST keys from
+// the given items. Used by Reconcile to ensure list caches match the
+// informer's authoritative state.
+func (rw *ResourceWatcher) rebuildListCaches(ctx context.Context, gvr schema.GroupVersionResource, items []unstructured.Unstructured) {
+	byNamespace := make(map[string][]unstructured.Unstructured)
+	for i := range items {
+		ns := items[i].GetNamespace()
+		byNamespace[ns] = append(byNamespace[ns], items[i])
+	}
+
+	// Write cluster-wide list.
+	clusterList := &unstructured.UnstructuredList{Items: items}
+	if len(items) > 0 {
+		clusterList.SetAPIVersion(items[0].GetAPIVersion())
+		clusterList.SetKind(items[0].GetKind() + "List")
+	}
+	_ = rw.cache.SetForGVR(ctx, gvr, ListKey(gvr, ""), clusterList)
+
+	// Write per-namespace lists.
+	for ns, nsItems := range byNamespace {
+		if ns == "" {
+			continue
+		}
+		nsList := &unstructured.UnstructuredList{Items: nsItems}
+		if len(nsItems) > 0 {
+			nsList.SetAPIVersion(nsItems[0].GetAPIVersion())
+			nsList.SetKind(nsItems[0].GetKind() + "List")
+		}
+		_ = rw.cache.SetForGVR(ctx, gvr, ListKey(gvr, ns), nsList)
+	}
+}
+
 // patchListCache atomically patches the cached list in-place using WATCH/MULTI/EXEC.
 func (rw *ResourceWatcher) patchListCache(ctx context.Context, gvr schema.GroupVersionResource, listKey string, uns *unstructured.Unstructured, eventType string) {
 	ttl := rw.cache.TTLForGVR(gvr)

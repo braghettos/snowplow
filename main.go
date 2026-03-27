@@ -329,6 +329,19 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 	log.Info("starting cache warmup")
 	warmer.Run(warmupCtx)
 
+	// Phase 4a: Reconcile L3 from informer stores — fixes stale data from pod restart.
+	// Informers have an active WATCH, so their in-memory store is authoritative.
+	// Any ghost objects (missed DELETEs during downtime) are removed, and missing
+	// or stale objects are patched.
+	reconcileStats := resourceWatcher.Reconcile(warmupCtx)
+	log.Info("L3 reconciliation completed",
+		slog.Int("gvrs", reconcileStats.GVRs),
+		slog.Int("added", reconcileStats.Added),
+		slog.Int("removed", reconcileStats.Removed),
+		slog.Int("updated", reconcileStats.Updated),
+		slog.Int("errors", reconcileStats.Errors),
+		slog.Duration("duration", reconcileStats.Duration))
+
 	// Phase 4b: Pre-populate RBAC cache for all users so L3→L2 promotions
 	// and the watcher's cache-only RBAC checks work from the start.
 	dispatchers.WarmRBACForAllUsers(warmupCtx, c, rc, authnNS, signKey)
