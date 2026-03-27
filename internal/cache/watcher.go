@@ -81,7 +81,13 @@ func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error
 
 func (rw *ResourceWatcher) Start(ctx context.Context) {
 	rw.appCtx = ctx
-	rw.syncNewGVRs(ctx)
+	// Register all known informers from Redis BEFORE starting the factory.
+	// This ensures event handlers are attached before the initial LIST/WATCH,
+	// so existing objects trigger ADD callbacks during the first sync.
+	rw.registerFromRedis(ctx)
+	// Start the factory ONCE — all registered informers begin their initial sync.
+	rw.factory.Start(ctx.Done())
+	// Periodically check for new GVRs added to Redis by other components.
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
@@ -95,6 +101,24 @@ func (rw *ResourceWatcher) Start(ctx context.Context) {
 		}
 	}()
 	go rw.l1Worker(ctx)
+}
+
+// registerFromRedis reads the watched-gvrs set from Redis and registers
+// informers for each GVR. Does NOT call factory.Start — the caller does
+// that after all registrations are complete.
+func (rw *ResourceWatcher) registerFromRedis(ctx context.Context) {
+	members, err := rw.cache.SMembers(ctx, WatchedGVRsKey)
+	if err != nil {
+		slog.Warn("resource-watcher: failed to read watched GVR set", slog.Any("err", err))
+		return
+	}
+	for _, key := range members {
+		gvr := ParseGVRKey(key)
+		if gvr.Resource == "" {
+			continue
+		}
+		rw.registerInformer(gvr)
+	}
 }
 
 // l1Worker has two responsibilities:
