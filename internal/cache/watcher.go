@@ -239,9 +239,12 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 		collect(L1ApiDepKey(gvrKey))                 // API-level dep
 
 		// CRD-based chain: for any GVR, also look up L1 keys that depend on
-		// the CRD for this GVR. This handles zero-state agnostically —
-		// e.g. composition ADD → CRD dep → compositions-get-ns-and-crd.
-		// CRD name is a K8s convention: resource + "." + group.
+		// the cluster-wide CRD LIST. This handles zero-state agnostically —
+		// e.g. composition ADD → CRD LIST dep → compositions-get-ns-and-crd.
+		//
+		// Use the cluster-wide LIST dep (typically 1-2 keys: compositions-get-ns-and-crd
+		// per user). Do NOT use the specific CRD GET dep (40+ form widgets that
+		// check CRD schema for validation — they don't need refresh on data changes).
 		gvr := ParseGVRKey(gvrKey)
 		if gvr.Group != "" && gvr.Resource != "" {
 			crdGVRKey := GVRToKey(schema.GroupVersionResource{
@@ -249,10 +252,6 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 				Version:  "v1",
 				Resource: "customresourcedefinitions",
 			})
-			crdName := gvr.Resource + "." + gvr.Group
-			// GET dep on specific CRD
-			collect(L1ResourceDepKey(crdGVRKey, "", crdName))
-			// LIST dep on all CRDs (compositions-get-ns-and-crd does LIST)
 			collect(L1ResourceDepKey(crdGVRKey, "", ""))
 		}
 	}
@@ -436,9 +435,37 @@ func (rw *ResourceWatcher) registerInformer(gvr schema.GroupVersionResource) boo
 
 // startInformer registers the informer and immediately starts the factory.
 // Used by AddGVR when a new GVR is discovered at request time.
+// After starting, it waits for the informer to sync and then patches L3
+// from the informer's cache to ensure all existing objects are in L3.
 func (rw *ResourceWatcher) startInformer(gvr schema.GroupVersionResource) {
-	if rw.registerInformer(gvr) {
-		rw.factory.Start(rw.appCtx.Done())
+	if !rw.registerInformer(gvr) {
+		return
+	}
+	rw.factory.Start(rw.appCtx.Done())
+
+	// Wait for the new informer to sync (initial LIST complete).
+	// Use a short timeout — if it doesn't sync, the l3gen scanner will
+	// catch up later via periodic scans.
+	syncCtx, cancel := context.WithTimeout(rw.appCtx, 30*time.Second)
+	defer cancel()
+	informer := rw.factory.ForResource(gvr).Informer()
+	k8scache.WaitForCacheSync(syncCtx.Done(), informer.HasSynced)
+
+	if !informer.HasSynced() {
+		slog.Warn("resource-watcher: new informer did not sync in time",
+			slog.String("gvr", gvr.String()))
+		return
+	}
+
+	// Replay existing objects from the informer's cache into L3.
+	// The informer has them from its initial LIST, but the ADD callbacks
+	// may have been missed due to the registration race.
+	items := informer.GetStore().List()
+	slog.Info("resource-watcher: replaying existing objects into L3",
+		slog.String("gvr", gvr.String()),
+		slog.Int("count", len(items)))
+	for _, obj := range items {
+		rw.handleEvent(rw.appCtx, gvr, nil, obj, "add")
 	}
 }
 
