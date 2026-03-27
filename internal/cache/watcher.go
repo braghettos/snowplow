@@ -208,6 +208,8 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 	}
 
 	if len(changedGVRNS) == 0 {
+		slog.Debug("resource-watcher: l3gen scan — no changes",
+			slog.Int("total_keys", len(genKeys)))
 		return
 	}
 

@@ -16,9 +16,10 @@ import (
 )
 
 const (
-	refreshConcurrency = 20
-	restactionResource = "restactions"
-	templatesGroup     = "templates.krateo.io"
+	refreshConcurrency         = 20 // warmup and HTTP-triggered refreshes
+	refreshConcurrencyBackground = 4  // l3gen scanner refreshes (fewer keys, less RBAC pressure)
+	restactionResource         = "restactions"
+	templatesGroup             = "templates.krateo.io"
 )
 
 // MakeL1Refresher returns a cache.L1RefreshFunc that re-resolves L1 keys in
@@ -27,9 +28,18 @@ const (
 func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey string) cache.L1RefreshFunc {
 	return func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string) {
 		log := slog.Default()
+
+		// Use lower concurrency for background l3gen scans (empty triggerGVR)
+		// to reduce RBAC API pressure. Warmup uses full concurrency.
+		concurrency := refreshConcurrency
+		if triggerGVR.Resource == "" {
+			concurrency = refreshConcurrencyBackground
+		}
+
 		log.Info("L1 refresh: starting",
 			slog.String("trigger", triggerGVR.String()),
-			slog.Int("keys", len(l1Keys)))
+			slog.Int("keys", len(l1Keys)),
+			slog.Int("concurrency", concurrency))
 
 		type userKeys struct {
 			info cache.ResolvedKeyInfo
@@ -58,7 +68,7 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 
 			var (
 				wg           sync.WaitGroup
-				sem          = make(chan struct{}, refreshConcurrency)
+				sem          = make(chan struct{}, concurrency)
 				mu           sync.Mutex
 				n            int64
 				allCascade   []string

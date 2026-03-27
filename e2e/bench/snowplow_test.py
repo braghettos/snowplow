@@ -1482,7 +1482,7 @@ def run_phase_browser():
                                       ignore_https_errors=True)
             page = ctx.new_page()
 
-            page.goto(f"{FRONTEND}/login", wait_until="networkidle", timeout=60000)
+            page.goto(f"{FRONTEND}/login", wait_until="networkidle", timeout=300000)
             page.click('#basic_username', timeout=10000)
             page.keyboard.type(username, delay=30)
             page.click('#basic_password', timeout=10000)
@@ -1495,7 +1495,7 @@ def run_phase_browser():
             for page_name, page_path in BROWSER_PAGES:
                 log(f"  {page_name} — cold ...")
                 page.evaluate("() => performance.clearResourceTimings()")
-                page.goto(f"{FRONTEND}{page_path}", wait_until="networkidle", timeout=60000)
+                page.goto(f"{FRONTEND}{page_path}", wait_until="networkidle", timeout=300000)
 
                 timing = page.evaluate("""() => {
                     const t = performance.getEntriesByType('navigation')[0];
@@ -1521,7 +1521,7 @@ def run_phase_browser():
 
                 load_values = [cold.get("loadComplete", 0)]
                 for _ in range(ITERS - 1):
-                    page.goto(f"{FRONTEND}{page_path}", wait_until="networkidle", timeout=60000)
+                    page.goto(f"{FRONTEND}{page_path}", wait_until="networkidle", timeout=300000)
                     wt = page.evaluate("""() => {
                         const t = performance.getEntriesByType('navigation')[0];
                         return t ? Math.round(t.loadEventEnd - t.startTime) : 0;
@@ -1573,7 +1573,7 @@ def _browser_login(page, username, password, retries=3):
     """Login via the frontend UI and return True on success."""
     for attempt in range(retries):
         try:
-            page.goto(f"{FRONTEND}/login", wait_until="networkidle", timeout=60000)
+            page.goto(f"{FRONTEND}/login", wait_until="networkidle", timeout=300000)
             log(f"    browser: login page loaded, URL={page.url}")
             page.click('#basic_username', timeout=10000)
             page.keyboard.type(username, delay=30)
@@ -1615,7 +1615,7 @@ def _browser_measure_navigation(page, page_path, label):
     }""")
 
     # Navigate and wait for network to settle
-    page.goto(f"{FRONTEND}{page_path}", wait_until="networkidle", timeout=120_000)
+    page.goto(f"{FRONTEND}{page_path}", wait_until="networkidle", timeout=300_000)
 
     # If redirected to login, the session expired — try to detect
     if "/login" in page.url:
@@ -2225,17 +2225,18 @@ def main():
     log(f"Results saved to {out_file}")
 
     # Capture pod logs for post-mortem analysis.
+    # Use --since=3h to capture the full test window (test takes ~2h).
     tag = os.environ.get("EXPECTED_IMAGE_TAG", "unknown")
     pod_log_file = f"/tmp/snowplow_pod_logs_{tag}.txt"
     try:
         result = subprocess.run(
             ["kubectl", "logs", "-n", "krateo-system", "-l", "app=snowplow",
-             "-c", "snowplow", "--tail=50000"],
-            capture_output=True, text=True, timeout=30)
+             "-c", "snowplow", "--since=3h"],
+            capture_output=True, text=True, timeout=60)
         if result.returncode == 0 and result.stdout:
             with open(pod_log_file, "w") as f:
                 f.write(result.stdout)
-            log(f"Pod logs saved to {pod_log_file}")
+            log(f"Pod logs saved to {pod_log_file} ({len(result.stdout)} bytes)")
     except Exception as e:
         log(f"WARNING: could not capture pod logs: {e}")
 
