@@ -122,6 +122,7 @@ func main() {
 	} else {
 		sarc.QPS = 100
 		sarc.Burst = 200
+		sarc.NextProtos = []string{"http/1.1"} // disable HTTP2 to avoid h2 frame crashes
 	}
 
 	if redisCache != nil {
@@ -258,6 +259,7 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 	}
 	rc.QPS = 100
 	rc.Burst = 200
+	rc.NextProtos = []string{"http/1.1"} // disable HTTP2 to avoid h2 frame crashes
 
 	// Phase 1: Start long-running watchers bound to the process lifetime (signal ctx).
 	resourceWatcher, err := cache.NewResourceWatcher(c, rc)
