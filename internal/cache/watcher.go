@@ -37,7 +37,7 @@ const expiryRefreshWorkers = 10
 // dynamicReconcileDebounce is how long to wait after the last informer event
 // for a dynamic GVR before running reconcileGVR. This collapses rapid events
 // into fewer reconciliation passes.
-const dynamicReconcileDebounce = 5 * time.Second
+const dynamicReconcileDebounce = 2 * time.Second
 
 // maxReconcileDelay caps how long reconciliation can be deferred during a
 // sustained burst. Even if events keep arriving, reconcileGVR fires at least
@@ -962,10 +962,43 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 		}
 		rw.rebuildListCaches(ctx, gvr, allItems)
 
-		// Trigger L1 refresh for this GVR.
+		// Trigger L1 refresh using PRECISE dependency indexes (same approach
+		// as the l3gen scanner). The broad L1GVRKey index can yield 2000+
+		// keys for popular GVRs (e.g. every per-composition widget/button),
+		// causing the refresh to time out. The precise indexes yield only
+		// the RESTAction + widget keys that aggregate compositions
+		// (typically 6-10 keys), which complete in <1s.
 		gvrKey := GVRToKey(gvr)
-		l1IdxKey := L1GVRKey(gvrKey)
-		if l1Keys, serr := rw.cache.SMembers(ctx, l1IdxKey); serr == nil && len(l1Keys) > 0 {
+		affected := make(map[string]bool)
+		collect := func(idxKey string) {
+			if keys, serr := rw.cache.SMembers(ctx, idxKey); serr == nil {
+				for _, k := range keys {
+					affected[k] = true
+				}
+			}
+		}
+		// Namespace-scoped list deps (per-namespace composition lists).
+		// Collect from ALL namespaces that had changes.
+		for k := range informerMap {
+			ns := strings.SplitN(k, "/", 2)[0]
+			collect(L1ResourceDepKey(gvrKey, ns, ""))
+		}
+		collect(L1ResourceDepKey(gvrKey, "", "")) // cluster-wide LIST dep
+		collect(L1ApiDepKey(gvrKey))              // API-level dep
+		// CRD-based chain (same as l3gen scanner).
+		crdGVRKey := GVRToKey(schema.GroupVersionResource{
+			Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions",
+		})
+		collect(L1ResourceDepKey(crdGVRKey, "", ""))
+
+		// Expand transitive dependencies (e.g. compositions-list → piechart).
+		rw.expandDependents(ctx, affected, 5)
+
+		if len(affected) > 0 {
+			l1Keys := make([]string, 0, len(affected))
+			for k := range affected {
+				l1Keys = append(l1Keys, k)
+			}
 			if fn, ok := rw.l1Refresh.Load().(L1RefreshFunc); ok && fn != nil {
 				go func() {
 					refreshCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -973,7 +1006,7 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 					fn(refreshCtx, gvr, l1Keys)
 				}()
 			} else {
-				_ = rw.cache.Delete(ctx, append(l1Keys, l1IdxKey)...)
+				_ = rw.cache.Delete(ctx, l1Keys...)
 			}
 		}
 	}
