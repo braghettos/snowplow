@@ -79,6 +79,12 @@ type ResourceWatcher struct {
 	// maxReconcileDelay even during sustained bursts.
 	dynamicReconcileTimers    map[string]*time.Timer
 	dynamicReconcileDeadlines map[string]time.Time
+
+	// l3genScanNow is a signal channel to trigger an immediate l3gen scan.
+	// Used by scheduleDynamicReconcile after reconcileGVR updates L3, so
+	// the l3gen scanner detects the changes instantly instead of waiting
+	// for the next 3s tick.
+	l3genScanNow chan struct{}
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -103,6 +109,7 @@ func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error
 		dynamicGVRs:               make(map[string]schema.GroupVersionResource),
 		dynamicReconcileTimers:    make(map[string]*time.Timer),
 		dynamicReconcileDeadlines: make(map[string]time.Time),
+		l3genScanNow:              make(chan struct{}, 1),
 	}, nil
 }
 
@@ -190,6 +197,8 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			rw.scanL3Gens(ctx, lastSeen)
+		case <-rw.l3genScanNow:
 			rw.scanL3Gens(ctx, lastSeen)
 		}
 	}
@@ -799,6 +808,15 @@ func (rw *ResourceWatcher) scheduleDynamicReconcile(gvr schema.GroupVersionResou
 				slog.Int("errors", errs))
 		}
 
+		// Signal the l3gen scanner to run immediately so it picks up
+		// the L3 changes from reconcileGVR without waiting for the
+		// next 3s tick. Non-blocking: if a signal is already pending,
+		// the scanner will process both changes in one pass.
+		select {
+		case rw.l3genScanNow <- struct{}{}:
+		default:
+		}
+
 		// Clean up so the next event starts a fresh debounce cycle.
 		rw.dynamicGVRsMu.Lock()
 		delete(rw.dynamicReconcileTimers, key)
@@ -913,7 +931,9 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 	}
 
 	// 3. Diff: find additions, removals, and updates.
+	// Track which namespaces have changes for precise L1 refresh.
 	var keysToDelete []string
+	changedNamespaces := make(map[string]bool)
 
 	// Objects in L3 but NOT in informer → ghost objects (missed DELETEs).
 	for k := range l3Map {
@@ -921,6 +941,7 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 			parts := strings.SplitN(k, "/", 2)
 			ns, name := parts[0], parts[1]
 			keysToDelete = append(keysToDelete, GetKey(gvr, ns, name))
+			changedNamespaces[ns] = true
 			removed++
 		}
 	}
@@ -941,6 +962,7 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 		if serr := rw.cache.SetForGVR(ctx, gvr, getKey, stripped); serr != nil {
 			errs++
 		}
+		changedNamespaces[stripped.GetNamespace()] = true
 	}
 
 	// 4. Delete orphaned GET keys.
@@ -977,10 +999,10 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 				}
 			}
 		}
-		// Namespace-scoped list deps (per-namespace composition lists).
-		// Collect from ALL namespaces that had changes.
-		for k := range informerMap {
-			ns := strings.SplitN(k, "/", 2)[0]
+		// Namespace-scoped list deps — only for namespaces that actually changed.
+		// For S7 (delete 1 composition from bench-ns-01), this collects deps from
+		// bench-ns-01 only (~6 keys) instead of all 120 namespaces.
+		for ns := range changedNamespaces {
 			collect(L1ResourceDepKey(gvrKey, ns, ""))
 		}
 		collect(L1ResourceDepKey(gvrKey, "", "")) // cluster-wide LIST dep
