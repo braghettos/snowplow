@@ -484,15 +484,23 @@ func (rw *ResourceWatcher) startInformer(gvr schema.GroupVersionResource) {
 		return
 	}
 
-	// Replay existing objects from the informer's cache into L3.
-	// The informer has them from its initial LIST, but the ADD callbacks
-	// may have been missed due to the registration race.
-	items := informer.GetStore().List()
-	slog.Info("resource-watcher: replaying existing objects into L3",
+	// Reconcile L3 from the informer's authoritative store in a single pass.
+	// This replaces the old event-by-event replay which caused sustained
+	// AtomicUpdateJSON contention on list keys (e.g. 4759 RESTActions each
+	// hitting 20 retries on the cluster-wide list key).
+	// reconcileGVR writes individual GET keys + rebuilds all list caches at once.
+	storeSize := len(informer.GetStore().List())
+	slog.Info("resource-watcher: reconciling new informer with L3",
 		slog.String("gvr", gvr.String()),
-		slog.Int("count", len(items)))
-	for _, obj := range items {
-		rw.handleEvent(rw.appCtx, gvr, nil, obj, "add")
+		slog.Int("storeSize", storeSize))
+	added, removed, updated, errs := rw.reconcileGVR(rw.appCtx, gvr)
+	if added+removed+updated > 0 || errs > 0 {
+		slog.Info("resource-watcher: initial reconciliation done",
+			slog.String("gvr", gvr.String()),
+			slog.Int("added", added),
+			slog.Int("removed", removed),
+			slog.Int("updated", updated),
+			slog.Int("errors", errs))
 	}
 }
 
