@@ -58,8 +58,8 @@ SMOKE = os.environ.get("SMOKE", "0") == "1"
 NS = "krateo-system"
 
 USERS = {
-    "admin": "jl1DDPGMFOWw",
-    "cyberjoker": "T8te3k57Nm22",
+    "admin": "WopwYooV0F3Z",
+    "cyberjoker": "d1Z5iVRcY0gj",
 }
 
 COMPDEF_NAME = "github-scaffolding-with-composition-page"

@@ -34,6 +34,16 @@ type L1RefreshFunc func(ctx context.Context, triggerGVR schema.GroupVersionResou
 // mass TTL expiry (e.g., after Redis restart or bulk warmup with identical TTLs).
 const expiryRefreshWorkers = 10
 
+// dynamicReconcileDebounce is how long to wait after the last informer event
+// for a dynamic GVR before running reconcileGVR. This collapses rapid events
+// into fewer reconciliation passes.
+const dynamicReconcileDebounce = 5 * time.Second
+
+// maxReconcileDelay caps how long reconciliation can be deferred during a
+// sustained burst. Even if events keep arriving, reconcileGVR fires at least
+// every maxReconcileDelay to keep L3 list caches reasonably fresh.
+const maxReconcileDelay = 30 * time.Second
+
 // l1Event represents an informer event that needs L1 refresh processing.
 type l1Event struct {
 	gvr             schema.GroupVersionResource
@@ -56,6 +66,19 @@ type ResourceWatcher struct {
 	l1Refresh          atomic.Value // stores L1RefreshFunc
 	eventCh            chan l1Event  // buffered channel for L1 refresh events (100k)
 	autoDiscoverGroups []string     // CRD group suffix patterns for auto-registration
+
+	// dynamicGVRs tracks GVRs registered at runtime via autoRegisterCRDInformer.
+	// When events fire for these GVRs, a debounced reconciliation is scheduled
+	// so that rapid deployment bursts collapse into a single reconcileGVR call.
+	dynamicGVRs   map[string]schema.GroupVersionResource
+	dynamicGVRsMu sync.Mutex
+
+	// dynamicReconcileTimers holds per-GVR debounce state. When an event fires
+	// for a dynamic GVR, the timer is reset — but only up to maxReconcileDelay
+	// from the first event. This ensures reconciliation fires at least every
+	// maxReconcileDelay even during sustained bursts.
+	dynamicReconcileTimers    map[string]*time.Timer
+	dynamicReconcileDeadlines map[string]time.Time
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -72,11 +95,14 @@ func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error
 		return nil, err
 	}
 	return &ResourceWatcher{
-		cache:     c,
-		dynClient: dynClient,
-		factory:   dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 0),
-		watched:   make(map[string]bool),
-		eventCh:   make(chan l1Event, 100000),
+		cache:                  c,
+		dynClient:              dynClient,
+		factory:                dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 0),
+		watched:                make(map[string]bool),
+		eventCh:                make(chan l1Event, 100000),
+		dynamicGVRs:               make(map[string]schema.GroupVersionResource),
+		dynamicReconcileTimers:    make(map[string]*time.Timer),
+		dynamicReconcileDeadlines: make(map[string]time.Time),
 	}, nil
 }
 
@@ -563,6 +589,19 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		rw.autoRegisterCRDInformer(uns)
 	}
 
+	// ── Debounced reconciliation for dynamic GVRs ────────────────────────────
+	// patchListCache updates L3 list keys one-by-one via AtomicUpdateJSON.
+	// Under rapid deployment bursts this can lag behind due to Redis transaction
+	// contention. For dynamic GVRs, schedule a debounced reconciliation that
+	// rebuilds all list caches from the informer's authoritative store once
+	// the burst settles.
+	rw.dynamicGVRsMu.Lock()
+	_, isDynamic := rw.dynamicGVRs[gvrKey]
+	rw.dynamicGVRsMu.Unlock()
+	if isDynamic {
+		rw.scheduleDynamicReconcile(gvr)
+	}
+
 	// ── Enqueue L1 refresh event ─────────────────────────────────────────────
 	// L3 was just patched above. Enqueue the event for the L1 worker to
 	// process sequentially. The worker will read the latest L3 state.
@@ -637,6 +676,10 @@ func (rw *ResourceWatcher) autoRegisterCRDInformer(uns *unstructured.Unstructure
 	if rw.cache != nil {
 		_ = rw.cache.SAddGVR(context.Background(), newGVR)
 	}
+	// Track as dynamic GVR for periodic reconciliation.
+	rw.dynamicGVRsMu.Lock()
+	rw.dynamicGVRs[GVRToKey(newGVR)] = newGVR
+	rw.dynamicGVRsMu.Unlock()
 }
 
 // matchesAutoDiscoverGroup checks if a CRD group matches any configured
@@ -702,6 +745,60 @@ func (rw *ResourceWatcher) collectAffectedL1Keys(ctx context.Context, gvrKey, ns
 // Repeats up to maxDepth levels. Returns all keys (input + discovered).
 //
 // Example: compositions-get-ns-and-crd → compositions-list → piechart
+// scheduleDynamicReconcile debounces reconciliation for a dynamic GVR.
+// Each call resets the timer, but only up to maxReconcileDelay from the first
+// event. This ensures:
+//   - Quiet periods: reconciliation fires 5s after the last event
+//   - Sustained bursts: reconciliation fires every 30s regardless
+func (rw *ResourceWatcher) scheduleDynamicReconcile(gvr schema.GroupVersionResource) {
+	key := GVRToKey(gvr)
+
+	rw.dynamicGVRsMu.Lock()
+	defer rw.dynamicGVRsMu.Unlock()
+
+	deadline, hasDeadline := rw.dynamicReconcileDeadlines[key]
+	now := time.Now()
+
+	if t, ok := rw.dynamicReconcileTimers[key]; ok {
+		// Timer exists — reset it, but cap at the deadline.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			// Deadline already passed — let the timer fire immediately.
+			return
+		}
+		delay := dynamicReconcileDebounce
+		if delay > remaining {
+			delay = remaining
+		}
+		t.Reset(delay)
+		return
+	}
+
+	// First event — set the deadline and start the timer.
+	if !hasDeadline {
+		rw.dynamicReconcileDeadlines[key] = now.Add(maxReconcileDelay)
+	}
+
+	rw.dynamicReconcileTimers[key] = time.AfterFunc(dynamicReconcileDebounce, func() {
+		ctx := rw.appCtx
+		added, removed, updated, errs := rw.reconcileGVR(ctx, gvr)
+		if added+removed+updated > 0 {
+			slog.Info("reconcile-dynamic: patched L3",
+				slog.String("gvr", gvr.String()),
+				slog.Int("added", added),
+				slog.Int("removed", removed),
+				slog.Int("updated", updated),
+				slog.Int("errors", errs))
+		}
+
+		// Clean up so the next event starts a fresh debounce cycle.
+		rw.dynamicGVRsMu.Lock()
+		delete(rw.dynamicReconcileTimers, key)
+		delete(rw.dynamicReconcileDeadlines, key)
+		rw.dynamicGVRsMu.Unlock()
+	})
+}
+
 // ReconcileStats holds aggregate results from a startup reconciliation pass.
 type ReconcileStats struct {
 	GVRs     int
