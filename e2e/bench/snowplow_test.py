@@ -1612,6 +1612,16 @@ def _browser_measure_navigation(page, page_path, label, min_calls=0):
             so WARM navigations don't exit early when networkidle fires
             prematurely (e.g. cache OFF with slow backend responses).
     """
+    # Track /call HTTP response statuses via Playwright response listener.
+    # Resource Timing API doesn't expose status codes, so we capture them here.
+    _call_statuses = []
+
+    def _on_response(response):
+        if "/call" in response.url:
+            _call_statuses.append({"url": response.url, "status": response.status})
+
+    page.on("response", _on_response)
+
     # Clear previous performance entries and expand the resource timing buffer.
     # The default buffer (250 entries) includes ALL resources (JS, CSS, images,
     # fonts).  At high cardinality the buffer overflows and late /call entries
@@ -1685,6 +1695,13 @@ def _browser_measure_navigation(page, page_path, label, min_calls=0):
         };
     }""")
 
+    # Remove the response listener.
+    page.remove_listener("response", _on_response)
+
+    # Count HTTP 200 vs non-200 /call responses.
+    ok_count = sum(1 for s in _call_statuses if s["status"] == 200)
+    err_count = len(_call_statuses) - ok_count
+
     return {
         "label": label,
         "callCount": result.get("callCount", 0),
@@ -1692,6 +1709,8 @@ def _browser_measure_navigation(page, page_path, label, min_calls=0):
         "domContentLoaded": (nav or {}).get("domContentLoaded", 0),
         "loadComplete": (nav or {}).get("loadComplete", 0),
         "calls": result.get("calls", []),
+        "httpOk": ok_count,
+        "httpErr": err_count,
     }
 
 
@@ -1889,10 +1908,13 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, token=None, 
             if nav_num == 1:
                 cold_calls = m["callCount"]  # COLD nav sets the baseline
             cold_warm = 'COLD' if nav_num == 1 else 'WARM'
+            http_info = f"  http={m['httpOk']}ok" if m.get("httpOk", 0) + m.get("httpErr", 0) > 0 else ""
+            if m.get("httpErr", 0) > 0:
+                http_info += f"/{m['httpErr']}err"
             log(f"  {cold_warm} {page_name:<15s} "
                 f"waterfall={m['waterfallMs']:>5d}ms  "
                 f"load={m['loadComplete']:>5d}ms  "
-                f"calls={m['callCount']}")
+                f"calls={m['callCount']}{http_info}")
 
             # On the last warm navigation, verify composition count via both
             # the piechart widget API and the browser UI fetch.
