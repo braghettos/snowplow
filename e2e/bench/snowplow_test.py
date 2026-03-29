@@ -1603,8 +1603,15 @@ def _browser_login(page, username, password, retries=3):
     return False
 
 
-def _browser_measure_navigation(page, page_path, label):
-    """Navigate to a page and measure the /call API waterfall timing."""
+def _browser_measure_navigation(page, page_path, label, min_calls=0):
+    """Navigate to a page and measure the /call API waterfall timing.
+
+    Args:
+        min_calls: Minimum number of /call requests to wait for before
+            declaring stability. Set from the COLD navigation's call count
+            so WARM navigations don't exit early when networkidle fires
+            prematurely (e.g. cache OFF with slow backend responses).
+    """
     # Clear previous performance entries and expand the resource timing buffer.
     # The default buffer (250 entries) includes ALL resources (JS, CSS, images,
     # fonts).  At high cardinality the buffer overflows and late /call entries
@@ -1625,13 +1632,14 @@ def _browser_measure_navigation(page, page_path, label):
     # no network activity, but at high cardinality without cache the backend
     # can take >500ms between responses, causing premature "idle" detection.
     # Poll call count every 1s; require 3 consecutive identical counts (3s
-    # stability window) to avoid exiting after only the first 2 fast requests.
+    # stability window) AND at least min_calls requests to avoid exiting
+    # after only the first few fast requests.
     _stable_streak = 0
     _prev_count = -1
-    for _ in range(60):  # up to 60s
+    for _ in range(120):  # up to 120s (cache OFF at scale can be very slow)
         _cur_count = page.evaluate(
             "() => performance.getEntriesByType('resource').filter(e => e.name.includes('/call')).length")
-        if _cur_count == _prev_count and _cur_count > 0:
+        if _cur_count == _prev_count and _cur_count > 0 and _cur_count >= min_calls:
             _stable_streak += 1
             if _stable_streak >= 2:  # 3 consecutive identical polls = 3s stable
                 break
@@ -1865,10 +1873,14 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, token=None, 
     pages_data = {}
     for page_name, page_path in BROWSER_SCALING_PAGES:
         navs = []
+        cold_calls = 0  # Set from COLD nav, used as min_calls for WARM navs
         for nav_num in range(1, num_navs + 1):
             m = _browser_measure_navigation(page, page_path,
-                                            f"S{stage_num} {cache_mode} nav#{nav_num} {page_name}")
+                                            f"S{stage_num} {cache_mode} nav#{nav_num} {page_name}",
+                                            min_calls=cold_calls)
             navs.append(m)
+            if nav_num == 1:
+                cold_calls = m["callCount"]  # COLD nav sets the baseline
             cold_warm = 'COLD' if nav_num == 1 else 'WARM'
             log(f"  {cold_warm} {page_name:<15s} "
                 f"waterfall={m['waterfallMs']:>5d}ms  "
@@ -1959,7 +1971,7 @@ def run_phase_browser_scaling(tokens):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
 
-        for cache_mode in ("ON",):  # Skip cache OFF for debugging
+        for cache_mode in ("ON", "OFF"):
             section(f"BROWSER MATRIX: cache={cache_mode}")
             clean_environment()
             if cache_mode == "ON":
