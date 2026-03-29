@@ -1668,6 +1668,13 @@ def _browser_measure_navigation(page, page_path, label, min_calls=0):
         };
     }""")
 
+    # If the page didn't load all expected calls, mark measurement as invalid.
+    # This happens when cache OFF responses are so slow that calls fail or the
+    # page renders with partial data — the waterfall would be artificially low.
+    if min_calls > 0 and result.get("callCount", 0) < min_calls:
+        result["waterfallMs"] = 0  # 0 = incomplete, shown as "*" in summary
+        result["incomplete"] = True
+
     # Also measure navigation timing
     nav = page.evaluate("""() => {
         const t = performance.getEntriesByType('navigation')[0];
