@@ -1009,7 +1009,11 @@ def delete_bench_rbac():
 
 def clean_environment():
     section("Cleaning environment")
-    delete_all_clientconfigs()
+    # NOTE: clientconfig secrets are NOT deleted — they contain per-user K8s API
+    # credentials needed by the L1 refresh mechanism. Deleting them causes all
+    # background L1 refreshes to fail ("secrets X-clientconfig not found") until
+    # the user re-authenticates via the browser, leading to stale piechart counts
+    # and non-deterministic convergence times (4s vs 60s+ depending on timing).
     # Correct deletion order: compositions → CompositionDefinitions → namespaces
     # CompositionDefinition must only be deleted after ALL compositions are gone,
     # otherwise the controller can't reconcile finalizer removal.
