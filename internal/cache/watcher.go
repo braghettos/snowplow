@@ -629,16 +629,13 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	rw.dynamicGVRsMu.Unlock()
 	if isDynamic {
 		rw.scheduleDynamicReconcile(gvr)
-	}
 
-	// ── Immediate L1 refresh for high-value dependency keys ──────────────────
-	// Instead of waiting for the l3gen scanner (up to 3s) + L1 refresh cascade,
-	// directly refresh the precise L1 keys that depend on this GVR's LIST.
-	// This targets compositions-list, piechart, and table (~6 keys) — not the
-	// 2000+ per-composition widget keys in L1GVRKey.
-	// Debounced at 1s to coalesce rapid events (e.g. 1200 compositions deployed)
-	// into a single L1 refresh pass.
-	rw.scheduleImmediateL1Refresh(gvr, ns)
+		// ── Immediate L1 refresh for high-value dependency keys ──────────
+		// Only for dynamic GVRs (compositions). Static GVRs are handled by
+		// the l3gen scanner and startup reconciliation.
+		// Debounced at 1s to coalesce rapid events into a single refresh.
+		rw.scheduleImmediateL1Refresh(gvr, ns)
+	}
 
 	// ── Enqueue L1 refresh event ─────────────────────────────────────────────
 	// L3 was just patched above. Enqueue the event for the L1 worker to
