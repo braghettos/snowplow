@@ -44,10 +44,6 @@ const dynamicReconcileDebounce = 2 * time.Second
 // every maxReconcileDelay to keep L3 list caches reasonably fresh.
 const maxReconcileDelay = 30 * time.Second
 
-// immediateL1Debounce is how long to wait after the last informer event
-// before firing an immediate L1 refresh for high-value dependency keys.
-// Short (1s) to minimize latency; coalesces rapid events into one refresh.
-const immediateL1Debounce = 1 * time.Second
 
 // l1Event represents an informer event that needs L1 refresh processing.
 type l1Event struct {
@@ -91,11 +87,6 @@ type ResourceWatcher struct {
 	// for the next 3s tick.
 	l3genScanNow chan struct{}
 
-	// immediateL1Timer is a per-GVR debounce timer for immediate L1 refresh.
-	// Fires 1s after the last informer event, refreshing high-value L1 keys
-	// (compositions-list, piechart) without waiting for the l3gen scanner.
-	immediateL1Timer   map[string]*time.Timer
-	immediateL1TimerMu sync.Mutex
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -121,7 +112,6 @@ func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error
 		dynamicReconcileTimers:    make(map[string]*time.Timer),
 		dynamicReconcileDeadlines: make(map[string]time.Time),
 		l3genScanNow:              make(chan struct{}, 1),
-		immediateL1Timer:          make(map[string]*time.Timer),
 	}, nil
 }
 
@@ -629,12 +619,6 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	rw.dynamicGVRsMu.Unlock()
 	if isDynamic {
 		rw.scheduleDynamicReconcile(gvr)
-
-		// ── Immediate L1 refresh for high-value dependency keys ──────────
-		// Only for dynamic GVRs (compositions). Static GVRs are handled by
-		// the l3gen scanner and startup reconciliation.
-		// Debounced at 1s to coalesce rapid events into a single refresh.
-		rw.scheduleImmediateL1Refresh(gvr, ns)
 	}
 
 	// ── Enqueue L1 refresh event ─────────────────────────────────────────────
@@ -780,67 +764,6 @@ func (rw *ResourceWatcher) collectAffectedL1Keys(ctx context.Context, gvrKey, ns
 // Repeats up to maxDepth levels. Returns all keys (input + discovered).
 //
 // Example: compositions-get-ns-and-crd → compositions-list → piechart
-
-// scheduleImmediateL1Refresh debounces an immediate L1 refresh for high-value
-// dependency keys after an informer event. Unlike the l3gen scanner (3s tick)
-// or reconcileGVR (2s debounce + L3 rebuild), this fires 1s after the last
-// event and ONLY refreshes the precise L1 keys that aggregate this GVR's data
-// (compositions-list, piechart, table — typically ~6 keys per user).
-//
-// This eliminates the transient window where users see stale counts after
-// composition create/delete: L3 is already patched by patchListCache, so
-// re-resolving the compositions-list RESTAction from L3 yields correct data.
-func (rw *ResourceWatcher) scheduleImmediateL1Refresh(gvr schema.GroupVersionResource, ns string) {
-	fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
-	if !ok || fn == nil {
-		return
-	}
-
-	key := GVRToKey(gvr)
-	rw.immediateL1TimerMu.Lock()
-	defer rw.immediateL1TimerMu.Unlock()
-
-	if t, ok := rw.immediateL1Timer[key]; ok {
-		t.Reset(immediateL1Debounce)
-		return
-	}
-
-	rw.immediateL1Timer[key] = time.AfterFunc(immediateL1Debounce, func() {
-		ctx := rw.appCtx
-		affected := make(map[string]bool)
-		collect := func(idxKey string) {
-			if keys, serr := rw.cache.SMembers(ctx, idxKey); serr == nil {
-				for _, k := range keys {
-					affected[k] = true
-				}
-			}
-		}
-		gvrKey := GVRToKey(gvr)
-		collect(L1ResourceDepKey(gvrKey, ns, "")) // this namespace's LIST dep
-		collect(L1ResourceDepKey(gvrKey, "", ""))  // cluster-wide LIST dep
-		collect(L1ApiDepKey(gvrKey))               // API-level dep
-		// CRD chain: compositions-get-ns-and-crd depends on CRD LIST.
-		crdGVRKey := GVRToKey(schema.GroupVersionResource{
-			Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions",
-		})
-		collect(L1ResourceDepKey(crdGVRKey, "", ""))
-		rw.expandDependents(ctx, affected, 5)
-
-		if len(affected) > 0 {
-			l1Keys := make([]string, 0, len(affected))
-			for k := range affected {
-				l1Keys = append(l1Keys, k)
-			}
-			refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			defer cancel()
-			fn(refreshCtx, gvr, l1Keys)
-		}
-
-		rw.immediateL1TimerMu.Lock()
-		delete(rw.immediateL1Timer, key)
-		rw.immediateL1TimerMu.Unlock()
-	})
-}
 
 // scheduleDynamicReconcile debounces reconciliation for a dynamic GVR.
 // Each call resets the timer, but only up to maxReconcileDelay from the first
