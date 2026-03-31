@@ -30,13 +30,6 @@ const (
 
 const compressMinSize = 256
 
-// compressMaxSize is the threshold above which compression is skipped.
-// At 1MB+, gzip compression becomes CPU-dominant (5-8s for 12MB) and
-// trades latency for storage. For L1 resolved keys (e.g. compositions-list
-// at 1200 scale = 12MB), storing uncompressed is faster. The Redis sidecar
-// has sufficient memory for a few large uncompressed values.
-const compressMaxSize = 1 << 20 // 1MB
-
 var gzWriterPool = sync.Pool{
 	New: func() any {
 		w, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed)
@@ -45,7 +38,7 @@ var gzWriterPool = sync.Pool{
 }
 
 func compressValue(data []byte) []byte {
-	if len(data) < compressMinSize || len(data) > compressMaxSize {
+	if len(data) < compressMinSize {
 		return data
 	}
 	var buf bytes.Buffer
