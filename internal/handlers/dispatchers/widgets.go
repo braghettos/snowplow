@@ -204,11 +204,18 @@ func ResolveWidgetBackground(ctx context.Context, c *cache.RedisCache, got objec
 	if resolvedKey == "" {
 		return resolveWidgetFromObject(ctx, c, got, resolvedKey, authnNS, perPage, page, nil)
 	}
+	// Use WithoutCancel so the resolution doesn't abort if the first caller's
+	// context expires — other callers waiting in the singleflight group may
+	// have longer deadlines.
+	sfCtx := context.WithoutCancel(ctx)
 	result, err, _ := widgetBgFlight.Do(resolvedKey, func() (interface{}, error) {
-		return resolveWidgetFromObject(ctx, c, got, resolvedKey, authnNS, perPage, page, nil)
+		return resolveWidgetFromObject(sfCtx, c, got, resolvedKey, authnNS, perPage, page, nil)
 	})
 	if err != nil {
 		return nil, err
+	}
+	if result == nil {
+		return nil, nil
 	}
 	return result.(*ResolveWidgetResult), nil
 }

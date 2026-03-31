@@ -228,11 +228,18 @@ func ResolveRESTActionBackground(ctx context.Context, c *cache.RedisCache, obj m
 	if resolvedKey == "" {
 		return resolveRESTActionFromObject(ctx, c, obj, resolvedKey, authnNS, perPage, page, nil)
 	}
+	// Use WithoutCancel so the resolution doesn't abort if the first caller's
+	// context expires — other callers waiting in the singleflight group may
+	// have longer deadlines.
+	sfCtx := context.WithoutCancel(ctx)
 	result, err, _ := restactionBgFlight.Do(resolvedKey, func() (interface{}, error) {
-		return resolveRESTActionFromObject(ctx, c, obj, resolvedKey, authnNS, perPage, page, nil)
+		return resolveRESTActionFromObject(sfCtx, c, obj, resolvedKey, authnNS, perPage, page, nil)
 	})
 	if err != nil {
 		return nil, err
+	}
+	if result == nil {
+		return nil, nil
 	}
 	return result.([]byte), nil
 }
