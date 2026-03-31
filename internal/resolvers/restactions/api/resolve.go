@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,11 +14,15 @@ import (
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	httpcall "github.com/krateoplatformops/plumbing/http/request"
 	"github.com/krateoplatformops/plumbing/http/response"
+	"github.com/krateoplatformops/plumbing/jqutil"
 	"github.com/krateoplatformops/plumbing/maps"
 	"github.com/krateoplatformops/plumbing/ptr"
+	"github.com/krateoplatformops/snowplow/apis"
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
+	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
@@ -300,6 +305,43 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					}
 				}
 			}
+			// ── In-process resolution for /call paths ─────────────────────
+			// Instead of HTTP loopback to snowplow's own /call endpoint
+			// (300-800ms network overhead), resolve nested RESTActions and
+			// widgets in-process by reading the K8s object from L3 cache
+			// and invoking the resolver recursively.
+			if c != nil && verb == http.MethodGet {
+				if callGVR, callNS, callName := cache.ParseCallPath(call.Path); callGVR.Resource != "" && callName != "" {
+					// Read the K8s object from L3 GET cache.
+					l3ObjKey := cache.GetKey(callGVR, callNS, callName)
+					if l3ObjRaw, l3ObjHit, _ := c.GetRaw(ctx, l3ObjKey); l3ObjHit && !cache.IsNotFoundRaw(l3ObjRaw) {
+						// Check RBAC before resolving.
+						if rbac.UserCan(ctx, rbac.UserCanOptions{
+							Verb:          "get",
+							GroupResource: schema.GroupResource{Group: callGVR.Group, Resource: callGVR.Resource},
+							Namespace:     callNS,
+						}) {
+							// Resolve in-process: parse K8s object, then resolve
+							// as RESTAction (recursive) and feed through handler.
+							resolvedKey := cache.ResolvedKey(user.Username, callGVR, callNS, callName, 0, 0)
+							resolved, resolveErr := resolveInProcess(ctx, c, callGVR, l3ObjRaw, resolvedKey, opts.AuthnNS, 0, 0)
+							if resolveErr == nil && resolved != nil {
+								handler := jsonHandler(ctx, jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter})
+								if mu != nil {
+									mu.Lock()
+								}
+								_ = handler(io.NopCloser(bytes.NewReader(resolved)))
+								if mu != nil {
+									mu.Unlock()
+								}
+								return true
+							}
+							// Fall through to httpcall.Do on error.
+						}
+					}
+				}
+			}
+
 			// ── L3 miss → live HTTP call ───────────────────────────────────
 			{
 				plain := jsonHandler(ctx, jsonHandlerOptions{
@@ -410,6 +452,78 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	}
 
 	return dict
+}
+
+// resolveInProcess resolves a nested /call path for a RESTAction without
+// HTTP loopback. Reads the K8s object from L3 cache (already provided as
+// l3ObjRaw), extracts the API spec, and calls Resolve recursively.
+// Returns the resolved JSON bytes, or error if not possible.
+func resolveInProcess(ctx context.Context, c *cache.RedisCache, gvr schema.GroupVersionResource, l3ObjRaw []byte, resolvedKey, authnNS string, perPage, page int) ([]byte, error) {
+	// Only resolve RESTActions in-process. Widgets have complex resolution
+	// (child widgets, forms) that requires the full dispatcher context.
+	if gvr.Resource != "restactions" || gvr.Group != "templates.krateo.io" {
+		return nil, fmt.Errorf("in-process resolution not supported for %s", gvr.String())
+	}
+
+	// Unmarshal the L3 object to extract the API spec.
+	var obj map[string]interface{}
+	if err := json.Unmarshal(l3ObjRaw, &obj); err != nil {
+		return nil, err
+	}
+
+	// Extract API items from spec.api using the same typed conversion
+	// as the dispatchers package.
+	scheme := runtime.NewScheme()
+	if err := apis.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
+	var cr templates.RESTAction
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj, &cr); err != nil {
+		return nil, err
+	}
+
+	// Resolve using the same resolver (recursive call).
+	rc, _ := rest.InClusterConfig()
+	result := Resolve(ctx, ResolveOptions{
+		RC:      rc,
+		AuthnNS: authnNS,
+		Verbose: false,
+		Items:   cr.Spec.API,
+		PerPage: perPage,
+		Page:    page,
+	})
+
+	// Apply the RESTAction's JQ filter.
+	if cr.Spec.Filter != nil {
+		q := ptr.Deref(cr.Spec.Filter, "")
+		s, err := jqutil.Eval(context.TODO(), jqutil.EvalOptions{
+			Query:        q,
+			Data:         result,
+			ModuleLoader: jqsupport.ModuleLoader(),
+		})
+		if err != nil {
+			return nil, err
+		}
+		raw := []byte(s)
+		// Cache the resolved output.
+		if c != nil && resolvedKey != "" {
+			_ = c.SetResolvedRaw(ctx, resolvedKey, raw)
+		}
+
+		// Build full RESTAction response envelope.
+		cr.Status = &runtime.RawExtension{Raw: raw}
+		return json.Marshal(&cr)
+	}
+
+	raw, err := json.Marshal(result)
+	if err != nil {
+		return nil, err
+	}
+	if c != nil && resolvedKey != "" {
+		_ = c.SetResolvedRaw(ctx, resolvedKey, raw)
+	}
+	cr.Status = &runtime.RawExtension{Raw: raw}
+	return json.Marshal(&cr)
 }
 
 func removeManagedFields(data any) {
