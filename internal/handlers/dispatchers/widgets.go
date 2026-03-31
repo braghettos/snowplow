@@ -196,11 +196,21 @@ func ResolveWidgetDirect(ctx context.Context, c *cache.RedisCache, got objects.R
 	return result.(*ResolveWidgetResult), nil
 }
 
-// ResolveWidgetBackground resolves a widget without joining the shared
-// singleflight group. Used by the background L1 worker to avoid blocking
-// HTTP requests that resolve the same key concurrently.
+// ResolveWidgetBackground resolves a widget using a dedicated background
+// singleflight group. This deduplicates concurrent background L1 refresh
+// attempts for the same key without blocking HTTP requests (which use the
+// separate widgetFlight group).
 func ResolveWidgetBackground(ctx context.Context, c *cache.RedisCache, got objects.Result, resolvedKey, authnNS string, perPage, page int) (*ResolveWidgetResult, error) {
-	return resolveWidgetFromObject(ctx, c, got, resolvedKey, authnNS, perPage, page, nil)
+	if resolvedKey == "" {
+		return resolveWidgetFromObject(ctx, c, got, resolvedKey, authnNS, perPage, page, nil)
+	}
+	result, err, _ := widgetBgFlight.Do(resolvedKey, func() (interface{}, error) {
+		return resolveWidgetFromObject(ctx, c, got, resolvedKey, authnNS, perPage, page, nil)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result.(*ResolveWidgetResult), nil
 }
 
 func writeWidgetError(wri http.ResponseWriter, err error) {
