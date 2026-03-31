@@ -195,6 +195,35 @@ func (c *RedisCache) GetRaw(ctx context.Context, key string) ([]byte, bool, erro
 	return val, true, nil
 }
 
+// GetRawMulti fetches multiple keys in a single Redis pipeline round-trip.
+// Returns a map of key → decompressed value for keys that exist.
+// Keys that don't exist or have the not-found sentinel are omitted.
+func (c *RedisCache) GetRawMulti(ctx context.Context, keys []string) map[string][]byte {
+	if c == nil || len(keys) == 0 {
+		return nil
+	}
+	pipe := c.client.Pipeline()
+	cmds := make([]*redis.StringCmd, len(keys))
+	for i, k := range keys {
+		cmds[i] = pipe.Get(ctx, k)
+	}
+	_, _ = pipe.Exec(ctx)
+
+	result := make(map[string][]byte, len(keys))
+	for i, cmd := range cmds {
+		val, err := cmd.Bytes()
+		if err != nil {
+			continue
+		}
+		val = decompressValue(val)
+		if bytes.Equal(val, []byte(notFoundSentinel)) {
+			continue
+		}
+		result[keys[i]] = val
+	}
+	return result
+}
+
 // Exists returns true when the key is present in Redis (regardless of value).
 func (c *RedisCache) Exists(ctx context.Context, key string) bool {
 	if c == nil {

@@ -159,7 +159,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		// all writes to the shared dict so that JQ handlers can safely append.
 		//
 		// For single-call entries (the common case) we skip goroutine overhead.
-		runOne := func(call httpcall.RequestOptions, mu *sync.Mutex) (continueOnErr bool) {
+		runOne := func(call httpcall.RequestOptions, mu *sync.Mutex, prefetched map[string][]byte) (continueOnErr bool) {
 			call.Endpoint = &ep
 			verb := strings.ToUpper(ptr.Deref(call.Verb, http.MethodGet))
 
@@ -192,7 +192,13 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					} else {
 						cacheKey = cache.GetKey(pathGVR, pathNS, pathName)
 					}
-					if raw, hit, _ := c.GetRaw(ctx, cacheKey); hit {
+					// Check pre-fetched MGET results first (0 round-trips),
+					// fall back to individual GetRaw (1 round-trip).
+					raw, hit := prefetched[cacheKey]
+					if !hit {
+						raw, hit, _ = c.GetRaw(ctx, cacheKey)
+					}
+					if hit {
 						log.Debug("L3 cache hit for K8s API path",
 							slog.String("name", id),
 							slog.String("path", call.Path),
@@ -250,7 +256,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					} else {
 						l3Key = cache.ListKey(pathGVR, pathNS)
 					}
-					if l3Raw, l3Hit, _ := c.GetRaw(ctx, l3Key); l3Hit && !cache.IsNotFoundRaw(l3Raw) {
+					l3Raw, l3Hit := prefetched[l3Key]
+					if !l3Hit {
+						l3Raw, l3Hit, _ = c.GetRaw(ctx, l3Key)
+					}
+					if l3Hit && !cache.IsNotFoundRaw(l3Raw) {
 						rbacVerb := "list"
 						if pathName != "" {
 							rbacVerb = "get"
@@ -344,18 +354,36 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 
 		if len(tmp) == 1 {
 			// Single call: run inline to avoid goroutine overhead.
-			if !runOne(tmp[0], nil) {
+			if !runOne(tmp[0], nil, nil) {
 				return dict
 			}
 		} else {
 			// Iterator: N independent calls — run concurrently.
+			// Pre-fetch all L3 cache keys in a single MGET to avoid 120+
+			// sequential Redis round-trips (2-5ms each = 240-600ms).
+			var prefetchedL3 map[string][]byte
+			if c != nil {
+				var l3Keys []string
+				for _, call := range tmp {
+					if pathGVR, pathNS, pathName := cache.ParseK8sAPIPath(call.Path); pathGVR.Resource != "" {
+						if pathName == "" {
+							l3Keys = append(l3Keys, cache.ListKey(pathGVR, pathNS))
+						} else {
+							l3Keys = append(l3Keys, cache.GetKey(pathGVR, pathNS, pathName))
+						}
+					}
+				}
+				if len(l3Keys) > 0 {
+					prefetchedL3 = c.GetRawMulti(ctx, l3Keys)
+				}
+			}
 			var mu sync.Mutex
 			var wg sync.WaitGroup
 			for _, call := range tmp {
 				wg.Add(1)
 				go func(c httpcall.RequestOptions) {
 					defer wg.Done()
-					runOne(c, &mu)
+					runOne(c, &mu, prefetchedL3)
 				}(call)
 			}
 			wg.Wait()
