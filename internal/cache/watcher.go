@@ -1025,16 +1025,11 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 				l1Keys = append(l1Keys, k)
 			}
 			if fn, ok := rw.l1Refresh.Load().(L1RefreshFunc); ok && fn != nil {
-				// Synchronous: block until the precise L1 keys are refreshed.
-				// This runs inside the scheduleDynamicReconcile timer callback
-				// (its own goroutine), so blocking doesn't affect request handling.
-				// Synchronous refresh ensures deterministic convergence —
-				// the piechart and compositions-list L1 keys are updated before
-				// the l3genScanNow signal fires, guaranteeing the next API/UI
-				// request sees correct data.
-				refreshCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-				fn(refreshCtx, gvr, l1Keys)
-				cancel()
+				go func() {
+					refreshCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+					defer cancel()
+					fn(refreshCtx, gvr, l1Keys)
+				}()
 			} else {
 				_ = rw.cache.Delete(ctx, l1Keys...)
 			}
