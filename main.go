@@ -37,6 +37,25 @@ var (
 	build string
 )
 
+func init() {
+	// Disable HTTP/2 for ALL outgoing client connections process-wide.
+	// Multiple code paths create K8s clients (kubeconfig.NewClientConfig,
+	// rest.InClusterConfig, dynamic.NewClient) that default to HTTP/2.
+	// Under load the K8s API server closes HTTP/2 connections mid-stream,
+	// crashing the Go http2 frame reader and killing the process (exit 2).
+	// The main rest.Config instances set NextProtos=["http/1.1"], but
+	// dynamically-created clients from the plumbing library don't inherit
+	// that setting. GODEBUG=http2client=0 is the only way to disable
+	// HTTP/2 globally without patching every client creation point.
+	// The h2c server (line ~207) is unaffected — it uses explicit
+	// h2c.NewHandler, not the default transport.
+	if existing := os.Getenv("GODEBUG"); existing != "" {
+		os.Setenv("GODEBUG", existing+",http2client=0")
+	} else {
+		os.Setenv("GODEBUG", "http2client=0")
+	}
+}
+
 // @title SnowPlow API
 // @version 0.1.0
 // @description This the total new Krateo backend.
