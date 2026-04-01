@@ -247,7 +247,16 @@ func WarmRBACForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Conf
 		return
 	}
 
+	// Throttle RBAC warmup to avoid overwhelming the K8s API with
+	// SelfSubjectAccessReview calls. With 2 users × 29 GVRs × 120 ns × 6
+	// verbs = 41,760 checks, unthrottled calls exhaust connections and crash
+	// the process on restart with existing compositions.
+	const rbacWarmupConcurrency = 10
+	sem := make(chan struct{}, rbacWarmupConcurrency)
 	var total int64
+	var totalMu sync.Mutex
+	var wg sync.WaitGroup
+
 	for _, u := range users {
 		token := mintJWT(u.userInfo, signKey)
 		rctx := xcontext.BuildContext(ctx,
@@ -264,15 +273,24 @@ func WarmRBACForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Conf
 			}
 			gr := gvr.GroupResource()
 			for _, ns := range namespaces {
-				for _, verb := range []string{"list", "get", "create", "update", "delete", "patch"} {
-					rbac.UserCan(rctx, rbac.UserCanOptions{
-						Verb: verb, GroupResource: gr, Namespace: ns,
-					})
-					total++
-				}
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(ns string) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					for _, verb := range []string{"list", "get", "create", "update", "delete", "patch"} {
+						rbac.UserCan(rctx, rbac.UserCanOptions{
+							Verb: verb, GroupResource: gr, Namespace: ns,
+						})
+						totalMu.Lock()
+						total++
+						totalMu.Unlock()
+					}
+				}(ns)
 			}
 		}
 	}
+	wg.Wait()
 	log.Info("RBAC warmup: completed",
 		slog.Int("users", len(users)),
 		slog.Int("gvrs", len(gvrKeys)),
