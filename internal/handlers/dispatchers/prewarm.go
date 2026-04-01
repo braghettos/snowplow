@@ -275,7 +275,7 @@ func WarmRBACForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Conf
 			for _, ns := range namespaces {
 				wg.Add(1)
 				sem <- struct{}{}
-				go func(ns string) {
+				go func(ns string, gr schema.GroupResource) {
 					defer wg.Done()
 					defer func() { <-sem }()
 					for _, verb := range []string{"list", "get", "create", "update", "delete", "patch"} {
@@ -286,7 +286,7 @@ func WarmRBACForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Conf
 						total++
 						totalMu.Unlock()
 					}
-				}(ns)
+				}(ns, gr)
 			}
 		}
 	}
