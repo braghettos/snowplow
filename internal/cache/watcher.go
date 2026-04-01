@@ -81,12 +81,6 @@ type ResourceWatcher struct {
 	dynamicReconcileTimers    map[string]*time.Timer
 	dynamicReconcileDeadlines map[string]time.Time
 
-	// l1RefreshSem limits concurrent L1 refresh goroutines. Without this,
-	// the l3gen scanner (every 3s) and reconcileGVR each spawn unbounded
-	// goroutines that accumulate when resolution is slow (10-15s at scale),
-	// eventually crashing the process (1M+ goroutines, exit code 2).
-	l1RefreshSem chan struct{}
-
 	// l3genScanNow is a signal channel to trigger an immediate l3gen scan.
 	// Used by scheduleDynamicReconcile after reconcileGVR updates L3, so
 	// the l3gen scanner detects the changes instantly instead of waiting
@@ -117,7 +111,6 @@ func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error
 		dynamicGVRs:               make(map[string]schema.GroupVersionResource),
 		dynamicReconcileTimers:    make(map[string]*time.Timer),
 		dynamicReconcileDeadlines: make(map[string]time.Time),
-		l1RefreshSem:              make(chan struct{}, 2), // max 2 concurrent L1 refresh goroutines
 		l3genScanNow:              make(chan struct{}, 1),
 	}, nil
 }
@@ -236,17 +229,18 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 	}
 	_, _ = pipe.Exec(ctx)
 
-	// Find which GVR+ns changed and prune expired keys from lastSeen.
+	// Prune expired keys from lastSeen to prevent unbounded memory growth.
 	currentKeys := make(map[string]bool, len(genKeys))
 	for _, gk := range genKeys {
 		currentKeys[gk] = true
 	}
 	for gk := range lastSeen {
 		if !currentKeys[gk] {
-			delete(lastSeen, gk) // prune expired/deleted l3gen keys
+			delete(lastSeen, gk)
 		}
 	}
 
+	// Find which GVR+ns changed.
 	changedGVRNS := make(map[string]bool)
 	for gk, cmd := range cmds {
 		curVal, _ := cmd.Result()
@@ -330,27 +324,21 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 		slog.Int("l1_keys", len(keys)))
 
 	// Run refresh asynchronously so it doesn't block the 3s ticker.
-	// Semaphore prevents goroutine accumulation when resolution is slow.
-	select {
-	case rw.l1RefreshSem <- struct{}{}:
-		go func() {
-			defer func() { <-rw.l1RefreshSem }()
-			defer func() {
-				if r := recover(); r != nil {
-					buf := make([]byte, 4096)
-					n := runtime.Stack(buf, false)
-					slog.Error("resource-watcher: panic in l3gen refresh",
-						slog.Any("error", r),
-						slog.String("stack", string(buf[:n])))
-				}
-			}()
-			refreshCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-			defer cancel()
-			fn(refreshCtx, schema.GroupVersionResource{}, keys)
+	// The refresh may take 30s+ due to RBAC rate limiting or slow resolution.
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				buf := make([]byte, 4096)
+				n := runtime.Stack(buf, false)
+				slog.Error("resource-watcher: panic in l3gen refresh",
+					slog.Any("error", r),
+					slog.String("stack", string(buf[:n])))
+			}
 		}()
-	default:
-		slog.Debug("resource-watcher: l3gen refresh skipped (semaphore full)")
-	}
+		refreshCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+		fn(refreshCtx, schema.GroupVersionResource{}, keys)
+	}()
 }
 
 // expandDependents walks the L1 dependency tree and adds all transitively
@@ -1048,17 +1036,11 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 				l1Keys = append(l1Keys, k)
 			}
 			if fn, ok := rw.l1Refresh.Load().(L1RefreshFunc); ok && fn != nil {
-				select {
-				case rw.l1RefreshSem <- struct{}{}:
-					go func() {
-						defer func() { <-rw.l1RefreshSem }()
-						refreshCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-						defer cancel()
-						fn(refreshCtx, gvr, l1Keys)
-					}()
-				default:
-					slog.Debug("reconcile: L1 refresh skipped (semaphore full)")
-				}
+				go func() {
+					refreshCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+					defer cancel()
+					fn(refreshCtx, gvr, l1Keys)
+				}()
 			} else {
 				_ = rw.cache.Delete(ctx, l1Keys...)
 			}
