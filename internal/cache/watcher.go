@@ -81,6 +81,11 @@ type ResourceWatcher struct {
 	dynamicReconcileTimers    map[string]*time.Timer
 	dynamicReconcileDeadlines map[string]time.Time
 
+	// reconcileMu serializes reconcileGVR calls per GVR. Without this,
+	// startInformer and scheduleDynamicReconcile can run reconcileGVR
+	// concurrently for the same GVR, causing TOCTOU on L3 list writes (Bug 4).
+	reconcileMu   sync.Map // map[string]*sync.Mutex — keyed by GVR string
+
 	// l3genScanNow is a signal channel to trigger an immediate l3gen scan.
 	// Used by scheduleDynamicReconcile after reconcileGVR updates L3, so
 	// the l3gen scanner detects the changes instantly instead of waiting
@@ -323,9 +328,11 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 		slog.Int("changed_gvr_ns", len(changedGVRNS)),
 		slog.Int("l1_keys", len(keys)))
 
-	// Run refresh asynchronously so it doesn't block the 3s ticker.
-	// The refresh may take 30s+ due to RBAC rate limiting or slow resolution.
-	go func() {
+	// Run refresh synchronously. This blocks the l3gen scanner's 3s ticker,
+	// which is fine — the scanner is a safety net, not real-time. Running
+	// inline guarantees at most ONE L1 refresh at a time, preventing the
+	// goroutine accumulation (Bug 7) that caused pod crashes at scale.
+	func() {
 		defer func() {
 			if r := recover(); r != nil {
 				buf := make([]byte, 4096)
@@ -894,6 +901,15 @@ func (rw *ResourceWatcher) Reconcile(ctx context.Context) ReconcileStats {
 }
 
 func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVersionResource) (added, removed, updated, errs int) {
+	// Per-GVR mutex: prevent concurrent reconciliation for the same GVR (Bug 4).
+	// startInformer and scheduleDynamicReconcile can both call reconcileGVR
+	// simultaneously, causing TOCTOU on L3 list cache writes.
+	muKey := GVRToKey(gvr)
+	muVal, _ := rw.reconcileMu.LoadOrStore(muKey, &sync.Mutex{})
+	mu := muVal.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+
 	// 1. Read authoritative state from informer store (in-memory, no API call).
 	lister := rw.factory.ForResource(gvr).Lister()
 	objects, err := lister.List(labels.Everything())
@@ -1036,11 +1052,12 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 				l1Keys = append(l1Keys, k)
 			}
 			if fn, ok := rw.l1Refresh.Load().(L1RefreshFunc); ok && fn != nil {
-				go func() {
-					refreshCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-					defer cancel()
-					fn(refreshCtx, gvr, l1Keys)
-				}()
+				// Synchronous: runs inside scheduleDynamicReconcile's timer
+				// callback (its own goroutine). No new goroutine needed.
+				// This prevents unbounded goroutine accumulation (Bug 7).
+				refreshCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+				fn(refreshCtx, gvr, l1Keys)
+				cancel()
 			} else {
 				_ = rw.cache.Delete(ctx, l1Keys...)
 			}
