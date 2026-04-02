@@ -86,6 +86,13 @@ type ResourceWatcher struct {
 	// concurrently for the same GVR, causing TOCTOU on L3 list writes (Bug 4).
 	reconcileMu   sync.Map // map[string]*sync.Mutex — keyed by GVR string
 
+	// l1RefreshRunning is a non-blocking mutex for L1 refresh. At most one
+	// refresh goroutine runs at a time. If a refresh is already running,
+	// new requests are skipped (the next l3gen tick will retry).
+	// This prevents both goroutine accumulation (Bug 7) and scanner
+	// blocking (synchronous approach regressed S4/S5 convergence).
+	l1RefreshRunning atomic.Bool
+
 	// l3genScanNow is a signal channel to trigger an immediate l3gen scan.
 	// Used by scheduleDynamicReconcile after reconcileGVR updates L3, so
 	// the l3gen scanner detects the changes instantly instead of waiting
@@ -328,11 +335,17 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 		slog.Int("changed_gvr_ns", len(changedGVRNS)),
 		slog.Int("l1_keys", len(keys)))
 
-	// Run refresh synchronously. This blocks the l3gen scanner's 3s ticker,
-	// which is fine — the scanner is a safety net, not real-time. Running
-	// inline guarantees at most ONE L1 refresh at a time, preventing the
-	// goroutine accumulation (Bug 7) that caused pod crashes at scale.
-	func() {
+	// Launch at most ONE async refresh. If a refresh is already running,
+	// skip this tick — the running refresh is processing changes, and the
+	// next tick will catch any new ones. This prevents both goroutine
+	// accumulation (Bug 7, unbounded go func) and scanner blocking
+	// (synchronous approach regressed S4/S5 convergence from 3s to 40s).
+	if !rw.l1RefreshRunning.CompareAndSwap(false, true) {
+		slog.Debug("resource-watcher: l3gen refresh skipped (already running)")
+		return
+	}
+	go func() {
+		defer rw.l1RefreshRunning.Store(false)
 		defer func() {
 			if r := recover(); r != nil {
 				buf := make([]byte, 4096)
@@ -1052,12 +1065,17 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 				l1Keys = append(l1Keys, k)
 			}
 			if fn, ok := rw.l1Refresh.Load().(L1RefreshFunc); ok && fn != nil {
-				// Synchronous: runs inside scheduleDynamicReconcile's timer
-				// callback (its own goroutine). No new goroutine needed.
-				// This prevents unbounded goroutine accumulation (Bug 7).
-				refreshCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-				fn(refreshCtx, gvr, l1Keys)
-				cancel()
+				// Bounded async: at most one refresh at a time via
+				// l1RefreshRunning. If the l3gen scanner is already
+				// refreshing, skip — it will pick up our changes.
+				if rw.l1RefreshRunning.CompareAndSwap(false, true) {
+					go func() {
+						defer rw.l1RefreshRunning.Store(false)
+						refreshCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+						defer cancel()
+						fn(refreshCtx, gvr, l1Keys)
+					}()
+				}
 			} else {
 				_ = rw.cache.Delete(ctx, l1Keys...)
 			}
