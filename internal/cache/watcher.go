@@ -831,6 +831,16 @@ func (rw *ResourceWatcher) scheduleDynamicReconcile(gvr schema.GroupVersionResou
 	}
 
 	rw.dynamicReconcileTimers[key] = time.AfterFunc(dynamicReconcileDebounce, func() {
+		// Clean up BEFORE running reconcileGVR so that new events
+		// arriving during reconciliation create a fresh timer instead
+		// of calling Reset() on this fired AfterFunc timer (Bug 3:
+		// Reset on a fired AfterFunc is undefined per Go docs and can
+		// silently drop events or schedule duplicate callbacks).
+		rw.dynamicGVRsMu.Lock()
+		delete(rw.dynamicReconcileTimers, key)
+		delete(rw.dynamicReconcileDeadlines, key)
+		rw.dynamicGVRsMu.Unlock()
+
 		ctx := rw.appCtx
 		added, removed, updated, errs := rw.reconcileGVR(ctx, gvr)
 		if added+removed+updated > 0 {
@@ -842,20 +852,12 @@ func (rw *ResourceWatcher) scheduleDynamicReconcile(gvr schema.GroupVersionResou
 				slog.Int("errors", errs))
 		}
 
-		// Signal the l3gen scanner to run immediately so it picks up
-		// the L3 changes from reconcileGVR without waiting for the
-		// next 3s tick. Non-blocking: if a signal is already pending,
-		// the scanner will process both changes in one pass.
-		select {
-		case rw.l3genScanNow <- struct{}{}:
-		default:
-		}
-
-		// Clean up so the next event starts a fresh debounce cycle.
-		rw.dynamicGVRsMu.Lock()
-		delete(rw.dynamicReconcileTimers, key)
-		delete(rw.dynamicReconcileDeadlines, key)
-		rw.dynamicGVRsMu.Unlock()
+		// Note: we do NOT signal l3genScanNow here. reconcileGVR
+		// already triggers its own L1 refresh (lines 1066+), so
+		// also waking the l3gen scanner would cause a redundant
+		// second L1 refresh for the same L3 changes (Bug 11).
+		// The scanner will still detect the l3gen bump on its
+		// next 3s tick, but l1RefreshRunning prevents duplicate work.
 	})
 }
 

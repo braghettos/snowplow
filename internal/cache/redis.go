@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math/rand/v2"
 	"os"
 	"strings"
 	"sync"
@@ -279,18 +280,23 @@ func (c *RedisCache) SetRaw(ctx context.Context, key string, val []byte) error {
 // ResolvedCacheTTL. Freshness is guaranteed by the GVR reverse index
 // (targeted invalidation from informer events); TTL is only for memory
 // management. Also tracks the key in a per-user index SET for O(1) invalidation.
+// The SET + SADD + EXPIRE are executed atomically in a MULTI/EXEC transaction
+// so a crash between steps cannot leave orphaned keys without index entries (Bug 9).
 func (c *RedisCache) SetResolvedRaw(ctx context.Context, key string, val []byte) error {
 	if c == nil {
 		return nil
 	}
-	if err := c.client.Set(ctx, key, compressValue(val), ResolvedCacheTTL).Err(); err != nil {
+	info, hasInfo := ParseResolvedKey(key)
+	if hasInfo && info.Username != "" {
+		idxKey := UserResolvedIndexKey(info.Username)
+		pipe := c.client.TxPipeline()
+		pipe.Set(ctx, key, compressValue(val), ResolvedCacheTTL)
+		pipe.SAdd(ctx, idxKey, key)
+		pipe.Expire(ctx, idxKey, ReverseIndexTTL)
+		_, err := pipe.Exec(ctx)
 		return err
 	}
-	// Track in per-user index for fast invalidation (avoid SCAN).
-	if info, ok := ParseResolvedKey(key); ok && info.Username != "" {
-		_ = c.SAddWithTTL(ctx, UserResolvedIndexKey(info.Username), key, ReverseIndexTTL)
-	}
-	return nil
+	return c.client.Set(ctx, key, compressValue(val), ResolvedCacheTTL).Err()
 }
 
 func (c *RedisCache) setWithTTL(ctx context.Context, key string, val any, ttl time.Duration) error {
@@ -351,8 +357,10 @@ func (c *RedisCache) AtomicUpdateJSON(ctx context.Context, key string, fn func([
 			return nil
 		}
 		if errors.Is(err, redis.TxFailedErr) {
-			// Brief sleep with jitter to reduce contention on retry.
-			time.Sleep(time.Duration(1+i) * time.Millisecond)
+			// Exponential backoff with full jitter (Bug 6: linear retry
+			// without jitter causes synchronized retry waves).
+			base := time.Duration(1<<min(i, 6)) * time.Millisecond // 1,2,4,...,64ms
+			time.Sleep(base + time.Duration(rand.Int64N(int64(base)+1)))
 			continue
 		}
 		return err
@@ -385,13 +393,14 @@ func (c *RedisCache) DeletePattern(ctx context.Context, pattern string) error {
 }
 
 // SAddWithTTL adds member to a Redis set and refreshes the set's TTL.
-// Used for reverse-index sets (l1gvr) that should expire when the
-// associated cache entries expire.
+// Uses MULTI/EXEC transaction to ensure atomicity (Bug 5: if Redis
+// crashes between SADD and EXPIRE in a plain pipeline, the set
+// persists without TTL, causing unbounded growth).
 func (c *RedisCache) SAddWithTTL(ctx context.Context, key, member string, ttl time.Duration) error {
 	if c == nil {
 		return nil
 	}
-	pipe := c.client.Pipeline()
+	pipe := c.client.TxPipeline()
 	pipe.SAdd(ctx, key, member)
 	pipe.Expire(ctx, key, ttl)
 	_, err := pipe.Exec(ctx)
@@ -455,6 +464,14 @@ func (c *RedisCache) SetString(ctx context.Context, key, value string) error {
 		return nil
 	}
 	return c.client.Set(ctx, key, value, 0).Err()
+}
+
+// SetStringWithTTL stores a string value with an explicit TTL.
+func (c *RedisCache) SetStringWithTTL(ctx context.Context, key, value string, ttl time.Duration) error {
+	if c == nil {
+		return nil
+	}
+	return c.client.Set(ctx, key, value, ttl).Err()
 }
 
 func (c *RedisCache) GetString(ctx context.Context, key string) (string, bool, error) {

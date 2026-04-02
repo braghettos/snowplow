@@ -21,11 +21,13 @@ const (
 // MarkL1Ready writes a Unix-epoch timestamp to the L1 ready sentinel key.
 // External consumers (e.g. e2e tests) can poll this key to deterministically
 // know when the most recent L1 warmup or refresh cycle completed.
+// The key expires after 5 minutes so a stale timestamp from a crashed pod
+// does not mislead readiness probes (Bug 13).
 func MarkL1Ready(ctx context.Context, c *RedisCache) {
 	if c == nil {
 		return
 	}
-	_ = c.SetString(ctx, L1ReadyKey, strconv.FormatInt(time.Now().Unix(), 10))
+	_ = c.SetStringWithTTL(ctx, L1ReadyKey, strconv.FormatInt(time.Now().Unix(), 10), 5*time.Minute)
 }
 
 // L1ReadyTimestamp returns the Unix epoch stored in the L1 ready key, or 0.
@@ -347,8 +349,8 @@ func ParseResolvedKey(key string) (ResolvedKeyInfo, bool) {
 		GVR:      ParseGVRKey(parts[3]),
 		NS:       parts[4],
 		Name:     parts[5],
-		Page:     -1,
-		PerPage:  -1,
+		Page:     0,
+		PerPage:  0,
 	}
 	if len(parts) == 7 {
 		fmt.Sscanf(parts[6], "p%d-pp%d", &info.Page, &info.PerPage)

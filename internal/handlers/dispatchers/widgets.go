@@ -105,12 +105,19 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			writeWidgetError(wri, resolveErr)
 			return
 		}
+		// Safe type assertion to avoid panic if singleflight returns
+		// an unexpected type (Bug 14).
+		res, ok := result.(*ResolveWidgetResult)
+		if !ok || res == nil {
+			writeWidgetError(wri, fmt.Errorf("singleflight returned unexpected type %T", result))
+			return
+		}
 		log.Info("Widget successfully resolved (singleflight)",
 			slog.String("key", resolvedKey),
 			slog.String("duration", util.ETA(start)))
 		wri.Header().Set("Content-Type", "application/json")
 		wri.WriteHeader(http.StatusOK)
-		_, _ = wri.Write(result.(*ResolveWidgetResult).Raw)
+		_, _ = wri.Write(res.Raw)
 		return
 	}
 

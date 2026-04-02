@@ -3,6 +3,7 @@ package dispatchers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -99,12 +100,19 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			response.InternalError(wri, resolveErr)
 			return
 		}
+		// Safe type assertion to avoid panic if singleflight returns
+		// an unexpected type (Bug 14).
+		raw, ok := result.([]byte)
+		if !ok || raw == nil {
+			response.InternalError(wri, fmt.Errorf("singleflight returned unexpected type %T", result))
+			return
+		}
 		log.Info("RESTAction successfully resolved (singleflight)",
 			slog.String("key", resolvedKey),
 			slog.String("duration", util.ETA(start)))
 		wri.Header().Set("Content-Type", "application/json")
 		wri.WriteHeader(http.StatusOK)
-		_, _ = wri.Write(result.([]byte))
+		_, _ = wri.Write(raw)
 		return
 	}
 
