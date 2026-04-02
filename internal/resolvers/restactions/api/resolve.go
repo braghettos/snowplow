@@ -347,7 +347,6 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			log.Info("api successfully resolved",
 				slog.String("name", id),
 				slog.String("host", call.Endpoint.ServerURL), slog.String("path", call.Path),
-				slog.Any("depth", mapDepth(dict)),
 			)
 			return true
 		}
