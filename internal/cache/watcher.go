@@ -93,6 +93,12 @@ type ResourceWatcher struct {
 	// blocking (synchronous approach regressed S4/S5 convergence).
 	l1RefreshRunning atomic.Bool
 
+	// l3genRescanPending is set when the scanner detects l3gen changes but
+	// the refresh is skipped (l1RefreshRunning=true). When the running
+	// refresh completes, it checks this flag and signals l3genScanNow for
+	// an immediate re-scan to catch events that arrived during the refresh.
+	l3genRescanPending atomic.Bool
+
 	// l3genScanNow is a signal channel to trigger an immediate l3gen scan.
 	// Used by scheduleDynamicReconcile after reconcileGVR updates L3, so
 	// the l3gen scanner detects the changes instantly instead of waiting
@@ -342,10 +348,21 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 	// (synchronous approach regressed S4/S5 convergence from 3s to 40s).
 	if !rw.l1RefreshRunning.CompareAndSwap(false, true) {
 		slog.Debug("resource-watcher: l3gen refresh skipped (already running)")
+		rw.l3genRescanPending.Store(true)
 		return
 	}
 	go func() {
-		defer rw.l1RefreshRunning.Store(false)
+		defer func() {
+			rw.l1RefreshRunning.Store(false)
+			// If changes were skipped while this refresh was running,
+			// trigger an immediate re-scan to catch them.
+			if rw.l3genRescanPending.CompareAndSwap(true, false) {
+				select {
+				case rw.l3genScanNow <- struct{}{}:
+				default:
+				}
+			}
+		}()
 		defer func() {
 			if r := recover(); r != nil {
 				buf := make([]byte, 4096)
