@@ -253,17 +253,14 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 	}
 
 	// Find which GVR+ns changed.
-	// Stage new values — only commit to lastSeen once the L1 refresh actually starts.
-	// Otherwise a skipped refresh "consumes" changes without acting on them (S8 regression).
 	changedGVRNS := make(map[string]bool)
-	pendingLastSeen := make(map[string]string)
 	for gk, cmd := range cmds {
 		curVal, _ := cmd.Result()
 		if curVal == "" {
 			continue
 		}
 		if lastSeen[gk] != curVal {
-			pendingLastSeen[gk] = curVal
+			lastSeen[gk] = curVal
 			// Extract GVR+ns from key: "snowplow:l3gen:{gvrKey}:{ns}"
 			// The gvrKey is "group/version/resource", ns is the namespace.
 			suffix := strings.TrimPrefix(gk, "snowplow:l3gen:")
@@ -346,11 +343,6 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 	if !rw.l1RefreshRunning.CompareAndSwap(false, true) {
 		slog.Debug("resource-watcher: l3gen refresh skipped (already running)")
 		return
-	}
-	// Commit staged lastSeen values now that the refresh will actually run.
-	// If the CAS failed above, lastSeen stays stale so the next tick re-detects.
-	for gk, v := range pendingLastSeen {
-		lastSeen[gk] = v
 	}
 	go func() {
 		defer rw.l1RefreshRunning.Store(false)
