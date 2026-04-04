@@ -252,15 +252,18 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 		}
 	}
 
-	// Find which GVR+ns changed.
+	// Find which GVR+ns changed. Stage lastSeen updates — only commit them
+	// when the refresh actually launches (CAS succeeds). If CAS fails,
+	// lastSeen stays stale so the next tick re-detects the changes.
 	changedGVRNS := make(map[string]bool)
+	pendingLastSeen := make(map[string]string)
 	for gk, cmd := range cmds {
 		curVal, _ := cmd.Result()
 		if curVal == "" {
 			continue
 		}
 		if lastSeen[gk] != curVal {
-			lastSeen[gk] = curVal
+			pendingLastSeen[gk] = curVal
 			// Extract GVR+ns from key: "snowplow:l3gen:{gvrKey}:{ns}"
 			// The gvrKey is "group/version/resource", ns is the namespace.
 			suffix := strings.TrimPrefix(gk, "snowplow:l3gen:")
@@ -343,6 +346,12 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 	if !rw.l1RefreshRunning.CompareAndSwap(false, true) {
 		slog.Debug("resource-watcher: l3gen refresh skipped (already running)")
 		return
+	}
+	// Commit staged lastSeen values now that the refresh is launching.
+	// If CAS had failed above, lastSeen would stay stale and the next tick
+	// would re-detect the changes, ensuring no events are dropped.
+	for gk, v := range pendingLastSeen {
+		lastSeen[gk] = v
 	}
 	go func() {
 		defer rw.l1RefreshRunning.Store(false)
