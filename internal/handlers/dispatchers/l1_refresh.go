@@ -17,7 +17,7 @@ import (
 
 const (
 	refreshConcurrency         = 20 // warmup and HTTP-triggered refreshes
-	refreshConcurrencyBackground = 4  // l3gen scanner refreshes (fewer keys, less RBAC pressure)
+	refreshConcurrencyBackground = 8  // l3gen scanner refreshes (fewer keys, less RBAC pressure)
 	restactionResource         = "restactions"
 	templatesGroup             = "templates.krateo.io"
 )

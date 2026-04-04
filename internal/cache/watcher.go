@@ -203,7 +203,7 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 	// L3gen scanner: runs every 3s independently of event volume.
 	// Detects L3 changes via generation keys and refreshes affected L1 keys.
 	lastSeen := make(map[string]string)
-	ticker := time.NewTicker(3 * time.Second)
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	for {
