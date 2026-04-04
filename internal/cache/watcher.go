@@ -99,12 +99,6 @@ type ResourceWatcher struct {
 	// for the next 3s tick.
 	l3genScanNow chan struct{}
 
-	// l3genCommit is a buffered channel (cap 1) used to commit pendingLastSeen
-	// snapshots from the refresh goroutine back to the scanner goroutine.
-	// This avoids the consumption race where lastSeen is updated before
-	// the refresh goroutine actually processes the changes (S6/S8 regression).
-	// The scanner drains this channel at the top of each scanL3Gens call.
-	l3genCommit chan map[string]string
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -130,7 +124,6 @@ func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error
 		dynamicReconcileTimers:    make(map[string]*time.Timer),
 		dynamicReconcileDeadlines: make(map[string]time.Time),
 		l3genScanNow:              make(chan struct{}, 1),
-		l3genCommit:               make(chan map[string]string, 1),
 	}, nil
 }
 
@@ -227,23 +220,7 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 
 // scanL3Gens scans all snowplow:l3gen:* keys, detects changes since the last
 // scan, and refreshes affected L1 keys via the dependency indexes.
-//
-// lastSeen is exclusively owned by the scanner goroutine (l1Worker). The
-// refresh goroutine communicates completed snapshots back via rw.l3genCommit,
-// which is drained at the top of every call. This avoids the v0.25.106
-// regression where committing lastSeen at CAS time "consumed" changes before
-// the refresh goroutine processed them, causing 111s convergence.
 func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]string) {
-	// Drain completed snapshots from the refresh goroutine into lastSeen.
-	// Safe: only the scanner goroutine reads/writes lastSeen.
-	select {
-	case committed := <-rw.l3genCommit:
-		for gk, v := range committed {
-			lastSeen[gk] = v
-		}
-	default:
-	}
-
 	fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
 	if !ok || fn == nil {
 		// Don't update lastSeen — accumulate changes until fn is available.
@@ -276,8 +253,8 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 	}
 
 	// Find which GVR+ns changed.
-	// Stage new values in pendingLastSeen — only committed to lastSeen once
-	// the refresh goroutine completes (via l3genCommit channel).
+	// Stage new values — only commit to lastSeen once the L1 refresh actually starts.
+	// Otherwise a skipped refresh "consumes" changes without acting on them (S8 regression).
 	changedGVRNS := make(map[string]bool)
 	pendingLastSeen := make(map[string]string)
 	for gk, cmd := range cmds {
@@ -297,14 +274,6 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 	if len(changedGVRNS) == 0 {
 		slog.Debug("resource-watcher: l3gen scan — no changes",
 			slog.Int("total_keys", len(genKeys)))
-		return
-	}
-
-	// CAS BEFORE the expensive dependency walk. If a refresh is already
-	// running, return immediately — lastSeen stays stale so the next tick
-	// re-detects the same changes (cheap: just SCAN + MGET).
-	if !rw.l1RefreshRunning.CompareAndSwap(false, true) {
-		slog.Debug("resource-watcher: l3gen refresh skipped (already running)")
 		return
 	}
 
@@ -352,11 +321,6 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 	}
 
 	if len(affected) == 0 {
-		// No L1 keys affected — commit pendingLastSeen directly and release lock.
-		for gk, v := range pendingLastSeen {
-			lastSeen[gk] = v
-		}
-		rw.l1RefreshRunning.Store(false)
 		return
 	}
 
@@ -374,27 +338,22 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 		slog.Int("changed_gvr_ns", len(changedGVRNS)),
 		slog.Int("l1_keys", len(keys)))
 
-	// Capture pendingLastSeen snapshot for the goroutine closure.
-	// The goroutine will commit it via l3genCommit on completion,
-	// so the scanner only sees it after the refresh actually ran.
-	snapshot := pendingLastSeen
+	// Launch at most ONE async refresh. If a refresh is already running,
+	// skip this tick — the running refresh is processing changes, and the
+	// next tick will catch any new ones. This prevents both goroutine
+	// accumulation (Bug 7, unbounded go func) and scanner blocking
+	// (synchronous approach regressed S4/S5 convergence from 3s to 40s).
+	if !rw.l1RefreshRunning.CompareAndSwap(false, true) {
+		slog.Debug("resource-watcher: l3gen refresh skipped (already running)")
+		return
+	}
+	// Commit staged lastSeen values now that the refresh will actually run.
+	// If the CAS failed above, lastSeen stays stale so the next tick re-detects.
+	for gk, v := range pendingLastSeen {
+		lastSeen[gk] = v
+	}
 	go func() {
 		defer rw.l1RefreshRunning.Store(false)
-		defer func() {
-			// Commit the snapshot via channel so the scanner merges it
-			// into lastSeen on its next tick.
-			select {
-			case rw.l3genCommit <- snapshot:
-			default:
-				// Channel full — merge with existing pending snapshot.
-				// Safe because only 1 refresh goroutine runs at a time.
-				existing := <-rw.l3genCommit
-				for k, v := range snapshot {
-					existing[k] = v
-				}
-				rw.l3genCommit <- existing
-			}
-		}()
 		defer func() {
 			if r := recover(); r != nil {
 				buf := make([]byte, 4096)
@@ -409,7 +368,6 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 		fn(refreshCtx, schema.GroupVersionResource{}, keys)
 	}()
 }
-
 
 // expandDependents walks the L1 dependency tree and adds all transitively
 // dependent keys to the affected set. For example, refreshing compositions-list
