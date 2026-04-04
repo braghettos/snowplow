@@ -1097,24 +1097,28 @@ func (rw *ResourceWatcher) rebuildListCaches(ctx context.Context, gvr schema.Gro
 		byNamespace[ns] = append(byNamespace[ns], items[i])
 	}
 
-	// Write cluster-wide list.
-	clusterList := &unstructured.UnstructuredList{Items: items}
+	// Write cluster-wide list. Skip if empty: we don't know the Kind for this
+	// GVR without at least one item, and writing a malformed list (missing
+	// Kind/APIVersion) would cause patchListCache to fail on subsequent events.
+	// The list will be created correctly when the first ADD event arrives.
 	if len(items) > 0 {
+		clusterList := &unstructured.UnstructuredList{Items: items}
 		clusterList.SetAPIVersion(items[0].GetAPIVersion())
 		clusterList.SetKind(items[0].GetKind() + "List")
+		_ = rw.cache.SetForGVR(ctx, gvr, ListKey(gvr, ""), clusterList)
 	}
-	_ = rw.cache.SetForGVR(ctx, gvr, ListKey(gvr, ""), clusterList)
 
 	// Write per-namespace lists.
 	for ns, nsItems := range byNamespace {
 		if ns == "" {
 			continue
 		}
-		nsList := &unstructured.UnstructuredList{Items: nsItems}
-		if len(nsItems) > 0 {
-			nsList.SetAPIVersion(nsItems[0].GetAPIVersion())
-			nsList.SetKind(nsItems[0].GetKind() + "List")
+		if len(nsItems) == 0 {
+			continue
 		}
+		nsList := &unstructured.UnstructuredList{Items: nsItems}
+		nsList.SetAPIVersion(nsItems[0].GetAPIVersion())
+		nsList.SetKind(nsItems[0].GetKind() + "List")
 		_ = rw.cache.SetForGVR(ctx, gvr, ListKey(gvr, ns), nsList)
 	}
 }
@@ -1137,6 +1141,14 @@ func (rw *ResourceWatcher) patchListCache(ctx context.Context, gvr schema.GroupV
 				"apiVersion": uns.GetAPIVersion(),
 				"metadata":   map[string]interface{}{"resourceVersion": ""},
 			}
+		}
+		// Heal malformed lists that were previously stored without Kind/APIVersion
+		// (e.g. empty lists written by rebuildListCaches before this fix).
+		if list.GetKind() == "" {
+			list.SetKind(uns.GetKind() + "List")
+		}
+		if list.GetAPIVersion() == "" {
+			list.SetAPIVersion(uns.GetAPIVersion())
 		}
 		idx := -1
 		for i := range list.Items {
