@@ -655,13 +655,27 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		}
 	}
 
-	// ── Update L3 generation (resourceVersion) ──────────────────────────────
-	// Store the latest resourceVersion for this GVR+ns so the dirty refresh
-	// ticker can detect L3 changes without re-reading the full list.
 	gvrKey := GVRToKey(gvr)
-	l3GenKey := L3GenKey(gvrKey, ns)
+
+	// Check if GVR is dynamic once for both l3gen bump and reconcile decisions.
+	rw.dynamicGVRsMu.Lock()
+	_, isDynamic := rw.dynamicGVRs[gvrKey]
+	rw.dynamicGVRsMu.Unlock()
+
+	// ── Update L3 generation (resourceVersion) ──────────────────────────────
+	// Store the latest resourceVersion for this GVR+ns so the l3gen scanner
+	// can detect L3 changes without re-reading the full list.
+	//
+	// SKIP for dynamic GVRs: their L3 list updates via patchListCache are
+	// under WATCH/MULTI contention and may lag the l3gen bump. If the
+	// scanner fires based on the l3gen bump while the list is still being
+	// patched, it refreshes L1 with stale/ghost items (S8 tail bug).
+	// For dynamic GVRs, reconcileGVR (debounced below) is the sole trigger:
+	// it first rebuilds the L3 list from the informer's authoritative state,
+	// then triggers the L1 refresh from consistent data.
 	rv := uns.GetResourceVersion()
-	if rv != "" {
+	if !isDynamic && rv != "" {
+		l3GenKey := L3GenKey(gvrKey, ns)
 		// Only update if new rv is greater (monotonic). Prevents out-of-order
 		// events from lowering the generation, which would block the dirty ticker.
 		luaMaxSet := `
@@ -689,10 +703,7 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	// Under rapid deployment bursts this can lag behind due to Redis transaction
 	// contention. For dynamic GVRs, schedule a debounced reconciliation that
 	// rebuilds all list caches from the informer's authoritative store once
-	// the burst settles.
-	rw.dynamicGVRsMu.Lock()
-	_, isDynamic := rw.dynamicGVRs[gvrKey]
-	rw.dynamicGVRsMu.Unlock()
+	// the burst settles, then triggers L1 refresh from consistent data.
 	if isDynamic {
 		rw.scheduleDynamicReconcile(gvr)
 	}
