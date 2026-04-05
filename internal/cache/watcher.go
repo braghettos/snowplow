@@ -256,7 +256,11 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen, prevObserve
 		}
 	}
 
-	// Snapshot current l3gen values for stability comparison.
+	// Snapshot current l3gen values and detect per-key changes.
+	// Stable-tick debounce applies ONLY to keys that actually changed since
+	// lastSeen — a changed key is considered stable if its current value
+	// matches what we saw in the previous tick. Keys bumping for unrelated
+	// GVRs don't block refresh for the changed keys.
 	currentObserved := make(map[string]string, len(cmds))
 	for gk, cmd := range cmds {
 		if curVal, _ := cmd.Result(); curVal != "" {
@@ -264,21 +268,29 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen, prevObserve
 		}
 	}
 
-	// Stable-tick debounce: only launch a refresh if l3gen values match
-	// what we saw last tick. If values changed since prev tick, events
-	// are still arriving — wait for quiescence to avoid refreshing with
-	// partial L3 data during bursts.
-	stable := true
-	if len(currentObserved) != len(prevObserved) {
-		stable = false
-	} else {
-		for gk, v := range currentObserved {
-			if prevObserved[gk] != v {
-				stable = false
-				break
-			}
+	// Find which GVR+ns changed. Stage lastSeen updates — only commit them
+	// when the refresh actually launches (CAS succeeds).
+	// A changed key is only processed if its current value is stable
+	// (matches prev tick's observation). Otherwise defer to next tick.
+	changedGVRNS := make(map[string]bool)
+	pendingLastSeen := make(map[string]string)
+	unstableChanges := 0
+	for gk, curVal := range currentObserved {
+		if lastSeen[gk] == curVal {
+			continue // not changed
 		}
+		if prevObserved[gk] != curVal {
+			// Changed since last tick — still bumping, wait for quiescence.
+			unstableChanges++
+			continue
+		}
+		pendingLastSeen[gk] = curVal
+		// Extract GVR+ns from key: "snowplow:l3gen:{gvrKey}:{ns}"
+		// The gvrKey is "group/version/resource", ns is the namespace.
+		suffix := strings.TrimPrefix(gk, "snowplow:l3gen:")
+		changedGVRNS[suffix] = true
 	}
+
 	// Update prevObserved for next tick (swap contents in place).
 	for gk := range prevObserved {
 		delete(prevObserved, gk)
@@ -286,25 +298,10 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen, prevObserve
 	for gk, v := range currentObserved {
 		prevObserved[gk] = v
 	}
-	if !stable {
-		slog.Debug("resource-watcher: l3gen unstable — waiting for next tick",
-			slog.Int("observed", len(currentObserved)))
-		return
-	}
-
-	// Find which GVR+ns changed. Stage lastSeen updates — only commit them
-	// when the refresh actually launches (CAS succeeds). If CAS fails,
-	// lastSeen stays stale so the next tick re-detects the changes.
-	changedGVRNS := make(map[string]bool)
-	pendingLastSeen := make(map[string]string)
-	for gk, curVal := range currentObserved {
-		if lastSeen[gk] != curVal {
-			pendingLastSeen[gk] = curVal
-			// Extract GVR+ns from key: "snowplow:l3gen:{gvrKey}:{ns}"
-			// The gvrKey is "group/version/resource", ns is the namespace.
-			suffix := strings.TrimPrefix(gk, "snowplow:l3gen:")
-			changedGVRNS[suffix] = true
-		}
+	if unstableChanges > 0 {
+		slog.Debug("resource-watcher: l3gen partially unstable — deferring changes",
+			slog.Int("unstable", unstableChanges),
+			slog.Int("stable_changes", len(changedGVRNS)))
 	}
 
 	if len(changedGVRNS) == 0 {
