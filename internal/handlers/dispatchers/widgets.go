@@ -67,6 +67,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 				profile.Mark(req.Context(), "redis_get")
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
+				profile.Mark(req.Context(), "metrics")
 					log.Info("Widget resolved from cache",
 						slog.String("key", resolvedKey),
 						slog.String("user", user.Username),
@@ -75,11 +76,13 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 						slog.String("namespace", nsn.Namespace),
 						slog.String("source", "L1-cache"),
 						slog.String("duration", util.ETA(start)))
+					profile.Mark(req.Context(), "log_info")
 					wri.Header().Set("Content-Type", "application/json")
 					wri.Header().Set("Cache-Control", "public, max-age=15")
 					wri.WriteHeader(http.StatusOK)
+					profile.Mark(req.Context(), "headers")
 					_, _ = wri.Write(raw)
-					profile.Mark(req.Context(), "write")
+					profile.Mark(req.Context(), "body_write")
 					profile.End(req.Context(), "l1_hit")
 					return
 				}
