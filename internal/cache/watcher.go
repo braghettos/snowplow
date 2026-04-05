@@ -200,9 +200,13 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 		}
 	}()
 
-	// L3gen scanner: runs every 3s independently of event volume.
+	// L3gen scanner: runs every 1s independently of event volume.
 	// Detects L3 changes via generation keys and refreshes affected L1 keys.
+	// prevObserved tracks l3gen values from the previous tick — we only
+	// launch a refresh when values are stable (no change from prev tick).
+	// This avoids refreshing with partial L3 data during event bursts.
 	lastSeen := make(map[string]string)
+	prevObserved := make(map[string]string)
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -211,16 +215,16 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			rw.scanL3Gens(ctx, lastSeen)
+			rw.scanL3Gens(ctx, lastSeen, prevObserved)
 		case <-rw.l3genScanNow:
-			rw.scanL3Gens(ctx, lastSeen)
+			rw.scanL3Gens(ctx, lastSeen, prevObserved)
 		}
 	}
 }
 
 // scanL3Gens scans all snowplow:l3gen:* keys, detects changes since the last
 // scan, and refreshes affected L1 keys via the dependency indexes.
-func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]string) {
+func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen, prevObserved map[string]string) {
 	fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
 	if !ok || fn == nil {
 		// Don't update lastSeen — accumulate changes until fn is available.
@@ -252,16 +256,48 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 		}
 	}
 
+	// Snapshot current l3gen values for stability comparison.
+	currentObserved := make(map[string]string, len(cmds))
+	for gk, cmd := range cmds {
+		if curVal, _ := cmd.Result(); curVal != "" {
+			currentObserved[gk] = curVal
+		}
+	}
+
+	// Stable-tick debounce: only launch a refresh if l3gen values match
+	// what we saw last tick. If values changed since prev tick, events
+	// are still arriving — wait for quiescence to avoid refreshing with
+	// partial L3 data during bursts.
+	stable := true
+	if len(currentObserved) != len(prevObserved) {
+		stable = false
+	} else {
+		for gk, v := range currentObserved {
+			if prevObserved[gk] != v {
+				stable = false
+				break
+			}
+		}
+	}
+	// Update prevObserved for next tick (swap contents in place).
+	for gk := range prevObserved {
+		delete(prevObserved, gk)
+	}
+	for gk, v := range currentObserved {
+		prevObserved[gk] = v
+	}
+	if !stable {
+		slog.Debug("resource-watcher: l3gen unstable — waiting for next tick",
+			slog.Int("observed", len(currentObserved)))
+		return
+	}
+
 	// Find which GVR+ns changed. Stage lastSeen updates — only commit them
 	// when the refresh actually launches (CAS succeeds). If CAS fails,
 	// lastSeen stays stale so the next tick re-detects the changes.
 	changedGVRNS := make(map[string]bool)
 	pendingLastSeen := make(map[string]string)
-	for gk, cmd := range cmds {
-		curVal, _ := cmd.Result()
-		if curVal == "" {
-			continue
-		}
+	for gk, curVal := range currentObserved {
 		if lastSeen[gk] != curVal {
 			pendingLastSeen[gk] = curVal
 			// Extract GVR+ns from key: "snowplow:l3gen:{gvrKey}:{ns}"
