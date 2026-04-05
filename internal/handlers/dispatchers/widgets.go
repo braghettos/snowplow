@@ -15,6 +15,7 @@ import (
 	"github.com/krateoplatformops/plumbing/maps"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
+	"github.com/krateoplatformops/snowplow/internal/profile"
 	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -44,6 +45,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		response.BadRequest(wri, err)
 		return
 	}
+	profile.Mark(req.Context(), "parse_extras")
 
 	// ── Resolved-output cache ─────────────────────────────────────────────────
 	// Cache the fully-resolved widget JSON keyed per user + resource.
@@ -60,7 +62,9 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			user, uerr := xcontext.UserInfo(req.Context())
 			if uerr == nil {
 				resolvedKey = cache.ResolvedKey(user.Username, gvr, nsn.Namespace, nsn.Name, page, perPage)
+				profile.Mark(req.Context(), "build_key")
 				if raw, hit, _ := c.GetRaw(req.Context(), resolvedKey); hit {
+				profile.Mark(req.Context(), "redis_get")
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 					log.Info("Widget resolved from cache",
@@ -75,6 +79,8 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 					wri.Header().Set("Cache-Control", "public, max-age=15")
 					wri.WriteHeader(http.StatusOK)
 					_, _ = wri.Write(raw)
+					profile.Mark(req.Context(), "write")
+					profile.End(req.Context(), "l1_hit")
 					return
 				}
 		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawMisses, "raw_misses")

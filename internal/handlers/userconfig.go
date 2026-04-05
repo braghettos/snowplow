@@ -14,6 +14,7 @@ import (
 	"github.com/krateoplatformops/plumbing/jwtutil"
 	"github.com/krateoplatformops/plumbing/kubeutil"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateoplatformops/snowplow/internal/profile"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/rest"
 )
@@ -26,6 +27,8 @@ import (
 func CachedUserConfig(signingKey, authnNS string, rc *rest.Config, c *cache.RedisCache) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(wri http.ResponseWriter, req *http.Request) {
+			ctx := profile.Start(req.Context(), req.URL.Path)
+
 			authHeader := req.Header.Get("Authorization")
 			if authHeader == "" {
 				response.Unauthorized(wri, fmt.Errorf("missing authorization header"))
@@ -43,8 +46,9 @@ func CachedUserConfig(signingKey, authnNS string, rc *rest.Config, c *cache.Redi
 				response.Unauthorized(wri, err)
 				return
 			}
+			profile.Mark(ctx, "jwt")
 
-			ep, err := cachedEndpointLookup(req.Context(), c, rc, userInfo.Username, authnNS)
+			ep, err := cachedEndpointLookup(ctx, c, rc, userInfo.Username, authnNS)
 			if err != nil {
 				if apierrors.IsNotFound(err) {
 					response.Unauthorized(wri, err)
@@ -53,8 +57,9 @@ func CachedUserConfig(signingKey, authnNS string, rc *rest.Config, c *cache.Redi
 				response.InternalError(wri, err)
 				return
 			}
+			profile.Mark(ctx, "usercfg")
 
-			ctx := xcontext.BuildContext(req.Context(),
+			ctx = xcontext.BuildContext(ctx,
 				xcontext.WithAccessToken(parts[1]),
 				xcontext.WithUserInfo(userInfo),
 				xcontext.WithUserConfig(ep),
