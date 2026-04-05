@@ -1099,6 +1099,9 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 		for ns := range changedNamespaces {
 			if ns != "" && !nsWithItems[ns] {
 				_ = rw.cache.Delete(ctx, ListKey(gvr, ns))
+				slog.Info("reconcile: cleared stale empty-ns list key",
+					slog.String("gvr", gvr.String()),
+					slog.String("ns", ns))
 			}
 		}
 
