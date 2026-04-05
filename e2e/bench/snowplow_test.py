@@ -586,6 +586,55 @@ def count_compositions():
     return len(out.strip().split("\n"))
 
 
+def list_composition_names():
+    """Return a set of (namespace, name) tuples for all compositions in the
+    cluster via kubectl. This is the ground-truth used by correctness
+    assertions. Returns None on failure (so callers can distinguish from
+    'legitimately empty').
+    """
+    rc, out, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "--all-namespaces",
+                         "-o", "jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name}{\"\\n\"}{end}")
+    if rc != 0:
+        return None
+    names = set()
+    for line in out.strip().split("\n"):
+        line = line.strip()
+        if "/" in line:
+            names.add(line)
+    return names
+
+
+def list_composition_names_from_cache(token):
+    """Return the set of (namespace, name) tuples the cache reports via the
+    compositions-list RESTAction. This is what the UI renders in the
+    Compositions page table. Compares against list_composition_names() to
+    detect silent cache corruption (right count, wrong items).
+    """
+    try:
+        _ms, code, body = http_get_json(
+            '/call?apiVersion=templates.krateo.io%2Fv1'
+            '&resource=restactions'
+            '&name=compositions-list'
+            '&namespace=krateo-system',
+            token,
+        )
+        if code != 200 or not isinstance(body, dict):
+            return None
+        items = (body.get("status") or {}).get("list") or []
+        names = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            md = item.get("metadata") or {}
+            ns = md.get("namespace", "")
+            name = md.get("name", "")
+            if ns and name:
+                names.add(f"{ns}/{name}")
+        return names
+    except Exception:
+        return None
+
+
 def count_compositions_in_ns(ns_name):
     rc, out, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "-n", ns_name, "--no-headers")
     if rc != 0 or not out.strip():
@@ -1924,6 +1973,10 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, token=None, 
             # the piechart widget API and the browser UI fetch.
             # Poll with retries to allow cascading refresh to propagate.
             if page_name == "Dashboard" and nav_num == num_navs:
+                # Prepare screenshots directory
+                screenshots_dir = os.path.join(os.path.dirname(__file__), "screenshots")
+                os.makedirs(screenshots_dir, exist_ok=True)
+
                 verify_timeout = 300
                 verify_interval = 3
                 verify_start = time.time()
@@ -1943,6 +1996,45 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, token=None, 
                     api_str_p = f"{api_count}" if api_count >= 0 else "?"
                     ui_str_p = f"{ui_count}" if ui_count >= 0 else "?"
                     log(f"    VERIFY poll {poll_num}: api={api_str_p} ui={ui_str_p} cluster={fresh_comp_count} ({elapsed_ms}ms)")
+
+                    # Scroll down to make the Compositions piechart visible
+                    try:
+                        page.evaluate("""() => {
+                            // Find all text nodes matching "Compositions", pick the
+                            // one in the main content area (not the sidebar nav).
+                            const walker = document.createTreeWalker(
+                                document.body, NodeFilter.SHOW_TEXT, null);
+                            let target = null;
+                            while (walker.nextNode()) {
+                                const node = walker.currentNode;
+                                if (node.textContent.trim() === 'Compositions') {
+                                    const el = node.parentElement;
+                                    // Skip sidebar/nav elements
+                                    if (el.closest('nav, [class*="sidebar"], [class*="menu"], [class*="sider"]'))
+                                        continue;
+                                    target = el;
+                                }
+                            }
+                            if (target) {
+                                // Scroll so the heading is at the top, exposing the
+                                // piechart below it in the viewport
+                                target.scrollIntoView({ block: 'start', behavior: 'instant' });
+                                return true;
+                            }
+                            // Fallback: scroll to bottom of page
+                            window.scrollTo(0, document.body.scrollHeight);
+                            return false;
+                        }""")
+                        page.wait_for_timeout(500)
+                    except Exception:
+                        pass
+                    ss_name = f"S{stage_num}_{cache_mode}_poll{poll_num}_api{api_str_p}_ui{ui_str_p}_cluster{fresh_comp_count}.png"
+                    try:
+                        page.screenshot(path=os.path.join(screenshots_dir, ss_name))
+                        log(f"    screenshot: {ss_name}")
+                    except Exception as e:
+                        log(f"    screenshot failed: {e}")
+
                     api_ok = (api_count >= 0 and api_count == fresh_comp_count)
                     ui_ok = (ui_count >= 0 and ui_count == fresh_comp_count)
                     if api_ok and ui_ok:
@@ -1961,6 +2053,67 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, token=None, 
                 log(f"    VERIFY {status} api={api_str} ui={ui_str} "
                     f"cluster={fresh_comp_count} converged={conv_str}"
                     + ("" if matched else " — MISMATCH"))
+
+                # Content-level correctness check: compare composition NAMES,
+                # not just counts. Catches silent cache corruption where the
+                # count matches but the cached items are the wrong set
+                # (stale entries present, recent deletes missing, etc.).
+                if matched and cache_mode == "ON" and token:
+                    truth = list_composition_names()
+                    cached = list_composition_names_from_cache(token)
+                    if truth is not None and cached is not None:
+                        if truth == cached:
+                            log(f"    CONTENT \u2713 {len(truth)} composition names match")
+                            m["content_match"] = True
+                        else:
+                            missing = truth - cached  # in cluster, not in cache
+                            extra = cached - truth    # in cache, not in cluster (stale)
+                            log(f"    CONTENT \u2717 DRIFT — missing={len(missing)} extra={len(extra)}")
+                            if missing:
+                                log(f"      missing (cluster has, cache doesn't): {sorted(missing)[:3]}...")
+                            if extra:
+                                log(f"      extra (cache has, cluster deleted): {sorted(extra)[:3]}...")
+                            m["content_match"] = False
+                            m["content_missing"] = len(missing)
+                            m["content_extra"] = len(extra)
+
+                # Final VERIFY screenshot — reload dashboard to get fresh
+                # data from the cache, then scroll to Compositions piechart
+                try:
+                    page.goto(f"{FRONTEND}/dashboard", wait_until="networkidle", timeout=30000)
+                    page.wait_for_timeout(2000)
+                except Exception:
+                    pass
+                try:
+                    page.evaluate("""() => {
+                        const walker = document.createTreeWalker(
+                            document.body, NodeFilter.SHOW_TEXT, null);
+                        let target = null;
+                        while (walker.nextNode()) {
+                            const node = walker.currentNode;
+                            if (node.textContent.trim() === 'Compositions') {
+                                const el = node.parentElement;
+                                if (el.closest('nav, [class*="sidebar"], [class*="menu"], [class*="sider"]'))
+                                    continue;
+                                target = el;
+                            }
+                        }
+                        if (target) {
+                            target.scrollIntoView({ block: 'start', behavior: 'instant' });
+                            return true;
+                        }
+                        window.scrollTo(0, document.body.scrollHeight);
+                        return false;
+                    }""")
+                    page.wait_for_timeout(500)
+                except Exception:
+                    pass
+                ss_final = f"S{stage_num}_{cache_mode}_VERIFY_{'PASS' if matched else 'FAIL'}_api{api_str}_ui{ui_str}_{conv_str}.png"
+                try:
+                    page.screenshot(path=os.path.join(screenshots_dir, ss_final))
+                    log(f"    screenshot: {ss_final}")
+                except Exception as e:
+                    log(f"    screenshot failed: {e}")
 
         # Compute metrics from navigations:
         # - p50: median of ALL navigations (including cold)
