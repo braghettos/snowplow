@@ -145,6 +145,7 @@ func main() {
 		} else {
 			log.Info("redis connected")
 			cache.GlobalMetrics.SetRedis(redisCache)
+			cache.GlobalMetrics.StartMetricsFlusher(ctx, 10*time.Second)
 		}
 	}
 

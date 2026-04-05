@@ -4,6 +4,7 @@ import (
 	"context"
 	"strconv"
 	"sync/atomic"
+	"time"
 )
 
 const metricsRedisKey = "snowplow:metrics"
@@ -35,13 +36,43 @@ func (m *Metrics) SetRedis(c *RedisCache) {
 	}
 }
 
-// Inc atomically increments the given counter and persists the delta to Redis.
-// The Redis write is fire-and-forget so it never blocks the hot path.
+// Inc atomically increments the given counter. The in-memory atomic is
+// always updated; Redis persistence happens asynchronously via a background
+// flusher (see StartMetricsFlusher) so the hot path stays ~nanoseconds.
 func (m *Metrics) Inc(counter *atomic.Int64, field string) {
 	counter.Add(1)
-	if c := m.rc.Load(); c != nil {
-		c.client.HIncrBy(context.Background(), metricsRedisKey, field, 1)
-	}
+}
+
+// StartMetricsFlusher starts a background goroutine that flushes the
+// in-memory counters to Redis every `interval`. Call once at startup.
+// The flush writes the TOTAL current count (HSET), not a delta — so
+// concurrent Inc calls and multi-pod deployments are both safe.
+func (m *Metrics) StartMetricsFlusher(ctx context.Context, interval time.Duration) {
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				c := m.rc.Load()
+				if c == nil {
+					continue
+				}
+				s := m.snapshotFromAtomics()
+				c.client.HSet(ctx, metricsRedisKey,
+					"get_hits", s.GetHits, "get_misses", s.GetMisses,
+					"list_hits", s.ListHits, "list_misses", s.ListMisses,
+					"rbac_hits", s.RBACHits, "rbac_misses", s.RBACMisses,
+					"raw_hits", s.RawHits, "raw_misses", s.RawMisses,
+					"l1_hits", s.L1Hits, "l1_misses", s.L1Misses,
+					"call_hits", s.CallHits, "call_misses", s.CallMisses,
+					"l3_promotions", s.L3Promotions, "negative_hits", s.NegativeHits,
+					"expiry_refreshes", s.ExpiryRefreshes)
+			}
+		}
+	}()
 }
 
 type MetricsSnapshot struct {
