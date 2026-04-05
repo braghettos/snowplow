@@ -70,7 +70,6 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 						slog.String("source", "L1-cache"),
 						slog.String("duration", util.ETA(start)))
 					wri.Header().Set("Content-Type", "application/json")
-					wri.Header().Set("Cache-Control", "public, max-age=15")
 					wri.WriteHeader(http.StatusOK)
 					_, _ = wri.Write(raw)
 					return
