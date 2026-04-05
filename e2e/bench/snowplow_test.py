@@ -1928,7 +1928,8 @@ def _verify_composition_count_ui(page):
                         + '%2Fv1beta1&resource=piecharts'
                         + '&name=dashboard-compositions-panel-row-piechart'
                         + '&namespace=krateo-system',
-                        { headers: { 'Authorization': 'Bearer ' + token } }
+                        { headers: { 'Authorization': 'Bearer ' + token },
+                          cache: 'no-store' }
                     );
                     if (resp.status !== 200) return -1;
                     const body = await resp.json();
