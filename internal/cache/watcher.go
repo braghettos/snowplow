@@ -1085,6 +1085,23 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 		}
 		rw.rebuildListCaches(ctx, gvr, allItems)
 
+		// Clear per-namespace list keys for namespaces that had changes but
+		// now have 0 items in the informer (e.g. namespace deleted with all
+		// its resources). rebuildListCaches only WRITES lists for namespaces
+		// WITH items, so stale per-ns list keys with ghost entries would
+		// otherwise persist until TTL expiry (causing the S8 21s tail bug).
+		nsWithItems := make(map[string]bool)
+		for _, it := range allItems {
+			if ns := it.GetNamespace(); ns != "" {
+				nsWithItems[ns] = true
+			}
+		}
+		for ns := range changedNamespaces {
+			if ns != "" && !nsWithItems[ns] {
+				_ = rw.cache.Delete(ctx, ListKey(gvr, ns))
+			}
+		}
+
 		// Trigger L1 refresh using PRECISE dependency indexes (same approach
 		// as the l3gen scanner). The broad L1GVRKey index can yield 2000+
 		// keys for popular GVRs (e.g. every per-composition widget/button),
