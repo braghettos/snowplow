@@ -14,8 +14,11 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	otellog "go.opentelemetry.io/otel/log/global"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
@@ -119,13 +122,33 @@ func Init(ctx context.Context, version string) (shutdown func(context.Context) e
 		return noop, err
 	}
 
-	// Composite shutdown flushes both providers.
+	// --- Log exporter ---
+	logExporter, err := otlploggrpc.New(ctx,
+		otlploggrpc.WithEndpoint(endpoint),
+		otlploggrpc.WithInsecure(),
+	)
+	if err != nil {
+		_ = tp.Shutdown(ctx)
+		_ = mp.Shutdown(ctx)
+		return noop, err
+	}
+
+	lp := sdklog.NewLoggerProvider(
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(logExporter, sdklog.WithExportTimeout(5*time.Second))),
+		sdklog.WithResource(res),
+	)
+	otellog.SetLoggerProvider(lp)
+
+	// Composite shutdown flushes all three providers.
 	shutdown = func(ctx context.Context) error {
 		var firstErr error
 		if e := tp.Shutdown(ctx); e != nil {
 			firstErr = e
 		}
 		if e := mp.Shutdown(ctx); e != nil && firstErr == nil {
+			firstErr = e
+		}
+		if e := lp.Shutdown(ctx); e != nil && firstErr == nil {
 			firstErr = e
 		}
 		return firstErr

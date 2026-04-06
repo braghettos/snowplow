@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 
+	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -54,4 +55,51 @@ func (h *TraceIDHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 
 func (h *TraceIDHandler) WithGroup(name string) slog.Handler {
 	return &TraceIDHandler{inner: h.inner.WithGroup(name)}
+}
+
+// NewOTelSlogHandler creates a multi-handler that writes logs to BOTH the
+// original handler (stderr JSON) AND the OTel LoggerProvider (OTLP export).
+// The OTel bridge automatically includes trace_id/span_id from context.
+func NewOTelSlogHandler(original slog.Handler) slog.Handler {
+	otelHandler := otelslog.NewHandler("snowplow")
+	return &multiHandler{handlers: []slog.Handler{original, otelHandler}}
+}
+
+// multiHandler fans out log records to multiple slog.Handlers.
+type multiHandler struct {
+	handlers []slog.Handler
+}
+
+func (m *multiHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	for _, h := range m.handlers {
+		if h.Enabled(ctx, level) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *multiHandler) Handle(ctx context.Context, r slog.Record) error {
+	for _, h := range m.handlers {
+		if h.Enabled(ctx, r.Level) {
+			_ = h.Handle(ctx, r)
+		}
+	}
+	return nil
+}
+
+func (m *multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	handlers := make([]slog.Handler, len(m.handlers))
+	for i, h := range m.handlers {
+		handlers[i] = h.WithAttrs(attrs)
+	}
+	return &multiHandler{handlers: handlers}
+}
+
+func (m *multiHandler) WithGroup(name string) slog.Handler {
+	handlers := make([]slog.Handler, len(m.handlers))
+	for i, h := range m.handlers {
+		handlers[i] = h.WithGroup(name)
+	}
+	return &multiHandler{handlers: handlers}
 }

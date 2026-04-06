@@ -159,10 +159,13 @@ func main() {
 	}
 	defer otelShutdown(ctx)
 
-	// When OTel is enabled, wrap the slog handler to inject trace_id/span_id
-	// into every log record that has an active span in context.
+	// When OTel is enabled, wrap the slog handler to:
+	// 1. Inject trace_id/span_id into stderr log output
+	// 2. Export logs via OTLP to ClickHouse (for HyperDX correlation)
 	if strings.EqualFold(os.Getenv("OTEL_ENABLED"), "true") {
-		log = slog.New(observability.NewTraceIDHandler(lh))
+		traceHandler := observability.NewTraceIDHandler(lh)
+		otelHandler := observability.NewOTelSlogHandler(traceHandler)
+		log = slog.New(otelHandler)
 		slog.SetDefault(log)
 	}
 
