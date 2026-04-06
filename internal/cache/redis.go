@@ -15,8 +15,13 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
+
+var redisTracer = otel.Tracer("snowplow/redis")
 
 type gvrNotifyFunc = func(context.Context, schema.GroupVersionResource)
 
@@ -182,16 +187,37 @@ func (c *RedisCache) GetRaw(ctx context.Context, key string) ([]byte, bool, erro
 	if c == nil {
 		return nil, false, nil
 	}
+	ctx, span := redisTracer.Start(ctx, "redis.get",
+		trace.WithAttributes(
+			attribute.String("db.system", "redis"),
+			attribute.String("db.operation", "GET"),
+			attribute.String("cache.key", key),
+		))
+	defer span.End()
+
 	val, err := c.client.Get(ctx, key).Bytes()
 	if errors.Is(err, redis.Nil) {
+		if span.IsRecording() {
+			span.SetAttributes(attribute.Bool("cache.hit", false))
+		}
 		return nil, false, nil
 	}
 	if err != nil {
+		span.RecordError(err)
 		return nil, false, err
 	}
 	val = decompressValue(val)
 	if bytes.Equal(val, []byte(notFoundSentinel)) {
+		if span.IsRecording() {
+			span.SetAttributes(attribute.Bool("cache.hit", false))
+		}
 		return nil, false, nil
+	}
+	if span.IsRecording() {
+		span.SetAttributes(
+			attribute.Bool("cache.hit", true),
+			attribute.Int("cache.value_size", len(val)),
+		)
 	}
 	return val, true, nil
 }
@@ -273,7 +299,20 @@ func (c *RedisCache) SetRaw(ctx context.Context, key string, val []byte) error {
 	if c == nil {
 		return nil
 	}
-	return c.client.Set(ctx, key, compressValue(val), c.ResourceTTL).Err()
+	ctx, span := redisTracer.Start(ctx, "redis.set",
+		trace.WithAttributes(
+			attribute.String("db.system", "redis"),
+			attribute.String("db.operation", "SET"),
+			attribute.String("cache.key", key),
+			attribute.Int("cache.value_size", len(val)),
+		))
+	defer span.End()
+
+	err := c.client.Set(ctx, key, compressValue(val), c.ResourceTTL).Err()
+	if err != nil {
+		span.RecordError(err)
+	}
+	return err
 }
 
 // SetResolvedRaw stores a fully-resolved widget/restaction output with
@@ -327,6 +366,14 @@ func (c *RedisCache) AtomicUpdateJSON(ctx context.Context, key string, fn func([
 	if c == nil {
 		return nil
 	}
+	ctx, span := redisTracer.Start(ctx, "redis.atomic_update",
+		trace.WithAttributes(
+			attribute.String("db.system", "redis"),
+			attribute.String("db.operation", "WATCH/MULTI/EXEC"),
+			attribute.String("cache.key", key),
+		))
+	defer span.End()
+
 	// High-contention workloads (e.g. 10 compositions/ns deployed rapidly) can
 	// cause repeated WATCH/EXEC failures on the same LIST key. 20 retries with
 	// jitter ensures all patches land even under burst event rates.
@@ -354,6 +401,9 @@ func (c *RedisCache) AtomicUpdateJSON(ctx context.Context, key string, fn func([
 			return err
 		}, key)
 		if err == nil {
+			if span.IsRecording() {
+				span.SetAttributes(attribute.Int("redis.retries", i))
+			}
 			return nil
 		}
 		if errors.Is(err, redis.TxFailedErr) {
@@ -363,8 +413,13 @@ func (c *RedisCache) AtomicUpdateJSON(ctx context.Context, key string, fn func([
 			time.Sleep(base + time.Duration(rand.Int64N(int64(base)+1)))
 			continue
 		}
+		span.RecordError(err)
 		return err
 	}
+	if span.IsRecording() {
+		span.SetAttributes(attribute.Int("redis.retries", maxRetries))
+	}
+	span.RecordError(redis.TxFailedErr)
 	return redis.TxFailedErr
 }
 

@@ -18,9 +18,14 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/profile"
 	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
+
+var widgetTracer = otel.Tracer("snowplow/dispatchers")
 
 func Widgets() http.Handler {
 	return &widgetsHandler{
@@ -63,7 +68,17 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			if uerr == nil {
 				resolvedKey = cache.ResolvedKey(user.Username, gvr, nsn.Namespace, nsn.Name, page, perPage)
 				profile.Mark(req.Context(), "build_key")
-				if raw, hit, _ := c.GetRaw(req.Context(), resolvedKey); hit {
+				lookupCtx, lookupSpan := widgetTracer.Start(req.Context(), "cache.lookup",
+					trace.WithAttributes(
+						attribute.String("cache.layer", "l1"),
+						attribute.String("cache.key", resolvedKey),
+					))
+				raw, hit, _ := c.GetRaw(lookupCtx, resolvedKey)
+				if lookupSpan.IsRecording() {
+					lookupSpan.SetAttributes(attribute.Bool("cache.hit", hit))
+				}
+				lookupSpan.End()
+				if hit {
 				profile.Mark(req.Context(), "redis_get")
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")

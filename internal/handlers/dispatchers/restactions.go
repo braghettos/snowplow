@@ -16,8 +16,13 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"k8s.io/apimachinery/pkg/runtime"
 )
+
+var restactionTracer = otel.Tracer("snowplow/dispatchers")
 
 func RESTAction() http.Handler {
 	return &restActionHandler{
@@ -58,7 +63,17 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			user, uerr := xcontext.UserInfo(req.Context())
 			if uerr == nil {
 				resolvedKey = cache.ResolvedKey(user.Username, gvr, nsn.Namespace, nsn.Name, page, perPage)
-				if raw, hit, _ := c.GetRaw(req.Context(), resolvedKey); hit {
+				lookupCtx, lookupSpan := restactionTracer.Start(req.Context(), "cache.lookup",
+					trace.WithAttributes(
+						attribute.String("cache.layer", "l1"),
+						attribute.String("cache.key", resolvedKey),
+					))
+				raw, hit, _ := c.GetRaw(lookupCtx, resolvedKey)
+				if lookupSpan.IsRecording() {
+					lookupSpan.SetAttributes(attribute.Bool("cache.hit", hit))
+				}
+				lookupSpan.End()
+				if hit {
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 					log.Info("RESTAction resolved from cache",

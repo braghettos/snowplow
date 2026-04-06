@@ -19,6 +19,7 @@ import (
 	"github.com/krateoplatformops/plumbing/server/use/cors"
 	"github.com/krateoplatformops/plumbing/slogs/pretty"
 	_ "github.com/krateoplatformops/snowplow/docs"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	"github.com/krateoplatformops/snowplow/internal/cache"
@@ -196,7 +197,7 @@ func main() {
 
 	mux.Handle("POST /jq", chain.Append(userCfg).Then(handlers.JQ()))
 
-	httpHandler := recoveryMiddleware(handlers.Gzip(use.CORS(cors.Options{
+	httpHandler := otelhttp.NewHandler(recoveryMiddleware(handlers.Gzip(use.CORS(cors.Options{
 		AllowedOrigins: []string{"*"},
 		AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowedHeaders: []string{
@@ -209,7 +210,7 @@ func main() {
 		ExposedHeaders:   []string{"Link"},
 		AllowCredentials: true,
 		MaxAge:           300,
-	})(mux)))
+	})(mux))), "snowplow")
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", *port),
