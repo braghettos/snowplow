@@ -70,9 +70,10 @@ func Init(ctx context.Context, version string) (shutdown func(context.Context) e
 		attrs = append(attrs, semconv.K8SNamespaceName(ns))
 	}
 
-	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes(semconv.SchemaURL, attrs...),
+	res, err := resource.New(ctx,
+		resource.WithAttributes(attrs...),
+		resource.WithProcessRuntimeDescription(),
+		resource.WithHost(),
 	)
 	if err != nil {
 		return noop, err
