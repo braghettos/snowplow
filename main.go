@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -157,6 +158,13 @@ func main() {
 		log.Warn("otel init failed", slog.Any("err", otelErr))
 	}
 	defer otelShutdown(ctx)
+
+	// When OTel is enabled, wrap the slog handler to inject trace_id/span_id
+	// into every log record that has an active span in context.
+	if strings.EqualFold(os.Getenv("OTEL_ENABLED"), "true") {
+		log = slog.New(observability.NewTraceIDHandler(lh))
+		slog.SetDefault(log)
+	}
 
 	// Middleware that injects the cache into every request context.
 	withCache := func(next http.Handler) http.Handler {

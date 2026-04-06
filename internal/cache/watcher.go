@@ -230,6 +230,9 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 // scanL3Gens scans all snowplow:l3gen:* keys, detects changes since the last
 // scan, and refreshes affected L1 keys via the dependency indexes.
 func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen, prevObserved map[string]string) {
+	ctx, span := watcherTracer.Start(ctx, "l3gen.scan")
+	defer span.End()
+
 	fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
 	if !ok || fn == nil {
 		// Don't update lastSeen — accumulate changes until fn is available.
@@ -378,6 +381,10 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen, prevObserve
 	slog.Info("resource-watcher: l3gen scan refresh",
 		slog.Int("changed_gvr_ns", len(changedGVRNS)),
 		slog.Int("l1_keys", len(keys)))
+	span.AddEvent("l3gen.scan.refresh", trace.WithAttributes(
+		attribute.Int("changed_gvr_ns", len(changedGVRNS)),
+		attribute.Int("l1_keys", len(keys)),
+	))
 
 	// Launch at most ONE async refresh. If a refresh is already running,
 	// skip this tick — the running refresh is processing changes, and the
@@ -386,6 +393,9 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen, prevObserve
 	// (synchronous approach regressed S4/S5 convergence from 3s to 40s).
 	if !rw.l1RefreshRunning.CompareAndSwap(false, true) {
 		slog.Debug("resource-watcher: l3gen refresh skipped (already running)")
+		span.AddEvent("l1.refresh.skipped", trace.WithAttributes(
+			attribute.String("reason", "already_running"),
+		))
 		return
 	}
 	// Commit staged lastSeen values now that the refresh is launching.
@@ -1105,6 +1115,10 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 			allItems = append(allItems, *stripped)
 		}
 		rw.rebuildListCaches(ctx, gvr, allItems)
+		span.AddEvent("l3.rebuilt", trace.WithAttributes(
+			attribute.String("gvr", gvr.String()),
+			attribute.Int("items", len(allItems)),
+		))
 
 		// Clear per-namespace list keys for namespaces that had changes but
 		// now have 0 items in the informer (e.g. namespace deleted with all
@@ -1120,6 +1134,10 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 		for ns := range changedNamespaces {
 			if ns != "" && !nsWithItems[ns] {
 				_ = rw.cache.Delete(ctx, ListKey(gvr, ns))
+				span.AddEvent("stale_ns_key.cleared", trace.WithAttributes(
+					attribute.String("gvr", gvr.String()),
+					attribute.String("namespace", ns),
+				))
 				slog.Debug("reconcile: cleared stale empty-ns list key",
 					slog.String("gvr", gvr.String()),
 					slog.String("ns", ns))
