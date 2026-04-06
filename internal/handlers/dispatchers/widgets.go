@@ -78,6 +78,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 						slog.String("duration", util.ETA(start)))
 					profile.Mark(req.Context(), "log_info")
 					wri.Header().Set("Content-Type", "application/json")
+					wri.Header().Set("Cache-Control", "public, max-age=3, stale-while-revalidate=12")
 					wri.WriteHeader(http.StatusOK)
 					profile.Mark(req.Context(), "headers")
 					_, _ = wri.Write(raw)
