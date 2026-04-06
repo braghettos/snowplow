@@ -148,6 +148,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 // resolve → marshal → strip annotations → cache-set. Called from the HTTP
 // handler (via singleflight) and from L1 refresh (via ResolveRESTActionDirect).
 func resolveRESTActionFromObject(ctx context.Context, c *cache.RedisCache, obj map[string]interface{}, resolvedKey, authnNS string, perPage, page int, extras map[string]any) ([]byte, error) {
+	ctx, span := restactionTracer.Start(ctx, "restaction.resolve")
+	defer span.End()
+
 	log := xcontext.Logger(ctx)
 
 	scheme := runtime.NewScheme()
@@ -159,7 +162,14 @@ func resolveRESTActionFromObject(ctx context.Context, c *cache.RedisCache, obj m
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj, &cr); err != nil {
 		log.Error("unable to convert unstructured to typed rest action",
 			slog.Any("err", err))
+		span.RecordError(err)
 		return nil, err
+	}
+	if span.IsRecording() {
+		span.SetAttributes(
+			attribute.String("restaction.name", cr.GetName()),
+			attribute.String("restaction.namespace", cr.GetNamespace()),
+		)
 	}
 
 	tracker := cache.NewDependencyTracker()

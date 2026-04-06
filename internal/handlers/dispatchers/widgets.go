@@ -165,6 +165,14 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 // Returns a *ResolveWidgetResult so singleflight callers can access both the
 // raw JSON (for HTTP response) and the resolved unstructured (for child pre-warming).
 func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objects.Result, resolvedKey, authnNS string, perPage, page int, extras map[string]any) (*ResolveWidgetResult, error) {
+	ctx, span := widgetTracer.Start(ctx, "widget.resolve",
+		trace.WithAttributes(
+			attribute.String("widget.kind", widgets.GetKind(got.Unstructured.Object)),
+			attribute.String("widget.name", widgets.GetName(got.Unstructured.Object)),
+			attribute.String("widget.namespace", widgets.GetNamespace(got.Unstructured.Object)),
+		))
+	defer span.End()
+
 	log := xcontext.Logger(ctx)
 
 	log = log.With(

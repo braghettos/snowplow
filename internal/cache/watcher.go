@@ -11,6 +11,9 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -21,6 +24,8 @@ import (
 	"k8s.io/client-go/rest"
 	k8scache "k8s.io/client-go/tools/cache"
 )
+
+var watcherTracer = otel.Tracer("snowplow/watcher")
 
 // L1RefreshFunc is invoked by the ResourceWatcher to proactively re-resolve
 // L1 cache entries instead of deleting them. The function receives the GVR
@@ -972,6 +977,22 @@ func (rw *ResourceWatcher) Reconcile(ctx context.Context) ReconcileStats {
 }
 
 func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVersionResource) (added, removed, updated, errs int) {
+	ctx, span := watcherTracer.Start(ctx, "reconcile.gvr",
+		trace.WithAttributes(
+			attribute.String("gvr", gvr.String()),
+		))
+	defer func() {
+		if span.IsRecording() {
+			span.SetAttributes(
+				attribute.Int("reconcile.added", added),
+				attribute.Int("reconcile.removed", removed),
+				attribute.Int("reconcile.updated", updated),
+				attribute.Int("reconcile.errors", errs),
+			)
+		}
+		span.End()
+	}()
+
 	// Per-GVR mutex: prevent concurrent reconciliation for the same GVR (Bug 4).
 	// startInformer and scheduleDynamicReconcile can both call reconcileGVR
 	// simultaneously, causing TOCTOU on L3 list cache writes.

@@ -11,9 +11,14 @@ import (
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/objects"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
+
+var l1RefreshTracer = otel.Tracer("snowplow/l1refresh")
 
 const (
 	refreshConcurrency         = 20 // warmup and HTTP-triggered refreshes
@@ -27,6 +32,14 @@ const (
 // the refresh runs (stale-while-revalidate).
 func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey string) cache.L1RefreshFunc {
 	return func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string) {
+		ctx, span := l1RefreshTracer.Start(ctx, "l1.refresh",
+			trace.WithAttributes(
+				attribute.String("trigger", triggerGVR.String()),
+				attribute.Int("keys", len(l1Keys)),
+			),
+		)
+		defer span.End()
+
 		log := slog.Default()
 
 		// Use lower concurrency for background l3gen scans (empty triggerGVR)
