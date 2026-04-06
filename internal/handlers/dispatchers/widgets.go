@@ -79,6 +79,12 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 				}
 				lookupSpan.End()
 				if hit {
+				if httpSpan := trace.SpanFromContext(req.Context()); httpSpan.IsRecording() {
+					httpSpan.AddEvent("cache.hit", trace.WithAttributes(
+						attribute.String("cache.key", resolvedKey),
+						attribute.String("cache.layer", "l1"),
+					))
+				}
 				profile.Mark(req.Context(), "redis_get")
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
@@ -101,6 +107,12 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 					profile.End(req.Context(), "l1_hit")
 					return
 				}
+		if httpSpan := trace.SpanFromContext(req.Context()); httpSpan.IsRecording() {
+			httpSpan.AddEvent("cache.miss", trace.WithAttributes(
+				attribute.String("cache.key", resolvedKey),
+				attribute.String("cache.layer", "l1"),
+			))
+		}
 		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawMisses, "raw_misses")
 		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Misses, "l1_misses")
 				log.Info("widget: L1 miss", slog.String("key", resolvedKey))
@@ -172,6 +184,13 @@ func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objec
 			attribute.String("widget.namespace", widgets.GetNamespace(got.Unstructured.Object)),
 		))
 	defer span.End()
+
+	if span.IsRecording() {
+		span.AddEvent("widget.resolution.started", trace.WithAttributes(
+			attribute.String("widget.kind", widgets.GetKind(got.Unstructured.Object)),
+			attribute.String("widget.name", widgets.GetName(got.Unstructured.Object)),
+		))
+	}
 
 	log := xcontext.Logger(ctx)
 

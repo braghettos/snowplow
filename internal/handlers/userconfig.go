@@ -15,6 +15,8 @@ import (
 	"github.com/krateoplatformops/plumbing/kubeutil"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/profile"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/rest"
 )
@@ -48,6 +50,12 @@ func CachedUserConfig(signingKey, authnNS string, rc *rest.Config, c *cache.Redi
 			}
 			profile.Mark(ctx, "jwt")
 
+			if span := trace.SpanFromContext(ctx); span.IsRecording() {
+				span.AddEvent("user.authenticated", trace.WithAttributes(
+					attribute.String("username", userInfo.Username),
+				))
+			}
+
 			ep, err := cachedEndpointLookup(ctx, c, rc, userInfo.Username, authnNS)
 			if err != nil {
 				if apierrors.IsNotFound(err) {
@@ -77,6 +85,11 @@ func cachedEndpointLookup(ctx context.Context, c *cache.RedisCache, rc *rest.Con
 		if raw, hit, _ := c.GetRaw(ctx, cacheKey); hit {
 			ep, err := unmarshalEndpoint(raw)
 			if err == nil {
+				if span := trace.SpanFromContext(ctx); span.IsRecording() {
+					span.AddEvent("user.config.cache_hit", trace.WithAttributes(
+						attribute.String("username", username),
+					))
+				}
 				slog.Debug("userconfig: cache hit", slog.String("user", username))
 				return ep, nil
 			}
@@ -95,6 +108,11 @@ func cachedEndpointLookup(ctx context.Context, c *cache.RedisCache, rc *rest.Con
 		}
 	}
 
+	if span := trace.SpanFromContext(ctx); span.IsRecording() {
+		span.AddEvent("user.config.cache_miss", trace.WithAttributes(
+			attribute.String("username", username),
+		))
+	}
 	slog.Debug("userconfig: cache miss, fetched from API", slog.String("user", username))
 	return ep, nil
 }

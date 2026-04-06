@@ -74,6 +74,12 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				}
 				lookupSpan.End()
 				if hit {
+				if httpSpan := trace.SpanFromContext(req.Context()); httpSpan.IsRecording() {
+					httpSpan.AddEvent("cache.hit", trace.WithAttributes(
+						attribute.String("cache.key", resolvedKey),
+						attribute.String("cache.layer", "l1"),
+					))
+				}
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 					log.Info("RESTAction resolved from cache",
@@ -90,6 +96,12 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 					_, _ = wri.Write(raw)
 					return
 				}
+		if httpSpan := trace.SpanFromContext(req.Context()); httpSpan.IsRecording() {
+			httpSpan.AddEvent("cache.miss", trace.WithAttributes(
+				attribute.String("cache.key", resolvedKey),
+				attribute.String("cache.layer", "l1"),
+			))
+		}
 		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawMisses, "raw_misses")
 		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Misses, "l1_misses")
 				log.Info("restaction: L1 miss", slog.String("key", resolvedKey))
