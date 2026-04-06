@@ -18,6 +18,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -175,6 +176,7 @@ func resolveRESTActionFromObject(ctx context.Context, c *cache.RedisCache, obj m
 		log.Error("unable to convert unstructured to typed rest action",
 			slog.Any("err", err))
 		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 	if span.IsRecording() {
@@ -198,6 +200,8 @@ func resolveRESTActionFromObject(ctx context.Context, c *cache.RedisCache, obj m
 			slog.String("name", cr.GetName()),
 			slog.String("namespace", cr.GetNamespace()),
 			slog.Any("err", err))
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 

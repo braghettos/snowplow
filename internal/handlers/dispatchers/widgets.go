@@ -20,6 +20,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -215,6 +216,8 @@ func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objec
 	})
 	if err != nil {
 		log.Error("unable to resolve widget", slog.Any("err", err))
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 

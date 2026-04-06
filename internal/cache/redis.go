@@ -17,6 +17,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -204,6 +205,7 @@ func (c *RedisCache) GetRaw(ctx context.Context, key string) ([]byte, bool, erro
 	}
 	if err != nil {
 		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, false, err
 	}
 	val = decompressValue(val)
@@ -311,6 +313,7 @@ func (c *RedisCache) SetRaw(ctx context.Context, key string, val []byte) error {
 	err := c.client.Set(ctx, key, compressValue(val), c.ResourceTTL).Err()
 	if err != nil {
 		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 	}
 	return err
 }
@@ -414,12 +417,14 @@ func (c *RedisCache) AtomicUpdateJSON(ctx context.Context, key string, fn func([
 			continue
 		}
 		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 	if span.IsRecording() {
 		span.SetAttributes(attribute.Int("redis.retries", maxRetries))
 	}
 	span.RecordError(redis.TxFailedErr)
+	span.SetStatus(codes.Error, redis.TxFailedErr.Error())
 	return redis.TxFailedErr
 }
 
