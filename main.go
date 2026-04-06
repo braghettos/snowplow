@@ -23,6 +23,7 @@ import (
 	"golang.org/x/net/http2/h2c"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers"
+	"github.com/krateoplatformops/snowplow/internal/observability"
 	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
 	httpSwagger "github.com/swaggo/http-swagger"
@@ -148,6 +149,13 @@ func main() {
 			cache.GlobalMetrics.StartMetricsFlusher(ctx, 10*time.Second)
 		}
 	}
+
+	// Initialize OpenTelemetry SDK (no-op when OTEL_ENABLED != "true").
+	otelShutdown, otelErr := observability.Init(ctx, build)
+	if otelErr != nil {
+		log.Warn("otel init failed", slog.Any("err", otelErr))
+	}
+	defer otelShutdown(ctx)
 
 	// Middleware that injects the cache into every request context.
 	withCache := func(next http.Handler) http.Handler {

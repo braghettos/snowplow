@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"sync/atomic"
 	"time"
+
+	"github.com/krateoplatformops/snowplow/internal/observability"
 )
 
 const metricsRedisKey = "snowplow:metrics"
@@ -41,6 +43,7 @@ func (m *Metrics) SetRedis(c *RedisCache) {
 // flusher (see StartMetricsFlusher) so the hot path stays ~nanoseconds.
 func (m *Metrics) Inc(counter *atomic.Int64, field string) {
 	counter.Add(1)
+	observability.IncrementCacheMetric(field)
 }
 
 // StartMetricsFlusher starts a background goroutine that flushes the
