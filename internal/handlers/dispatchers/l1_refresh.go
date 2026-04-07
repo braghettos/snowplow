@@ -144,100 +144,82 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 			slog.Int("warm", len(classified[warmUser])),
 			slog.Int("cold", len(classified[coldUser])))
 
-		var (
-			totalRefreshed int64
-			totalMu        sync.Mutex
-			outerWg        sync.WaitGroup
-			outerSem       = make(chan struct{}, 4) // max 4 concurrent users
-		)
+		var totalRefreshed int64
 		for username, keys := range byUser {
-			outerWg.Add(1)
-			outerSem <- struct{}{}
-			go func(username string, keys []userKeys) {
-				defer outerWg.Done()
-				defer func() { <-outerSem }()
+			ep, err := endpoints.FromSecret(ctx, rc, username+clientConfigSecretSuffix, authnNS)
+			if err != nil {
+				log.Warn("L1 refresh: cannot load user endpoint",
+					slog.String("user", username), slog.Any("err", err))
+				continue
+			}
+			groups := extractGroupsFromClientCert(ep.ClientCertificateData)
+			user := jwtutil.UserInfo{Username: username, Groups: groups}
+			accessToken := mintJWT(user, signKey)
 
-				ep, err := endpoints.FromSecret(ctx, rc, username+clientConfigSecretSuffix, authnNS)
-				if err != nil {
-					log.Warn("L1 refresh: cannot load user endpoint",
-						slog.String("user", username), slog.Any("err", err))
-					return
-				}
-				groups := extractGroupsFromClientCert(ep.ClientCertificateData)
-				user := jwtutil.UserInfo{Username: username, Groups: groups}
-				accessToken := mintJWT(user, signKey)
+			var (
+				wg         sync.WaitGroup
+				sem        = make(chan struct{}, concurrency)
+				mu         sync.Mutex
+				n          int64
+				allCascade []string
+			)
+			for _, k := range keys {
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(info cache.ResolvedKeyInfo, rawKey string) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					ok, cascade := refreshSingleL1(ctx, c, user, ep, accessToken, info, rawKey, authnNS)
+					if ok {
+						mu.Lock()
+						n++
+						allCascade = append(allCascade, cascade...)
+						mu.Unlock()
+					}
+				}(k.info, k.raw)
+			}
+			wg.Wait()
+			totalRefreshed += n
 
-				var (
-					wg         sync.WaitGroup
-					sem        = make(chan struct{}, concurrency)
-					mu         sync.Mutex
-					n          int64
-					allCascade []string
-				)
-				for _, k := range keys {
+			// Cascading refresh: iteratively re-resolve L1 keys that depend
+			// on refreshed RESTActions. Each round may discover more dependents
+			// (e.g. CRD event → compositions-get-ns-and-crd → compositions-list
+			// → piechart). Limit depth to avoid infinite loops.
+			refreshed := make(map[string]bool, len(keys))
+			for _, k := range keys {
+				refreshed[k.raw] = true
+			}
+			const maxCascadeDepth = 5
+			pending := allCascade
+			for depth := 0; depth < maxCascadeDepth && len(pending) > 0; depth++ {
+				var nextCascade []string
+				for _, ck := range pending {
+					if refreshed[ck] {
+						continue
+					}
+					refreshed[ck] = true
+					ci, cok := cache.ParseResolvedKey(ck)
+					if !cok || ci.Username != username {
+						continue
+					}
 					wg.Add(1)
 					sem <- struct{}{}
-					go func(info cache.ResolvedKeyInfo, rawKey string) {
+					go func(cInfo cache.ResolvedKeyInfo, cRawKey string) {
 						defer wg.Done()
 						defer func() { <-sem }()
-						ok, cascade := refreshSingleL1(ctx, c, user, ep, accessToken, info, rawKey, authnNS)
+						ok, cascade := refreshSingleL1(ctx, c, user, ep, accessToken, cInfo, cRawKey, authnNS)
 						if ok {
 							mu.Lock()
-							n++
-							allCascade = append(allCascade, cascade...)
+							totalRefreshed++
+							nextCascade = append(nextCascade, cascade...)
 							mu.Unlock()
 						}
-					}(k.info, k.raw)
+					}(ci, ck)
 				}
 				wg.Wait()
-
-				totalMu.Lock()
-				totalRefreshed += n
-				totalMu.Unlock()
-
-				// Cascading refresh: iteratively re-resolve L1 keys that depend
-				// on refreshed RESTActions. Each round may discover more dependents
-				// (e.g. CRD event → compositions-get-ns-and-crd → compositions-list
-				// → piechart). Limit depth to avoid infinite loops.
-				refreshed := make(map[string]bool, len(keys))
-				for _, k := range keys {
-					refreshed[k.raw] = true
-				}
-				const maxCascadeDepth = 5
-				pending := allCascade
-				for depth := 0; depth < maxCascadeDepth && len(pending) > 0; depth++ {
-					var nextCascade []string
-					for _, ck := range pending {
-						if refreshed[ck] {
-							continue
-						}
-						refreshed[ck] = true
-						ci, cok := cache.ParseResolvedKey(ck)
-						if !cok || ci.Username != username {
-							continue
-						}
-						wg.Add(1)
-						sem <- struct{}{}
-						go func(cInfo cache.ResolvedKeyInfo, cRawKey string) {
-							defer wg.Done()
-							defer func() { <-sem }()
-							ok, cascade := refreshSingleL1(ctx, c, user, ep, accessToken, cInfo, cRawKey, authnNS)
-							if ok {
-								mu.Lock()
-								totalMu.Lock()
-								totalRefreshed++
-								totalMu.Unlock()
-								nextCascade = append(nextCascade, cascade...)
-								mu.Unlock()
-							}
-						}(ci, ck)
-					}
-					wg.Wait()
-					pending = nextCascade
-				}
-			}(username, keys)
+				pending = nextCascade
+			}
 		}
-		outerWg.Wait()
 
 		if ctx.Err() != nil {
 			log.Warn("L1 refresh: context expired before completion",
