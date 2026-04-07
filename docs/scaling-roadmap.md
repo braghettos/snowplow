@@ -124,7 +124,11 @@
 1. In the RESTAction resolver (`resolve.go`), when page/perPage are specified, pass them to the K8s API as `?limit=N&continue=token` instead of fetching all and slicing
 2. Store only the requested page in L1
 3. When page/perPage are NOT specified (full list request), still store as a single key (backward compatible)
-4. The frontend sends page/perPage — snowplow stores and serves per-page
+
+**IMPORTANT**: The Krateo frontend does NOT currently support paginated compositions-list rendering. This feature requires coordinated frontend + backend work:
+- **Backend** (snowplow): accept and honor page/perPage parameters for compositions-list
+- **Frontend**: modify the compositions table component to request paginated data, handle page navigation, and display total count from a separate aggregation widget (piechart already provides this)
+- This is NOT a backend-only change. Frontend must be adapted first or simultaneously.
 
 **Pros**:
 - Breaks the 512MB Redis value limit: each page is ~1MB (100 items × 10KB) instead of 100MB
@@ -134,12 +138,13 @@
 - patchListCache on paginated keys: only the affected page needs re-resolve, not the entire list
 
 **Cons**:
+- **Frontend change required**: the current frontend requests the full compositions-list without pagination and renders it client-side with virtual scrolling/filtering. Adding server-side pagination requires frontend changes to the compositions table, search, sorting, and filtering components. This is a cross-team effort, not a snowplow-only change
 - **Invalidation complexity**: when a composition is added/deleted, WHICH page keys need invalidation? A composition in namespace bench-ns-50 could affect page 5 or page 50 depending on sort order. Safest approach: invalidate ALL pages for that user's compositions-list (batch DELETE of page keys)
 - **K8s API pagination semantics**: `?limit=100&continue=token` returns items in etcd key order, not alphabetical. Sort order depends on the continue token. If the frontend wants alphabetical sorting, server-side pagination may return inconsistent pages during mutations
 - **Continue token staleness**: K8s continue tokens are tied to a specific resource version. If the resource changes between page fetches, the token becomes invalid. The client must restart from page 1
 - **Cache coherence**: user views page 1 (items 1-100), then a new composition is added. Page 1 L1 key is invalidated. User navigates to page 2 — but page 2's L1 key is also invalidated because the new item shifted all subsequent pages. ALL page keys must be invalidated on any change, losing the per-page caching benefit
-- **Backward compatibility**: the compositions-list RESTAction uses a JQ filter that operates on the FULL array (counting ready/not-ready). Paginated K8s API results don't have aggregated counts. The piechart widget (which shows total count) would need a separate aggregation query
-- **Frontend dependency**: requires the frontend to send page/perPage. Diego confirmed this is optional (frontend may request unpaginated). The system must handle both paths
+- **Aggregation split**: the compositions-list RESTAction uses a JQ filter that operates on the FULL array (counting ready/not-ready). Paginated K8s API results don't have aggregated counts. The piechart widget (which shows total count) would need a separate aggregation query — this may already work since the piechart is a separate widget
+- **Backward compatibility**: unpaginated requests must still work (return full list). The system must handle both paths until the frontend is fully migrated
 
 ---
 
