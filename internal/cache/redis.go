@@ -359,6 +359,44 @@ func (c *RedisCache) Delete(ctx context.Context, keys ...string) error {
 	return c.client.Del(ctx, keys...).Err()
 }
 
+// ── Stale-while-revalidate markers ───────────────────────────────────────────
+
+const stalePrefix = "snowplow:stale:"
+
+// MarkStale sets a short-lived stale marker for each L1 key using a Redis
+// pipeline. The marker key is "snowplow:stale:{resolvedKey}". The actual L1
+// data is kept intact so it can be served immediately while a background
+// refresh runs.
+func (c *RedisCache) MarkStale(ctx context.Context, keys ...string) error {
+	if c == nil || len(keys) == 0 {
+		return nil
+	}
+	pipe := c.client.Pipeline()
+	for _, k := range keys {
+		pipe.Set(ctx, stalePrefix+k, "1", 5*time.Minute)
+	}
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// IsStale checks whether the given L1 key has been marked stale.
+func (c *RedisCache) IsStale(ctx context.Context, key string) bool {
+	if c == nil {
+		return false
+	}
+	n, _ := c.client.Exists(ctx, stalePrefix+key).Result()
+	return n > 0
+}
+
+// ClearStale removes the stale marker for a key (called after a successful
+// background refresh has written fresh data into L1).
+func (c *RedisCache) ClearStale(ctx context.Context, key string) {
+	if c == nil {
+		return
+	}
+	c.client.Del(ctx, stalePrefix+key)
+}
+
 // ── Atomic read-modify-write ──────────────────────────────────────────────────
 
 // AtomicUpdateJSON performs an optimistic-locking read-modify-write using

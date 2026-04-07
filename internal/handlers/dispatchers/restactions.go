@@ -15,6 +15,7 @@ import (
 	v1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
+	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -83,6 +84,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				}
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
+					stale := c.IsStale(req.Context(), resolvedKey)
 					log.Info("RESTAction resolved from cache",
 						slog.String("key", resolvedKey),
 						slog.String("user", user.Username),
@@ -90,11 +92,61 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 						slog.String("name", nsn.Name),
 						slog.String("namespace", nsn.Namespace),
 						slog.String("source", "L1-cache"),
+						slog.Bool("stale", stale),
 						slog.String("duration", util.ETA(start)))
 					wri.Header().Set("Content-Type", "application/json")
 					wri.Header().Set("Cache-Control", "public, max-age=3, stale-while-revalidate=12")
 					wri.WriteHeader(http.StatusOK)
 					_, _ = wri.Write(raw)
+
+					// Stale-while-revalidate: if this L1 key was marked stale
+					// by the invalidation path, trigger a background refresh so
+					// the NEXT request gets fresh data. The goroutine is bounded
+					// by singleflight (restactionBgFlight) — concurrent stale hits
+					// for the same key coalesce into one resolution.
+					if stale {
+						bgCtx := context.WithoutCancel(req.Context())
+						capturedGVR := gvr
+						capturedNSN := nsn
+						capturedKey := resolvedKey
+						capturedAuthnNS := r.authnNS
+						capturedPerPage := perPage
+						capturedPage := page
+						go func() {
+							defer func() {
+								if r := recover(); r != nil {
+									slog.Default().Error("stale restaction refresh panic",
+										slog.Any("recover", r),
+										slog.String("key", capturedKey))
+								}
+							}()
+							bgGot := objects.Get(bgCtx, v1.ObjectReference{
+								Reference: v1.Reference{
+									Name:      capturedNSN.Name,
+									Namespace: capturedNSN.Namespace,
+								},
+								APIVersion: capturedGVR.GroupVersion().String(),
+								Resource:   capturedGVR.Resource,
+							})
+							if bgGot.Err != nil {
+								slog.Default().Warn("stale restaction refresh: fetch failed",
+									slog.String("key", capturedKey),
+									slog.Any("err", bgGot.Err))
+								return
+							}
+							_, err := ResolveRESTActionBackground(bgCtx, c, bgGot.Unstructured.Object, capturedKey, capturedAuthnNS, capturedPerPage, capturedPage)
+							if err != nil {
+								slog.Default().Warn("stale restaction refresh: resolve failed",
+									slog.String("key", capturedKey),
+									slog.Any("err", err))
+								return
+							}
+							c.ClearStale(bgCtx, capturedKey)
+							slog.Default().Info("stale restaction refresh: done",
+								slog.String("key", capturedKey))
+						}()
+					}
+
 					return
 				}
 		if httpSpan := trace.SpanFromContext(req.Context()); httpSpan.IsRecording() {
