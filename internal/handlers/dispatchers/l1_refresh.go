@@ -73,22 +73,34 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 		// set tracks exactly who should get eager refresh.
 		// Users without a secret are skipped — their L1 expires via TTL and
 		// gets re-resolved on next login.
-		activeUsers, _ := c.SMembers(ctx, cache.ActiveUsersKey)
-		activeSet := make(map[string]bool, len(activeUsers))
-		for _, u := range activeUsers {
-			activeSet[u] = true
-		}
-		skippedUsers := 0
-		for username := range byUser {
-			if !activeSet[username] {
-				delete(byUser, username)
-				skippedUsers++
+		//
+		// FAIL-OPEN: if we cannot read the active-users set (Redis error,
+		// context cancelled, empty set), refresh ALL users rather than
+		// skipping everyone. Silent skip caused the S7 regression in v0.25.131.
+		activeUsers, err := c.SMembers(ctx, cache.ActiveUsersKey)
+		if err != nil || len(activeUsers) == 0 {
+			if err != nil {
+				log.Warn("L1 refresh: cannot read active-users set, refreshing all users",
+					slog.Any("err", err))
 			}
-		}
-		if skippedUsers > 0 {
-			log.Info("L1 refresh: skipped inactive users",
-				slog.Int("skipped", skippedUsers),
-				slog.Int("active", len(byUser)))
+			// Fall through — byUser is unchanged, all users refreshed
+		} else {
+			activeSet := make(map[string]bool, len(activeUsers))
+			for _, u := range activeUsers {
+				activeSet[u] = true
+			}
+			skippedUsers := 0
+			for username := range byUser {
+				if !activeSet[username] {
+					delete(byUser, username)
+					skippedUsers++
+				}
+			}
+			if skippedUsers > 0 {
+				log.Info("L1 refresh: skipped inactive users",
+					slog.Int("skipped", skippedUsers),
+					slog.Int("active", len(byUser)))
+			}
 		}
 
 		var totalRefreshed int64
