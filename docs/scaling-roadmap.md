@@ -1,6 +1,6 @@
 # Snowplow Cache — Scaling Roadmap
 
-**Baseline**: v0.25.131 (bounded-eager L1 refresh, full OTel, stale-while-revalidate Cache-Control)
+**Baseline**: v0.25.133 (bounded-eager L1 refresh with active-users filter, fail-open, UserSecretWatcher sync, full OTel, stale-while-revalidate Cache-Control)
 **Current validated scale**: 1,200 compositions × 2 users (4.3-4.5s convergence, full content correctness)
 **Target scale**: 50,000+ compositions × 1,000 users
 
@@ -112,45 +112,65 @@
 
 ---
 
-## Phase B — Pagination (Weeks 3-4)
+## Phase B — Per-Item L3 and RBAC Optimization (Weeks 3-4)
 
-### B1. Server-side paginated L1 storage
+### B1. Per-item L3 storage (replace monolithic list blobs)
 
-**What**: Instead of storing the entire compositions-list resolved output as a single L1 Redis key (~12MB at 1,200 compositions, ~100MB at 10K), store it as per-page keys: `snowplow:resolved:{user}:{gvr}:{ns}:{name}:p{page}:pp{perPage}`.
+**What**: Replace the monolithic L3 list keys (one Redis key holding ALL compositions serialized as JSON) with per-item storage: each composition is its own Redis key, and a Redis SET serves as the index.
 
-**Current code**: `restactions.go:219` calls `c.SetResolvedRaw(ctx, resolvedKey, raw)` with the FULL resolved output. The key format in `keys.go:340` already includes `page` and `perPage` but the resolver always produces the full result.
+**Current architecture**: `rebuildListCaches` serializes ALL items for a GVR into one Redis key. At 10K compositions, this key is ~100MB raw (~33MB gzip). `patchListCache` does WATCH/MULTI/EXEC on this entire blob for every single informer event.
 
-**Proposed change**:
-1. In the RESTAction resolver (`resolve.go`), when page/perPage are specified, pass them to the K8s API as `?limit=N&continue=token` instead of fetching all and slicing
-2. Store only the requested page in L1
-3. When page/perPage are NOT specified (full list request), still store as a single key (backward compatible)
+**Proposed architecture**:
+```
+# Current (monolithic blob):
+snowplow:list:composition.krateo.io/.../compositions:bench-ns-01 = {JSON blob with 1000 items}
 
-**Frontend status**: The Krateo frontend already has pagination infrastructure in `useWidgetQuery.ts`:
-- Uses `@tanstack/react-query`'s `useInfiniteQuery` for progressive page loading
-- Reads `page`/`perPage` from widget endpoint URL params
-- Detects more pages via `status.resourcesRefs.slice.continue === true`
-- Automatically fetches subsequent pages and merges `resourcesRefs.items` + `widgetData.items`
-- This is **progressive loading (infinite scroll)**, not classic page-by-page UI
+# Proposed (per-item + index):
+snowplow:get:...:bench-ns-01:app-01 = {single composition, 10KB}  (already exists)
+snowplow:get:...:bench-ns-01:app-02 = {single composition, 10KB}  (already exists)
+snowplow:list-idx:...:bench-ns-01 = SET {"snowplow:get:...:app-01", "snowplow:get:...:app-02", ...}  (NEW)
+```
 
-**Activation**: Pagination only activates when the widget endpoint URL includes `page` and `perPage` params. The compositions-list widget's RESTAction currently does NOT include these params. To enable:
-- **Backend** (snowplow): the compositions-list RESTAction's widget definition must include `page`/`perPage` in its endpoint URL, and snowplow must honor them by passing `?limit=N&continue=token` to the K8s API
-- **Frontend**: already handles it — no frontend code changes needed for the basic case
+**Impact at scale**:
+
+| Operation | Monolithic (current) | Per-item L3 |
+|-----------|---------------------|-------------|
+| Add 1 composition | Read 10MB blob → unmarshal → append → marshal → write 10MB (**2-5s**) | `SADD` index + `SET` 10KB key (**1ms**) |
+| Delete 1 composition | Read 10MB blob → unmarshal → scan → remove → marshal → write 10MB (**2-5s**) | `SREM` index + `DEL` key (**1ms**) |
+| Read full list | `GET` one 10MB key (**3ms**) | `SMEMBERS` + `MGET` all keys (**5-10ms**) |
+| CAS contention under burst | All writers contend on same key (**minutes of retries**) | **Zero contention** — each item independent |
+| Redis value limit | **512MB per key → ~50K compositions max** | **No limit** — each key is 10KB |
+
+**Changes required**:
+
+| File | Change | Effort |
+|------|--------|--------|
+| `watcher.go` `patchListCache` | Replace `AtomicUpdateJSON` on blob with `SADD`/`SREM` on index + `SET`/`DEL` on item | Medium |
+| `watcher.go` `rebuildListCaches` | Write index SET + verify individual items instead of blob | Medium |
+| `resolve.go` L3 intercept | Assemble list from `SMEMBERS` + `MGET` instead of single `GET` | Medium |
+| `redis.go` | Add index helpers (SAdd/SRem with TTL, assembly-on-read) | Low |
+| `patchListCache` | **Can be deleted entirely** — replaced by simple SET operations | Simplification |
+
+**Migration path**:
+1. Dual-write: write both blob + per-item index
+2. Read from per-item first, fall back to blob
+3. Validate correctness at test scale
+4. Remove blob writes
 
 **Pros**:
-- Breaks the 512MB Redis value limit: each page is ~1MB (100 items × 10KB) instead of 100MB
-- 100x reduction in per-request JSON marshal/unmarshal time
-- Browser receives 1MB instead of 100MB — instant rendering
-- L1 memory per user drops from 100MB to ~3MB (3 pages cached via LRU)
-- patchListCache on paginated keys: only the affected page needs re-resolve, not the entire list
+- Eliminates the #1 hard scaling limit (512MB Redis value = ~50K compositions)
+- Eliminates patchListCache CAS contention storms (the dominant write bottleneck)
+- Write operations drop from seconds to milliseconds
+- Enables future per-item pagination (read N items from index without assembling full list)
+- Individual GET keys already exist — the index SET is the only new data structure
+- `patchListCache` (the most complex, bug-prone function in watcher.go) can be deleted
 
 **Cons**:
-- **RESTAction configuration change**: the compositions-list widget's RESTAction must be updated to include `page`/`perPage` in its endpoint URL. This is a widget definition change (YAML/CR), not a code change, but it changes the API contract for that specific RESTAction
-- **Invalidation complexity**: when a composition is added/deleted, WHICH page keys need invalidation? A composition in namespace bench-ns-50 could affect page 5 or page 50 depending on sort order. Safest approach: invalidate ALL pages for that user's compositions-list (batch DELETE of page keys)
-- **K8s API pagination semantics**: `?limit=100&continue=token` returns items in etcd key order, not alphabetical. Sort order depends on the continue token. If the frontend wants alphabetical sorting, server-side pagination may return inconsistent pages during mutations
-- **Continue token staleness**: K8s continue tokens are tied to a specific resource version. If the resource changes between page fetches, the token becomes invalid. The client must restart from page 1
-- **Cache coherence**: user views page 1 (items 1-100), then a new composition is added. Page 1 L1 key is invalidated. User navigates to page 2 — but page 2's L1 key is also invalidated because the new item shifted all subsequent pages. ALL page keys must be invalidated on any change, losing the per-page caching benefit
-- **Aggregation split**: the compositions-list RESTAction uses a JQ filter that operates on the FULL array (counting ready/not-ready). Paginated K8s API results don't have aggregated counts. The piechart widget (which shows total count) would need a separate aggregation query — this may already work since the piechart is a separate widget
-- **Backward compatibility**: unpaginated requests must still work (return full list). RESTActions without `page`/`perPage` in their endpoint URL continue to work as before
+- Reads become ~3x slower: `SMEMBERS` + `MGET(1000 keys)` ≈ 5-10ms vs single `GET` ≈ 2-3ms. Acceptable given L1 cache serves most reads.
+- `SMEMBERS` returns unordered — if sort order matters, client-side sort is needed after assembly
+- Index SET + item keys must be kept in sync. If an item key exists but is not in the index (or vice versa), data is inconsistent. `rebuildListCaches` from informer store is the self-healing mechanism.
+- Migration period (dual-write) doubles Redis memory temporarily
+- Cluster-wide list assembly: reading ALL compositions (all namespaces) requires iterating all per-namespace index SETs. At 500 namespaces: 500 `SMEMBERS` calls. Can be pipelined.
 
 ---
 
@@ -351,6 +371,56 @@ for _, level := range levels {
 
 ---
 
+## Frontend Pagination (Design — ready for implementation when needed)
+
+### forPath-driven merge strategy
+
+The frontend's `useWidgetQuery.ts` `select()` function currently hardcodes merging `widgetData.items` across pages. This should be generalized to merge ALL `widgetDataTemplate` `forPath` fields:
+
+- **forPath produces an array** → concatenate across pages
+- **forPath produces a single value** (number, string) → sum across pages
+
+This enables any widget type to participate in pagination. The merge strategy is determined by the value type, not the widget kind.
+
+**Example — PieChart with paginated compositions-list**:
+
+```yaml
+widgetDataTemplate:
+  - forPath: series.data[0].value   # Ready count for this page
+    expression: ${ .list | map(select(...Ready:True...)) | length }
+  - forPath: series.data[1].value   # NotReady count
+    expression: ${ .list | map(select(...Ready:False...)) | length }
+  - forPath: series.total
+    expression: ${ .list | length }
+  - forPath: title
+    expression: ${ .list | length | tostring }
+```
+
+Page 1 (500 items): `series.data[0].value=475, series.total=500, title="500"`
+Page 2 (500 items): `series.data[0].value=480, series.total=500, title="500"`
+Merge: `series.data[0].value=955, series.total=1000, title="1000"`
+
+Snowplow's `maps.ParsePath` already supports indexed forPath (`series.data[0].value` → `["series","data","0","value"]`). No backend changes needed.
+
+**Note**: This design is ready but provides **no real advantage at current scale**. The RESTAction resolution fetches ALL compositions regardless of pagination — the JQ merely slices the output. Pagination reduces HTTP response size but not server-side resolution time. The L1 cache already serves most requests at 60ms. This feature becomes valuable only when combined with per-item L3 (Phase B1) which enables true server-side pagination.
+
+**Non-scrollable widgets** (PieChart, BarChart) would use `AutoPagination` (auto-fetch all pages) instead of `ScrollPagination` (fetch on scroll).
+
+---
+
+## RBAC Architecture Note
+
+The current `compositions-get-ns-and-crd` RESTAction lists namespaces using the user's credentials. Users without cluster-wide namespace list permission see zero compositions (silent 403 via `continueOnError: true`).
+
+**Correct approach**: The namespace listing should use a service account token obtained via K8s TokenRequest API. The RESTAction spec already supports this — `verb: POST` with `payload` for the TokenRequest call, then the SA token used in subsequent call headers via JQ interpolation.
+
+This requires:
+1. A dedicated ServiceAccount (`namespace-reader`) with ClusterRole to list namespaces
+2. User permission to `create` on `serviceaccounts/token` in the SA's namespace
+3. Updated `compositions-get-ns-and-crd` RESTAction YAML in `braghettos/portal`
+
+---
+
 ## Summary Matrix
 
 | Phase | Feature | Scale unlocked | Effort | Risk |
@@ -359,11 +429,11 @@ for _, level := range levels {
 | A2 | Activity classes (hot/warm/cold) | 1K users efficient | 2 days | Low |
 | A3 | OTel metrics + alerting | Production readiness | 1 day | None |
 | A4 | Phase 7 test (5K compositions) | Validation | 3 days | None |
-| B1 | Paginated L1 storage | 50K compositions | 1 week | Medium |
+| B1 | Per-item L3 (index sets replace blobs) | **50K compositions** | 1 week | Medium |
 | B2 | RBAC pre-warming | 500 namespaces | 3 days | Medium |
 | B3 | MGET batching | 500+ namespaces | 2 hours | Low |
 | C1 | zstd compression | 30% less memory + 3x faster | 2 days | Medium |
-| C2 | Incremental L1 patch | 50K compositions fast convergence | 1 week | High |
+| C2 | Incremental L1 patch | 50K fast convergence | 1 week | High |
 | C3 | Parallel topological levels | 30-40% faster resolution | 2 days | Low |
 | D1 | Sharded pods | 5K+ users | 2 weeks | High |
 | D2 | Push-based invalidation | Unlimited users (trades convergence) | 1 week | Medium |
