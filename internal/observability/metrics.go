@@ -16,6 +16,10 @@ var (
 	RBACHits     otelmetric.Int64Counter
 	RBACMisses   otelmetric.Int64Counter
 
+	// L1 refresh observability
+	L1RefreshDuration otelmetric.Float64Histogram
+	L1RefreshUsers    otelmetric.Int64Counter
+
 	// initialized is set to 1 after InitMetrics completes. Checked by
 	// IncrementCacheMetric to avoid nil-pointer dereferences.
 	initialized atomic.Int32
@@ -65,6 +69,25 @@ func InitMetrics(meter otelmetric.Meter) error {
 	RBACMisses, err = meter.Int64Counter("rbac.misses",
 		otelmetric.WithDescription("Number of RBAC cache misses"),
 		otelmetric.WithUnit("{miss}"),
+	)
+	if err != nil {
+		return err
+	}
+
+	// L1 refresh duration histogram (seconds)
+	l1Buckets := []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60, 120}
+	L1RefreshDuration, err = meter.Float64Histogram("l1.refresh.duration",
+		otelmetric.WithDescription("L1 refresh duration in seconds"),
+		otelmetric.WithUnit("s"),
+		otelmetric.WithExplicitBucketBoundaries(l1Buckets...),
+	)
+	if err != nil {
+		return err
+	}
+
+	L1RefreshUsers, err = meter.Int64Counter("l1.refresh.users",
+		otelmetric.WithDescription("Number of users refreshed in L1 refresh cycles"),
+		otelmetric.WithUnit("{user}"),
 	)
 	if err != nil {
 		return err

@@ -13,6 +13,7 @@ import (
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/objects"
+	"github.com/krateoplatformops/snowplow/internal/observability"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -50,6 +51,8 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 		if triggerGVR.Resource == "" {
 			concurrency = refreshConcurrencyBackground
 		}
+
+		refreshStart := time.Now()
 
 		log.Info("L1 refresh: starting",
 			slog.String("trigger", triggerGVR.String()),
@@ -221,17 +224,29 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 			}
 		}
 
+		// Record OTel metrics
+		refreshDuration := time.Since(refreshStart)
+		if observability.L1RefreshDuration != nil {
+			observability.L1RefreshDuration.Record(ctx, refreshDuration.Seconds())
+		}
+		if observability.L1RefreshUsers != nil {
+			observability.L1RefreshUsers.Add(ctx, int64(len(byUser)))
+		}
+
 		if ctx.Err() != nil {
-			log.Warn("L1 refresh: context expired before completion",
+			log.Error("L1 refresh: context expired before completion",
 				slog.String("trigger", triggerGVR.String()),
 				slog.Int64("refreshed", totalRefreshed),
 				slog.Int("total", len(l1Keys)),
+				slog.String("duration", refreshDuration.String()),
 				slog.Any("err", ctx.Err()))
+			span.SetStatus(2, "context expired") // codes.Error = 2
 		}
 		log.Info("L1 refresh: done",
 			slog.String("trigger", triggerGVR.String()),
 			slog.Int64("refreshed", totalRefreshed),
-			slog.Int("total", len(l1Keys)))
+			slog.Int("total", len(l1Keys)),
+			slog.String("duration", refreshDuration.String()))
 		// Use a fresh background context so the sentinel is always written,
 		// even if the refresh context has expired.
 		cache.MarkL1Ready(context.Background(), c)
