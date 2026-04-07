@@ -67,6 +67,30 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 			byUser[info.Username] = append(byUser[info.Username], userKeys{info: info, raw: key})
 		}
 
+		// Only refresh L1 for users with a valid -clientconfig secret
+		// (i.e., users who logged in while their certificate is still valid).
+		// authn removes the secret when the cert expires, so the active-users
+		// set tracks exactly who should get eager refresh.
+		// Users without a secret are skipped — their L1 expires via TTL and
+		// gets re-resolved on next login.
+		activeUsers, _ := c.SMembers(ctx, cache.ActiveUsersKey)
+		activeSet := make(map[string]bool, len(activeUsers))
+		for _, u := range activeUsers {
+			activeSet[u] = true
+		}
+		skippedUsers := 0
+		for username := range byUser {
+			if !activeSet[username] {
+				delete(byUser, username)
+				skippedUsers++
+			}
+		}
+		if skippedUsers > 0 {
+			log.Info("L1 refresh: skipped inactive users",
+				slog.Int("skipped", skippedUsers),
+				slog.Int("active", len(byUser)))
+		}
+
 		var totalRefreshed int64
 		for username, keys := range byUser {
 			ep, err := endpoints.FromSecret(ctx, rc, username+clientConfigSecretSuffix, authnNS)
