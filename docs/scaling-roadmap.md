@@ -125,10 +125,16 @@
 2. Store only the requested page in L1
 3. When page/perPage are NOT specified (full list request), still store as a single key (backward compatible)
 
-**IMPORTANT**: The Krateo frontend does NOT currently support paginated compositions-list rendering. This feature requires coordinated frontend + backend work:
-- **Backend** (snowplow): accept and honor page/perPage parameters for compositions-list
-- **Frontend**: modify the compositions table component to request paginated data, handle page navigation, and display total count from a separate aggregation widget (piechart already provides this)
-- This is NOT a backend-only change. Frontend must be adapted first or simultaneously.
+**Frontend status**: The Krateo frontend already has pagination infrastructure in `useWidgetQuery.ts`:
+- Uses `@tanstack/react-query`'s `useInfiniteQuery` for progressive page loading
+- Reads `page`/`perPage` from widget endpoint URL params
+- Detects more pages via `status.resourcesRefs.slice.continue === true`
+- Automatically fetches subsequent pages and merges `resourcesRefs.items` + `widgetData.items`
+- This is **progressive loading (infinite scroll)**, not classic page-by-page UI
+
+**Activation**: Pagination only activates when the widget endpoint URL includes `page` and `perPage` params. The compositions-list widget's RESTAction currently does NOT include these params. To enable:
+- **Backend** (snowplow): the compositions-list RESTAction's widget definition must include `page`/`perPage` in its endpoint URL, and snowplow must honor them by passing `?limit=N&continue=token` to the K8s API
+- **Frontend**: already handles it — no frontend code changes needed for the basic case
 
 **Pros**:
 - Breaks the 512MB Redis value limit: each page is ~1MB (100 items × 10KB) instead of 100MB
@@ -138,13 +144,13 @@
 - patchListCache on paginated keys: only the affected page needs re-resolve, not the entire list
 
 **Cons**:
-- **Frontend change required**: the current frontend requests the full compositions-list without pagination and renders it client-side with virtual scrolling/filtering. Adding server-side pagination requires frontend changes to the compositions table, search, sorting, and filtering components. This is a cross-team effort, not a snowplow-only change
+- **RESTAction configuration change**: the compositions-list widget's RESTAction must be updated to include `page`/`perPage` in its endpoint URL. This is a widget definition change (YAML/CR), not a code change, but it changes the API contract for that specific RESTAction
 - **Invalidation complexity**: when a composition is added/deleted, WHICH page keys need invalidation? A composition in namespace bench-ns-50 could affect page 5 or page 50 depending on sort order. Safest approach: invalidate ALL pages for that user's compositions-list (batch DELETE of page keys)
 - **K8s API pagination semantics**: `?limit=100&continue=token` returns items in etcd key order, not alphabetical. Sort order depends on the continue token. If the frontend wants alphabetical sorting, server-side pagination may return inconsistent pages during mutations
 - **Continue token staleness**: K8s continue tokens are tied to a specific resource version. If the resource changes between page fetches, the token becomes invalid. The client must restart from page 1
 - **Cache coherence**: user views page 1 (items 1-100), then a new composition is added. Page 1 L1 key is invalidated. User navigates to page 2 — but page 2's L1 key is also invalidated because the new item shifted all subsequent pages. ALL page keys must be invalidated on any change, losing the per-page caching benefit
 - **Aggregation split**: the compositions-list RESTAction uses a JQ filter that operates on the FULL array (counting ready/not-ready). Paginated K8s API results don't have aggregated counts. The piechart widget (which shows total count) would need a separate aggregation query — this may already work since the piechart is a separate widget
-- **Backward compatibility**: unpaginated requests must still work (return full list). The system must handle both paths until the frontend is fully migrated
+- **Backward compatibility**: unpaginated requests must still work (return full list). RESTActions without `page`/`perPage` in their endpoint URL continue to work as before
 
 ---
 
