@@ -51,7 +51,18 @@ func (uw *UserSecretWatcher) Start(ctx context.Context) error {
 		},
 	})
 	factory.Start(ctx.Done())
-	slog.Info("user-watcher: started informer", slog.String("namespace", uw.authnNS))
+
+	// Wait for the initial LIST to complete so that the active-users set
+	// is populated before any L1 refresh runs. Without this, the first
+	// refresh after pod start finds an empty active-users set and either
+	// skips all users (bug) or falls through to refresh everyone (wasteful).
+	synced := factory.WaitForCacheSync(ctx.Done())
+	for resource, ok := range synced {
+		if !ok {
+			slog.Warn("user-watcher: informer sync failed", slog.String("resource", resource.String()))
+		}
+	}
+	slog.Info("user-watcher: started and synced informer", slog.String("namespace", uw.authnNS))
 	return nil
 }
 
