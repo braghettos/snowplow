@@ -3,7 +3,9 @@ package dispatchers
 import (
 	"context"
 	"log/slog"
+	"strconv"
 	"sync"
+	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/endpoints"
@@ -102,6 +104,45 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 					slog.Int("active", len(byUser)))
 			}
 		}
+
+		// Classify users by activity: hot (<5min), warm (5-60min), cold (>60min).
+		// Cold users are skipped — their L1 expires via TTL and refreshes on next request.
+		type userClass int
+		const (
+			hotUser  userClass = iota // last request < 5 min
+			warmUser                  // 5-60 min
+			coldUser                  // > 60 min or no timestamp
+		)
+
+		now := time.Now().Unix()
+		classified := make(map[userClass][]string)
+		for username := range byUser {
+			raw, _, _ := c.GetRaw(ctx, "snowplow:last-seen:"+username)
+			if raw == nil {
+				classified[coldUser] = append(classified[coldUser], username)
+				continue
+			}
+			lastSeen, _ := strconv.ParseInt(string(raw), 10, 64)
+			age := now - lastSeen
+			switch {
+			case age < 300: // 5 min
+				classified[hotUser] = append(classified[hotUser], username)
+			case age < 3600: // 60 min
+				classified[warmUser] = append(classified[warmUser], username)
+			default:
+				classified[coldUser] = append(classified[coldUser], username)
+			}
+		}
+
+		// Skip cold users — they haven't been active in over 60 min
+		for _, username := range classified[coldUser] {
+			delete(byUser, username)
+		}
+
+		log.Info("L1 refresh: user activity classes",
+			slog.Int("hot", len(classified[hotUser])),
+			slog.Int("warm", len(classified[warmUser])),
+			slog.Int("cold", len(classified[coldUser])))
 
 		var totalRefreshed int64
 		for username, keys := range byUser {

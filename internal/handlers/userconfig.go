@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/endpoints"
@@ -49,6 +51,13 @@ func CachedUserConfig(signingKey, authnNS string, rc *rest.Config, c *cache.Redi
 				return
 			}
 			profile.Mark(ctx, "jwt")
+
+			// Track last-request timestamp for user activity classification.
+			// Fire-and-forget: failure here is non-critical.
+			if c != nil {
+				go c.SetStringWithTTL(context.Background(), "snowplow:last-seen:"+userInfo.Username,
+					strconv.FormatInt(time.Now().Unix(), 10), 60*time.Minute)
+			}
 
 			if span := trace.SpanFromContext(ctx); span.IsRecording() {
 				span.AddEvent("user.authenticated", trace.WithAttributes(
