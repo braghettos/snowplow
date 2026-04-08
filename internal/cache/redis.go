@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -33,35 +34,46 @@ const (
 	notFoundTTL        = 30 * time.Second
 )
 
-// ── Transparent gzip compression ──────────────────────────────────────────────
+// ── Transparent zstd compression (with gzip read-back for migration) ────────
 
 const compressMinSize = 256
 
-var gzWriterPool = sync.Pool{
-	New: func() any {
-		w, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed)
-		return w
-	},
-}
+// Package-level zstd encoder/decoder — these are expensive to create and
+// goroutine-safe, so we reuse a single instance of each.
+var (
+	zstdEncoder, _ = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+	zstdDecoder, _ = zstd.NewReader(nil)
+)
 
 func compressValue(data []byte) []byte {
 	if len(data) < compressMinSize {
 		return data
 	}
-	var buf bytes.Buffer
-	buf.Grow(len(data) / 3)
-	w := gzWriterPool.Get().(*gzip.Writer)
-	w.Reset(&buf)
-	_, _ = w.Write(data)
-	_ = w.Close()
-	gzWriterPool.Put(w)
-	return buf.Bytes()
+	return zstdEncoder.EncodeAll(data, make([]byte, 0, len(data)/2))
 }
 
 func decompressValue(data []byte) []byte {
-	if len(data) < 2 || data[0] != 0x1f || data[1] != 0x8b {
+	if len(data) < 2 {
 		return data
 	}
+	// Legacy gzip: magic bytes 0x1F 0x8B
+	if data[0] == 0x1f && data[1] == 0x8b {
+		return decompressGzip(data)
+	}
+	// zstd: magic bytes 0x28 0xB5 0x2F 0xFD (check first 4 bytes)
+	if len(data) >= 4 && data[0] == 0x28 && data[1] == 0xB5 && data[2] == 0x2F && data[3] == 0xFD {
+		out, err := zstdDecoder.DecodeAll(data, nil)
+		if err != nil {
+			return data
+		}
+		return out
+	}
+	// Uncompressed (below compressMinSize threshold)
+	return data
+}
+
+// decompressGzip handles legacy gzip-compressed values during migration.
+func decompressGzip(data []byte) []byte {
 	r, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
 		return data
