@@ -227,28 +227,42 @@ func (c *RedisCache) GetRaw(ctx context.Context, key string) ([]byte, bool, erro
 // GetRawMulti fetches multiple keys in a single Redis pipeline round-trip.
 // Returns a map of key → decompressed value for keys that exist.
 // Keys that don't exist or have the not-found sentinel are omitted.
+//
+// When len(keys) > mgetChunkSize, the request is split into chunks to avoid
+// blocking Redis for too long with a single large MGET (B3 scaling roadmap).
 func (c *RedisCache) GetRawMulti(ctx context.Context, keys []string) map[string][]byte {
 	if c == nil || len(keys) == 0 {
 		return nil
 	}
-	pipe := c.client.Pipeline()
-	cmds := make([]*redis.StringCmd, len(keys))
-	for i, k := range keys {
-		cmds[i] = pipe.Get(ctx, k)
-	}
-	_, _ = pipe.Exec(ctx)
+
+	const mgetChunkSize = 100
 
 	result := make(map[string][]byte, len(keys))
-	for i, cmd := range cmds {
-		val, err := cmd.Bytes()
-		if err != nil {
-			continue
+	for start := 0; start < len(keys); start += mgetChunkSize {
+		end := start + mgetChunkSize
+		if end > len(keys) {
+			end = len(keys)
 		}
-		val = decompressValue(val)
-		if bytes.Equal(val, []byte(notFoundSentinel)) {
-			continue
+		chunk := keys[start:end]
+
+		pipe := c.client.Pipeline()
+		cmds := make([]*redis.StringCmd, len(chunk))
+		for i, k := range chunk {
+			cmds[i] = pipe.Get(ctx, k)
 		}
-		result[keys[i]] = val
+		_, _ = pipe.Exec(ctx)
+
+		for i, cmd := range cmds {
+			val, err := cmd.Bytes()
+			if err != nil {
+				continue
+			}
+			val = decompressValue(val)
+			if bytes.Equal(val, []byte(notFoundSentinel)) {
+				continue
+			}
+			result[chunk[i]] = val
+		}
 	}
 	return result
 }
