@@ -108,8 +108,11 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 			}
 		}
 
-		// Classify users by activity: hot (<5min), warm (5-60min), cold (>60min).
-		// Cold users are skipped — their L1 expires via TTL and refreshes on next request.
+		// Classify users by activity for observability.
+		// NOTE: We intentionally do NOT skip cold users — the active-users set
+		// filter above is the only gate. Skipping cold users caused an S5 TIMEOUT
+		// regression in 0.25.136 when compositions were created during a period
+		// with no browser activity.
 		type userClass int
 		const (
 			hotUser  userClass = iota // last request < 5 min
@@ -135,11 +138,6 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 			default:
 				classified[coldUser] = append(classified[coldUser], username)
 			}
-		}
-
-		// Skip cold users — they haven't been active in over 60 min
-		for _, username := range classified[coldUser] {
-			delete(byUser, username)
 		}
 
 		log.Info("L1 refresh: user activity classes",
