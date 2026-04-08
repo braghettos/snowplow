@@ -34,7 +34,12 @@ const (
 // the background instead of deleting them. Old values keep being served while
 // the refresh runs (stale-while-revalidate).
 func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey string) cache.L1RefreshFunc {
-	return func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string) {
+	// incrementalCount tracks how many consecutive incremental patches have
+	// been applied. After fullRefreshInterval incremental patches, force a
+	// full re-resolve to correct any drift (safety net).
+	var incrementalCount int64
+
+	return func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string, changes []cache.L1ChangeInfo) {
 		ctx, span := l1RefreshTracer.Start(ctx, "l1.refresh",
 			trace.WithAttributes(
 				attribute.String("trigger", triggerGVR.String()),
@@ -151,8 +156,33 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 		// = 32 goroutines) which caused resource contention. A single global
 		// semaphore keeps total concurrent work at `concurrency` regardless of
 		// how many users are being refreshed.
+		// ── Incremental L1 patch (C2) ─────────────────────────────────────────
+		// When changes are small (delete-only, ≤20 items), try JSON-level patching
+		// on RESTAction L1 values before doing full resolution. This avoids the
+		// O(N) L3 assembly + JQ evaluation for the common single-delete case.
+		//
+		// Safety net: after fullRefreshInterval consecutive incremental patches,
+		// force a full re-resolve to correct any accumulated drift.
+		useIncremental := len(changes) > 0 && len(changes) <= 20 &&
+			incrementalCount < fullRefreshInterval && allDeleteChanges(changes)
+
+		if useIncremental {
+			incrementalCount++
+			span.AddEvent("l1.refresh.incremental", trace.WithAttributes(
+				attribute.Int("changes", len(changes)),
+				attribute.Int64("consecutive", incrementalCount),
+			))
+		} else {
+			if incrementalCount > 0 {
+				log.Info("L1 refresh: safety-net full resolve",
+					slog.Int64("after_incremental", incrementalCount))
+			}
+			incrementalCount = 0
+		}
+
 		var (
 			totalRefreshed int64
+			totalPatched   int64
 			globalSem      = make(chan struct{}, concurrency)
 			globalWg       sync.WaitGroup
 			globalMu       sync.Mutex
@@ -162,6 +192,36 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 		for _, cu := range orderedUsers {
 			username := cu.username
 			keys := byUser[username]
+
+			// For incremental patches on RESTAction keys, try patching
+			// before loading user credentials (which is expensive).
+			if useIncremental {
+				remaining := make([]userKeys, 0, len(keys))
+				for _, k := range keys {
+					if k.info.GVR.Group == templatesGroup && k.info.GVR.Resource == restactionResource {
+						if patchRESTActionL1(ctx, c, k.raw, changes) {
+							globalMu.Lock()
+							totalPatched++
+							totalRefreshed++
+							// Cascade: find L1 keys that depend on this RESTAction.
+							depKey := cache.L1ResourceDepKey(
+								cache.GVRToKey(k.info.GVR), k.info.NS, k.info.Name,
+							)
+							if cascade, err := c.SMembers(ctx, depKey); err == nil {
+								allCascade = append(allCascade, cascade...)
+							}
+							globalMu.Unlock()
+							continue
+						}
+					}
+					remaining = append(remaining, k)
+				}
+				keys = remaining
+				if len(keys) == 0 {
+					continue
+				}
+			}
+
 			ep, err := endpoints.FromSecret(ctx, rc, username+clientConfigSecretSuffix, authnNS)
 			if err != nil {
 				log.Warn("L1 refresh: cannot load user endpoint",
@@ -267,6 +327,7 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 		log.Info("L1 refresh: done",
 			slog.String("trigger", triggerGVR.String()),
 			slog.Int64("refreshed", totalRefreshed),
+			slog.Int64("patched", totalPatched),
 			slog.Int("total", len(l1Keys)),
 			slog.String("duration", refreshDuration.String()))
 		// Use a fresh background context so the sentinel is always written,
@@ -332,4 +393,14 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 	default:
 		return false, nil
 	}
+}
+
+// allDeleteChanges returns true if all changes in the list are delete operations.
+func allDeleteChanges(changes []cache.L1ChangeInfo) bool {
+	for _, ch := range changes {
+		if ch.Operation != "delete" {
+			return false
+		}
+	}
+	return true
 }

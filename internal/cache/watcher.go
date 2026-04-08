@@ -27,12 +27,22 @@ import (
 
 var watcherTracer = otel.Tracer("snowplow/watcher")
 
+// L1ChangeInfo describes a single L3 change that triggered an L1 refresh.
+// Used by the incremental L1 patch path (C2) to avoid full re-resolution
+// when only one item changed.
+type L1ChangeInfo struct {
+	GVR       schema.GroupVersionResource
+	Namespace string
+	Name      string
+	Operation string // "add", "update", "delete"
+}
+
 // L1RefreshFunc is invoked by the ResourceWatcher to proactively re-resolve
 // L1 cache entries instead of deleting them. The function receives the GVR
 // that triggered the refresh (for logging), the list of L1 keys to refresh,
-// and a long-lived context. It must run synchronously; the caller invokes it
-// in a goroutine.
-type L1RefreshFunc func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string)
+// recent L3 changes (for incremental patching), and a long-lived context.
+// It must run synchronously; the caller invokes it in a goroutine.
+type L1RefreshFunc func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string, changes []L1ChangeInfo)
 
 // expiryRefreshWorkers limits the number of concurrent goroutines handling
 // Redis key expiry refresh to prevent unbounded goroutine creation under
@@ -97,6 +107,14 @@ type ResourceWatcher struct {
 	// This prevents both goroutine accumulation (Bug 7) and scanner
 	// blocking (synchronous approach regressed S4/S5 convergence).
 	l1RefreshRunning atomic.Bool
+
+	// recentChanges tracks recent L3 changes for incremental L1 patching (C2).
+	// handleEvent appends; scanL3Gens drains. Protected by recentChangesMu.
+	// recentChangesOverflow is set when the buffer reaches capacity, signaling
+	// that some changes were lost and full resolution is needed.
+	recentChanges         []L1ChangeInfo
+	recentChangesOverflow bool
+	recentChangesMu       sync.Mutex
 
 	// l3genScanNow is a signal channel to trigger an immediate l3gen scan.
 	// Used by scheduleDynamicReconcile after reconcileGVR updates L3, so
@@ -404,6 +422,19 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen, prevObserve
 	for gk, v := range pendingLastSeen {
 		lastSeen[gk] = v
 	}
+
+	// Drain recent changes for incremental L1 patching (C2).
+	// If the buffer overflowed, pass nil to force full resolution.
+	rw.recentChangesMu.Lock()
+	changes := rw.recentChanges
+	overflow := rw.recentChangesOverflow
+	rw.recentChanges = nil
+	rw.recentChangesOverflow = false
+	rw.recentChangesMu.Unlock()
+	if overflow {
+		changes = nil // force full resolution
+	}
+
 	go func() {
 		defer rw.l1RefreshRunning.Store(false)
 		defer func() {
@@ -417,7 +448,7 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen, prevObserve
 		}()
 		refreshCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		defer cancel()
-		fn(refreshCtx, schema.GroupVersionResource{}, keys)
+		fn(refreshCtx, schema.GroupVersionResource{}, keys, changes)
 	}()
 }
 
@@ -728,6 +759,20 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	if isDynamic {
 		rw.scheduleDynamicReconcile(gvr)
 	}
+
+	// ── Record change for incremental L1 patching (C2) ──────────────────────
+	rw.recentChangesMu.Lock()
+	if len(rw.recentChanges) < 1000 {
+		rw.recentChanges = append(rw.recentChanges, L1ChangeInfo{
+			GVR:       gvr,
+			Namespace: ns,
+			Name:      name,
+			Operation: eventType,
+		})
+	} else {
+		rw.recentChangesOverflow = true
+	}
+	rw.recentChangesMu.Unlock()
 
 	// ── Enqueue L1 refresh event ─────────────────────────────────────────────
 	// L3 was just patched above. Enqueue the event for the L1 worker to
@@ -1196,7 +1241,9 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 						defer rw.l1RefreshRunning.Store(false)
 						refreshCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 						defer cancel()
-						fn(refreshCtx, gvr, l1Keys)
+						// reconcileGVR is a bulk operation — pass nil changes
+						// to force full resolution (no incremental patching).
+						fn(refreshCtx, gvr, l1Keys, nil)
 					}()
 				}
 			} else {
