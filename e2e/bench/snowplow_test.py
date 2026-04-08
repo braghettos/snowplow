@@ -680,12 +680,12 @@ def delete_all_compositions():
     def delete_comp(item):
         kubectl("delete", f"{COMP_RES}.{COMP_GVR}", item[1], "-n", item[0],
                 "--ignore-not-found", "--wait=false")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
         list(ex.map(delete_comp, items))
     log(f"Triggered deletion of {len(items)} compositions")
 
-    # Wait for all compositions to disappear (give controllers 120s to reconcile)
-    deadline = time.time() + 120
+    # Wait for all compositions to disappear (give controllers 300s to reconcile)
+    deadline = time.time() + 300
     while time.time() < deadline:
         remaining = count_compositions()
         if remaining == 0:
@@ -842,6 +842,47 @@ def deploy_compositions(ns_start, ns_end, comps_per_ns, max_retries=5):
                 log(f"  Deployed {deployed}/{total} compositions")
     if failed:
         log(f"  WARNING: {len(failed)}/{total} compositions failed to deploy")
+    else:
+        log(f"  All {total} compositions deployed successfully")
+
+
+def deploy_compositions_parallel(ns_start, ns_end, comps_per_ns, max_retries=5, workers=32):
+    """Deploy compositions in parallel using a thread pool.
+    Batches compositions per namespace into a single multi-doc YAML to reduce
+    kubectl invocations from N*M to N (one per namespace).
+    """
+    total = (ns_end - ns_start + 1) * comps_per_ns
+    log(f"Deploying {total} compositions in parallel (workers={workers}, batch-per-ns) ...")
+    failed = []
+    deployed_count = [0]  # mutable for closure
+
+    def deploy_ns_batch(ns_i):
+        ns = f"bench-ns-{ns_i:02d}"
+        yamls = []
+        for comp_i in range(1, comps_per_ns + 1):
+            name = f"bench-app-{ns_i:02d}-{comp_i:02d}"
+            yamls.append(composition_yaml(ns, name))
+        batch_yaml = "\n---\n".join(yamls)
+        ok = False
+        for attempt in range(1, max_retries + 1):
+            rc, _, err = kubectl("apply", "--server-side", "-f", "-", input_data=batch_yaml)
+            if rc == 0:
+                ok = True
+                break
+            if attempt < max_retries:
+                time.sleep(2 * attempt)
+        if not ok:
+            failed.append(ns)
+            log(f"  FAILED after {max_retries} attempts: {ns}: {err[:200]}")
+        deployed_count[0] += comps_per_ns
+        if deployed_count[0] % 500 == 0 or deployed_count[0] == total:
+            log(f"  Deployed {deployed_count[0]}/{total} compositions")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(deploy_ns_batch, range(ns_start, ns_end + 1)))
+
+    if failed:
+        log(f"  WARNING: {len(failed)} namespace batches failed to deploy")
     else:
         log(f"  All {total} compositions deployed successfully")
 
@@ -2228,22 +2269,42 @@ def run_phase_browser_scaling(tokens):
             if r:
                 all_results.append(r)
 
-            # S5 — 120 namespaces
+            # S5 — 500 namespaces (Phase 7: 5K scale)
             ts = _snapshot_l1()
-            create_bench_namespaces(21, 120); wait_for_bench_namespaces(120)
+            create_bench_namespaces(21, 500); wait_for_bench_namespaces(500, timeout=300)
             _stabilize(ts, quiesce=True)
-            r = _browser_measure_stage(page, 5, "120 bench ns", cache_mode, token=admin_token)
+            r = _browser_measure_stage(page, 5, "500 bench ns", cache_mode, token=admin_token)
             if r:
                 all_results.append(r)
 
-            # S6 — 1200 compositions
+            # S6 — 5000 compositions (Phase 7: 5K scale)
             ts = _snapshot_l1()
-            deploy_compositions(1, 120, 10)
-            wait_for_compositions(1200, timeout=600)
-            _stabilize(ts, quiesce=True, quiesce_secs=30)
-            r = _browser_measure_stage(page, 6, "1200 compositions", cache_mode, token=admin_token)
+            deploy_compositions_parallel(1, 500, 10)
+            wait_for_compositions(5000, timeout=1200)
+            _stabilize(ts, quiesce=True, quiesce_secs=60)
+            r = _browser_measure_stage(page, 6, "5000 compositions", cache_mode, token=admin_token)
             if r:
                 all_results.append(r)
+
+            # Redis memory snapshot at peak scale
+            if cache_mode == "ON":
+                try:
+                    mem_info = redis_cmd("INFO", "memory")
+                    for line in (mem_info or "").split("\n"):
+                        if line.startswith("used_memory_human:") or line.startswith("used_memory_peak_human:"):
+                            log(f"    REDIS {line.strip()}")
+                except Exception as e:
+                    log(f"    REDIS memory check failed: {e}")
+
+            # Pod restart check at peak scale
+            try:
+                rc, out, _ = kubectl("get", "pods", "-n", "krateo-system",
+                                     "-l", "app.kubernetes.io/name=snowplow",
+                                     "-o", "jsonpath={.items[0].status.containerStatuses[0].restartCount}")
+                if rc == 0:
+                    log(f"    POD restarts at 5K scale: {out.strip()}")
+            except Exception:
+                pass
 
             # S7 — Delete 1 composition
             ts = _snapshot_l1()
@@ -2254,10 +2315,10 @@ def run_phase_browser_scaling(tokens):
             if r:
                 all_results.append(r)
 
-            # S8 — Delete 1 namespace
+            # S8 — Delete 1 namespace (~10 compositions)
             ts = _snapshot_l1()
-            delete_one_bench_namespace("bench-ns-120")
-            wait_for_namespace_gone("bench-ns-120")
+            delete_one_bench_namespace("bench-ns-500")
+            wait_for_namespace_gone("bench-ns-500")
             _stabilize(ts)
             r = _browser_measure_stage(page, 8, "Deleted 1 ns", cache_mode, token=admin_token)
             if r:
