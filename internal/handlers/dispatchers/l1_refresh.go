@@ -108,45 +108,60 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 			}
 		}
 
-		// Classify users by activity for observability.
-		// NOTE: We intentionally do NOT skip cold users — the active-users set
-		// filter above is the only gate. Skipping cold users caused an S5 TIMEOUT
-		// regression in 0.25.136 when compositions were created during a period
-		// with no browser activity.
-		type userClass int
-		const (
-			hotUser  userClass = iota // last request < 5 min
-			warmUser                  // 5-60 min
-			coldUser                  // > 60 min or no timestamp
-		)
-
+		// Classify users by activity and build a priority-ordered refresh list.
+		// Hot users first, warm second, cold last. ALL users get refreshed —
+		// just in priority order so active users see fresh data sooner.
 		now := time.Now().Unix()
-		classified := make(map[userClass][]string)
+		type classifiedUser struct {
+			username string
+			class    string
+		}
+		var hotUsers, warmUsers, coldUsers []classifiedUser
 		for username := range byUser {
 			raw, _, _ := c.GetRaw(ctx, "snowplow:last-seen:"+username)
 			if raw == nil {
-				classified[coldUser] = append(classified[coldUser], username)
+				coldUsers = append(coldUsers, classifiedUser{username, "cold"})
 				continue
 			}
 			lastSeen, _ := strconv.ParseInt(string(raw), 10, 64)
 			age := now - lastSeen
 			switch {
 			case age < 300: // 5 min
-				classified[hotUser] = append(classified[hotUser], username)
+				hotUsers = append(hotUsers, classifiedUser{username, "hot"})
 			case age < 3600: // 60 min
-				classified[warmUser] = append(classified[warmUser], username)
+				warmUsers = append(warmUsers, classifiedUser{username, "warm"})
 			default:
-				classified[coldUser] = append(classified[coldUser], username)
+				coldUsers = append(coldUsers, classifiedUser{username, "cold"})
 			}
 		}
 
-		log.Info("L1 refresh: user activity classes",
-			slog.Int("hot", len(classified[hotUser])),
-			slog.Int("warm", len(classified[warmUser])),
-			slog.Int("cold", len(classified[coldUser])))
+		// Priority-ordered: hot first, warm second, cold last
+		orderedUsers := make([]classifiedUser, 0, len(hotUsers)+len(warmUsers)+len(coldUsers))
+		orderedUsers = append(orderedUsers, hotUsers...)
+		orderedUsers = append(orderedUsers, warmUsers...)
+		orderedUsers = append(orderedUsers, coldUsers...)
 
-		var totalRefreshed int64
-		for username, keys := range byUser {
+		log.Info("L1 refresh: user activity classes",
+			slog.Int("hot", len(hotUsers)),
+			slog.Int("warm", len(warmUsers)),
+			slog.Int("cold", len(coldUsers)))
+
+		// Global concurrency semaphore shared across ALL users.
+		// Previous attempt (v0.25.135) used nested semaphores (4 outer × 8 inner
+		// = 32 goroutines) which caused resource contention. A single global
+		// semaphore keeps total concurrent work at `concurrency` regardless of
+		// how many users are being refreshed.
+		var (
+			totalRefreshed int64
+			globalSem      = make(chan struct{}, concurrency)
+			globalWg       sync.WaitGroup
+			globalMu       sync.Mutex
+			allCascade     []string
+		)
+
+		for _, cu := range orderedUsers {
+			username := cu.username
+			keys := byUser[username]
 			ep, err := endpoints.FromSecret(ctx, rc, username+clientConfigSecretSuffix, authnNS)
 			if err != nil {
 				log.Warn("L1 refresh: cannot load user endpoint",
@@ -157,69 +172,78 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 			user := jwtutil.UserInfo{Username: username, Groups: groups}
 			accessToken := mintJWT(user, signKey)
 
-			var (
-				wg         sync.WaitGroup
-				sem        = make(chan struct{}, concurrency)
-				mu         sync.Mutex
-				n          int64
-				allCascade []string
-			)
 			for _, k := range keys {
-				wg.Add(1)
-				sem <- struct{}{}
-				go func(info cache.ResolvedKeyInfo, rawKey string) {
-					defer wg.Done()
-					defer func() { <-sem }()
-					ok, cascade := refreshSingleL1(ctx, c, user, ep, accessToken, info, rawKey, authnNS)
+				globalWg.Add(1)
+				globalSem <- struct{}{} // blocks if concurrency limit reached
+				go func(u jwtutil.UserInfo, e endpoints.Endpoint, token string, info cache.ResolvedKeyInfo, rawKey string) {
+					defer globalWg.Done()
+					defer func() { <-globalSem }()
+					ok, cascade := refreshSingleL1(ctx, c, u, e, token, info, rawKey, authnNS)
 					if ok {
-						mu.Lock()
-						n++
+						globalMu.Lock()
+						totalRefreshed++
 						allCascade = append(allCascade, cascade...)
-						mu.Unlock()
+						globalMu.Unlock()
 					}
-				}(k.info, k.raw)
+				}(user, ep, accessToken, k.info, k.raw)
 			}
-			wg.Wait()
-			totalRefreshed += n
+		}
 
-			// Cascading refresh: iteratively re-resolve L1 keys that depend
-			// on refreshed RESTActions. Each round may discover more dependents
-			// (e.g. CRD event → compositions-get-ns-and-crd → compositions-list
-			// → piechart). Limit depth to avoid infinite loops.
-			refreshed := make(map[string]bool, len(keys))
-			for _, k := range keys {
-				refreshed[k.raw] = true
-			}
-			const maxCascadeDepth = 5
-			pending := allCascade
-			for depth := 0; depth < maxCascadeDepth && len(pending) > 0; depth++ {
-				var nextCascade []string
-				for _, ck := range pending {
-					if refreshed[ck] {
-						continue
-					}
-					refreshed[ck] = true
-					ci, cok := cache.ParseResolvedKey(ck)
-					if !cok || ci.Username != username {
-						continue
-					}
-					wg.Add(1)
-					sem <- struct{}{}
-					go func(cInfo cache.ResolvedKeyInfo, cRawKey string) {
-						defer wg.Done()
-						defer func() { <-sem }()
-						ok, cascade := refreshSingleL1(ctx, c, user, ep, accessToken, cInfo, cRawKey, authnNS)
-						if ok {
-							mu.Lock()
-							totalRefreshed++
-							nextCascade = append(nextCascade, cascade...)
-							mu.Unlock()
-						}
-					}(ci, ck)
+		// Wait for ALL initial refreshes across all users to complete.
+		globalWg.Wait()
+
+		// Cascading refresh: iteratively re-resolve L1 keys that depend
+		// on refreshed RESTActions. Each round may discover more dependents
+		// (e.g. CRD event → compositions-get-ns-and-crd → compositions-list
+		// → piechart). Limit depth to avoid infinite loops.
+		// Cascade uses per-user credentials, so we re-load endpoints per key.
+		refreshed := make(map[string]bool, len(l1Keys))
+		for _, key := range l1Keys {
+			refreshed[key] = true
+		}
+		const maxCascadeDepth = 5
+		pending := allCascade
+		for depth := 0; depth < maxCascadeDepth && len(pending) > 0; depth++ {
+			var nextCascade []string
+			var cascadeWg sync.WaitGroup
+			var cascadeMu sync.Mutex
+			for _, ck := range pending {
+				if refreshed[ck] {
+					continue
 				}
-				wg.Wait()
-				pending = nextCascade
+				refreshed[ck] = true
+				ci, cok := cache.ParseResolvedKey(ck)
+				if !cok {
+					continue
+				}
+				// Skip if user is not in our active set
+				if _, ok := byUser[ci.Username]; !ok {
+					continue
+				}
+				ep, err := endpoints.FromSecret(ctx, rc, ci.Username+clientConfigSecretSuffix, authnNS)
+				if err != nil {
+					continue
+				}
+				groups := extractGroupsFromClientCert(ep.ClientCertificateData)
+				user := jwtutil.UserInfo{Username: ci.Username, Groups: groups}
+				accessToken := mintJWT(user, signKey)
+
+				cascadeWg.Add(1)
+				globalSem <- struct{}{}
+				go func(cInfo cache.ResolvedKeyInfo, cRawKey string, u jwtutil.UserInfo, e endpoints.Endpoint, token string) {
+					defer cascadeWg.Done()
+					defer func() { <-globalSem }()
+					ok, cascade := refreshSingleL1(ctx, c, u, e, token, cInfo, cRawKey, authnNS)
+					if ok {
+						cascadeMu.Lock()
+						totalRefreshed++
+						nextCascade = append(nextCascade, cascade...)
+						cascadeMu.Unlock()
+					}
+				}(ci, ck, user, ep, accessToken)
 			}
+			cascadeWg.Wait()
+			pending = nextCascade
 		}
 
 		// Record OTel metrics
