@@ -467,6 +467,131 @@ func (c *RedisCache) SAddWithTTL(ctx context.Context, key, member string, ttl ti
 	return err
 }
 
+// SAddMultiWithTTL adds multiple members to a Redis set and refreshes the TTL.
+// Uses a pipeline for efficiency — all operations in one round-trip.
+func (c *RedisCache) SAddMultiWithTTL(ctx context.Context, key string, members []string, ttl time.Duration) error {
+	if c == nil || len(members) == 0 {
+		return nil
+	}
+	args := make([]interface{}, len(members))
+	for i, m := range members {
+		args[i] = m
+	}
+	pipe := c.client.TxPipeline()
+	pipe.SAdd(ctx, key, args...)
+	pipe.Expire(ctx, key, ttl)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// SRemMembers removes one or more members from a Redis set.
+func (c *RedisCache) SRemMembers(ctx context.Context, key string, members ...string) error {
+	if c == nil || len(members) == 0 {
+		return nil
+	}
+	args := make([]interface{}, len(members))
+	for i, m := range members {
+		args[i] = m
+	}
+	return c.client.SRem(ctx, key, args...).Err()
+}
+
+// ReplaceSetWithTTL atomically replaces a Redis SET's members using DEL + SADD + EXPIRE
+// in a MULTI/EXEC transaction. This ensures the index is always consistent — no partial
+// state visible to concurrent readers.
+func (c *RedisCache) ReplaceSetWithTTL(ctx context.Context, key string, members []string, ttl time.Duration) error {
+	if c == nil {
+		return nil
+	}
+	pipe := c.client.TxPipeline()
+	pipe.Del(ctx, key)
+	if len(members) > 0 {
+		args := make([]interface{}, len(members))
+		for i, m := range members {
+			args[i] = m
+		}
+		pipe.SAdd(ctx, key, args...)
+		pipe.Expire(ctx, key, ttl)
+	}
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// AssembleListFromIndex reads a list-index SET (SMEMBERS) and fetches all
+// referenced GET keys via MGET, returning the assembled raw JSON as an
+// UnstructuredList. Falls back to the monolithic list blob if the index
+// does not exist (migration period).
+//
+// The apiVersion and kind parameters are needed to construct the list metadata
+// when assembling from per-item keys (the index SET does not store this info).
+func (c *RedisCache) AssembleListFromIndex(ctx context.Context, gvr schema.GroupVersionResource, namespace string) ([]byte, bool, error) {
+	if c == nil {
+		return nil, false, nil
+	}
+	idxKey := ListIndexKey(gvr, namespace)
+	members, err := c.client.SMembers(ctx, idxKey).Result()
+	if err != nil || len(members) == 0 {
+		// Index does not exist or is empty — fall back to blob.
+		return nil, false, err
+	}
+
+	// Build GET keys from member names.
+	// For namespace-scoped indexes, members are just "name".
+	// For cluster-wide indexes (namespace=""), members are "ns/name".
+	getKeys := make([]string, len(members))
+	for i, member := range members {
+		if namespace == "" {
+			// Cluster-wide index: member format is "ns/name".
+			parts := strings.SplitN(member, "/", 2)
+			if len(parts) == 2 {
+				getKeys[i] = GetKey(gvr, parts[0], parts[1])
+			} else {
+				// Cluster-scoped resource (no namespace): member is just "name".
+				getKeys[i] = GetKey(gvr, "", member)
+			}
+		} else {
+			getKeys[i] = GetKey(gvr, namespace, member)
+		}
+	}
+
+	// MGET all item keys in one pipeline.
+	results := c.GetRawMulti(ctx, getKeys)
+	if len(results) == 0 {
+		// All items expired — treat as miss.
+		return nil, false, nil
+	}
+
+	// Assemble into an UnstructuredList JSON.
+	// We build the JSON manually to avoid unmarshal/re-marshal overhead.
+	var buf bytes.Buffer
+	buf.WriteString(`{"apiVersion":"`)
+	g := gvr.Group
+	if g == "" {
+		buf.WriteString(gvr.Version)
+	} else {
+		buf.WriteString(g)
+		buf.WriteByte('/')
+		buf.WriteString(gvr.Version)
+	}
+	buf.WriteString(`","kind":"List","metadata":{"resourceVersion":""},"items":[`)
+
+	first := true
+	for _, k := range getKeys {
+		raw, ok := results[k]
+		if !ok || IsNotFoundRaw(raw) {
+			continue
+		}
+		if !first {
+			buf.WriteByte(',')
+		}
+		buf.Write(raw)
+		first = false
+	}
+	buf.WriteString(`]}`)
+
+	return buf.Bytes(), true, nil
+}
+
 // IsRBACAllowed performs a cache-only RBAC lookup (no K8s API call).
 // Returns (allowed, cached). If the RBAC result is not in the cache,
 // cached is false and allowed defaults to false (conservative deny).

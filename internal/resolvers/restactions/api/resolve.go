@@ -184,25 +184,35 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				// ── L3 cache intercept for K8s API GET calls ──────────────
 				// If this is a read (GET) and we have a cache, try to serve
 				// from L3 instead of hitting the K8s API. The informer keeps
-				// L3 up-to-date via patchListCache / SetForGVR.
+				// L3 up-to-date via per-item index SETs + SetForGVR.
 				if c != nil && verb == http.MethodGet {
-					var cacheKey string
+					var raw []byte
+					var hit bool
+
 					if pathName == "" {
-						cacheKey = cache.ListKey(pathGVR, pathNS)
+						// LIST operation: try per-item index assembly first (O(1) writes),
+						// then fall back to monolithic blob (legacy).
+						raw, hit, _ = c.AssembleListFromIndex(ctx, pathGVR, pathNS)
+						if !hit {
+							cacheKey := cache.ListKey(pathGVR, pathNS)
+							raw, hit = prefetched[cacheKey]
+							if !hit {
+								raw, hit, _ = c.GetRaw(ctx, cacheKey)
+							}
+						}
 					} else {
-						cacheKey = cache.GetKey(pathGVR, pathNS, pathName)
+						// GET operation: direct key lookup.
+						cacheKey := cache.GetKey(pathGVR, pathNS, pathName)
+						raw, hit = prefetched[cacheKey]
+						if !hit {
+							raw, hit, _ = c.GetRaw(ctx, cacheKey)
+						}
 					}
-					// Check pre-fetched MGET results first (0 round-trips),
-					// fall back to individual GetRaw (1 round-trip).
-					raw, hit := prefetched[cacheKey]
-					if !hit {
-						raw, hit, _ = c.GetRaw(ctx, cacheKey)
-					}
+
 					if hit {
 						log.Debug("L3 cache hit for K8s API path",
 							slog.String("name", id),
-							slog.String("path", call.Path),
-							slog.String("cacheKey", cacheKey))
+							slog.String("path", call.Path))
 						// Feed the cached JSON through the response handler
 						// as if it came from the K8s API.
 						handler := call.ResponseHandler
@@ -232,8 +242,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					} else {
 						log.Debug("L3 cache miss for K8s API path",
 							slog.String("name", id),
-							slog.String("path", call.Path),
-							slog.String("cacheKey", cacheKey))
+							slog.String("path", call.Path))
 					}
 				}
 			} else if callGVR, callNS, callName := cache.ParseCallPath(call.Path); callGVR.Resource != "" {
@@ -250,15 +259,24 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			if c != nil && verb == http.MethodGet {
 				pathGVR, pathNS, pathName := cache.ParseK8sAPIPath(call.Path)
 				if pathGVR.Resource != "" {
-					var l3Key string
+					var l3Raw []byte
+					var l3Hit bool
 					if pathName != "" {
-						l3Key = cache.GetKey(pathGVR, pathNS, pathName)
+						l3Key := cache.GetKey(pathGVR, pathNS, pathName)
+						l3Raw, l3Hit = prefetched[l3Key]
+						if !l3Hit {
+							l3Raw, l3Hit, _ = c.GetRaw(ctx, l3Key)
+						}
 					} else {
-						l3Key = cache.ListKey(pathGVR, pathNS)
-					}
-					l3Raw, l3Hit := prefetched[l3Key]
-					if !l3Hit {
-						l3Raw, l3Hit, _ = c.GetRaw(ctx, l3Key)
+						// LIST: try per-item index assembly first, then blob.
+						l3Raw, l3Hit, _ = c.AssembleListFromIndex(ctx, pathGVR, pathNS)
+						if !l3Hit {
+							l3Key := cache.ListKey(pathGVR, pathNS)
+							l3Raw, l3Hit = prefetched[l3Key]
+							if !l3Hit {
+								l3Raw, l3Hit, _ = c.GetRaw(ctx, l3Key)
+							}
+						}
 					}
 					if l3Hit && !cache.IsNotFoundRaw(l3Raw) {
 						rbacVerb := "list"

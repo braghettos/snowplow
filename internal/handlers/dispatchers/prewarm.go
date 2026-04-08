@@ -235,9 +235,21 @@ func WarmRBACForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Conf
 
 	var namespaces []string
 	nsGVR := schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}
-	nsListKey := cache.ListKey(nsGVR, "")
 	var nsList unstructured.UnstructuredList
-	if hit, gerr := c.Get(ctx, nsListKey, &nsList); hit && gerr == nil {
+	var nsHit bool
+	// Try per-item index assembly first.
+	if raw, idxHit, _ := c.AssembleListFromIndex(ctx, nsGVR, ""); idxHit {
+		if jerr := json.Unmarshal(raw, &nsList); jerr == nil {
+			nsHit = true
+		}
+	}
+	// Fallback to monolithic blob.
+	if !nsHit {
+		nsListKey := cache.ListKey(nsGVR, "")
+		nsHit2, gerr := c.Get(ctx, nsListKey, &nsList)
+		nsHit = nsHit2 && gerr == nil
+	}
+	if nsHit {
 		for _, ns := range nsList.Items {
 			namespaces = append(namespaces, ns.GetName())
 		}
@@ -344,10 +356,19 @@ func warmL1ForUser(ctx context.Context, c *cache.RedisCache, user jwtutil.UserIn
 
 	var allRefs []l1Ref
 	for _, gvr := range gvrs {
-		listKey := cache.ListKey(gvr, "")
 		var list unstructured.UnstructuredList
-		if hit, err := c.Get(ctx, listKey, &list); !hit || err != nil {
-			continue
+		var listFound bool
+		// Try per-item index assembly first.
+		if raw, idxHit, _ := c.AssembleListFromIndex(ctx, gvr, ""); idxHit {
+			if jerr := json.Unmarshal(raw, &list); jerr == nil {
+				listFound = true
+			}
+		}
+		if !listFound {
+			listKey := cache.ListKey(gvr, "")
+			if hit, err := c.Get(ctx, listKey, &list); !hit || err != nil {
+				continue
+			}
 		}
 		for _, obj := range list.Items {
 			rKey := cache.ResolvedKey(user.Username, gvr, obj.GetNamespace(), obj.GetName(), -1, -1)

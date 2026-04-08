@@ -68,9 +68,21 @@ func GetKey(gvr schema.GroupVersionResource, namespace, name string) string {
 	return fmt.Sprintf("snowplow:get:%s:%s:%s", GVRToKey(gvr), namespace, name)
 }
 
-// ListKey builds the shared cache key for a LIST operation.
+// ListKey builds the shared cache key for a LIST operation (monolithic blob, legacy).
 func ListKey(gvr schema.GroupVersionResource, namespace string) string {
 	return fmt.Sprintf("snowplow:list:%s:%s", GVRToKey(gvr), namespace)
+}
+
+// ListIndexKey builds the Redis SET key that indexes all item names for a
+// GVR+namespace combination. Each member is the resource name (not the full
+// GET key) so the index stays compact and we can reconstruct GET keys cheaply.
+func ListIndexKey(gvr schema.GroupVersionResource, namespace string) string {
+	return fmt.Sprintf("snowplow:list-idx:%s:%s", GVRToKey(gvr), namespace)
+}
+
+// ListIndexKeyPattern returns a glob pattern matching all list index keys for a GVR.
+func ListIndexKeyPattern(gvr schema.GroupVersionResource) string {
+	return fmt.Sprintf("snowplow:list-idx:%s:*", GVRToKey(gvr))
 }
 
 // DiscoveryKey builds the shared cache key for an API discovery result.
@@ -275,6 +287,15 @@ func ParseGetKey(key string) (gvr schema.GroupVersionResource, namespace, name s
 func ParseListKey(key string) (gvr schema.GroupVersionResource, namespace string, ok bool) {
 	parts := strings.SplitN(key, ":", 4)
 	if len(parts) != 4 || parts[0] != "snowplow" || parts[1] != "list" {
+		return
+	}
+	return ParseGVRKey(parts[2]), parts[3], true
+}
+
+// ParseListIndexKey parses a snowplow:list-idx cache key into its components.
+func ParseListIndexKey(key string) (gvr schema.GroupVersionResource, namespace string, ok bool) {
+	parts := strings.SplitN(key, ":", 4)
+	if len(parts) != 4 || parts[0] != "snowplow" || parts[1] != "list-idx" {
 		return
 	}
 	return ParseGVRKey(parts[2]), parts[3], true

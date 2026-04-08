@@ -176,7 +176,8 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	if has([]string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}, opts.verb) && c != nil {
 		getKey := cache.GetKey(opts.gvr, opts.nsn.Namespace, opts.nsn.Name)
 		listKey := cache.ListKey(opts.gvr, opts.nsn.Namespace)
-		_ = c.Delete(req.Context(), getKey, listKey, cache.ListKey(opts.gvr, ""))
+		listIdxKey := cache.ListIndexKey(opts.gvr, opts.nsn.Namespace)
+		_ = c.Delete(req.Context(), getKey, listKey, cache.ListKey(opts.gvr, ""), listIdxKey, cache.ListIndexKey(opts.gvr, ""))
 
 		gvrKey := cache.GVRToKey(opts.gvr)
 		for _, prefix := range []string{"snowplow:l1gvr:", "snowplow:l2gvr:"} {

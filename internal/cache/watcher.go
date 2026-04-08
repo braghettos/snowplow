@@ -645,15 +645,18 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		slog.String("ns", ns),
 		slog.String("name", name))
 	getKey := GetKey(gvr, ns, name)
-	nsListKey := ListKey(gvr, ns)
-	clusterListKey := ListKey(gvr, "")
+	ttl := rw.cache.TTLForGVR(gvr)
 
 	switch eventType {
 	case "delete":
 		_ = rw.cache.Delete(ctx, getKey)
-		rw.patchListCache(ctx, gvr, nsListKey, uns, "delete")
+		// Per-item index: remove from namespace and cluster-wide index SETs.
+		// O(1) — no read-modify-write of a blob.
+		nsIdxKey := ListIndexKey(gvr, ns)
+		_ = rw.cache.SRemMembers(ctx, nsIdxKey, name)
 		if ns != "" {
-			rw.patchListCache(ctx, gvr, clusterListKey, uns, "delete")
+			clusterIdxKey := ListIndexKey(gvr, "")
+			_ = rw.cache.SRemMembers(ctx, clusterIdxKey, ns+"/"+name)
 		}
 
 	case "add", "update":
@@ -664,9 +667,14 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 			slog.Warn("resource-watcher: failed to update GET cache",
 				slog.String("key", getKey), slog.Any("err", serr))
 		}
-		rw.patchListCache(ctx, gvr, nsListKey, stripped, eventType)
+		// Per-item index: add to namespace and cluster-wide index SETs.
+		// O(1) — no read-modify-write of a blob. The GET key written above
+		// holds the item data; the index SET just tracks membership.
+		nsIdxKey := ListIndexKey(gvr, ns)
+		_ = rw.cache.SAddWithTTL(ctx, nsIdxKey, name, ttl)
 		if ns != "" {
-			rw.patchListCache(ctx, gvr, clusterListKey, stripped, eventType)
+			clusterIdxKey := ListIndexKey(gvr, "")
+			_ = rw.cache.SAddWithTTL(ctx, clusterIdxKey, ns+"/"+name, ttl)
 		}
 	}
 
@@ -681,12 +689,10 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	// Store the latest resourceVersion for this GVR+ns so the l3gen scanner
 	// can detect L3 changes without re-reading the full list.
 	//
-	// SKIP for dynamic GVRs: their L3 list updates via patchListCache are
-	// under WATCH/MULTI contention and may lag the l3gen bump. If the
-	// scanner fires based on the l3gen bump while the list is still being
-	// patched, it refreshes L1 with stale/ghost items (S8 tail bug).
+	// SKIP for dynamic GVRs: per-item index updates are fast and contention-free,
+	// but the l3gen bump can still race with the debounced reconciliation.
 	// For dynamic GVRs, reconcileGVR (debounced below) is the sole trigger:
-	// it first rebuilds the L3 list from the informer's authoritative state,
+	// it rebuilds the L3 index + blob from the informer's authoritative state,
 	// then triggers the L1 refresh from consistent data.
 	rv := uns.GetResourceVersion()
 	if !isDynamic && rv != "" {
@@ -714,11 +720,11 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	}
 
 	// ── Debounced reconciliation for dynamic GVRs ────────────────────────────
-	// patchListCache updates L3 list keys one-by-one via AtomicUpdateJSON.
-	// Under rapid deployment bursts this can lag behind due to Redis transaction
-	// contention. For dynamic GVRs, schedule a debounced reconciliation that
-	// rebuilds all list caches from the informer's authoritative store once
-	// the burst settles, then triggers L1 refresh from consistent data.
+	// Per-item index updates (SADD/SREM) are O(1) and contention-free, but
+	// during rapid deployment bursts the index may temporarily have members
+	// whose GET keys haven't been written yet. For dynamic GVRs, schedule a
+	// debounced reconciliation that rebuilds all indexes from the informer's
+	// authoritative store once the burst settles, then triggers L1 refresh.
 	if isDynamic {
 		rw.scheduleDynamicReconcile(gvr)
 	}
@@ -1133,7 +1139,7 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 		}
 		for ns := range changedNamespaces {
 			if ns != "" && !nsWithItems[ns] {
-				_ = rw.cache.Delete(ctx, ListKey(gvr, ns))
+				_ = rw.cache.Delete(ctx, ListKey(gvr, ns), ListIndexKey(gvr, ns))
 				span.AddEvent("stale_ns_key.cleared", trace.WithAttributes(
 					attribute.String("gvr", gvr.String()),
 					attribute.String("namespace", ns),
@@ -1205,16 +1211,55 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 // rebuildListCaches writes namespace-scoped and cluster-wide LIST keys from
 // the given items. Used by Reconcile to ensure list caches match the
 // informer's authoritative state.
+//
+// Writes BOTH per-item index SETs (new) AND monolithic blobs (legacy)
+// during the migration period. The index SETs are authoritative; the blobs
+// are kept for backward compatibility with readers that haven't migrated.
 func (rw *ResourceWatcher) rebuildListCaches(ctx context.Context, gvr schema.GroupVersionResource, items []unstructured.Unstructured) {
+	ttl := rw.cache.TTLForGVR(gvr)
+
 	byNamespace := make(map[string][]unstructured.Unstructured)
 	for i := range items {
 		ns := items[i].GetNamespace()
 		byNamespace[ns] = append(byNamespace[ns], items[i])
 	}
 
+	// ── Per-item index SETs ──────────────────────────────────────────────────
+
+	// Build cluster-wide index: members are "ns/name" for namespaced resources.
+	var clusterMembers []string
+	for i := range items {
+		ns := items[i].GetNamespace()
+		name := items[i].GetName()
+		if ns != "" {
+			clusterMembers = append(clusterMembers, ns+"/"+name)
+		} else {
+			clusterMembers = append(clusterMembers, name)
+		}
+	}
+	if len(clusterMembers) > 0 {
+		_ = rw.cache.ReplaceSetWithTTL(ctx, ListIndexKey(gvr, ""), clusterMembers, ttl)
+	} else {
+		_ = rw.cache.Delete(ctx, ListIndexKey(gvr, ""))
+	}
+
+	// Build per-namespace indexes: members are just "name".
+	for ns, nsItems := range byNamespace {
+		if ns == "" {
+			continue
+		}
+		members := make([]string, len(nsItems))
+		for i := range nsItems {
+			members[i] = nsItems[i].GetName()
+		}
+		_ = rw.cache.ReplaceSetWithTTL(ctx, ListIndexKey(gvr, ns), members, ttl)
+	}
+
+	// ── Legacy monolithic blobs (dual-write for migration) ───────────────────
+
 	// Write cluster-wide list. Skip if empty: we don't know the Kind for this
 	// GVR without at least one item, and writing a malformed list (missing
-	// Kind/APIVersion) would cause patchListCache to fail on subsequent events.
+	// Kind/APIVersion) would produce a malformed list blob (legacy dual-write).
 	// The list will be created correctly when the first ADD event arrives.
 	if len(items) > 0 {
 		clusterList := &unstructured.UnstructuredList{Items: items}
@@ -1238,75 +1283,12 @@ func (rw *ResourceWatcher) rebuildListCaches(ctx context.Context, gvr schema.Gro
 	}
 }
 
-// patchListCache atomically patches the cached list in-place using WATCH/MULTI/EXEC.
-func (rw *ResourceWatcher) patchListCache(ctx context.Context, gvr schema.GroupVersionResource, listKey string, uns *unstructured.Unstructured, eventType string) {
-	ttl := rw.cache.TTLForGVR(gvr)
-	objNS, objName := uns.GetNamespace(), uns.GetName()
-
-	err := rw.cache.AtomicUpdateJSON(ctx, listKey, func(raw []byte) ([]byte, error) {
-		var list unstructured.UnstructuredList
-		if raw != nil {
-			if err := json.Unmarshal(raw, &list); err != nil {
-				return nil, err
-			}
-		}
-		if list.Object == nil {
-			list.Object = map[string]interface{}{
-				"kind":       uns.GetKind() + "List",
-				"apiVersion": uns.GetAPIVersion(),
-				"metadata":   map[string]interface{}{"resourceVersion": ""},
-			}
-		}
-		// Heal malformed lists that were previously stored without Kind/APIVersion
-		// (e.g. empty lists written by rebuildListCaches before this fix).
-		if list.GetKind() == "" {
-			list.SetKind(uns.GetKind() + "List")
-		}
-		if list.GetAPIVersion() == "" {
-			list.SetAPIVersion(uns.GetAPIVersion())
-		}
-		idx := -1
-		for i := range list.Items {
-			if list.Items[i].GetNamespace() == objNS && list.Items[i].GetName() == objName {
-				idx = i
-				break
-			}
-		}
-		switch eventType {
-		case "add":
-			if idx < 0 {
-				list.Items = append(list.Items, *uns)
-			} else {
-				list.Items[idx] = *uns
-			}
-		case "update":
-			if idx >= 0 {
-				list.Items[idx] = *uns
-			} else {
-				list.Items = append(list.Items, *uns)
-			}
-		case "delete":
-			if raw == nil {
-				return nil, nil
-			}
-			if idx >= 0 {
-				filtered := make([]unstructured.Unstructured, 0, len(list.Items)-1)
-				for i := range list.Items {
-					if i != idx {
-						filtered = append(filtered, list.Items[i])
-					}
-				}
-				list.Items = filtered
-			}
-		}
-		return json.Marshal(&list)
-	}, ttl)
-
-	if err != nil {
-		slog.Warn("resource-watcher: failed to patch list cache",
-			slog.String("key", listKey), slog.Any("err", err))
-	}
-}
+// patchListCache was the monolithic list patching function that used WATCH/MULTI/EXEC
+// to atomically read-modify-write the entire list blob for every informer event.
+// It has been replaced by per-item index SET operations (SADD/SREM) which are O(1)
+// and contention-free. The legacy blob is now only written by rebuildListCaches
+// during periodic reconciliation. This function is retained as dead code during
+// the migration period and can be removed once per-item storage is validated.
 
 // ── Proactive expiry refresh ──────────────────────────────────────────────────
 
@@ -1326,6 +1308,12 @@ func (rw *ResourceWatcher) handleExpiredKey(ctx context.Context, key string) {
 		gvr, ns, name, ok := ParseGetKey(key)
 		if ok && gvr.Resource != "" && name != "" {
 			rw.refreshGetKey(ctx, gvr, ns, name)
+		}
+	case strings.HasPrefix(key, "snowplow:list-idx:"):
+		// Index key expired — refresh the list (which rebuilds both index + blob).
+		gvr, ns, ok := ParseListIndexKey(key)
+		if ok && gvr.Resource != "" {
+			rw.refreshListKey(ctx, gvr, ns)
 		}
 	case strings.HasPrefix(key, "snowplow:list:"):
 		gvr, ns, ok := ParseListKey(key)
@@ -1375,12 +1363,32 @@ func (rw *ResourceWatcher) refreshListKey(ctx context.Context, gvr schema.GroupV
 			slog.String("gvr", gvr.String()), slog.Any("err", err))
 		return
 	}
+	ttl := rw.cache.TTLForGVR(gvr)
+
+	// Write per-item GET keys and build index members.
+	var members []string
+	for i := range list.Items {
+		obj := &list.Items[i]
+		_ = rw.cache.SetForGVR(ctx, gvr, GetKey(gvr, obj.GetNamespace(), obj.GetName()), obj)
+		if ns != "" {
+			members = append(members, obj.GetName())
+		} else if obj.GetNamespace() != "" {
+			members = append(members, obj.GetNamespace()+"/"+obj.GetName())
+		} else {
+			members = append(members, obj.GetName())
+		}
+	}
+
+	// Write per-item index SET.
+	if len(members) > 0 {
+		_ = rw.cache.ReplaceSetWithTTL(ctx, ListIndexKey(gvr, ns), members, ttl)
+	} else {
+		_ = rw.cache.Delete(ctx, ListIndexKey(gvr, ns))
+	}
+
+	// Dual-write: legacy blob.
 	listKey := ListKey(gvr, ns)
 	if serr := rw.cache.SetForGVR(ctx, gvr, listKey, list); serr == nil {
-		for i := range list.Items {
-			obj := &list.Items[i]
-			_ = rw.cache.SetForGVR(ctx, gvr, GetKey(gvr, obj.GetNamespace(), obj.GetName()), obj)
-		}
 		GlobalMetrics.Inc(&GlobalMetrics.ExpiryRefreshes, "expiry_refreshes")
 	}
 }

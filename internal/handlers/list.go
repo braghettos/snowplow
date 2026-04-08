@@ -105,18 +105,31 @@ func List() http.HandlerFunc {
 				_ = c.SAddGVR(req.Context(), gvr)
 			}
 
-			// Try list from shared cache.
+			// Try list from shared cache: per-item index first, then blob fallback.
 			if c != nil {
 				var cached unstructured.UnstructuredList
-				if hit, rerr := c.Get(req.Context(), listCacheKey, &cached); hit && rerr == nil {
-				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.ListHits, "list_hits")
-				log.Debug("list cache hit", slog.String("gvr", gvr.String()))
-				for _, x := range cached.Items {
-					unstructured.RemoveNestedField(x.UnstructuredContent(), "metadata", "managedFields")
-					rt = append(rt, x)
+				var listHit bool
+				// Try per-item index assembly.
+				if raw, idxHit, _ := c.AssembleListFromIndex(req.Context(), gvr, ns); idxHit {
+					if jerr := json.Unmarshal(raw, &cached); jerr == nil {
+						listHit = true
+					}
 				}
-				continue
-			}
+				// Fallback to monolithic blob.
+				if !listHit {
+					if hit, rerr := c.Get(req.Context(), listCacheKey, &cached); hit && rerr == nil {
+						listHit = true
+					}
+				}
+				if listHit {
+					cache.GlobalMetrics.Inc(&cache.GlobalMetrics.ListHits, "list_hits")
+					log.Debug("list cache hit", slog.String("gvr", gvr.String()))
+					for _, x := range cached.Items {
+						unstructured.RemoveNestedField(x.UnstructuredContent(), "metadata", "managedFields")
+						rt = append(rt, x)
+					}
+					continue
+				}
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.ListMisses, "list_misses")
 			}
 

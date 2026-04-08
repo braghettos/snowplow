@@ -223,6 +223,39 @@ func (w *Warmer) warmGVR(ctx context.Context, dynClient k8sdynamic.Interface, gv
 		byNamespace[obj.GetNamespace()] = append(byNamespace[obj.GetNamespace()], i)
 	}
 
+	ttl := w.cache.TTLForGVR(gvr)
+
+	// ── Per-item index SETs ──────────────────────────────────────────────────
+	// Build cluster-wide index members.
+	var clusterMembers []string
+	for i := range list.Items {
+		obj := &list.Items[i]
+		ns, name := obj.GetNamespace(), obj.GetName()
+		if ns != "" {
+			clusterMembers = append(clusterMembers, ns+"/"+name)
+		} else {
+			clusterMembers = append(clusterMembers, name)
+		}
+	}
+	if len(clusterMembers) > 0 {
+		_ = w.cache.ReplaceSetWithTTL(ctx, ListIndexKey(gvr, ""), clusterMembers, ttl)
+	}
+
+	// Build per-namespace index members.
+	nsMembers := make(map[string][]string)
+	for ns, indices := range byNamespace {
+		if ns == "" {
+			continue
+		}
+		for _, idx := range indices {
+			nsMembers[ns] = append(nsMembers[ns], list.Items[idx].GetName())
+		}
+	}
+	for ns, members := range nsMembers {
+		_ = w.cache.ReplaceSetWithTTL(ctx, ListIndexKey(gvr, ns), members, ttl)
+	}
+
+	// ── Legacy monolithic blobs (dual-write for migration) ───────────────────
 	if serr := w.cache.SetForGVR(ctx, gvr, ListKey(gvr, ""), list); serr != nil {
 		log.Warn("warmup: failed to cache cluster list", slog.Any("err", serr))
 	}
