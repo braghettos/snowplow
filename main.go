@@ -324,6 +324,7 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 
 	if authnNS != "" {
 		userWatcher := cache.NewUserSecretWatcher(c, rc, authnNS)
+		userWatcher.SetOnUserReady(dispatchers.MakeRBACPreWarmer(c, rc, authnNS, signKey))
 		if err := userWatcher.Start(ctx); err != nil {
 			log.Warn("failed to start user secret watcher", slog.Any("err", err))
 		}
