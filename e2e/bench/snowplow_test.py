@@ -57,6 +57,7 @@ FRONTEND = os.environ.get("FRONTEND_URL", "http://34.46.217.105:8080") or None
 ITERS = int(os.environ.get("ITERS", "10"))
 WARMUP_ITERS = int(os.environ.get("WARMUP_ITERS", "3"))
 SMOKE = os.environ.get("SMOKE", "0") == "1"
+SCREENSHOTS = os.environ.get("SCREENSHOTS", "0") == "1"
 SCALE = int(os.environ.get("SCALE", "5000"))
 NS = "krateo-system"
 
@@ -2087,12 +2088,13 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, token=None, 
                         page.wait_for_timeout(500)
                     except Exception:
                         pass
-                    ss_name = f"S{stage_num}_{cache_mode}_poll{poll_num}_api{api_str_p}_ui{ui_str_p}_cluster{fresh_comp_count}.png"
-                    try:
-                        page.screenshot(path=os.path.join(screenshots_dir, ss_name))
-                        log(f"    screenshot: {ss_name}")
-                    except Exception as e:
-                        log(f"    screenshot failed: {e}")
+                    if SCREENSHOTS:
+                        ss_name = f"S{stage_num}_{cache_mode}_poll{poll_num}_api{api_str_p}_ui{ui_str_p}_cluster{fresh_comp_count}.png"
+                        try:
+                            page.screenshot(path=os.path.join(screenshots_dir, ss_name))
+                            log(f"    screenshot: {ss_name}")
+                        except Exception as e:
+                            log(f"    screenshot failed: {e}")
 
                     api_ok = (api_count >= 0 and api_count == fresh_comp_count)
                     ui_ok = (ui_count >= 0 and ui_count == fresh_comp_count)
@@ -2167,12 +2169,13 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, token=None, 
                     page.wait_for_timeout(500)
                 except Exception:
                     pass
-                ss_final = f"S{stage_num}_{cache_mode}_VERIFY_{'PASS' if matched else 'FAIL'}_api{api_str}_ui{ui_str}_{conv_str}.png"
-                try:
-                    page.screenshot(path=os.path.join(screenshots_dir, ss_final))
-                    log(f"    screenshot: {ss_final}")
-                except Exception as e:
-                    log(f"    screenshot failed: {e}")
+                if SCREENSHOTS:
+                    ss_final = f"S{stage_num}_{cache_mode}_VERIFY_{'PASS' if matched else 'FAIL'}_api{api_str}_ui{ui_str}_{conv_str}.png"
+                    try:
+                        page.screenshot(path=os.path.join(screenshots_dir, ss_final))
+                        log(f"    screenshot: {ss_final}")
+                    except Exception as e:
+                        log(f"    screenshot failed: {e}")
 
         # Compute metrics from navigations:
         # - p50: median of ALL navigations (including cold)

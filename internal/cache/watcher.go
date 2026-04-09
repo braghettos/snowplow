@@ -704,7 +704,8 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 
 	case "add", "update":
 		stripped := uns.DeepCopy()
-		StripAnnotationsFromUnstructured(stripped)
+		// Note: StripAnnotationsFromUnstructured is already applied by
+		// SetTransform at informer ingestion time. No need to strip again.
 
 		if serr := rw.cache.SetForGVR(ctx, gvr, getKey, stripped); serr != nil {
 			slog.Warn("resource-watcher: failed to update GET cache",
@@ -1152,7 +1153,7 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 			continue // identical, skip
 		}
 		stripped := entry.uns.DeepCopy()
-		StripAnnotationsFromUnstructured(stripped)
+		// Already stripped by SetTransform at informer ingestion.
 		getKey := GetKey(gvr, stripped.GetNamespace(), stripped.GetName())
 		if serr := rw.cache.SetForGVR(ctx, gvr, getKey, stripped); serr != nil {
 			errs++
@@ -1174,7 +1175,7 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 		var allItems []unstructured.Unstructured
 		for _, entry := range informerMap {
 			stripped := entry.uns.DeepCopy()
-			StripAnnotationsFromUnstructured(stripped)
+			// Already stripped by SetTransform at informer ingestion.
 			allItems = append(allItems, *stripped)
 		}
 		rw.rebuildListCaches(ctx, gvr, allItems)
