@@ -59,11 +59,16 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 
 		refreshStart := time.Now()
 
+		changeOps := map[string]int{}
+		for _, ch := range changes {
+			changeOps[ch.Operation]++
+		}
 		log.Info("L1 refresh: starting",
 			slog.String("trigger", triggerGVR.String()),
 			slog.Int("keys", len(l1Keys)),
 			slog.Int("concurrency", concurrency),
-			slog.Int("changes", len(changes)))
+			slog.Int("changes", len(changes)),
+			slog.Any("ops", changeOps))
 
 		type userKeys struct {
 			info cache.ResolvedKeyInfo
@@ -164,8 +169,11 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 		//
 		// Safety net: after fullRefreshInterval consecutive incremental patches,
 		// force a full re-resolve to correct any accumulated drift.
-		useIncremental := len(changes) > 0 && len(changes) <= 20 &&
-			incrementalCount < fullRefreshInterval && allDeleteChanges(changes)
+		// Extract only delete changes — status updates from controllers
+		// contaminate the buffer but don't affect L1 output.
+		deleteChanges := filterDeleteChanges(changes)
+		useIncremental := len(deleteChanges) > 0 && len(deleteChanges) <= 20 &&
+			incrementalCount < fullRefreshInterval
 
 		if useIncremental {
 			incrementalCount++
@@ -200,7 +208,7 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 				remaining := make([]userKeys, 0, len(keys))
 				for _, k := range keys {
 					if k.info.GVR.Group == templatesGroup && k.info.GVR.Resource == restactionResource {
-						if patchRESTActionL1(ctx, c, k.raw, changes) {
+						if patchRESTActionL1(ctx, c, k.raw, deleteChanges) {
 							globalMu.Lock()
 							totalPatched++
 							totalRefreshed++
@@ -396,20 +404,30 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 	}
 }
 
-// allDeleteChanges returns true if the net effect of all changes is deletes only.
-// K8s informers often fire UPDATE before DELETE (adding deletionTimestamp/finalizer),
-// so we check the last operation per namespace/name rather than requiring all events
-// to be deletes.
-func allDeleteChanges(changes []cache.L1ChangeInfo) bool {
+// filterDeleteChanges extracts changes whose net effect is a delete.
+// K8s informers fire UPDATE before DELETE (adding deletionTimestamp),
+// so we track the last operation per namespace/name. Items whose last
+// operation is "delete" are included; background controller updates
+// on other items are ignored.
+func filterDeleteChanges(changes []cache.L1ChangeInfo) []cache.L1ChangeInfo {
 	type nsName struct{ ns, name string }
 	lastOp := make(map[nsName]string, len(changes))
 	for _, ch := range changes {
 		lastOp[nsName{ch.Namespace, ch.Name}] = ch.Operation
 	}
-	for _, op := range lastOp {
-		if op != "delete" {
-			return false
+	var deletes []cache.L1ChangeInfo
+	seen := make(map[nsName]bool)
+	for _, ch := range changes {
+		key := nsName{ch.Namespace, ch.Name}
+		if lastOp[key] == "delete" && !seen[key] {
+			seen[key] = true
+			deletes = append(deletes, cache.L1ChangeInfo{
+				GVR:       ch.GVR,
+				Namespace: ch.Namespace,
+				Name:      ch.Name,
+				Operation: "delete",
+			})
 		}
 	}
-	return true
+	return deletes
 }
