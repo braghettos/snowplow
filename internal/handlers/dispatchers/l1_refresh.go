@@ -62,7 +62,8 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 		log.Info("L1 refresh: starting",
 			slog.String("trigger", triggerGVR.String()),
 			slog.Int("keys", len(l1Keys)),
-			slog.Int("concurrency", concurrency))
+			slog.Int("concurrency", concurrency),
+			slog.Int("changes", len(changes)))
 
 		type userKeys struct {
 			info cache.ResolvedKeyInfo
