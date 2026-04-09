@@ -580,6 +580,18 @@ func (rw *ResourceWatcher) registerInformer(gvr schema.GroupVersionResource) boo
 
 	ctx := rw.appCtx
 	informer := rw.factory.ForResource(gvr).Informer()
+	// Strip heavy metadata before objects enter the informer's in-memory store.
+	// managedFields + last-applied-configuration are 30-50% of each object but
+	// never used by widgets. Without this, the informer store at 50K objects
+	// consumes ~3.5GB instead of ~2GB (confirmed via pprof heap-223810).
+	if err := informer.SetTransform(func(obj any) (any, error) {
+		if uns, ok := obj.(*unstructured.Unstructured); ok {
+			StripAnnotationsFromUnstructured(uns)
+		}
+		return obj, nil
+	}); err != nil {
+		slog.Debug("resource-watcher: SetTransform not supported", slog.Any("err", err))
+	}
 	if _, err := informer.AddEventHandler(k8scache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { rw.handleEvent(ctx, gvr, nil, obj, "add") },
 		UpdateFunc: func(old, obj any) { rw.handleEvent(ctx, gvr, old, obj, "update") },

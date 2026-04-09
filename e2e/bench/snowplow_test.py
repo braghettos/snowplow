@@ -2735,23 +2735,27 @@ def measure_first_login_warmup(new_start, new_end, total_expected, tokens, timeo
 def run_phase_user_scaling(tokens):
     phase_banner(7, "MULTI-USER SCALING (warmup + first-login burst)")
 
-    # ── Step 1: Ensure compositions are deployed ──
+    # ── Step 0: Clean environment ──
+    section("Step 0: Clean environment")
+    clean_environment()
+    enable_cache()
+    if not wait_for_snowplow():
+        log("ERROR: snowplow not healthy after cleanup")
+        return
+
+    # ── Step 1: Deploy compositions ──
     section("Step 1: Deploy compositions")
-    comp_target = min(SCALE, 1000)
+    comp_target = SCALE
     ns_count = comp_target // 10 if comp_target >= 10 else 1
     comps_per_ns = 10
 
-    existing = count_compositions()
-    if existing < comp_target - 5:
-        log(f"Need {comp_target} compositions, have {existing}. Deploying ...")
-        create_bench_namespaces(1, ns_count)
-        wait_for_bench_namespaces(ns_count)
-        deploy_compositiondefinition("bench-ns-01")
-        time.sleep(10)
-        deploy_compositions_parallel(1, ns_count, comps_per_ns)
-        wait_for_compositions(comp_target, timeout=600)
-    else:
-        log(f"Already have {existing} compositions (target={comp_target})")
+    log(f"Deploying {comp_target} compositions across {ns_count} namespaces ...")
+    create_bench_namespaces(1, ns_count)
+    wait_for_bench_namespaces(ns_count, timeout=600)
+    deploy_compositiondefinition("bench-ns-01")
+    time.sleep(15)
+    deploy_compositions_parallel(1, ns_count, comps_per_ns)
+    wait_for_compositions(comp_target, timeout=3600)
 
     # ── Step 2: Baseline warmup (0 synthetic users) ──
     section("Step 2: Baseline warmup (admin + cyberjoker only)")
