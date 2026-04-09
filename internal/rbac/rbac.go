@@ -42,16 +42,15 @@ func UserCan(ctx context.Context, opts UserCanOptions) (ok bool) {
 		return false
 	}
 
-	// Attempt cache lookup.
+	// Attempt cache lookup using per-user RBAC HASH.
 	c := cache.FromContext(ctx)
-	cacheKey := ""
 	username := resolveUsername(ctx)
 	if c != nil && username != "" {
-		cacheKey = cache.RBACKey(username, opts.Verb, opts.GroupResource, opts.Namespace)
-		var allowed bool
-		if hit, rerr := c.Get(ctx, cacheKey, &allowed); hit && rerr == nil {
+		if allowed, cached := c.IsRBACAllowed(ctx, username, opts.Verb, opts.GroupResource, opts.Namespace); cached {
 			cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RBACHits, "rbac_hits")
-			log.Debug("RBAC cache hit", slog.String("key", cacheKey))
+			log.Debug("RBAC cache hit (hash)",
+				slog.String("username", username),
+				slog.String("verb", opts.Verb))
 			return allowed
 		}
 		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RBACMisses, "rbac_misses")
@@ -90,9 +89,8 @@ func UserCan(ctx context.Context, opts UserCanOptions) (ok bool) {
 
 	log.Debug("SelfSubjectAccessReviews result", slog.Any("response", resp))
 
-	if c != nil && cacheKey != "" {
-		_ = c.SetWithTTL(ctx, cacheKey, resp.Status.Allowed, rbacCacheTTL)
-		_ = c.SAddWithTTL(ctx, cache.UserRBACIndexKey(username), cacheKey, rbacCacheTTL)
+	if c != nil && username != "" {
+		_ = c.SetRBACResult(ctx, username, opts.Verb, opts.GroupResource, opts.Namespace, resp.Status.Allowed, rbacCacheTTL)
 	}
 
 	return resp.Status.Allowed

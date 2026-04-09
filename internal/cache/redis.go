@@ -181,6 +181,18 @@ func (c *RedisCache) SetGVRNotifier(fn gvrNotifyFunc) {
 	}
 }
 
+// ── Pipeline access ──────────────────────────────────────────────────────────
+
+// Pipeline returns a Redis pipeline for batching commands into a single
+// round-trip. Returns nil if the cache is disabled. Callers must call
+// pipe.Exec(ctx) to flush the pipeline.
+func (c *RedisCache) Pipeline(_ context.Context) redis.Pipeliner {
+	if c == nil {
+		return nil
+	}
+	return c.client.Pipeline()
+}
+
 // ── Core ops ──────────────────────────────────────────────────────────────────
 
 func (c *RedisCache) Ping(ctx context.Context) error {
@@ -488,12 +500,23 @@ func (c *RedisCache) Delete(ctx context.Context, keys ...string) error {
 			_ = c.diskStore.Delete(diskKeys...)
 		}
 		if len(redisKeys) > 0 {
-			return c.client.Del(ctx, redisKeys...).Err()
+			return c.unlinkOrDel(ctx, redisKeys)
 		}
 		return nil
 	}
 
-	return c.client.Del(ctx, keys...).Err()
+	return c.unlinkOrDel(ctx, keys)
+}
+
+// unlinkOrDel uses UNLINK for bulk deletes (>1 key) to free memory
+// asynchronously in a background thread, avoiding blocking the main
+// Redis event loop. For single-key deletes, DEL is used for immediate
+// reclaim (important for correctness when re-setting the key right after).
+func (c *RedisCache) unlinkOrDel(ctx context.Context, keys []string) error {
+	if len(keys) == 1 {
+		return c.client.Del(ctx, keys...).Err()
+	}
+	return c.client.Unlink(ctx, keys...).Err()
 }
 
 // ── Atomic read-modify-write ──────────────────────────────────────────────────
@@ -732,16 +755,54 @@ func (c *RedisCache) AssembleListFromIndex(ctx context.Context, gvr schema.Group
 // IsRBACAllowed performs a cache-only RBAC lookup (no K8s API call).
 // Returns (allowed, cached). If the RBAC result is not in the cache,
 // cached is false and allowed defaults to false (conservative deny).
+//
+// Uses Redis HASH: one hash per user, field per RBAC decision.
+// Falls back to legacy STRING key format for migration compatibility.
 func (c *RedisCache) IsRBACAllowed(ctx context.Context, username, verb string, gr schema.GroupResource, namespace string) (allowed, cached bool) {
 	if c == nil {
 		return false, false
 	}
-	key := RBACKey(username, verb, gr, namespace)
-	var val bool
-	if hit, err := c.Get(ctx, key, &val); hit && err == nil {
-		return val, true
+	hashKey := RBACHashKey(username)
+	field := RBACField(verb, gr, namespace)
+	val, err := c.client.HGet(ctx, hashKey, field).Result()
+	if err == nil {
+		return val == "true", true
+	}
+	// Fall back to legacy STRING key for migration period.
+	legacyKey := RBACKey(username, verb, gr, namespace)
+	var legacyVal bool
+	if hit, gerr := c.Get(ctx, legacyKey, &legacyVal); hit && gerr == nil {
+		return legacyVal, true
 	}
 	return false, false
+}
+
+// SetRBACResult stores an RBAC decision in the per-user Redis HASH.
+// Sets TTL on the entire hash (all fields for this user expire together).
+func (c *RedisCache) SetRBACResult(ctx context.Context, username, verb string, gr schema.GroupResource, namespace string, allowed bool, ttl time.Duration) error {
+	if c == nil {
+		return nil
+	}
+	hashKey := RBACHashKey(username)
+	field := RBACField(verb, gr, namespace)
+	val := "false"
+	if allowed {
+		val = "true"
+	}
+	pipe := c.client.TxPipeline()
+	pipe.HSet(ctx, hashKey, field, val)
+	pipe.Expire(ctx, hashKey, ttl)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// DeleteUserRBAC deletes all RBAC decisions for a user with a single DEL.
+// O(1) instead of SCAN + bulk DEL.
+func (c *RedisCache) DeleteUserRBAC(ctx context.Context, username string) error {
+	if c == nil {
+		return nil
+	}
+	return c.client.Del(ctx, RBACHashKey(username)).Err()
 }
 
 func (c *RedisCache) SAddGVR(ctx context.Context, gvr schema.GroupVersionResource) error {

@@ -142,11 +142,8 @@ func (uw *UserSecretWatcher) onDelete(ctx context.Context, secret *corev1.Secret
 }
 
 func (uw *UserSecretWatcher) purgeRBACKeys(ctx context.Context, username string) {
-	keys, err := uw.cache.ScanKeys(ctx, RBACKeyPattern(username))
-	if err != nil || len(keys) == 0 {
-		return
-	}
-	_ = uw.cache.Delete(ctx, keys...)
+	// With HASH-based RBAC, one DEL removes all decisions for the user.
+	_ = uw.cache.DeleteUserRBAC(ctx, username)
 }
 
 func isClientConfig(secret *corev1.Secret) bool {

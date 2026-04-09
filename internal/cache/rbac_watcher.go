@@ -124,6 +124,8 @@ func (rw *RBACWatcher) invalidate(ctx context.Context) {
 }
 
 func (rw *RBACWatcher) invalidateAllRBAC(ctx context.Context) {
+	// With HASH-based RBAC, each user has one hash key: snowplow:rbac:{username}.
+	// SCAN for those hashes and DEL them.
 	keys, err := rw.cache.ScanKeys(ctx, "snowplow:rbac:*")
 	if err != nil || len(keys) == 0 {
 		return
@@ -159,27 +161,26 @@ func (rw *RBACWatcher) invalidateFromBinding(ctx context.Context, obj any) {
 }
 
 // purgeUserCacheData deletes RBAC and L1 (resolved) cache entries for a
-// single user. Uses per-user index SETs for O(1) lookup instead of SCAN.
-// Falls back to SCAN if the index is empty (e.g., keys created before
-// index tracking was added). Returns the total number of keys deleted.
+// single user. RBAC uses a single HASH per user (O(1) DEL). L1 resolved
+// entries still use the per-user index SET for O(1) lookup, with SCAN fallback.
+// Returns the total number of keys deleted.
 func (rw *RBACWatcher) purgeUserCacheData(ctx context.Context, username string) int {
 	total := 0
-	for _, idx := range []struct {
-		indexKey string
-		pattern  string // fallback SCAN pattern
-	}{
-		{UserRBACIndexKey(username), RBACKeyPattern(username)},
-		{UserResolvedIndexKey(username), "snowplow:resolved:" + username + ":*"},
-	} {
-		keys, _ := rw.cache.SMembers(ctx, idx.indexKey)
-		if len(keys) == 0 {
-			// Fallback to SCAN for keys created before index tracking.
-			keys, _ = rw.cache.ScanKeys(ctx, idx.pattern)
-		}
-		if len(keys) > 0 {
-			_ = rw.cache.Delete(ctx, append(keys, idx.indexKey)...)
-			total += len(keys)
-		}
+
+	// RBAC: one DEL removes the entire per-user hash.
+	_ = rw.cache.DeleteUserRBAC(ctx, username)
+	total++ // count the hash key itself
+
+	// L1 resolved: index-based invalidation with SCAN fallback.
+	idxKey := UserResolvedIndexKey(username)
+	keys, _ := rw.cache.SMembers(ctx, idxKey)
+	if len(keys) == 0 {
+		// Fallback to SCAN for keys created before index tracking.
+		keys, _ = rw.cache.ScanKeys(ctx, "snowplow:resolved:"+username+":*")
+	}
+	if len(keys) > 0 {
+		_ = rw.cache.Delete(ctx, append(keys, idxKey)...)
+		total += len(keys)
 	}
 	return total
 }

@@ -98,23 +98,33 @@ func ListKeyPattern(gvr schema.GroupVersionResource) string {
 	return fmt.Sprintf("snowplow:list:%s:*", GVRToKey(gvr))
 }
 
-// RBACKey builds the per-user cache key for a SelfSubjectAccessReview result.
+// RBACHashKey returns the Redis HASH key for a user's RBAC decisions.
+// All RBAC results for a user are stored as fields in a single hash,
+// reducing per-key overhead from ~70 bytes to near zero per entry.
+// Invalidation is a single DEL instead of SCAN + bulk DEL.
+func RBACHashKey(username string) string {
+	return "snowplow:rbac:" + username
+}
+
+// RBACField builds the HASH field for a specific RBAC decision.
+// Format: "{verb}:{group/resource}:{namespace}"
+func RBACField(verb string, gr schema.GroupResource, namespace string) string {
+	g := gr.Group
+	if g == "" {
+		g = "core"
+	}
+	return fmt.Sprintf("%s:%s/%s:%s", verb, g, gr.Resource, namespace)
+}
+
+// RBACKey is kept for backward compatibility during migration. It returns
+// the legacy flat key format. New code should use RBACHashKey + RBACField.
+// Deprecated: use RBACHashKey + RBACField instead.
 func RBACKey(username, verb string, gr schema.GroupResource, namespace string) string {
 	g := gr.Group
 	if g == "" {
 		g = "core"
 	}
 	return fmt.Sprintf("snowplow:rbac:%s:%s:%s/%s:%s", username, verb, g, gr.Resource, namespace)
-}
-
-func RBACKeyPattern(username string) string {
-	return fmt.Sprintf("snowplow:rbac:%s:*", username)
-}
-
-// UserRBACIndexKey returns the Redis SET key that tracks all RBAC cache keys
-// for a given user. Used for O(1) invalidation instead of SCAN.
-func UserRBACIndexKey(username string) string {
-	return "snowplow:rbac-idx:" + username
 }
 
 // UserResolvedIndexKey returns the Redis SET key that tracks all resolved (L1)
@@ -181,23 +191,45 @@ func L3GenKey(gvrKey, ns string) string {
 
 // RegisterL1Dependencies registers the L1 resolved key in both the GVR-level
 // and per-resource reverse indexes based on dependencies captured by the tracker.
+// All SADD + EXPIRE commands are batched into a single Redis pipeline round-trip.
 func RegisterL1Dependencies(ctx context.Context, c *RedisCache, tracker *DependencyTracker, l1Key string) {
 	if c == nil || tracker == nil {
 		return
 	}
-	for _, gvrKey := range tracker.GVRKeys() {
-		_ = c.SAddWithTTL(ctx, L1GVRKey(gvrKey), l1Key, ReverseIndexTTL)
+	gvrKeys := tracker.GVRKeys()
+	refs := tracker.ResourceRefs()
+	if len(gvrKeys) == 0 && len(refs) == 0 {
+		return
 	}
-	for _, ref := range tracker.ResourceRefs() {
-		depKey := L1ResourceDepKey(ref.GVRKey, ref.NS, ref.Name)
-		_ = c.SAddWithTTL(ctx, depKey, l1Key, ReverseIndexTTL)
+
+	// Collect all (setKey, member, ttl) tuples, then flush in one pipeline.
+	type entry struct {
+		key string
 	}
+	entries := make([]entry, 0, len(gvrKeys)+len(refs))
+	for _, gvrKey := range gvrKeys {
+		entries = append(entries, entry{key: L1GVRKey(gvrKey)})
+	}
+	for _, ref := range refs {
+		entries = append(entries, entry{key: L1ResourceDepKey(ref.GVRKey, ref.NS, ref.Name)})
+	}
+
+	pipe := c.Pipeline(ctx)
+	if pipe == nil {
+		return
+	}
+	for _, e := range entries {
+		pipe.SAdd(ctx, e.key, l1Key)
+		pipe.Expire(ctx, e.key, ReverseIndexTTL)
+	}
+	_, _ = pipe.Exec(ctx)
 }
 
 // RegisterL1ApiDeps extracts K8s API GVRs from a list of resolved API request
 // paths and registers the L1 key under each GVR's API dependency index.
 // This ensures that when any resource of that type changes, L1 keys that
 // depend on it are refreshed — even if no per-resource deps exist (zero-state).
+// All SADD + EXPIRE commands are batched into a single Redis pipeline round-trip.
 //
 // Supports both /apis/<group>/<version>/... and /api/<version>/... (core K8s).
 func RegisterL1ApiDeps(ctx context.Context, c *RedisCache, l1Key string, apiRequests []string) {
@@ -205,6 +237,7 @@ func RegisterL1ApiDeps(ctx context.Context, c *RedisCache, l1Key string, apiRequ
 		return
 	}
 	seen := make(map[string]bool)
+	var depKeys []string
 	for _, path := range apiRequests {
 		group, version, resource := ExtractAPIGVR(path)
 		if group == "" || resource == "" {
@@ -220,8 +253,21 @@ func RegisterL1ApiDeps(ctx context.Context, c *RedisCache, l1Key string, apiRequ
 			continue
 		}
 		seen[gvrKey] = true
-		_ = c.SAddWithTTL(ctx, L1ApiDepKey(gvrKey), l1Key, ReverseIndexTTL)
+		depKeys = append(depKeys, L1ApiDepKey(gvrKey))
 	}
+	if len(depKeys) == 0 {
+		return
+	}
+
+	pipe := c.Pipeline(ctx)
+	if pipe == nil {
+		return
+	}
+	for _, dk := range depKeys {
+		pipe.SAdd(ctx, dk, l1Key)
+		pipe.Expire(ctx, dk, ReverseIndexTTL)
+	}
+	_, _ = pipe.Exec(ctx)
 }
 
 // ExtractAPIGVR extracts the K8s API group, version, and resource from a request path.
