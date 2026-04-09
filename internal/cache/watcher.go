@@ -1237,13 +1237,22 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 				// l1RefreshRunning. If the l3gen scanner is already
 				// refreshing, skip — it will pick up our changes.
 				if rw.l1RefreshRunning.CompareAndSwap(false, true) {
+					// Drain recent changes so incremental patching (C2)
+					// can apply for small delete-only changes.
+					rw.recentChangesMu.Lock()
+					changes := rw.recentChanges
+					overflow := rw.recentChangesOverflow
+					rw.recentChanges = nil
+					rw.recentChangesOverflow = false
+					rw.recentChangesMu.Unlock()
+					if overflow {
+						changes = nil
+					}
 					go func() {
 						defer rw.l1RefreshRunning.Store(false)
 						refreshCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 						defer cancel()
-						// reconcileGVR is a bulk operation — pass nil changes
-						// to force full resolution (no incremental patching).
-						fn(refreshCtx, gvr, l1Keys, nil)
+						fn(refreshCtx, gvr, l1Keys, changes)
 					}()
 				}
 			} else {
