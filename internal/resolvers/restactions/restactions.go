@@ -47,7 +47,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, e
 	}
 
 	log := xcontext.Logger(ctx)
-	log.Debug("resolved api", slog.Any("dict", dict))
+	log.Debug("resolved api", slog.Int("dict_keys", len(dict)))
 
 	var raw []byte
 	if opts.In.Spec.Filter != nil {

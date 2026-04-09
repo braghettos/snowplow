@@ -22,6 +22,36 @@ type ResolveOptions struct {
 
 const parallelThreshold = 3
 
+// estimateMapSize gives a rough byte estimate of a map[string]any tree
+// to decide whether deepCopy is affordable. Not exact — just needs to
+// distinguish 1KB from 100MB.
+func estimateMapSize(v any) int {
+	switch val := v.(type) {
+	case map[string]any:
+		size := 64 // map header
+		for k, v := range val {
+			size += len(k) + 16 + estimateMapSize(v)
+			if size > 20*1024*1024 { // early exit
+				return size
+			}
+		}
+		return size
+	case []any:
+		size := 24 + len(val)*8
+		for _, item := range val {
+			size += estimateMapSize(item)
+			if size > 20*1024*1024 {
+				return size
+			}
+		}
+		return size
+	case string:
+		return len(val) + 16
+	default:
+		return 16
+	}
+}
+
 // deepCopyValue recursively clones map[string]any and []any trees so that
 // each goroutine gets its own mutable copy. gojq.normalizeNumbers mutates
 // input maps in-place, so sharing a single DataSource across goroutines
@@ -90,7 +120,15 @@ func Resolve(ctx context.Context, opts ResolveOptions) ([]EvalResult, error) {
 		return nil
 	}
 
-	if len(work) < parallelThreshold {
+	// At large scale (50K+ items), the DataSource can be 500MB+.
+	// deepCopyValue per goroutine would allocate N×500MB.
+	// Run sequentially when DataSource is large to avoid OOM.
+	// The parallel path is only beneficial for small DataSources where
+	// deepCopy cost is negligible.
+	estimatedSize := estimateMapSize(opts.DataSource)
+	useParallel := len(work) >= parallelThreshold && estimatedSize < 10*1024*1024 // 10MB threshold
+
+	if !useParallel {
 		for _, w := range work {
 			if err := eval(w, opts.DataSource); err != nil {
 				return nil, err

@@ -145,7 +145,7 @@ func resolveWidgetData(ctx context.Context, obj *Widget, ds map[string]any) (map
 		log.Error("unable to resolve widgetDataTemplate", slog.Any("err", err))
 		return src, err
 	}
-	log.Debug("widgetDataTemplate JQ evaluation results", slog.Any("evals", evals))
+	log.Debug("widgetDataTemplate JQ evaluation complete", slog.Int("count", len(evals)))
 
 	for _, el := range evals {
 		fields := maps.ParsePath(el.Path)
@@ -154,9 +154,7 @@ func resolveWidgetData(ctx context.Context, obj *Widget, ds map[string]any) (map
 		}
 
 		log.Debug("widgetDataTemplate setting nested value",
-			slog.Any("fields", fields),
 			slog.String("path", el.Path),
-			slog.Any("value", el.Value),
 			slog.Any("type", reflect.TypeOf(el.Value)),
 		)
 
