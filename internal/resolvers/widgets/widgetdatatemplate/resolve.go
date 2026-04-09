@@ -2,7 +2,6 @@ package widgetdatatemplate
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 	"sync"
 
@@ -23,30 +22,56 @@ type ResolveOptions struct {
 
 const parallelThreshold = 3
 
-// preNormalize walks the value tree and converts json.Number to int/float64,
-// exactly as gojq's normalizeNumbers does. After this, gojq's normalizeNumbers
-// becomes a no-op (all values are already native types), making the map safe
-// to share read-only across goroutines for pure-read JQ queries.
-func preNormalize(v any) any {
+// estimateMapSize gives a rough byte estimate of a map[string]any tree
+// to decide whether deepCopy is affordable. Not exact — just needs to
+// distinguish 1KB from 100MB.
+func estimateMapSize(v any) int {
 	switch val := v.(type) {
 	case map[string]any:
-		for k, x := range val {
-			val[k] = preNormalize(x)
+		size := 64 // map header
+		for k, v := range val {
+			size += len(k) + 16 + estimateMapSize(v)
+			if size > 20*1024*1024 { // early exit
+				return size
+			}
 		}
-		return val
+		return size
 	case []any:
-		for i, x := range val {
-			val[i] = preNormalize(x)
+		size := 24 + len(val)*8
+		for _, item := range val {
+			size += estimateMapSize(item)
+			if size > 20*1024*1024 {
+				return size
+			}
 		}
-		return val
-	case json.Number:
-		if i, err := val.Int64(); err == nil {
-			return int(i)
+		return size
+	case string:
+		return len(val) + 16
+	default:
+		return 16
+	}
+}
+
+// deepCopyValue recursively clones map[string]any and []any trees so that
+// each goroutine gets its own mutable copy. gojq.normalizeNumbers mutates
+// input maps in-place (unconditionally writes v[k] = normalizeNumbers(x)
+// for every key, even when values are already normalized), so sharing a
+// single DataSource across goroutines causes concurrent map write panics
+// or silent map corruption.
+func deepCopyValue(v any) any {
+	switch val := v.(type) {
+	case map[string]any:
+		m := make(map[string]any, len(val))
+		for k, v := range val {
+			m[k] = deepCopyValue(v)
 		}
-		if f, err := val.Float64(); err == nil {
-			return f
+		return m
+	case []any:
+		s := make([]any, len(val))
+		for i, v := range val {
+			s[i] = deepCopyValue(v)
 		}
-		return val.String()
+		return s
 	default:
 		return v
 	}
@@ -97,12 +122,22 @@ func Resolve(ctx context.Context, opts ResolveOptions) ([]EvalResult, error) {
 		return nil
 	}
 
-	// Pre-normalize the DataSource so gojq's normalizeNumbers is a no-op.
-	// This makes the map safe to share across parallel goroutines for
-	// pure-read JQ queries (selectors, filters, aggregations).
-	preNormalize(opts.DataSource)
+	// At large scale (50K+ items), the DataSource can be 500MB+.
+	// deepCopyValue per goroutine would allocate N×500MB.
+	// Run sequentially when DataSource is large to avoid OOM.
+	// The parallel path is only beneficial for small DataSources where
+	// deepCopy cost is negligible.
+	//
+	// IMPORTANT: gojq.normalizeNumbers mutates input maps in-place
+	// (unconditionally writes v[k] = normalizeNumbers(x) for every key,
+	// even when values are already normalized). Sharing a single DataSource
+	// across goroutines causes concurrent map write panics or silent
+	// corruption (9.7GB heap / 35K goroutines with only 20 compositions).
+	// Each goroutine MUST get its own deepCopy.
+	estimatedSize := estimateMapSize(opts.DataSource)
+	useParallel := len(work) >= parallelThreshold && estimatedSize < 10*1024*1024 // 10MB threshold
 
-	if len(work) < parallelThreshold {
+	if !useParallel {
 		for _, w := range work {
 			if err := eval(w, opts.DataSource); err != nil {
 				return nil, err
@@ -111,9 +146,6 @@ func Resolve(ctx context.Context, opts ResolveOptions) ([]EvalResult, error) {
 		return results, nil
 	}
 
-	// Run parallel JQ on the shared pre-normalized DataSource.
-	// No deepCopy needed — normalizeNumbers is now a no-op, and
-	// widget JQ expressions are pure reads (no assignment operators).
 	var (
 		wg       sync.WaitGroup
 		errOnce  sync.Once
@@ -121,9 +153,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) ([]EvalResult, error) {
 	)
 	for _, w := range work {
 		wg.Add(1)
+		dsCopy := deepCopyValue(opts.DataSource).(map[string]any)
 		go func(w workItem) {
 			defer wg.Done()
-			if err := eval(w, opts.DataSource); err != nil {
+			if err := eval(w, dsCopy); err != nil {
 				errOnce.Do(func() { firstErr = err })
 			}
 		}(w)
