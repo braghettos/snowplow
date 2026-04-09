@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"runtime"
 	"os/signal"
@@ -202,6 +203,12 @@ func main() {
 	)
 
 	mux := http.NewServeMux()
+
+	// pprof endpoints for heap/goroutine profiling
+	mux.HandleFunc("GET /debug/pprof/", http.DefaultServeMux.ServeHTTP)
+	mux.HandleFunc("GET /debug/pprof/heap", http.DefaultServeMux.ServeHTTP)
+	mux.HandleFunc("GET /debug/pprof/goroutine", http.DefaultServeMux.ServeHTTP)
+	mux.HandleFunc("GET /debug/pprof/profile", http.DefaultServeMux.ServeHTTP)
 
 	mux.Handle("GET /swagger/", httpSwagger.WrapHandler)
 
