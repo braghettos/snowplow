@@ -1,8 +1,40 @@
 # Snowplow Cache — Scaling Roadmap
 
-**Baseline**: v0.25.133 (bounded-eager L1 refresh with active-users filter, fail-open, UserSecretWatcher sync, full OTel, stale-while-revalidate Cache-Control)
-**Current validated scale**: 1,200 compositions × 2 users (4.3-4.5s convergence, full content correctness)
+**Baseline**: v0.25.149 (per-item L3, RBAC pre-warming, MGET batching, zstd compression, incremental L1 delete patching, priority-ordered parallel L1 refresh, activity classes, full OTel)
+**Current validated scale**: 5,000 compositions × 500 namespaces × 2 users (7.0s convergence, full content correctness, 4.8x faster than cache OFF)
 **Target scale**: 50,000+ compositions × 1,000 users
+
+---
+
+## Test Results: v0.25.149 at 5K Scale (2026-04-09)
+
+### Convergence (time from cluster mutation to correct data in browser)
+
+| Stage | Desc | Cache ON | Cache OFF | Speedup |
+|-------|------|----------|-----------|---------|
+| S1 | 0 comp | 2.5s | 3.3s | 1.3x |
+| S4 | 20 comp | 3.2s | 4.6s | 1.4x |
+| S5 | 500 ns | 4.0s | 5.9s | 1.5x |
+| **S6** | **5000 comp** | **7.1s** | **33s** | **4.8x** |
+| **S7** | **del 1 comp** | **7.0s** | **12s** | **1.7x** |
+| **S8** | **del 1 ns** | **7.4s** | **12s** | **1.6x** |
+
+### Version progression at S6 (5000 compositions)
+
+| Version | Feature | S6 ON | S7 ON | S8 ON |
+|---------|---------|-------|-------|-------|
+| v0.25.138 | Phase A baseline | 56.0s | 7.8s | 35.3s |
+| v0.25.139 | + B1 per-item L3 | 7.2s | 7.1s | 8.8s |
+| v0.25.140 | + B2 RBAC pre-warm | 6.9s | 8.7s | 9.6s |
+| v0.25.141 | + B3 MGET batching | 6.9s | 8.0s | 8.8s |
+| v0.25.142 | + C1 zstd | 8.2s | 6.9s | 7.2s |
+| v0.25.149 | + C2 incremental L1 | 7.1s | 7.0s | 7.4s |
+
+### Infrastructure
+- Redis memory: 258MB peak (per-item keys + zstd)
+- Pod restarts: 0 at 16Gi limit
+- Warm dashboard waterfall (steady state): 70-83ms at low scale, 1.7s at 5K
+- C2 incremental patching: `patched:2` per delete refresh (compositions-list for 2 users)
 
 ---
 
@@ -423,18 +455,18 @@ This requires:
 
 ## Summary Matrix
 
-| Phase | Feature | Scale unlocked | Effort | Risk |
-|-------|---------|---------------|--------|------|
-| A1 | Parallel user refresh | 1K users faster | 1 day | Low |
-| A2 | Activity classes (hot/warm/cold) | 1K users efficient | 2 days | Low |
-| A3 | OTel metrics + alerting | Production readiness | 1 day | None |
-| A4 | Phase 7 test (5K compositions) | Validation | 3 days | None |
-| B1 | Per-item L3 (index sets replace blobs) | **50K compositions** | 1 week | Medium |
-| B2 | RBAC pre-warming | 500 namespaces | 3 days | Medium |
-| B3 | MGET batching | 500+ namespaces | 2 hours | Low |
-| C1 | zstd compression | 30% less memory + 3x faster | 2 days | Medium |
-| C2 | Incremental L1 patch | 50K fast convergence | 1 week | High |
-| C3 | Parallel topological levels | 30-40% faster resolution | 2 days | Low |
-| D1 | Sharded pods | 5K+ users | 2 weeks | High |
-| D2 | Push-based invalidation | Unlimited users (trades convergence) | 1 week | Medium |
-| D3 | External Redis | 64GB+ memory | 3 days | Low |
+| Phase | Feature | Scale unlocked | Effort | Risk | Status |
+|-------|---------|---------------|--------|------|--------|
+| A1 | Parallel user refresh | 1K users faster | 1 day | Low | **DONE** (v0.25.138) |
+| A2 | Activity classes (hot/warm/cold) | 1K users efficient | 2 days | Low | **DONE** (v0.25.138) |
+| A3 | OTel metrics + alerting | Production readiness | 1 day | None | **DONE** (v0.25.138) |
+| A4 | Phase 7 test (5K compositions) | Validation | 3 days | None | **DONE** (v0.25.138) |
+| B1 | Per-item L3 (index sets replace blobs) | **50K compositions** | 1 week | Medium | **DONE** (v0.25.139) — S6: 56s→7.2s |
+| B2 | RBAC pre-warming | 500 namespaces | 3 days | Medium | **DONE** (v0.25.140) |
+| B3 | MGET batching | 500+ namespaces | 2 hours | Low | **DONE** (v0.25.141) |
+| C1 | zstd compression | 3x faster compress/decompress | 2 days | Medium | **DONE** (v0.25.142) |
+| C2 | Incremental L1 delete patch | 50K fast delete convergence | 1 week | High | **DONE** (v0.25.149) — working, value at 50K+ |
+| C3 | Parallel topological levels | 30-40% faster resolution | 2 days | Low | Next |
+| D1 | Sharded pods | 5K+ users | 2 weeks | High | |
+| D2 | Push-based invalidation | Unlimited users (trades convergence) | 1 week | Medium | |
+| D3 | External Redis | 64GB+ memory | 3 days | Low | |
