@@ -81,7 +81,14 @@ func patchRESTActionL1(ctx context.Context, c *cache.RedisCache, l1Key string, c
 		return false
 	}
 
+	// Look for the array field — RESTActions use "items" or "list" depending
+	// on the JQ filter output.
+	itemsFieldName := "items"
 	itemsRaw, hasItems := status["items"]
+	if !hasItems || len(itemsRaw) == 0 {
+		itemsRaw, hasItems = status["list"]
+		itemsFieldName = "list"
+	}
 	if !hasItems || len(itemsRaw) == 0 {
 		statusKeys := make([]string, 0, len(status))
 		for k := range status {
@@ -147,7 +154,7 @@ func patchRESTActionL1(ctx context.Context, c *cache.RedisCache, l1Key string, c
 	if err != nil {
 		return false
 	}
-	status["items"] = newItemsRaw
+	status[itemsFieldName] = newItemsRaw
 
 	// Update total count if present.
 	if totalRaw, ok := status["total"]; ok {
