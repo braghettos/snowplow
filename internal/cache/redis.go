@@ -810,6 +810,28 @@ func (c *RedisCache) GetString(ctx context.Context, key string) (string, bool, e
 	return val, true, nil
 }
 
+// DBSize returns the number of keys in the current Redis database.
+// Returns 0 on nil receiver or error.
+func (c *RedisCache) DBSize(ctx context.Context) int64 {
+	if c == nil {
+		return 0
+	}
+	n, err := c.client.DBSize(ctx).Result()
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// DiskFileCount returns the number of .bin files in the disk store.
+// Returns 0 if no disk store is configured.
+func (c *RedisCache) DiskFileCount() int64 {
+	if c == nil || c.diskStore == nil {
+		return 0
+	}
+	return c.diskStore.FileCount()
+}
+
 // ── Expiry notifications ──────────────────────────────────────────────────────
 
 func (c *RedisCache) EnableExpiryNotifications(ctx context.Context) error {

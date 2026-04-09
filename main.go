@@ -208,6 +208,7 @@ func main() {
 	mux.Handle("GET /health", handlers.HealthCheck(serviceName, build, kubeutil.ServiceAccountNamespace))
 	mux.Handle("GET /ready", handlers.ReadinessCheck())
 	mux.Handle("GET /metrics/cache", chain.Then(handlers.CacheMetrics()))
+	mux.Handle("GET /metrics/runtime", handlers.RuntimeMetricsHandler(redisCache))
 	mux.Handle("GET /api-info/names", chain.Then(handlers.Plurals()))
 	userCfg := handlers.CachedUserConfig(*signKey, *authnNS, sarc, redisCache)
 

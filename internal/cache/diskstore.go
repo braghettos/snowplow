@@ -118,6 +118,21 @@ func (d *DiskStore) StartCleanup(ctx context.Context, interval time.Duration) {
 	}()
 }
 
+// FileCount returns the number of .bin files currently in the store.
+func (d *DiskStore) FileCount() int64 {
+	var count int64
+	_ = filepath.WalkDir(d.baseDir, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return nil
+		}
+		if filepath.Ext(path) == ".bin" {
+			count++
+		}
+		return nil
+	})
+	return count
+}
+
 // cleanup walks the store directory and removes expired files.
 // Also removes empty directories left behind after file deletion.
 func (d *DiskStore) cleanup() {
