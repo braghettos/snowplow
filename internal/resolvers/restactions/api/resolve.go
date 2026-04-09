@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	httpcall "github.com/krateoplatformops/plumbing/http/request"
@@ -115,12 +116,24 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	var apiRequestsMu sync.Mutex
 	var apiRequests []string
 
-	for _, id := range names {
+	// ── Parallel topological levels ──────────────────────────────────────
+	// APIs within the same dependency level are independent and can be
+	// resolved in parallel. A bounded semaphore (20) prevents overwhelming
+	// the K8s API server. Levels are processed sequentially so that
+	// dependent APIs see the results of their dependencies in dict.
+	//
+	// A single mutex (dictMu) serialises ALL writes to the shared dict
+	// across all API calls within a level.
+
+	// resolveAPI resolves a single API entry (which may fan out into N
+	// iterator calls). It returns false if the resolution failed and the
+	// API does not have continueOnError set.
+	resolveAPI := func(id string, dictMu *sync.Mutex) bool {
 		// Get the api with this identifier
 		apiCall, ok := apiMap[id]
 		if !ok {
 			log.Warn("api not found in apiMap", slog.Any("name", id))
-			continue
+			return true
 		}
 		if apiCall.Headers == nil {
 			apiCall.Headers = []string{headerAcceptJSON}
@@ -138,7 +151,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		if err != nil {
 			log.Error("unable to resolve api endpoint reference",
 				slog.String("name", id), slog.Any("ref", apiCall.EndpointRef), slog.Any("error", err))
-			return dict
+			return false
 		}
 		if opts.Verbose {
 			ep.Debug = opts.Verbose
@@ -146,16 +159,20 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		log.Debug("resolved endpoint for api call",
 			slog.String("name", id), slog.String("host", ep.ServerURL))
 
+		// createRequestOptions reads from dict — take a snapshot under lock
+		// so concurrent writers in this level don't cause a data race.
+		dictMu.Lock()
 		tmp := createRequestOptions(log, apiCall, dict)
+		dictMu.Unlock()
 
 		if len(tmp) == 0 {
 			log.Warn("empty request options for http call", slog.Any("name", id))
-			continue
+			return true
 		}
 
 		// ── Parallel execution of iterator calls ──────────────────────────────
 		// When a single API entry fans out into N calls via an iterator (e.g.
-		// one call per namespace), run them concurrently. A mutex serialises
+		// one call per namespace), run them concurrently. dictMu serialises
 		// all writes to the shared dict so that JQ handlers can safely append.
 		//
 		// For single-call entries (the common case) we skip goroutine overhead.
@@ -290,13 +307,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						}) {
 							cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L3Promotions, "l3_promotions")
 							handler := jsonHandler(ctx, jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter})
-							if mu != nil {
-								mu.Lock()
-							}
+							mu.Lock()
 							_ = handler(io.NopCloser(bytes.NewReader(l3Raw)))
-							if mu != nil {
-								mu.Unlock()
-							}
+							mu.Unlock()
 							return true
 						}
 					}
@@ -307,13 +320,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					if l1Raw, l1Hit, _ := c.GetRaw(ctx, l1Key); l1Hit {
 						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 						handler := jsonHandler(ctx, jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter})
-						if mu != nil {
-							mu.Lock()
-						}
+						mu.Lock()
 						_ = handler(io.NopCloser(bytes.NewReader(l1Raw)))
-						if mu != nil {
-							mu.Unlock()
-						}
+						mu.Unlock()
 						return true
 					}
 				}
@@ -323,18 +332,14 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				plain := jsonHandler(ctx, jsonHandlerOptions{
 					key: id, out: dict, filter: apiCall.Filter,
 				})
-				if mu != nil {
-					call.ResponseHandler = func(r io.ReadCloser) error {
-						data, rerr := io.ReadAll(r)
-						if rerr != nil {
-							return rerr
-						}
-						mu.Lock()
-						defer mu.Unlock()
-						return plain(io.NopCloser(bytes.NewReader(data)))
+				call.ResponseHandler = func(r io.ReadCloser) error {
+					data, rerr := io.ReadAll(r)
+					if rerr != nil {
+						return rerr
 					}
-				} else {
-					call.ResponseHandler = plain
+					mu.Lock()
+					defer mu.Unlock()
+					return plain(io.NopCloser(bytes.NewReader(data)))
 				}
 			}
 
@@ -348,17 +353,13 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					slog.String("error", res.Message))
 
 				errMap, merr := response.AsMap(res)
-				if mu != nil {
-					mu.Lock()
-				}
+				mu.Lock()
 				if merr == nil && len(errMap) > 0 {
 					dict[call.ErrorKey] = errMap
 				} else {
 					dict[call.ErrorKey] = res.Message
 				}
-				if mu != nil {
-					mu.Unlock()
-				}
+				mu.Unlock()
 				return call.ContinueOnError
 			}
 
@@ -371,8 +372,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 
 		if len(tmp) == 1 {
 			// Single call: run inline to avoid goroutine overhead.
-			if !runOne(tmp[0], nil, nil) {
-				return dict
+			// Still pass dictMu since we're inside a parallel level.
+			if !runOne(tmp[0], dictMu, nil) {
+				return false
 			}
 		} else {
 			// Iterator: N independent calls — run concurrently.
@@ -394,18 +396,71 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					prefetchedL3 = c.GetRawMulti(ctx, l3Keys)
 				}
 			}
-			var mu sync.Mutex
 			var wg sync.WaitGroup
 			for _, call := range tmp {
 				wg.Add(1)
 				go func(c httpcall.RequestOptions) {
 					defer wg.Done()
-					runOne(c, &mu, prefetchedL3)
+					runOne(c, dictMu, prefetchedL3)
 				}(call)
 			}
 			wg.Wait()
 		}
 		// ── End parallel execution ─────────────────────────────────────────────
+		return true
+	}
+
+	// Bounded semaphore: max 20 concurrent API resolutions per level.
+	sem := make(chan struct{}, 20)
+
+	for levelIdx, level := range levels {
+		if ctx.Err() != nil {
+			log.Warn("context cancelled, aborting remaining levels",
+				slog.Int("remaining", len(levels)-levelIdx))
+			break
+		}
+
+		if len(level) == 1 {
+			// Single API in this level: run inline, no goroutine overhead.
+			var dictMu sync.Mutex
+			if !resolveAPI(level[0], &dictMu) {
+				break // fatal error — stop processing further levels
+			}
+			continue
+		}
+
+		// Multiple APIs in this level: run in parallel with bounded concurrency.
+		var dictMu sync.Mutex
+		var levelWg sync.WaitGroup
+		// levelFailed tracks whether any non-continueOnError API failed.
+		// We collect errors but don't stop sibling goroutines.
+		var levelFailed int32 // atomic: 0 = ok, 1 = at least one fatal failure
+
+		for _, id := range level {
+			levelWg.Add(1)
+			sem <- struct{}{} // acquire semaphore slot
+			go func(apiID string) {
+				defer levelWg.Done()
+				defer func() { <-sem }() // release semaphore slot
+				defer func() {
+					if r := recover(); r != nil {
+						log.Error("panic in parallel API resolution",
+							slog.String("name", apiID), slog.Any("panic", r))
+						atomic.StoreInt32(&levelFailed, 1)
+					}
+				}()
+				if !resolveAPI(apiID, &dictMu) {
+					atomic.StoreInt32(&levelFailed, 1)
+				}
+			}(id)
+		}
+		levelWg.Wait()
+
+		if atomic.LoadInt32(&levelFailed) != 0 {
+			log.Warn("at least one API in level failed, stopping resolution",
+				slog.Int("level", levelIdx), slog.Any("apis", level))
+			break
+		}
 	}
 
 	removeManagedFields(dict)
