@@ -52,19 +52,24 @@ func patchRESTActionL1(ctx context.Context, c *cache.RedisCache, l1Key string, c
 	// Read existing L1 value.
 	raw, hit, err := c.GetRaw(ctx, l1Key)
 	if err != nil || !hit || len(raw) == 0 {
-		span.AddEvent("patch.skip", trace.WithAttributes(
-			attribute.String("reason", "no_existing_l1"),
-		))
+		log.Debug("L1 patch: skip - no existing L1", slog.String("key", l1Key))
 		return false
 	}
 
 	// Parse the top-level JSON to extract the status field.
 	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &envelope); err != nil {
+		log.Info("L1 patch: skip - envelope parse error", slog.String("key", l1Key), slog.Any("err", err))
 		return false
 	}
 	statusRaw, ok := envelope["status"]
 	if !ok || len(statusRaw) == 0 {
+		// Log available top-level keys for debugging
+		keys := make([]string, 0, len(envelope))
+		for k := range envelope {
+			keys = append(keys, k)
+		}
+		log.Info("L1 patch: skip - no status field", slog.String("key", l1Key), slog.Any("keys", keys))
 		return false
 	}
 
@@ -72,12 +77,17 @@ func patchRESTActionL1(ctx context.Context, c *cache.RedisCache, l1Key string, c
 	// (list-type RESTAction) or something else entirely.
 	var status map[string]json.RawMessage
 	if err := json.Unmarshal(statusRaw, &status); err != nil {
-		// status is not an object (might be an array or primitive from JQ filter)
+		log.Info("L1 patch: skip - status not object", slog.String("key", l1Key))
 		return false
 	}
 
 	itemsRaw, hasItems := status["items"]
 	if !hasItems || len(itemsRaw) == 0 {
+		statusKeys := make([]string, 0, len(status))
+		for k := range status {
+			statusKeys = append(statusKeys, k)
+		}
+		log.Info("L1 patch: skip - no items in status", slog.String("key", l1Key), slog.Any("statusKeys", statusKeys))
 		return false
 	}
 

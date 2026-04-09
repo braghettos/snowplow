@@ -2198,7 +2198,7 @@ def run_phase_browser_scaling(tokens):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
 
-        for cache_mode in ("ON", "OFF"):
+        for cache_mode in ("ON",):  # TEMP: ON only for C2 debugging
             section(f"BROWSER MATRIX: cache={cache_mode}")
             clean_environment()
             if cache_mode == "ON":
