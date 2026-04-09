@@ -10,6 +10,7 @@ Phases:
   3  scaling      8-stage incremental scaling matrix (cache ON vs OFF)
   4  browser      Playwright browser metrics (DOM, render, XHR waterfall)
   5  comparison   Browser navigation: cache OFF vs cache ON (cold) vs cache ON (warmed)
+  7  user-scaling Multi-user scaling: warmup + first-login burst at 10/50/100/500/1000 users (opt-in)
 
 Usage:
   python3 snowplow_test.py                     # all phases
@@ -2426,6 +2427,469 @@ def run_phase_browser_scaling(tokens):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# PHASE 7: MULTI-USER SCALING
+# ═════════════════════════════════════════════════════════════════════════════
+
+USER_COUNTS = [10, 50, 100, 500, 1000]
+PHASE7_AUTHN_NS = "krateo-system"
+
+
+def get_runtime_metrics():
+    """Fetch /metrics/runtime from snowplow. Returns dict or None."""
+    try:
+        req = urllib.request.Request(SNOWPLOW + "/metrics/runtime")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
+
+
+def get_redis_memory_mb():
+    """Return Redis used_memory in MB from INFO memory."""
+    info = redis_cmd("INFO", "memory")
+    for line in (info or "").split("\n"):
+        if line.startswith("used_memory:"):
+            try:
+                return int(line.split(":")[1].strip()) / (1024 * 1024)
+            except Exception:
+                pass
+    return 0.0
+
+
+def _scaleuser_name(i):
+    return f"scaleuser-{i:04d}"
+
+
+def _scaleuser_password():
+    """Fixed password for all scale users (test-only, not security-sensitive)."""
+    return "ScaleTest2026!"
+
+
+def create_synthetic_users(start, end):
+    """Register scale users via authn and login to create clientconfig secrets.
+
+    For each user scaleuser-{start:04d} through scaleuser-{end:04d}:
+      1. Create a kubernetes.io/basic-auth Secret holding the password
+      2. Create a users.basic.authn.krateo.io CR referencing that secret
+      3. Login via authn /basic/login to trigger clientconfig secret creation
+
+    Steps 1-2 use batched multi-doc YAML per 50 users for speed.
+    Step 3 uses parallel HTTP requests.
+
+    Returns (count_logged_in, dict_of_tokens).
+    """
+    password = _scaleuser_password()
+    total = end - start + 1
+
+    # ── Step 1+2: Batch-create password secrets + User CRs ──
+    log(f"  Registering {total} users in authn (batch YAML) ...")
+    batch_size = 50
+    registered = 0
+
+    for batch_start in range(start, end + 1, batch_size):
+        batch_end = min(batch_start + batch_size - 1, end)
+        docs = []
+        for i in range(batch_start, batch_end + 1):
+            name = _scaleuser_name(i)
+            docs.append(f"""\
+apiVersion: v1
+kind: Secret
+type: kubernetes.io/basic-auth
+metadata:
+  name: {name}-password
+  namespace: {PHASE7_AUTHN_NS}
+  labels:
+    app: scaletest
+stringData:
+  password: "{password}"
+""")
+            docs.append(f"""\
+apiVersion: basic.authn.krateo.io/v1alpha1
+kind: User
+metadata:
+  name: {name}
+  namespace: {PHASE7_AUTHN_NS}
+  labels:
+    app: scaletest
+spec:
+  displayName: "Scale User {i:04d}"
+  avatarURL: https://i.pravatar.cc/256?img={(i % 70) + 1}
+  groups:
+    - devs
+  passwordRef:
+    namespace: {PHASE7_AUTHN_NS}
+    name: {name}-password
+    key: password
+""")
+        batch_yaml = "---\n".join(docs)
+        rc, _, err = kubectl("apply", "--server-side", "-f", "-",
+                             input_data=batch_yaml, timeout_secs=60)
+        if rc == 0:
+            registered += batch_end - batch_start + 1
+        else:
+            log(f"    Batch {batch_start}-{batch_end} failed: {err[:200]}")
+
+    log(f"  Registered {registered}/{total} users")
+
+    # Brief pause for authn to reconcile the User CRs
+    time.sleep(5)
+
+    # ── Step 3: Login each user in parallel ──
+    user_tokens = {}
+
+    def _login_one(i):
+        name = _scaleuser_name(i)
+        creds = base64.b64encode(f"{name}:{password}".encode()).decode()
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(
+                    AUTHN + "/basic/login",
+                    headers={"Authorization": "Basic " + creds},
+                )
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    data = json.load(r)
+                    return name, data.get("accessToken")
+            except Exception:
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+        return name, None
+
+    log(f"  Logging in {total} users via authn ...")
+    created = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+        login_results = list(ex.map(_login_one, range(start, end + 1)))
+
+    for name, token in login_results:
+        if token:
+            user_tokens[name] = token
+            created += 1
+
+    log(f"  Logged in {created}/{total} users (clientconfig secrets created)")
+    return created, user_tokens
+
+
+def delete_synthetic_users():
+    """Delete all scaletest-labeled resources: User CRs, password secrets, clientconfig secrets."""
+    log("  Deleting User CRs (authn controller will clean up clientconfig secrets) ...")
+    kubectl("delete", "users.basic.authn.krateo.io", "-n", PHASE7_AUTHN_NS,
+            "-l", "app=scaletest", "--ignore-not-found", timeout_secs=180)
+    log("  Deleting password secrets ...")
+    kubectl("delete", "secret", "-n", PHASE7_AUTHN_NS,
+            "-l", "app=scaletest", "--ignore-not-found", timeout_secs=180)
+
+    # Authn may not clean up clientconfig secrets immediately — delete by name
+    log("  Cleaning up residual clientconfig secrets ...")
+
+    def _del_clientconfig(i):
+        name = f"{_scaleuser_name(i)}-clientconfig"
+        kubectl("delete", "secret", name, "-n", PHASE7_AUTHN_NS,
+                "--ignore-not-found", timeout_secs=10)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
+        list(ex.map(_del_clientconfig, range(1, max(USER_COUNTS) + 1)))
+
+    # Remove from Redis active-users set
+    log("  Removing users from Redis active-users set ...")
+    for i in range(1, max(USER_COUNTS) + 1):
+        redis_cmd("SREM", "snowplow:active-users", _scaleuser_name(i))
+    log("  Cleaned up synthetic users")
+
+
+def wait_for_active_users(expected_min, timeout=120):
+    """Poll /metrics/runtime until active_users >= expected_min."""
+    deadline = time.time() + timeout
+    last_count = 0
+    while time.time() < deadline:
+        m = get_runtime_metrics()
+        if m and m.get("active_users", 0) >= expected_min:
+            log(f"  Active users reached {m['active_users']} (needed {expected_min})")
+            return True
+        if m:
+            last_count = m.get("active_users", 0)
+        if int(time.time()) % 15 < 3:
+            log(f"  Waiting for active_users: {last_count}/{expected_min} ...")
+        time.sleep(3)
+    log(f"  TIMEOUT waiting for {expected_min} active users (got {last_count})")
+    return False
+
+
+def measure_warmup_after_restart(expected_users, timeout=300):
+    """Restart the snowplow pod and measure time until L1 is ready.
+
+    Returns dict with warmup_ms, peak_heap_mb, peak_goroutines, redis_mb
+    or None on timeout.
+    """
+    # Record pre-restart state
+    kubectl("rollout", "restart", "deploy/snowplow", "-n", NS)
+    kubectl("rollout", "status", "deploy/snowplow", "-n", NS,
+            f"--timeout={timeout}s", timeout_secs=timeout + 30)
+
+    if not wait_for_snowplow(max_wait=120):
+        return None
+
+    t0 = time.time()
+    peak_heap = 0.0
+    peak_goroutines = 0
+    deadline = time.time() + timeout
+
+    # Wait for L1 ready sentinel
+    while time.time() < deadline:
+        m = get_runtime_metrics()
+        if m:
+            peak_heap = max(peak_heap, m.get("heap_alloc_mb", 0))
+            peak_goroutines = max(peak_goroutines, m.get("goroutine_count", 0))
+
+        ts = _read_l1_ready_ts()
+        if ts > 0:
+            warmup_ms = int((time.time() - t0) * 1000)
+            redis_mb = get_redis_memory_mb()
+            return {
+                "warmup_ms": warmup_ms,
+                "peak_heap_mb": peak_heap,
+                "peak_goroutines": peak_goroutines,
+                "redis_mb": redis_mb,
+            }
+        time.sleep(3)
+
+    return None
+
+
+def measure_first_login_warmup(new_start, new_end, total_expected, tokens, timeout=180):
+    """Create new synthetic users and measure time until their L1 is warm.
+
+    Also measures latency impact on existing admin user during the burst.
+
+    Returns dict with warmup_ms, peak_heap_mb, peak_goroutines, redis_mb,
+    admin_latency_ms, or None on timeout.
+    """
+    admin_token = tokens.get("admin")
+
+    # Snapshot before creating users
+    before_sentinel = _read_l1_ready_ts()
+    peak_heap = 0.0
+    peak_goroutines = 0
+
+    # Measure admin baseline latency
+    baseline_latencies = []
+    for _ in range(3):
+        ms, code, _ = http_get(WIDGET_ENDPOINTS[0][1], admin_token)
+        if code == 200:
+            baseline_latencies.append(ms)
+    admin_baseline = statistics.median(baseline_latencies) if baseline_latencies else 0
+
+    # Create users (register + login via authn)
+    t0 = time.time()
+    created, _ = create_synthetic_users(new_start, new_end)
+    if created == 0:
+        return None
+
+    # Poll for active users and L1 ready
+    deadline = time.time() + timeout
+    admin_during_latencies = []
+
+    while time.time() < deadline:
+        m = get_runtime_metrics()
+        if m:
+            peak_heap = max(peak_heap, m.get("heap_alloc_mb", 0))
+            peak_goroutines = max(peak_goroutines, m.get("goroutine_count", 0))
+
+        # Check admin latency during burst (every other poll)
+        if admin_token and int(time.time()) % 6 < 3:
+            ms, code, _ = http_get(WIDGET_ENDPOINTS[0][1], admin_token)
+            if code == 200:
+                admin_during_latencies.append(ms)
+
+        # Check if L1 sentinel updated (new warmup completed)
+        ts = _read_l1_ready_ts()
+        if ts > before_sentinel:
+            # Also verify active user count
+            if m and m.get("active_users", 0) >= total_expected:
+                warmup_ms = int((time.time() - t0) * 1000)
+                redis_mb = get_redis_memory_mb()
+                admin_during = (statistics.median(admin_during_latencies)
+                                if admin_during_latencies else 0)
+                return {
+                    "warmup_ms": warmup_ms,
+                    "peak_heap_mb": peak_heap,
+                    "peak_goroutines": peak_goroutines,
+                    "redis_mb": redis_mb,
+                    "admin_baseline_ms": admin_baseline,
+                    "admin_during_ms": admin_during,
+                }
+        time.sleep(3)
+
+    # Timeout — return partial data
+    warmup_ms = int((time.time() - t0) * 1000)
+    admin_during = statistics.median(admin_during_latencies) if admin_during_latencies else 0
+    return {
+        "warmup_ms": warmup_ms,
+        "peak_heap_mb": peak_heap,
+        "peak_goroutines": peak_goroutines,
+        "redis_mb": get_redis_memory_mb(),
+        "admin_baseline_ms": admin_baseline,
+        "admin_during_ms": admin_during,
+        "timeout": True,
+    }
+
+
+def run_phase_user_scaling(tokens):
+    phase_banner(7, "MULTI-USER SCALING (warmup + first-login burst)")
+
+    # ── Step 1: Ensure compositions are deployed ──
+    section("Step 1: Deploy compositions")
+    comp_target = min(SCALE, 1000)
+    ns_count = comp_target // 10 if comp_target >= 10 else 1
+    comps_per_ns = 10
+
+    existing = count_compositions()
+    if existing < comp_target - 5:
+        log(f"Need {comp_target} compositions, have {existing}. Deploying ...")
+        create_bench_namespaces(1, ns_count)
+        wait_for_bench_namespaces(ns_count)
+        deploy_compositiondefinition("bench-ns-01")
+        time.sleep(10)
+        deploy_compositions_parallel(1, ns_count, comps_per_ns)
+        wait_for_compositions(comp_target, timeout=600)
+    else:
+        log(f"Already have {existing} compositions (target={comp_target})")
+
+    # ── Step 2: Baseline warmup (0 synthetic users) ──
+    section("Step 2: Baseline warmup (admin + cyberjoker only)")
+    delete_synthetic_users()
+    time.sleep(5)
+
+    baseline = measure_warmup_after_restart(expected_users=2, timeout=300)
+    if baseline:
+        log(f"  Baseline warmup: {baseline['warmup_ms']}ms, "
+            f"heap={baseline['peak_heap_mb']:.0f}MB, "
+            f"goroutines={baseline['peak_goroutines']}, "
+            f"redis={baseline['redis_mb']:.0f}MB")
+    else:
+        log("  WARNING: baseline warmup measurement timed out")
+
+    # Re-login after restart
+    tokens = login_all()
+
+    # ── Step 3-7: First-login burst at cumulative user counts ──
+    # Users are cumulative: 10, 50, 100, 500, 1000
+    cumulative_results = []
+    prev_end = 0
+
+    for target_count in USER_COUNTS:
+        new_start = prev_end + 1
+        new_end = target_count
+        added = new_end - prev_end
+        # +2 for admin + cyberjoker
+        total_expected = target_count + 2
+
+        section(f"First-login burst: +{added} users (total {target_count} synthetic)")
+        result = measure_first_login_warmup(
+            new_start, new_end, total_expected, tokens, timeout=300)
+
+        if result:
+            timed_out = result.get("timeout", False)
+            status = "TIMEOUT" if timed_out else f"{result['warmup_ms']}ms"
+            admin_impact = ""
+            if result.get("admin_baseline_ms") and result.get("admin_during_ms"):
+                ratio = result["admin_during_ms"] / max(result["admin_baseline_ms"], 1)
+                admin_impact = f", admin latency {ratio:.1f}x baseline"
+            log(f"  N={target_count}: warmup={status}, "
+                f"heap={result['peak_heap_mb']:.0f}MB, "
+                f"goroutines={result['peak_goroutines']}, "
+                f"redis={result['redis_mb']:.0f}MB"
+                f"{admin_impact}")
+
+            cumulative_results.append({
+                "users": target_count,
+                "added": added,
+                "type": "first_login",
+                **result,
+            })
+
+            record(f"P7: first-login N={target_count}",
+                   not timed_out,
+                   ms=result["warmup_ms"],
+                   note=f"heap={result['peak_heap_mb']:.0f}MB goroutines={result['peak_goroutines']}")
+        else:
+            log(f"  N={target_count}: FAILED (no data)")
+            cumulative_results.append({
+                "users": target_count, "added": added, "type": "first_login",
+                "warmup_ms": -1, "error": "no_data",
+            })
+            record(f"P7: first-login N={target_count}", False, note="no data")
+
+        prev_end = new_end
+
+    # ── Step 8: Full cold-start warmup with 1000 synthetic users ──
+    section("Step 8: Full warmup with 1000 users (cold start)")
+    full_warmup = measure_warmup_after_restart(
+        expected_users=max(USER_COUNTS) + 2, timeout=600)
+    if full_warmup:
+        timed_out = full_warmup.get("timeout", False)
+        log(f"  Full warmup (1000 users): {full_warmup['warmup_ms']}ms, "
+            f"heap={full_warmup['peak_heap_mb']:.0f}MB, "
+            f"goroutines={full_warmup['peak_goroutines']}, "
+            f"redis={full_warmup['redis_mb']:.0f}MB")
+        cumulative_results.append({
+            "users": max(USER_COUNTS),
+            "type": "cold_start",
+            **full_warmup,
+        })
+        record(f"P7: cold-start N={max(USER_COUNTS)}",
+               not full_warmup.get("timeout", False),
+               ms=full_warmup["warmup_ms"],
+               note=f"heap={full_warmup['peak_heap_mb']:.0f}MB goroutines={full_warmup['peak_goroutines']}")
+    else:
+        log("  Full warmup: TIMEOUT")
+        record(f"P7: cold-start N={max(USER_COUNTS)}", False, note="timeout")
+
+    # ── Step 9: Cleanup ──
+    section("Step 9: Cleanup synthetic users")
+    delete_synthetic_users()
+
+    # Re-login after cleanup
+    tokens = login_all()
+
+    # ── Summary table ──
+    section("PHASE 7 RESULTS")
+    print(f"\n  {BOLD}{'Type':<14s} {'Users':>6s} {'Added':>6s} │ {'Warmup':>10s} "
+          f"{'Heap(MB)':>10s} {'Goroutines':>11s} {'Redis(MB)':>10s} "
+          f"│ {'Admin Baseline':>15s} {'Admin During':>13s}{RESET}")
+    print(f"  {'─' * 120}")
+
+    if baseline:
+        print(f"  {'cold-start':<14s} {'2':>6s} {'—':>6s} │ "
+              f"{baseline['warmup_ms']:>8d}ms "
+              f"{baseline['peak_heap_mb']:>10.0f} "
+              f"{baseline['peak_goroutines']:>11d} "
+              f"{baseline['redis_mb']:>10.0f} │ "
+              f"{'—':>15s} {'—':>13s}")
+
+    for entry in cumulative_results:
+        warmup_str = ("TIMEOUT" if entry.get("timeout") or entry.get("warmup_ms", -1) < 0
+                       else f"{entry['warmup_ms']}ms")
+        admin_base = entry.get("admin_baseline_ms", 0)
+        admin_during = entry.get("admin_during_ms", 0)
+        admin_base_str = f"{admin_base:.0f}ms" if admin_base else "—"
+        admin_during_str = f"{admin_during:.0f}ms" if admin_during else "—"
+
+        print(f"  {entry.get('type', '?'):<14s} {entry['users']:>6d} "
+              f"{entry.get('added', '—'):>6} │ "
+              f"{warmup_str:>10s} "
+              f"{entry.get('peak_heap_mb', 0):>10.0f} "
+              f"{entry.get('peak_goroutines', 0):>11d} "
+              f"{entry.get('redis_mb', 0):>10.0f} │ "
+              f"{admin_base_str:>15s} {admin_during_str:>13s}")
+
+    # Save detailed results
+    out_file = "/tmp/phase7_user_scaling_results.json"
+    all_data = {"baseline": baseline, "results": cumulative_results}
+    with open(out_file, "w") as f:
+        json.dump(all_data, f, indent=2, default=str)
+    log(f"Detailed results saved to {out_file}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # REPORT
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -2495,6 +2959,10 @@ def main():
 
     if 6 in phases:
         run_phase_browser_scaling(tokens)
+        tokens = login_all()
+
+    if 7 in phases:
+        run_phase_user_scaling(tokens)
         tokens = login_all()
 
     enable_cache()
