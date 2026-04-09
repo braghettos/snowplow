@@ -86,9 +86,19 @@ func decompressGzip(data []byte) []byte {
 	return out
 }
 
+// resolvedPrefix is the key prefix for L1 resolved cache entries.
+// Used to route these keys to disk when a DiskStore is configured.
+const resolvedPrefix = "snowplow:resolved:"
+
+// isResolvedKey returns true if the key is an L1 resolved cache entry.
+func isResolvedKey(key string) bool {
+	return strings.HasPrefix(key, resolvedPrefix)
+}
+
 // RedisCache is a Redis-backed cache. All methods are safe on a nil receiver.
 type RedisCache struct {
 	client      *redis.Client
+	diskStore   *DiskStore // nil = use Redis for L1 resolved keys
 	ResourceTTL time.Duration
 	gvrTTLs     sync.Map
 	onNewGVR    atomic.Value // stores gvrNotifyFunc
@@ -121,6 +131,15 @@ func New(resourceTTL time.Duration) *RedisCache {
 			MaxRetries:   2,
 		}),
 		ResourceTTL: resourceTTL,
+	}
+}
+
+// SetDiskStore configures a disk-backed store for L1 resolved keys.
+// When set, GetRaw/SetResolvedRaw/Delete route snowplow:resolved:* keys
+// to disk instead of Redis. Pass nil to disable (default).
+func (c *RedisCache) SetDiskStore(ds *DiskStore) {
+	if c != nil {
+		c.diskStore = ds
 	}
 }
 
@@ -200,6 +219,12 @@ func (c *RedisCache) GetRaw(ctx context.Context, key string) ([]byte, bool, erro
 	if c == nil {
 		return nil, false, nil
 	}
+
+	// Route L1 resolved keys to disk when configured.
+	if c.diskStore != nil && isResolvedKey(key) {
+		return c.getDiskRaw(ctx, key)
+	}
+
 	ctx, span := redisTracer.Start(ctx, "redis.get",
 		trace.WithAttributes(
 			attribute.String("db.system", "redis"),
@@ -221,6 +246,46 @@ func (c *RedisCache) GetRaw(ctx context.Context, key string) ([]byte, bool, erro
 		return nil, false, err
 	}
 	val = decompressValue(val)
+	if bytes.Equal(val, []byte(notFoundSentinel)) {
+		if span.IsRecording() {
+			span.SetAttributes(attribute.Bool("cache.hit", false))
+		}
+		return nil, false, nil
+	}
+	if span.IsRecording() {
+		span.SetAttributes(
+			attribute.Bool("cache.hit", true),
+			attribute.Int("cache.value_size", len(val)),
+		)
+	}
+	return val, true, nil
+}
+
+// getDiskRaw reads an L1 resolved key from the disk store.
+// The disk store returns already-compressed bytes, so we decompress here
+// (matching the Redis path's behavior).
+func (c *RedisCache) getDiskRaw(ctx context.Context, key string) ([]byte, bool, error) {
+	_, span := redisTracer.Start(ctx, "disk.get",
+		trace.WithAttributes(
+			attribute.String("db.system", "disk"),
+			attribute.String("db.operation", "GET"),
+			attribute.String("cache.key", key),
+		))
+	defer span.End()
+
+	data, found, err := c.diskStore.Get(key)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return nil, false, err
+	}
+	if !found {
+		if span.IsRecording() {
+			span.SetAttributes(attribute.Bool("cache.hit", false))
+		}
+		return nil, false, nil
+	}
+	val := decompressValue(data)
 	if bytes.Equal(val, []byte(notFoundSentinel)) {
 		if span.IsRecording() {
 			span.SetAttributes(attribute.Bool("cache.hit", false))
@@ -279,10 +344,15 @@ func (c *RedisCache) GetRawMulti(ctx context.Context, keys []string) map[string]
 	return result
 }
 
-// Exists returns true when the key is present in Redis (regardless of value).
+// Exists returns true when the key is present in the cache (regardless of value).
 func (c *RedisCache) Exists(ctx context.Context, key string) bool {
 	if c == nil {
 		return false
+	}
+	// Route resolved keys to disk when configured.
+	if c.diskStore != nil && isResolvedKey(key) {
+		_, found, err := c.diskStore.Get(key)
+		return err == nil && found
 	}
 	n, err := c.client.Exists(ctx, key).Result()
 	return err == nil && n > 0
@@ -354,17 +424,38 @@ func (c *RedisCache) SetResolvedRaw(ctx context.Context, key string, val []byte)
 	if c == nil {
 		return nil
 	}
+	compressed := compressValue(val)
+
+	// Route L1 resolved keys to disk when configured.
+	// The per-user index SET stays in Redis (it's small and used for O(1) invalidation).
+	if c.diskStore != nil && isResolvedKey(key) {
+		if err := c.diskStore.Set(key, compressed); err != nil {
+			return err
+		}
+		// Still maintain the per-user index in Redis for invalidation lookups.
+		info, hasInfo := ParseResolvedKey(key)
+		if hasInfo && info.Username != "" {
+			idxKey := UserResolvedIndexKey(info.Username)
+			pipe := c.client.TxPipeline()
+			pipe.SAdd(ctx, idxKey, key)
+			pipe.Expire(ctx, idxKey, ReverseIndexTTL)
+			_, err := pipe.Exec(ctx)
+			return err
+		}
+		return nil
+	}
+
 	info, hasInfo := ParseResolvedKey(key)
 	if hasInfo && info.Username != "" {
 		idxKey := UserResolvedIndexKey(info.Username)
 		pipe := c.client.TxPipeline()
-		pipe.Set(ctx, key, compressValue(val), ResolvedCacheTTL)
+		pipe.Set(ctx, key, compressed, ResolvedCacheTTL)
 		pipe.SAdd(ctx, idxKey, key)
 		pipe.Expire(ctx, idxKey, ReverseIndexTTL)
 		_, err := pipe.Exec(ctx)
 		return err
 	}
-	return c.client.Set(ctx, key, compressValue(val), ResolvedCacheTTL).Err()
+	return c.client.Set(ctx, key, compressed, ResolvedCacheTTL).Err()
 }
 
 func (c *RedisCache) setWithTTL(ctx context.Context, key string, val any, ttl time.Duration) error {
@@ -382,6 +473,26 @@ func (c *RedisCache) Delete(ctx context.Context, keys ...string) error {
 	if c == nil || len(keys) == 0 {
 		return nil
 	}
+
+	// When disk store is configured, split keys: resolved → disk, rest → Redis.
+	if c.diskStore != nil {
+		var diskKeys, redisKeys []string
+		for _, k := range keys {
+			if isResolvedKey(k) {
+				diskKeys = append(diskKeys, k)
+			} else {
+				redisKeys = append(redisKeys, k)
+			}
+		}
+		if len(diskKeys) > 0 {
+			_ = c.diskStore.Delete(diskKeys...)
+		}
+		if len(redisKeys) > 0 {
+			return c.client.Del(ctx, redisKeys...).Err()
+		}
+		return nil
+	}
+
 	return c.client.Del(ctx, keys...).Err()
 }
 

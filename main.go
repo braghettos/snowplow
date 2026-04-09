@@ -71,6 +71,8 @@ func main() {
 		"path to cache warmup YAML config")
 	resourceTTL := flag.Duration("resource-ttl", env.Duration("RESOURCE_TTL", cache.DefaultResourceTTL),
 		"default TTL for cached Kubernetes resources")
+	l1DiskPath := flag.String("l1-disk-path", env.String("L1_DISK_PATH", ""),
+		"directory for disk-backed L1 resolved cache (empty = use Redis)")
 
 	flag.Usage = func() {
 		fmt.Fprintln(flag.CommandLine.Output(), "Flags:")
@@ -149,6 +151,21 @@ func main() {
 			log.Info("redis connected")
 			cache.GlobalMetrics.SetRedis(redisCache)
 			cache.GlobalMetrics.StartMetricsFlusher(ctx, 10*time.Second)
+		}
+	}
+
+	// Configure disk-backed L1 store when --l1-disk-path is set.
+	if redisCache != nil && *l1DiskPath != "" {
+		ds, err := cache.NewDiskStore(*l1DiskPath, cache.ResolvedCacheTTL)
+		if err != nil {
+			log.Error("failed to create disk store; L1 will use Redis",
+				slog.String("path", *l1DiskPath), slog.Any("err", err))
+		} else {
+			redisCache.SetDiskStore(ds)
+			ds.StartCleanup(ctx, 60*time.Second)
+			log.Info("disk-backed L1 store enabled",
+				slog.String("path", *l1DiskPath),
+				slog.Duration("ttl", cache.ResolvedCacheTTL))
 		}
 	}
 
