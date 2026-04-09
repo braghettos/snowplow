@@ -396,10 +396,18 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 	}
 }
 
-// allDeleteChanges returns true if all changes in the list are delete operations.
+// allDeleteChanges returns true if the net effect of all changes is deletes only.
+// K8s informers often fire UPDATE before DELETE (adding deletionTimestamp/finalizer),
+// so we check the last operation per namespace/name rather than requiring all events
+// to be deletes.
 func allDeleteChanges(changes []cache.L1ChangeInfo) bool {
+	type nsName struct{ ns, name string }
+	lastOp := make(map[nsName]string, len(changes))
 	for _, ch := range changes {
-		if ch.Operation != "delete" {
+		lastOp[nsName{ch.Namespace, ch.Name}] = ch.Operation
+	}
+	for _, op := range lastOp {
+		if op != "delete" {
 			return false
 		}
 	}
