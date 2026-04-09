@@ -321,13 +321,17 @@ def cache_metrics(token):
     return body or {}
 
 
-def kubectl(*args, input_data=None):
-    proc = subprocess.run(
-        ["kubectl"] + list(args),
-        input=input_data.encode() if input_data else None,
-        capture_output=True,
-    )
-    return proc.returncode, proc.stdout.decode().strip(), proc.stderr.decode().strip()
+def kubectl(*args, input_data=None, timeout_secs=120):
+    try:
+        proc = subprocess.run(
+            ["kubectl"] + list(args),
+            input=input_data.encode() if input_data else None,
+            capture_output=True,
+            timeout=timeout_secs,
+        )
+        return proc.returncode, proc.stdout.decode().strip(), proc.stderr.decode().strip()
+    except subprocess.TimeoutExpired:
+        return 1, "", f"kubectl timed out after {timeout_secs}s"
 
 
 def redis_cmd(*args):
@@ -555,12 +559,18 @@ subjects:
 
 
 def create_bench_namespaces(start, end):
-    yaml_parts = []
-    for i in range(start, end + 1):
-        yaml_parts.append(f"apiVersion: v1\nkind: Namespace\nmetadata:\n  name: bench-ns-{i:02d}")
-    rc, _, _ = kubectl("apply", "--server-side", "-f", "-",
-                       input_data="\n---\n".join(yaml_parts))
-    log(f"Created bench-ns-{start:02d}..{end:02d} ({end - start + 1} ns): rc={rc}")
+    count = end - start + 1
+    # For large batches, apply in chunks of 200 to avoid kubectl timeouts
+    chunk_size = 200
+    for chunk_start in range(start, end + 1, chunk_size):
+        chunk_end = min(chunk_start + chunk_size - 1, end)
+        yaml_parts = []
+        for i in range(chunk_start, chunk_end + 1):
+            yaml_parts.append(f"apiVersion: v1\nkind: Namespace\nmetadata:\n  name: bench-ns-{i:02d}")
+        rc, _, _ = kubectl("apply", "--server-side", "-f", "-",
+                           input_data="\n---\n".join(yaml_parts),
+                           timeout_secs=300)
+        log(f"Created bench-ns-{chunk_start:02d}..{chunk_end:02d} ({chunk_end - chunk_start + 1} ns): rc={rc}")
 
 
 def wait_for_bench_namespaces(expected, timeout=120):
@@ -1727,8 +1737,13 @@ def _browser_measure_navigation(page, page_path, label, min_calls=0):
         performance.setResourceTimingBufferSize(2000);
     }""")
 
-    # Navigate and wait for network to settle
-    page.goto(f"{FRONTEND}{page_path}", wait_until="networkidle", timeout=300_000)
+    # Navigate — use domcontentloaded instead of networkidle to avoid hanging
+    # when the page has persistent connections (SSE, websockets, long-poll).
+    # The stability polling loop below will wait for /call requests to finish.
+    try:
+        page.goto(f"{FRONTEND}{page_path}", wait_until="domcontentloaded", timeout=60_000)
+    except Exception as e:
+        log(f"    WARNING: page.goto timeout ({e}), continuing with stability poll")
 
     # If redirected to login, the session expired — try to detect
     if "/login" in page.url:
