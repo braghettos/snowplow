@@ -107,7 +107,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		}
 	}
 
-	log.Info("base dict for api resolver", slog.Any("dict", dict))
+	log.Debug("base dict for api resolver", slog.Int("dict_keys", len(dict)))
 
 	// Collect all API request paths executed during resolution.
 	// These are the actual expanded paths (not JQ templates) and are
