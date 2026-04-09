@@ -23,6 +23,7 @@ Environment:
   ITERS           iterations for latency/warm measurements (default: 10)
   WARMUP_ITERS    warmup requests before measurement (default: 3)
   SMOKE           "1" to limit scaling to stages 1-3 (default: "0")
+  SCALE           Target composition count for Phase 6 (default: 5000, e.g. 10000)
   EXPECTED_IMAGE_TAG  (required) e.g. 0.25.19 — tests will not start until deployment
                       runs this image. Deploy first: kubectl set image deployment/snowplow
                       snowplow=ghcr.io/<repo>/snowplow:0.25.19 -n krateo-system
@@ -55,6 +56,7 @@ FRONTEND = os.environ.get("FRONTEND_URL", "http://34.46.217.105:8080") or None
 ITERS = int(os.environ.get("ITERS", "10"))
 WARMUP_ITERS = int(os.environ.get("WARMUP_ITERS", "3"))
 SMOKE = os.environ.get("SMOKE", "0") == "1"
+SCALE = int(os.environ.get("SCALE", "5000"))
 NS = "krateo-system"
 
 USERS = {
@@ -2198,7 +2200,7 @@ def run_phase_browser_scaling(tokens):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
 
-        for cache_mode in ("ON", "OFF"):
+        for cache_mode in ("ON",):  # Run ON only for scale test
             section(f"BROWSER MATRIX: cache={cache_mode}")
             clean_environment()
             if cache_mode == "ON":
@@ -2269,20 +2271,24 @@ def run_phase_browser_scaling(tokens):
             if r:
                 all_results.append(r)
 
-            # S5 — 500 namespaces (Phase 7: 5K scale)
+            # S5 — namespaces (driven by SCALE: 500 for 5K, 1000 for 10K)
+            s5_ns_end = SCALE // 10  # 500 for 5K, 1000 for 10K
             ts = _snapshot_l1()
-            create_bench_namespaces(21, 500); wait_for_bench_namespaces(500, timeout=300)
+            create_bench_namespaces(21, s5_ns_end); wait_for_bench_namespaces(s5_ns_end, timeout=600)
             _stabilize(ts, quiesce=True)
-            r = _browser_measure_stage(page, 5, "500 bench ns", cache_mode, token=admin_token)
+            r = _browser_measure_stage(page, 5, f"{s5_ns_end} bench ns", cache_mode, token=admin_token)
             if r:
                 all_results.append(r)
 
-            # S6 — 5000 compositions (Phase 7: 5K scale)
+            # S6 — compositions (driven by SCALE)
+            s6_ns_end = SCALE // 10  # 500 for 5K, 1000 for 10K
+            s6_timeout = 1200 if SCALE <= 5000 else 2400
+            s6_quiesce = 60 if SCALE <= 5000 else 120
             ts = _snapshot_l1()
-            deploy_compositions_parallel(1, 500, 10)
-            wait_for_compositions(5000, timeout=1200)
-            _stabilize(ts, quiesce=True, quiesce_secs=60)
-            r = _browser_measure_stage(page, 6, "5000 compositions", cache_mode, token=admin_token)
+            deploy_compositions_parallel(1, s6_ns_end, 10)
+            wait_for_compositions(SCALE, timeout=s6_timeout)
+            _stabilize(ts, quiesce=True, quiesce_secs=s6_quiesce)
+            r = _browser_measure_stage(page, 6, f"{SCALE} compositions", cache_mode, token=admin_token)
             if r:
                 all_results.append(r)
 
@@ -2302,7 +2308,7 @@ def run_phase_browser_scaling(tokens):
                                      "-l", "app.kubernetes.io/name=snowplow",
                                      "-o", "jsonpath={.items[0].status.containerStatuses[0].restartCount}")
                 if rc == 0:
-                    log(f"    POD restarts at 5K scale: {out.strip()}")
+                    log(f"    POD restarts at {SCALE} scale: {out.strip()}")
             except Exception:
                 pass
 
@@ -2316,9 +2322,10 @@ def run_phase_browser_scaling(tokens):
                 all_results.append(r)
 
             # S8 — Delete 1 namespace (~10 compositions)
+            s8_ns = f"bench-ns-{SCALE // 10:02d}"
             ts = _snapshot_l1()
-            delete_one_bench_namespace("bench-ns-500")
-            wait_for_namespace_gone("bench-ns-500")
+            delete_one_bench_namespace(s8_ns)
+            wait_for_namespace_gone(s8_ns)
             _stabilize(ts)
             r = _browser_measure_stage(page, 8, "Deleted 1 ns", cache_mode, token=admin_token)
             if r:
