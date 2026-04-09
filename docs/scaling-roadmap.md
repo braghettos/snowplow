@@ -1,6 +1,6 @@
 # Snowplow Cache — Scaling Roadmap
 
-**Baseline**: v0.25.149 (per-item L3, RBAC pre-warming, MGET batching, zstd compression, incremental L1 delete patching, priority-ordered parallel L1 refresh, activity classes, full OTel)
+**Baseline**: v0.25.150 (per-item L3, RBAC pre-warming, MGET batching, zstd compression, incremental L1 delete patching, parallel topological levels, priority-ordered parallel L1 refresh, activity classes, full OTel)
 **Current validated scale**: 5,000 compositions × 500 namespaces × 2 users (7.0s convergence, full content correctness, 4.8x faster than cache OFF)
 **Target scale**: 50,000+ compositions × 1,000 users
 
@@ -29,6 +29,7 @@
 | v0.25.141 | + B3 MGET batching | 6.9s | 8.0s | 8.8s |
 | v0.25.142 | + C1 zstd | 8.2s | 6.9s | 7.2s |
 | v0.25.149 | + C2 incremental L1 | 7.1s | 7.0s | 7.4s |
+| v0.25.150 | + C3 parallel topo levels | 7.0s | 7.1s | 7.3s |
 
 ### Infrastructure
 - Redis memory: 258MB peak (per-item keys + zstd)
@@ -466,7 +467,7 @@ This requires:
 | B3 | MGET batching | 500+ namespaces | 2 hours | Low | **DONE** (v0.25.141) |
 | C1 | zstd compression | 3x faster compress/decompress | 2 days | Medium | **DONE** (v0.25.142) |
 | C2 | Incremental L1 delete patch | 50K fast delete convergence | 1 week | High | **DONE** (v0.25.149) — working, value at 50K+ |
-| C3 | Parallel topological levels | 30-40% faster resolution | 2 days | Low | Next |
+| C3 | Parallel topological levels | 30-40% faster resolution | 2 days | Low | **DONE** (v0.25.150) |
 | D1 | Sharded pods | 5K+ users | 2 weeks | High | |
 | D2 | Push-based invalidation | Unlimited users (trades convergence) | 1 week | Medium | |
 | D3 | External Redis | 64GB+ memory | 3 days | Low | |
