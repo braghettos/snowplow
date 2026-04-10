@@ -1143,6 +1143,19 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 	}
 
 	// Objects in informer but NOT in L3, or with different resourceVersion.
+	// Collect all writes and flush in pipelined batches to avoid 5055
+	// sequential Redis round-trips at large scale (was ~7s per round at 50K).
+	const batchSize = 500
+	pendingWrites := make(map[string]any, batchSize)
+	flushPending := func() {
+		if len(pendingWrites) == 0 {
+			return
+		}
+		if serr := rw.cache.SetMultiForGVR(ctx, gvr, pendingWrites); serr != nil {
+			errs++
+		}
+		pendingWrites = make(map[string]any, batchSize)
+	}
 	for k, entry := range informerMap {
 		l3RV, inL3 := l3Map[k]
 		if !inL3 {
@@ -1155,11 +1168,13 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 		stripped := entry.uns.DeepCopy()
 		// Already stripped by SetTransform at informer ingestion.
 		getKey := GetKey(gvr, stripped.GetNamespace(), stripped.GetName())
-		if serr := rw.cache.SetForGVR(ctx, gvr, getKey, stripped); serr != nil {
-			errs++
-		}
+		pendingWrites[getKey] = stripped
 		changedNamespaces[stripped.GetNamespace()] = true
+		if len(pendingWrites) >= batchSize {
+			flushPending()
+		}
 	}
+	flushPending()
 
 	// 4. Delete orphaned GET keys.
 	if len(keysToDelete) > 0 {
@@ -1329,32 +1344,11 @@ func (rw *ResourceWatcher) rebuildListCaches(ctx context.Context, gvr schema.Gro
 		_ = rw.cache.ReplaceSetWithTTL(ctx, ListIndexKey(gvr, ns), members, ttl)
 	}
 
-	// ── Legacy monolithic blobs (dual-write for migration) ───────────────────
-
-	// Write cluster-wide list. Skip if empty: we don't know the Kind for this
-	// GVR without at least one item, and writing a malformed list (missing
-	// Kind/APIVersion) would produce a malformed list blob (legacy dual-write).
-	// The list will be created correctly when the first ADD event arrives.
-	if len(items) > 0 {
-		clusterList := &unstructured.UnstructuredList{Items: items}
-		clusterList.SetAPIVersion(items[0].GetAPIVersion())
-		clusterList.SetKind(items[0].GetKind() + "List")
-		_ = rw.cache.SetForGVR(ctx, gvr, ListKey(gvr, ""), clusterList)
-	}
-
-	// Write per-namespace lists.
-	for ns, nsItems := range byNamespace {
-		if ns == "" {
-			continue
-		}
-		if len(nsItems) == 0 {
-			continue
-		}
-		nsList := &unstructured.UnstructuredList{Items: nsItems}
-		nsList.SetAPIVersion(nsItems[0].GetAPIVersion())
-		nsList.SetKind(nsItems[0].GetKind() + "List")
-		_ = rw.cache.SetForGVR(ctx, gvr, ListKey(gvr, ns), nsList)
-	}
+	// Legacy monolithic blob writes (cluster-wide + per-namespace) REMOVED.
+	// At 50K scale, these writes added ~6-9s per reconcile round and ~100MB
+	// Redis memory. The per-item index SETs above (ListIndexKey) are
+	// authoritative and readers consume them via AssembleListFromIndex.
+	_ = byNamespace // silence unused if all paths return
 }
 
 // patchListCache was the monolithic list patching function that used WATCH/MULTI/EXEC

@@ -791,6 +791,24 @@ def delete_bench_namespaces():
     kubectl("delete", "ns", *bench_ns, "--ignore-not-found", "--wait=false",
             "--force", "--grace-period=0")
     log(f"Triggered deletion of {len(bench_ns)} bench namespaces")
+
+    # Force-finalize via the /finalize subresource to bypass slow
+    # namespace controller processing. This clears spec.finalizers
+    # (which includes "kubernetes" by default) and allows the namespace
+    # to be removed immediately.
+    def force_finalize(ns):
+        body = json.dumps({
+            'apiVersion': 'v1', 'kind': 'Namespace',
+            'metadata': {'name': ns}, 'spec': {'finalizers': []}
+        })
+        kubectl("replace", "--raw", f"/api/v1/namespaces/{ns}/finalize",
+                "-f", "-", input_data=body)
+
+    time.sleep(2)  # let delete propagate first
+    log(f"Force-finalizing {len(bench_ns)} namespaces via /finalize API ...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
+        list(ex.map(force_finalize, bench_ns))
+
     deadline = time.time() + 600
     while time.time() < deadline:
         rc, out, _ = kubectl("get", "ns", "-o", "name")
@@ -799,7 +817,7 @@ def delete_bench_namespaces():
             log("All bench namespaces deleted")
             return
         time.sleep(5)
-    log("WARNING: bench namespace deletion timed out")
+    log(f"WARNING: bench namespace deletion timed out — {len(remaining)} remaining")
 
 
 def deploy_compositiondefinition(ns="bench-ns-01"):
@@ -870,25 +888,34 @@ def deploy_compositions_parallel(ns_start, ns_end, comps_per_ns, max_retries=5, 
     failed = []
     deployed_count = [0]  # mutable for closure
 
+    # Cap per-kubectl-apply batch size to avoid timeouts at large comps_per_ns.
+    # 200 compositions per apply takes ~10-20s; 1000 per apply exceeded 120s.
+    max_per_apply = 200
+
     def deploy_ns_batch(ns_i):
         ns = f"bench-ns-{ns_i:02d}"
-        yamls = []
-        for comp_i in range(1, comps_per_ns + 1):
-            name = f"bench-app-{ns_i:02d}-{comp_i:02d}"
-            yamls.append(composition_yaml(ns, name))
-        batch_yaml = "\n---\n".join(yamls)
-        ok = False
-        for attempt in range(1, max_retries + 1):
-            rc, _, err = kubectl("apply", "--server-side", "-f", "-", input_data=batch_yaml)
-            if rc == 0:
-                ok = True
-                break
-            if attempt < max_retries:
-                time.sleep(2 * attempt)
-        if not ok:
-            failed.append(ns)
-            log(f"  FAILED after {max_retries} attempts: {ns}: {err[:200]}")
-        deployed_count[0] += comps_per_ns
+        ns_ok = 0
+        for sub_start in range(1, comps_per_ns + 1, max_per_apply):
+            sub_end = min(sub_start + max_per_apply - 1, comps_per_ns)
+            yamls = []
+            for comp_i in range(sub_start, sub_end + 1):
+                name = f"bench-app-{ns_i:02d}-{comp_i:02d}"
+                yamls.append(composition_yaml(ns, name))
+            batch_yaml = "\n---\n".join(yamls)
+            sub_ok = False
+            for attempt in range(1, max_retries + 1):
+                rc, _, err = kubectl("apply", "--server-side", "-f", "-", input_data=batch_yaml, timeout_secs=180)
+                if rc == 0:
+                    sub_ok = True
+                    break
+                if attempt < max_retries:
+                    time.sleep(2 * attempt)
+            if sub_ok:
+                ns_ok += (sub_end - sub_start + 1)
+            else:
+                failed.append(f"{ns}[{sub_start}-{sub_end}]")
+                log(f"  FAILED after {max_retries} attempts: {ns}[{sub_start}-{sub_end}]: {err[:200]}")
+        deployed_count[0] += ns_ok
         if deployed_count[0] % 500 == 0 or deployed_count[0] == total:
             log(f"  Deployed {deployed_count[0]}/{total} compositions")
 
@@ -2290,8 +2317,15 @@ def run_phase_browser_scaling(tokens):
             if r:
                 all_results.append(r)
 
-            # S5 — namespaces (driven by SCALE: 500 for 5K, 1000 for 10K)
-            s5_ns_end = SCALE // 10  # 500 for 5K, 1000 for 10K
+            # S5/S6 — namespaces + compositions (driven by SCALE)
+            # At large scale, use fewer namespaces with more compositions per ns.
+            # K8s namespace controller cannot efficiently handle 5000+ namespaces.
+            if SCALE >= 10000:
+                s5_ns_end = 50
+                s6_comps_per_ns = SCALE // s5_ns_end
+            else:
+                s5_ns_end = SCALE // 10  # 500 for 5K
+                s6_comps_per_ns = 10
             ts = _snapshot_l1()
             create_bench_namespaces(21, s5_ns_end); wait_for_bench_namespaces(s5_ns_end, timeout=600)
             _stabilize(ts, quiesce=True)
@@ -2299,12 +2333,11 @@ def run_phase_browser_scaling(tokens):
             if r:
                 all_results.append(r)
 
-            # S6 — compositions (driven by SCALE)
-            s6_ns_end = SCALE // 10  # 500 for 5K, 1000 for 10K
-            s6_timeout = 1200 if SCALE <= 5000 else 2400
+            # S6 — compositions
+            s6_timeout = 1200 if SCALE <= 5000 else 3600
             s6_quiesce = 60 if SCALE <= 5000 else 120
             ts = _snapshot_l1()
-            deploy_compositions_parallel(1, s6_ns_end, 10)
+            deploy_compositions_parallel(1, s5_ns_end, s6_comps_per_ns)
             wait_for_compositions(SCALE, timeout=s6_timeout)
             _stabilize(ts, quiesce=True, quiesce_secs=s6_quiesce)
             r = _browser_measure_stage(page, 6, f"{SCALE} compositions", cache_mode, token=admin_token)
@@ -2340,8 +2373,8 @@ def run_phase_browser_scaling(tokens):
             if r:
                 all_results.append(r)
 
-            # S8 — Delete 1 namespace (~10 compositions)
-            s8_ns = f"bench-ns-{SCALE // 10:02d}"
+            # S8 — Delete 1 namespace (~comps_per_ns compositions)
+            s8_ns = f"bench-ns-{s5_ns_end:02d}"
             ts = _snapshot_l1()
             delete_one_bench_namespace(s8_ns)
             wait_for_namespace_gone(s8_ns)
@@ -2749,14 +2782,24 @@ def run_phase_user_scaling(tokens):
     # ── Step 1: Deploy compositions ──
     section("Step 1: Deploy compositions")
     comp_target = SCALE
-    ns_count = comp_target // 10 if comp_target >= 10 else 1
-    comps_per_ns = 10
+    # At large scale, use fewer namespaces with more compositions per ns.
+    # K8s namespace controller cannot handle 5000+ namespaces efficiently.
+    # 50 ns × 1000 comp = 50K is just as realistic as 5000 × 10.
+    if comp_target >= 10000:
+        ns_count = 50
+        comps_per_ns = comp_target // ns_count
+    else:
+        ns_count = comp_target // 10 if comp_target >= 10 else 1
+        comps_per_ns = 10
 
     log(f"Deploying {comp_target} compositions across {ns_count} namespaces ...")
     create_bench_namespaces(1, ns_count)
     wait_for_bench_namespaces(ns_count, timeout=600)
     deploy_compositiondefinition("bench-ns-01")
-    time.sleep(15)
+    if not wait_for_crd(timeout=300):
+        log("ERROR: CRD not ready after 300s, aborting")
+        return
+    time.sleep(10)
     deploy_compositions_parallel(1, ns_count, comps_per_ns)
     wait_for_compositions(comp_target, timeout=3600)
 

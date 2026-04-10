@@ -9,6 +9,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/dynamic"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/crds"
 	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+	"k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -19,10 +20,15 @@ const (
 	widgetDataKey = "widgetData"
 )
 
-// validatorCache memoises compiled OpenAPI validators per (gvr, version).
-// The CRD schema changes rarely compared to widget resolutions, so re-parsing
-// the schema on every L1 refresh wastes ~490MB of heap at 50K scale (pprof
-// verified on v0.25.160: ValidateObjectStatus cum = 490MB).
+// validatedSchema holds a compiled SchemaValidator ready to use.
+// The compiled validator is expensive to build (~40ms + 8KB per call);
+// caching eliminates 47% of all allocations at 50K scale (pprof verified:
+// NewSchemaValidator was 176GB cumulative allocs in v0.25.161).
+type validatedSchema struct {
+	crv       *apiextensions.CustomResourceValidation
+	validator validation.SchemaValidator
+}
+
 type validatorKey struct {
 	resource string
 	group    string
@@ -31,14 +37,14 @@ type validatorKey struct {
 
 var (
 	validatorCacheMu sync.RWMutex
-	validatorCache   = make(map[validatorKey]*apiextensions.CustomResourceValidation)
+	validatorCache   = make(map[validatorKey]*validatedSchema)
 )
 
 // InvalidateValidatorCache clears the cached validators. Should be called
-// when a CRD is updated (e.g. from an informer event on the CRD GVR).
+// when a CRD is updated to pick up schema changes.
 func InvalidateValidatorCache() {
 	validatorCacheMu.Lock()
-	validatorCache = make(map[validatorKey]*apiextensions.CustomResourceValidation)
+	validatorCache = make(map[validatorKey]*validatedSchema)
 	validatorCacheMu.Unlock()
 }
 
@@ -50,8 +56,7 @@ func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]a
 	}
 
 	// Use NestedFieldNoCopy to avoid DeepCopying the widgetData subtree.
-	// The validator does not mutate its input — this saves ~236MB heap at
-	// 50K scale (pprof verified: unstructured.NestedMap 236MB cum).
+	// The validator does not mutate its input — saves ~236MB heap at 50K.
 	widgetDataRaw, ok, err := unstructured.NestedFieldNoCopy(obj, "status", widgetDataKey)
 	if err != nil {
 		return err
@@ -73,16 +78,18 @@ func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]a
 	}
 	widgetData, _ := widgetDataRaw.(map[string]any)
 
-	// Cache lookup: if we already compiled the validator for this CRD
-	// version, reuse it. This is the biggest single hotspot at 50K
-	// (490MB cum on refreshSingleL1 path).
+	// Cache lookup: reuse the compiled SchemaValidator if we have one for
+	// this CRD version. The previous cache (v0.25.161) only cached the CRV
+	// but still called NewSchemaValidator on every invocation — proven by
+	// pprof to be 47% of all allocations. Now we cache the compiled
+	// validator itself.
 	cacheKey := validatorKey{
 		resource: gvr.Resource,
 		group:    gvr.Group,
 		version:  gvr.Version,
 	}
 	validatorCacheMu.RLock()
-	crv, cached := validatorCache[cacheKey]
+	entry, cached := validatorCache[cacheKey]
 	validatorCacheMu.RUnlock()
 
 	if !cached {
@@ -95,15 +102,25 @@ func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]a
 			return err
 		}
 
-		crv, err = extractOpenAPISchemaFromCRD(crd, gvr.Version)
+		crv, err := extractOpenAPISchemaFromCRD(crd, gvr.Version)
 		if err != nil {
 			return err
 		}
 
+		// Compile the validator once and cache it.
+		sv, _, svErr := validation.NewSchemaValidator(crv.OpenAPIV3Schema)
+		if svErr != nil {
+			return svErr
+		}
+
+		entry = &validatedSchema{
+			crv:       crv,
+			validator: sv,
+		}
 		validatorCacheMu.Lock()
-		validatorCache[cacheKey] = crv
+		validatorCache[cacheKey] = entry
 		validatorCacheMu.Unlock()
 	}
 
-	return validateCustomResource(crv, widgetData)
+	return validateCustomResourceWithCachedValidator(entry.validator, widgetData)
 }
