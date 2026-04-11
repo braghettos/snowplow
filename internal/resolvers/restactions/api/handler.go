@@ -10,7 +10,12 @@ import (
 	"github.com/krateoplatformops/plumbing/jqutil"
 	"github.com/krateoplatformops/plumbing/ptr"
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
+
+var apiHandlerTracer = otel.Tracer("snowplow/resolvers/restactions/api")
 
 type jsonHandlerOptions struct {
 	key    string
@@ -42,10 +47,20 @@ func jsonHandler(ctx context.Context, opts jsonHandlerOptions) func(io.ReadClose
 		if opts.filter != nil {
 			q := ptr.Deref(opts.filter, "")
 			log.Debug("found local filter on api result", slog.String("filter", q))
+			_, jqSpan := apiHandlerTracer.Start(ctx, "restaction.api.jq_eval",
+				trace.WithAttributes(
+					attribute.String("api.call.key", opts.key),
+					attribute.Int("api.call.input_bytes", len(dat)),
+					attribute.Int("api.call.filter_len", len(q)),
+				))
 			s, err := jqutil.Eval(context.TODO(), jqutil.EvalOptions{
 				Query: q, Data: pig,
 				ModuleLoader: jqsupport.ModuleLoader(),
 			})
+			if err == nil {
+				jqSpan.SetAttributes(attribute.Int("api.call.output_bytes", len(s)))
+			}
+			jqSpan.End()
 			if err != nil {
 				log.Error("unable to evaluate JQ filter",
 					slog.String("filter", q), slog.Any("error", err))

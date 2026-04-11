@@ -8,6 +8,9 @@ import (
 
 	"github.com/krateoplatformops/snowplow/internal/dynamic"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/crds"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -15,6 +18,10 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/rest"
 )
+
+// schemaTracer emits observation spans inside ValidateObjectStatus so we can
+// separate the cheap cache lookup path from the expensive validator walk.
+var schemaTracer = otel.Tracer("snowplow/resolvers/crds/schema")
 
 const (
 	widgetDataKey = "widgetData"
@@ -88,9 +95,15 @@ func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]a
 		group:    gvr.Group,
 		version:  gvr.Version,
 	}
+	_, lookupSpan := schemaTracer.Start(ctx, "schema.lookup_crd",
+		trace.WithAttributes(
+			attribute.String("schema.resource", gvr.Resource),
+			attribute.String("schema.group", gvr.Group),
+		))
 	validatorCacheMu.RLock()
 	entry, cached := validatorCache[cacheKey]
 	validatorCacheMu.RUnlock()
+	lookupSpan.SetAttributes(attribute.Bool("schema.validator_cache_hit", cached))
 
 	if !cached {
 		crd, err := crds.Get(ctx, crds.GetOptions{
@@ -99,17 +112,20 @@ func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]a
 			Version: gvr.Version,
 		})
 		if err != nil {
+			lookupSpan.End()
 			return err
 		}
 
 		crv, err := extractOpenAPISchemaFromCRD(crd, gvr.Version)
 		if err != nil {
+			lookupSpan.End()
 			return err
 		}
 
 		// Compile the validator once and cache it.
 		sv, _, svErr := validation.NewSchemaValidator(crv.OpenAPIV3Schema)
 		if svErr != nil {
+			lookupSpan.End()
 			return svErr
 		}
 
@@ -121,6 +137,13 @@ func ValidateObjectStatus(ctx context.Context, rc *rest.Config, obj map[string]a
 		validatorCache[cacheKey] = entry
 		validatorCacheMu.Unlock()
 	}
+	lookupSpan.End()
 
-	return validateCustomResourceWithCachedValidator(entry.validator, widgetData)
+	_, runSpan := schemaTracer.Start(ctx, "schema.validate_object",
+		trace.WithAttributes(
+			attribute.Int("schema.widgetdata.keys", len(widgetData)),
+		))
+	err = validateCustomResourceWithCachedValidator(entry.validator, widgetData)
+	runSpan.End()
+	return err
 }

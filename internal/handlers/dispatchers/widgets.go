@@ -130,7 +130,9 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 
 	// Fetch the K8s object (needed for resolution). Done outside singleflight
 	// because it requires the HTTP request to parse query parameters.
+	_, fetchSpan := widgetTracer.Start(req.Context(), "widget.fetch_object")
 	got := fetchObject(req)
+	fetchSpan.End()
 	if got.Err != nil {
 		response.Encode(wri, got.Err)
 		return

@@ -94,7 +94,13 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 					wri.Header().Set("Content-Type", "application/json")
 					wri.Header().Set("Cache-Control", "public, max-age=3, stale-while-revalidate=12")
 					wri.WriteHeader(http.StatusOK)
+					_, writeSpan := restactionTracer.Start(req.Context(), "http.write",
+						trace.WithAttributes(
+							attribute.Bool("cache.hit", true),
+							attribute.Int("http.response.body.size", len(raw)),
+						))
 					_, _ = wri.Write(raw)
+					writeSpan.End()
 					return
 				}
 		if httpSpan := trace.SpanFromContext(req.Context()); httpSpan.IsRecording() {
@@ -112,7 +118,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// ── End resolved-output cache ─────────────────────────────────────────────
 
 	// Fetch the K8s object (needs HTTP request for query params).
+	_, fetchSpan := restactionTracer.Start(req.Context(), "restaction.fetch_object")
 	got := fetchObject(req)
+	fetchSpan.End()
 	if got.Err != nil {
 		response.Encode(wri, got.Err)
 		return
@@ -140,7 +148,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			slog.String("duration", util.ETA(start)))
 		wri.Header().Set("Content-Type", "application/json")
 		wri.WriteHeader(http.StatusOK)
+		_, writeSpan := restactionTracer.Start(req.Context(), "http.write",
+			trace.WithAttributes(
+				attribute.Bool("cache.hit", false),
+				attribute.String("path", "singleflight"),
+				attribute.Int("http.response.body.size", len(raw)),
+			))
 		_, _ = wri.Write(raw)
+		writeSpan.End()
 		return
 	}
 
@@ -154,7 +169,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		slog.String("duration", util.ETA(start)))
 	wri.Header().Set("Content-Type", "application/json")
 	wri.WriteHeader(http.StatusOK)
+	_, writeSpan := restactionTracer.Start(req.Context(), "http.write",
+		trace.WithAttributes(
+			attribute.Bool("cache.hit", false),
+			attribute.String("path", "inline"),
+			attribute.Int("http.response.body.size", len(raw)),
+		))
 	_, _ = wri.Write(raw)
+	writeSpan.End()
 }
 
 // resolveRESTActionFromObject performs the full RESTAction resolution: convert →
@@ -209,12 +231,21 @@ func resolveRESTActionFromObject(ctx context.Context, c *cache.RedisCache, obj m
 		slog.String("name", cr.Name),
 		slog.String("namespace", cr.Namespace))
 
+	_, marshalSpan := restactionTracer.Start(ctx, "http.marshal")
 	raw, merr := json.Marshal(res)
+	if merr == nil {
+		marshalSpan.SetAttributes(attribute.Int("http.response.body.size", len(raw)))
+	}
+	marshalSpan.End()
 	if merr != nil {
 		return nil, merr
 	}
 
+	_, stripSpan := restactionTracer.Start(ctx, "http.strip_bulky",
+		trace.WithAttributes(attribute.Int("input.bytes", len(raw))))
 	raw = cache.StripBulkyAnnotations(raw)
+	stripSpan.SetAttributes(attribute.Int("output.bytes", len(raw)))
+	stripSpan.End()
 
 	if c != nil && resolvedKey != "" {
 		_ = c.SetResolvedRaw(ctx, resolvedKey, raw)
