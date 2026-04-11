@@ -346,8 +346,18 @@ func (c *RedisCache) GetRawMulti(ctx context.Context, keys []string) map[string]
 		return nil
 	}
 
+	ctx, span := redisTracer.Start(ctx, "redis.mget",
+		trace.WithAttributes(
+			attribute.String("db.system", "redis"),
+			attribute.String("db.operation", "MGET"),
+			attribute.Int("cache.keys.requested", len(keys)),
+		))
+	defer span.End()
+
 	const mgetChunkSize = 100
 
+	var chunks int
+	var totalBytes int
 	result := make(map[string][]byte, len(keys))
 	for start := 0; start < len(keys); start += mgetChunkSize {
 		end := start + mgetChunkSize
@@ -355,14 +365,21 @@ func (c *RedisCache) GetRawMulti(ctx context.Context, keys []string) map[string]
 			end = len(keys)
 		}
 		chunk := keys[start:end]
+		chunks++
 
+		chunkCtx, chunkSpan := redisTracer.Start(ctx, "redis.mget.chunk",
+			trace.WithAttributes(
+				attribute.Int("cache.chunk.size", len(chunk)),
+				attribute.Int("cache.chunk.index", chunks-1),
+			))
 		pipe := c.client.Pipeline()
 		cmds := make([]*redis.StringCmd, len(chunk))
 		for i, k := range chunk {
-			cmds[i] = pipe.Get(ctx, k)
+			cmds[i] = pipe.Get(chunkCtx, k)
 		}
-		_, _ = pipe.Exec(ctx)
+		_, _ = pipe.Exec(chunkCtx)
 
+		var chunkHits, chunkBytes int
 		for i, cmd := range cmds {
 			val, err := cmd.Bytes()
 			if err != nil {
@@ -373,7 +390,24 @@ func (c *RedisCache) GetRawMulti(ctx context.Context, keys []string) map[string]
 				continue
 			}
 			result[chunk[i]] = val
+			chunkHits++
+			chunkBytes += len(val)
 		}
+		totalBytes += chunkBytes
+		if chunkSpan.IsRecording() {
+			chunkSpan.SetAttributes(
+				attribute.Int("cache.chunk.hits", chunkHits),
+				attribute.Int("cache.chunk.bytes", chunkBytes),
+			)
+		}
+		chunkSpan.End()
+	}
+	if span.IsRecording() {
+		span.SetAttributes(
+			attribute.Int("cache.chunks", chunks),
+			attribute.Int("cache.hits", len(result)),
+			attribute.Int("cache.bytes", totalBytes),
+		)
 	}
 	return result
 }
@@ -710,11 +744,29 @@ func (c *RedisCache) AssembleListFromIndex(ctx context.Context, gvr schema.Group
 	if c == nil {
 		return nil, false, nil
 	}
+	ctx, span := redisTracer.Start(ctx, "cache.assemble_list",
+		trace.WithAttributes(
+			attribute.String("gvr", gvr.String()),
+			attribute.String("namespace", namespace),
+		))
+	defer span.End()
 	idxKey := ListIndexKey(gvr, namespace)
 	members, err := c.client.SMembers(ctx, idxKey).Result()
 	if err != nil || len(members) == 0 {
 		// Index does not exist or is empty — fall back to blob.
+		if span.IsRecording() {
+			span.SetAttributes(attribute.Bool("cache.index.hit", false))
+			if err != nil {
+				span.RecordError(err)
+			}
+		}
 		return nil, false, err
+	}
+	if span.IsRecording() {
+		span.SetAttributes(
+			attribute.Bool("cache.index.hit", true),
+			attribute.Int("cache.members", len(members)),
+		)
 	}
 
 	// Build GET keys from member names.
@@ -847,7 +899,23 @@ func (c *RedisCache) SMembers(ctx context.Context, key string) ([]string, error)
 	if c == nil {
 		return nil, nil
 	}
-	return c.client.SMembers(ctx, key).Result()
+	ctx, span := redisTracer.Start(ctx, "redis.smembers",
+		trace.WithAttributes(
+			attribute.String("db.system", "redis"),
+			attribute.String("db.operation", "SMEMBERS"),
+			attribute.String("cache.key", key),
+		))
+	defer span.End()
+	members, err := c.client.SMembers(ctx, key).Result()
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return nil, err
+	}
+	if span.IsRecording() {
+		span.SetAttributes(attribute.Int("cache.members", len(members)))
+	}
+	return members, nil
 }
 
 func (c *RedisCache) SAddUser(ctx context.Context, username string) error {
