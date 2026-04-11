@@ -17,7 +17,6 @@ import (
 	"github.com/krateoplatformops/plumbing/jwtutil"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
@@ -595,19 +594,29 @@ func warmL1RestActionsForUser(ctx context.Context, c *cache.RedisCache, user jwt
 			continue
 		}
 
-		got := objects.Get(rctx, templatesv1.ObjectReference{
-			Reference:  templatesv1.Reference{Name: ra.Name, Namespace: ra.Namespace},
-			APIVersion: raGVR.GroupVersion().String(),
-			Resource:   raGVR.Resource,
-		})
-		if got.Err != nil {
-			log.Warn("L1 warmup: failed to fetch RESTAction",
-				slog.String("name", ra.Name), slog.Any("err", got.Err))
+		// Read the RESTAction CR directly from the L2 cache (populated by
+		// warmer.warmGVR at pod startup). This bypasses the k8s client-side
+		// rate limiter completely — per-user rest configs have a 5 QPS / 10
+		// burst budget that is easily exhausted by 20K+ widget prewarm calls,
+		// leaving every RA fetch to fail with "context deadline exceeded".
+		//
+		// L2 is authoritative for CRs at prewarm time: the warmer has already
+		// listed every configured GVR and written per-item GET keys before
+		// WarmL1ForAllUsers is invoked (see main.go Phase 4 → Phase 5).
+		// If L2 misses here, the RA really doesn't exist on this cluster yet
+		// and nothing the user could do would find it either.
+		var cached unstructured.Unstructured
+		l2Key := cache.GetKey(raGVR, ra.Namespace, ra.Name)
+		if hit, cerr := c.Get(rctx, l2Key, &cached); !hit || cerr != nil {
+			log.Warn("L1 warmup: RESTAction not in L2 cache, skipping",
+				slog.String("name", ra.Name),
+				slog.String("namespace", ra.Namespace),
+				slog.Any("err", cerr))
 			continue
 		}
 
 		var cr templatesv1.RESTAction
-		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(got.Unstructured.Object, &cr); err != nil {
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(cached.Object, &cr); err != nil {
 			log.Warn("L1 warmup: failed to convert RESTAction",
 				slog.String("name", ra.Name), slog.Any("err", err))
 			continue
@@ -707,6 +716,10 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 				return
 			}
 
+			if r.gvr.Group != widgetGroup {
+				return
+			}
+
 			rctx := xcontext.BuildContext(ctx,
 				xcontext.WithUserConfig(ep),
 				xcontext.WithUserInfo(user),
@@ -714,25 +727,25 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			)
 			rctx = cache.WithCache(rctx, c)
 
-			got := objects.Get(rctx, templatesv1.ObjectReference{
-				Reference: templatesv1.Reference{
-					Name: r.name, Namespace: r.ns,
-				},
-				APIVersion: r.gvr.GroupVersion().String(),
-				Resource:   r.gvr.Resource,
-			})
-			if got.Err != nil {
+			// Read the widget CR directly from L2 cache (populated by
+			// warmer.warmGVR at pod startup). Bypasses the k8s client-side
+			// rate limiter: each user's rest.Config has only 5 QPS / 10
+			// burst, which 20K+ sequential objects.Get calls trivially
+			// exhaust, causing every subsequent call to fail with
+			// "client rate limiter Wait returned an error". Reading from
+			// L2 costs one Redis GET and is rate-limited only by Redis
+			// itself (plenty).
+			var cached unstructured.Unstructured
+			l2Key := cache.GetKey(r.gvr, r.ns, r.name)
+			if hit, cerr := c.Get(rctx, l2Key, &cached); !hit || cerr != nil {
 				return
 			}
 
 			tracker := cache.NewDependencyTracker()
 			tctx := cache.WithDependencyTracker(rctx, tracker)
 
-			if r.gvr.Group != widgetGroup {
-				return
-			}
 			res, resolveErr := widgets.Resolve(tctx, widgets.ResolveOptions{
-				In:      got.Unstructured,
+				In:      &cached,
 				AuthnNS: authnNS,
 				PerPage: -1,
 				Page:    -1,
@@ -748,7 +761,7 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			_ = c.SetResolvedRaw(rctx, rKey, raw)
 			cache.RegisterL1Dependencies(rctx, c, tracker, rKey)
 
-			if newDeps := registerApiRefGVRDeps(rctx, c, got.Unstructured, rKey, tracker); newDeps > 0 {
+			if newDeps := registerApiRefGVRDeps(rctx, c, &cached, rKey, tracker); newDeps > 0 {
 				_ = c.Delete(rctx, rKey)
 			}
 
@@ -789,6 +802,10 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 				return
 			}
 
+			if r.gvr.Group != widgetGroup {
+				return
+			}
+
 			rctx := xcontext.BuildContext(ctx,
 				xcontext.WithUserConfig(ep),
 				xcontext.WithUserInfo(user),
@@ -796,25 +813,25 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			)
 			rctx = cache.WithCache(rctx, c)
 
-			got := objects.Get(rctx, templatesv1.ObjectReference{
-				Reference: templatesv1.Reference{
-					Name: r.name, Namespace: r.ns,
-				},
-				APIVersion: r.gvr.GroupVersion().String(),
-				Resource:   r.gvr.Resource,
-			})
-			if got.Err != nil {
+			// Read the widget CR directly from L2 cache (populated by
+			// warmer.warmGVR at pod startup). Bypasses the k8s client-side
+			// rate limiter: each user's rest.Config has only 5 QPS / 10
+			// burst, which 20K+ sequential objects.Get calls trivially
+			// exhaust, causing every subsequent call to fail with
+			// "client rate limiter Wait returned an error". Reading from
+			// L2 costs one Redis GET and is rate-limited only by Redis
+			// itself (plenty).
+			var cached unstructured.Unstructured
+			l2Key := cache.GetKey(r.gvr, r.ns, r.name)
+			if hit, cerr := c.Get(rctx, l2Key, &cached); !hit || cerr != nil {
 				return
 			}
 
 			tracker := cache.NewDependencyTracker()
 			tctx := cache.WithDependencyTracker(rctx, tracker)
 
-			if r.gvr.Group != widgetGroup {
-				return
-			}
 			res, resolveErr := widgets.Resolve(tctx, widgets.ResolveOptions{
-				In:      got.Unstructured,
+				In:      &cached,
 				AuthnNS: authnNS,
 				PerPage: -1,
 				Page:    -1,
@@ -830,7 +847,7 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			_ = c.SetResolvedRaw(rctx, rKey, raw)
 			cache.RegisterL1Dependencies(rctx, c, tracker, rKey)
 
-			if newDeps := registerApiRefGVRDeps(rctx, c, got.Unstructured, rKey, tracker); newDeps > 0 {
+			if newDeps := registerApiRefGVRDeps(rctx, c, &cached, rKey, tracker); newDeps > 0 {
 				_ = c.Delete(rctx, rKey)
 			}
 
