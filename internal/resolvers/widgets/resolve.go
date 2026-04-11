@@ -52,6 +52,19 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 		return opts.In, err
 	}
 
+	// Inject .slice into the data source when the widget is paginated.
+	// widgetDataTemplate expressions can then do cumulative slicing via
+	// `.list[0 : (.slice.page * .slice.perPage)]` and the widget resolver
+	// uses `ds.total` (emitted by the RESTAction filter) to decide whether
+	// more pages exist (set below on status.resourcesRefs.slice.continue).
+	if ds != nil && opts.PerPage > 0 && opts.Page > 0 {
+		ds["slice"] = map[string]any{
+			"page":    opts.Page,
+			"perPage": opts.PerPage,
+			"offset":  (opts.Page - 1) * opts.PerPage,
+		}
+	}
+
 	_, jqSpan := widgetResolveTracer.Start(ctx, "widget.jq.eval")
 	widgetData, err := resolveWidgetData(ctx, opts.In, ds)
 	jqSpan.End()
@@ -76,17 +89,58 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 		return opts.In, err
 	}
 
+	// Build the status.resourcesRefs block selectively.
+	//   - items: populated if the widget declares its own resourcesRefs
+	//            (Row, Panel, NavMenu, etc.) with one or more entries.
+	//   - slice: populated whenever the widget is paginated. Source of
+	//            hasNext, in priority order:
+	//              1) data-source total from the apiRef response
+	//                 (ds["total"]), used by widgets that paginate over a
+	//                 list from a RESTAction (Table, PieChart). Cumulative
+	//                 slice semantics: hasNext = page*perPage < total.
+	//              2) widget's own resourcesRefs count (legacy behaviour
+	//                 preserved for structural widgets).
+	pig := map[string]any{}
+	hasResourcesContent := false
+
 	if tot := len(resourcesRefsResults); tot > 0 {
 		tmp, err := maps.StructSliceToMapSlice(resourcesRefsResults)
 		if err != nil {
 			return opts.In, err
 		}
+		pig["items"] = tmp
+		hasResourcesContent = true
+	}
 
-		pig := map[string]any{
-			"items": tmp,
+	if opts.PerPage > 0 && opts.Page > 0 {
+		// Cumulative-slice semantics: the widget's widgetDataTemplate slices
+		// `.list[0 : page*perPage]` from the apiref data source on every page
+		// call. hasNext is therefore (page*perPage < total-items-available).
+		//
+		// Convention: the restaction output top-level `.list` array holds the
+		// full dataset. This matches compositions-list and any RESTAction that
+		// acts as a "generic data source" by emitting a list under that name.
+		// Restactions with different output shapes will fall through to the
+		// legacy slice computation below (based on the widget's own
+		// resourcesRefs items).
+		var listLen int
+		if ds != nil {
+			if listRaw, ok := ds["list"].([]any); ok {
+				listLen = len(listRaw)
+			}
 		}
-		if opts.PerPage > 0 && opts.Page > 0 {
-			hasNext := (tot >= opts.PerPage)
+		if listLen > 0 {
+			hasNext := opts.Page*opts.PerPage < listLen
+			pig["slice"] = map[string]any{
+				"page":     opts.Page,
+				"perPage":  opts.PerPage,
+				"offset":   (opts.Page - 1) * opts.PerPage,
+				"total":    listLen,
+				"continue": hasNext,
+			}
+			hasResourcesContent = true
+		} else if len(resourcesRefsResults) > 0 {
+			hasNext := len(resourcesRefsResults) >= opts.PerPage
 			page := opts.Page
 			if hasNext {
 				page = page + 1
@@ -97,7 +151,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 				"continue": hasNext,
 			}
 		}
+	}
 
+	if hasResourcesContent {
 		err = maps.SetNestedField(opts.In.Object, pig, "status", resourcesRefsKey)
 		if err != nil {
 			return opts.In, err
@@ -131,12 +187,21 @@ func resolveApiRef(ctx context.Context, opts ResolveOptions) (map[string]any, er
 		return nil, err
 	}
 
+	// Always fetch the underlying RESTAction unpaginated. The widget handles
+	// slicing in its widgetDataTemplate via the `.slice` field injected by
+	// the widget resolver after this call returns. This keeps the apiref L1
+	// cache entry shared across pages (one entry per user+restaction instead
+	// of one entry per page), avoiding 980× redundant storage at 50K scale.
+	//
+	// Safe: no existing RESTAction honours `.slice` in its filter today, so
+	// passing PerPage=0/Page=0 is equivalent to passing the widget's actual
+	// pagination params for all current consumers.
 	return apiref.Resolve(ctx, apiref.ResolveOptions{
 		RC:      opts.RC,
 		ApiRef:  apiRef,
 		AuthnNS: opts.AuthnNS,
-		PerPage: opts.PerPage,
-		Page:    opts.Page,
+		PerPage: 0,
+		Page:    0,
 	})
 }
 
