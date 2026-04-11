@@ -168,16 +168,27 @@ func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config
 		slog.Int("restActions", len(restActions)),
 	)
 
+	// RESTActions BEFORE widgets: widget warmup issues 20K+ objects.Get calls
+	// (panels, buttons, etc) which exhausts the k8s client-side rate limiter's
+	// token bucket for each user. If RA fetches run after that, they all fail
+	// with "client rate limiter Wait returned an error: context deadline
+	// exceeded" — leaving critical RAs like compositions-list cold.
+	//
+	// Warming RAs first costs only ~7 API calls per user (one per configured
+	// RA), well within any rate budget, and ensures dashboards have zero
+	// cold-miss on their apiRef RAs. Widget warmup then gets whatever budget
+	// remains, which is still sufficient for its retries.
 	var totalWarmed int64
 	for _, u := range users {
 		token := mintJWT(u.userInfo, signKey)
-		warmed := warmL1ForUser(ctx, c, u.userInfo, u.endpoint, token, widgetGVRs, authnNS)
-		totalWarmed += warmed
 
 		if len(restActions) > 0 {
 			raWarmed := warmL1RestActionsForUser(ctx, c, u.userInfo, u.endpoint, token, restActions, authnNS)
 			totalWarmed += raWarmed
 		}
+
+		warmed := warmL1ForUser(ctx, c, u.userInfo, u.endpoint, token, widgetGVRs, authnNS)
+		totalWarmed += warmed
 	}
 
 	log.Info("L1 warmup: completed",
