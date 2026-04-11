@@ -25,9 +25,62 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
+	k8sdynamic "k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
+
+// prewarmDynClient is a SA-backed dynamic client with its rate limiter
+// disabled (QPS = -1). Used for CR fallback reads on L2 miss during
+// prewarm so the 20K+ reads per user do not exhaust the default
+// 5 QPS / 10 burst budget of the per-user rest.Config.
+//
+// Safe to use for *reading* CRs: authorisation/RBAC is applied by the
+// widget and restaction resolvers later, which run under each user's
+// context. The CR content itself is not user-sensitive; it is cluster
+// configuration already visible to the snowplow service account.
+//
+// Initialised once by WarmL1ForAllUsers at startup. Request-time callers
+// (e.g. preWarmChildWidgets via the widgets HTTP dispatcher) read it
+// without synchronisation — the read happens only after prewarm kickoff,
+// which already wrote this var, and preWarmComplete gates most callers.
+var prewarmDynClient k8sdynamic.Interface
+
+func newUnthrottledDynClient(rc *rest.Config) (k8sdynamic.Interface, error) {
+	cfg := rest.CopyConfig(rc)
+	cfg.QPS = -1
+	cfg.Burst = 0
+	return k8sdynamic.NewForConfig(cfg)
+}
+
+// prewarmFetchCR returns the unstructured.Unstructured for (gvr, ns, name).
+// Fast path: Redis L2 cache (populated by warmer.warmGVR at startup).
+// Slow path: a single GET via the shared unthrottled dynamic client, with
+// the result written back to L2 so subsequent prewarm passes skip the GET.
+//
+// Returns (nil, false) if neither L2 nor the k8s GET yields a CR (eg the
+// resource does not exist, RBAC denies, or the fallback client was nil).
+func prewarmFetchCR(ctx context.Context, c *cache.RedisCache, dynClient k8sdynamic.Interface, gvr schema.GroupVersionResource, ns, name string) (*unstructured.Unstructured, bool) {
+	if c != nil {
+		var cached unstructured.Unstructured
+		l2Key := cache.GetKey(gvr, ns, name)
+		if hit, cerr := c.Get(ctx, l2Key, &cached); hit && cerr == nil {
+			return &cached, true
+		}
+	}
+	if dynClient == nil {
+		return nil, false
+	}
+	uns, err := dynClient.Resource(gvr).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, false
+	}
+	cache.StripAnnotationsFromUnstructured(uns)
+	if c != nil {
+		_ = c.SetForGVR(ctx, gvr, cache.GetKey(gvr, ns, name), uns)
+	}
+	return uns, true
+}
 
 const (
 	preWarmConcurrency      = 10
@@ -91,7 +144,7 @@ func preWarmChildWidgets(parentCtx context.Context, c *cache.RedisCache, resolve
 		ctx, cancel := context.WithTimeout(context.Background(), preWarmTimeout)
 		defer cancel()
 		visited := make(map[string]bool)
-		recursivePreWarm(ctx, user, ep, accessToken, c, refs, authnNS, visited, 1)
+		recursivePreWarm(ctx, user, ep, accessToken, c, prewarmDynClient, refs, authnNS, visited, 1)
 		slog.Default().Info("L1 recursive pre-warm completed",
 			slog.String("user", user.Username),
 			slog.Int("total_warmed", len(visited)),
@@ -101,7 +154,7 @@ func preWarmChildWidgets(parentCtx context.Context, c *cache.RedisCache, resolve
 
 // recursivePreWarm resolves refs into L1 cache, then extracts their children
 // and recurses until maxDepth or no more children are found.
-func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, c *cache.RedisCache, refs []l1Ref, authnNS string, visited map[string]bool, depth int) {
+func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, c *cache.RedisCache, dynClient k8sdynamic.Interface, refs []l1Ref, authnNS string, visited map[string]bool, depth int) {
 	if depth > preWarmMaxDepth || len(refs) == 0 {
 		return
 	}
@@ -122,7 +175,7 @@ func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.E
 		return
 	}
 
-	resolved := resolveL1RefsCollect(ctx, user, ep, accessToken, c, unvisited, authnNS)
+	resolved := resolveL1RefsCollect(ctx, user, ep, accessToken, c, dynClient, unvisited, authnNS)
 
 	var nextRefs []l1Ref
 	for _, res := range resolved {
@@ -133,7 +186,7 @@ func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.E
 		nextRefs = append(nextRefs, extractChildWidgetRefs(ctx, c, childItems, user.Username)...)
 	}
 
-	recursivePreWarm(ctx, user, ep, accessToken, c, nextRefs, authnNS, visited, depth+1)
+	recursivePreWarm(ctx, user, ep, accessToken, c, dynClient, nextRefs, authnNS, visited, depth+1)
 }
 
 // ---------------------------------------------------------------------------
@@ -161,32 +214,36 @@ func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config
 		return
 	}
 
+	// Build a SA-backed unthrottled dynamic client for CR fallback reads
+	// on L2 miss. See prewarmDynClient for rationale.
+	dynClient, dcErr := newUnthrottledDynClient(rc)
+	if dcErr != nil {
+		log.Warn("L1 warmup: unable to build unthrottled dyn client; L2 miss will skip fallback",
+			slog.Any("err", dcErr))
+		// dynClient stays nil; prewarmFetchCR will treat L2 miss as skip.
+	}
+	prewarmDynClient = dynClient
+
 	log.Info("L1 warmup: starting",
 		slog.Int("users", len(users)),
 		slog.Int("widgetGVRs", len(widgetGVRs)),
 		slog.Int("restActions", len(restActions)),
 	)
 
-	// RESTActions BEFORE widgets: widget warmup issues 20K+ objects.Get calls
-	// (panels, buttons, etc) which exhausts the k8s client-side rate limiter's
-	// token bucket for each user. If RA fetches run after that, they all fail
-	// with "client rate limiter Wait returned an error: context deadline
-	// exceeded" — leaving critical RAs like compositions-list cold.
-	//
-	// Warming RAs first costs only ~7 API calls per user (one per configured
-	// RA), well within any rate budget, and ensures dashboards have zero
-	// cold-miss on their apiRef RAs. Widget warmup then gets whatever budget
-	// remains, which is still sufficient for its retries.
+	// RESTActions BEFORE widgets: widget warmup issues 20K+ CR fetches
+	// (panels, buttons, etc). Running RAs first guarantees the small set
+	// of critical RESTAction L1 entries (compositions-list etc.) is warm
+	// before we start the large widget walk.
 	var totalWarmed int64
 	for _, u := range users {
 		token := mintJWT(u.userInfo, signKey)
 
 		if len(restActions) > 0 {
-			raWarmed := warmL1RestActionsForUser(ctx, c, u.userInfo, u.endpoint, token, restActions, authnNS)
+			raWarmed := warmL1RestActionsForUser(ctx, c, dynClient, u.userInfo, u.endpoint, token, restActions, authnNS)
 			totalWarmed += raWarmed
 		}
 
-		warmed := warmL1ForUser(ctx, c, u.userInfo, u.endpoint, token, widgetGVRs, authnNS)
+		warmed := warmL1ForUser(ctx, c, dynClient, u.userInfo, u.endpoint, token, widgetGVRs, authnNS)
 		totalWarmed += warmed
 	}
 
@@ -518,7 +575,7 @@ func extractGroupsFromClientCert(certPEM string) []string {
 	return cert.Subject.Organization
 }
 
-func warmL1ForUser(ctx context.Context, c *cache.RedisCache, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, gvrs []schema.GroupVersionResource, authnNS string) int64 {
+func warmL1ForUser(ctx context.Context, c *cache.RedisCache, dynClient k8sdynamic.Interface, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, gvrs []schema.GroupVersionResource, authnNS string) int64 {
 	log := slog.Default()
 
 	var allRefs []l1Ref
@@ -555,7 +612,7 @@ func warmL1ForUser(ctx context.Context, c *cache.RedisCache, user jwtutil.UserIn
 	}
 
 	visited := make(map[string]bool)
-	recursivePreWarm(ctx, user, ep, accessToken, c, allRefs, authnNS, visited, 1)
+	recursivePreWarm(ctx, user, ep, accessToken, c, dynClient, allRefs, authnNS, visited, 1)
 
 	warmed := int64(len(visited))
 	log.Info("L1 warmup: user done (recursive)",
@@ -574,7 +631,7 @@ type l1Ref struct {
 
 // warmL1RestActionsForUser resolves the explicitly-configured RESTActions for
 // a single user and stores them in L1 cache. Returns the number warmed.
-func warmL1RestActionsForUser(ctx context.Context, c *cache.RedisCache, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, ras []cache.WarmupRestAction, authnNS string) int64 {
+func warmL1RestActionsForUser(ctx context.Context, c *cache.RedisCache, dynClient k8sdynamic.Interface, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, ras []cache.WarmupRestAction, authnNS string) int64 {
 	log := slog.Default()
 	raGVR := schema.GroupVersionResource{
 		Group: "templates.krateo.io", Version: "v1", Resource: "restactions",
@@ -594,24 +651,16 @@ func warmL1RestActionsForUser(ctx context.Context, c *cache.RedisCache, user jwt
 			continue
 		}
 
-		// Read the RESTAction CR directly from the L2 cache (populated by
-		// warmer.warmGVR at pod startup). This bypasses the k8s client-side
-		// rate limiter completely — per-user rest configs have a 5 QPS / 10
-		// burst budget that is easily exhausted by 20K+ widget prewarm calls,
-		// leaving every RA fetch to fail with "context deadline exceeded".
-		//
-		// L2 is authoritative for CRs at prewarm time: the warmer has already
-		// listed every configured GVR and written per-item GET keys before
-		// WarmL1ForAllUsers is invoked (see main.go Phase 4 → Phase 5).
-		// If L2 misses here, the RA really doesn't exist on this cluster yet
-		// and nothing the user could do would find it either.
-		var cached unstructured.Unstructured
-		l2Key := cache.GetKey(raGVR, ra.Namespace, ra.Name)
-		if hit, cerr := c.Get(rctx, l2Key, &cached); !hit || cerr != nil {
-			log.Warn("L1 warmup: RESTAction not in L2 cache, skipping",
+		// Fetch the RESTAction CR via L2-first with unthrottled k8s
+		// fallback. See prewarmFetchCR for rationale — avoids the
+		// default 5 QPS / 10 burst rate limiter on the per-user rest
+		// config that would otherwise fail every fallback with
+		// "client rate limiter Wait returned an error".
+		cached, ok := prewarmFetchCR(rctx, c, dynClient, raGVR, ra.Namespace, ra.Name)
+		if !ok {
+			log.Warn("L1 warmup: failed to fetch RESTAction",
 				slog.String("name", ra.Name),
-				slog.String("namespace", ra.Namespace),
-				slog.Any("err", cerr))
+				slog.String("namespace", ra.Namespace))
 			continue
 		}
 
@@ -687,7 +736,7 @@ func extractChildWidgetRefs(ctx context.Context, c *cache.RedisCache, items []in
 // warmed. The caller provides the context (with its own deadline).
 // resolveL1RefsCollect resolves refs into L1 and returns the resolved objects
 // so callers can inspect children for recursive pre-warming.
-func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, c *cache.RedisCache, refs []l1Ref, authnNS string) []*unstructured.Unstructured {
+func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, c *cache.RedisCache, dynClient k8sdynamic.Interface, refs []l1Ref, authnNS string) []*unstructured.Unstructured {
 	ctx = xcontext.BuildContext(ctx,
 		xcontext.WithUserConfig(ep),
 		xcontext.WithUserInfo(user),
@@ -727,17 +776,12 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			)
 			rctx = cache.WithCache(rctx, c)
 
-			// Read the widget CR directly from L2 cache (populated by
-			// warmer.warmGVR at pod startup). Bypasses the k8s client-side
-			// rate limiter: each user's rest.Config has only 5 QPS / 10
-			// burst, which 20K+ sequential objects.Get calls trivially
-			// exhaust, causing every subsequent call to fail with
-			// "client rate limiter Wait returned an error". Reading from
-			// L2 costs one Redis GET and is rate-limited only by Redis
-			// itself (plenty).
-			var cached unstructured.Unstructured
-			l2Key := cache.GetKey(r.gvr, r.ns, r.name)
-			if hit, cerr := c.Get(rctx, l2Key, &cached); !hit || cerr != nil {
+			// Fetch the widget CR via L2-first with unthrottled k8s
+			// fallback (see prewarmFetchCR). Avoids the 5 QPS / 10 burst
+			// rate limiter on the per-user rest.Config which 20K+
+			// sequential fetches would otherwise exhaust.
+			cached, ok := prewarmFetchCR(rctx, c, dynClient, r.gvr, r.ns, r.name)
+			if !ok {
 				return
 			}
 
@@ -745,7 +789,7 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			tctx := cache.WithDependencyTracker(rctx, tracker)
 
 			res, resolveErr := widgets.Resolve(tctx, widgets.ResolveOptions{
-				In:      &cached,
+				In:      cached,
 				AuthnNS: authnNS,
 				PerPage: -1,
 				Page:    -1,
@@ -761,7 +805,7 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			_ = c.SetResolvedRaw(rctx, rKey, raw)
 			cache.RegisterL1Dependencies(rctx, c, tracker, rKey)
 
-			if newDeps := registerApiRefGVRDeps(rctx, c, &cached, rKey, tracker); newDeps > 0 {
+			if newDeps := registerApiRefGVRDeps(rctx, c, cached, rKey, tracker); newDeps > 0 {
 				_ = c.Delete(rctx, rKey)
 			}
 
@@ -813,17 +857,9 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			)
 			rctx = cache.WithCache(rctx, c)
 
-			// Read the widget CR directly from L2 cache (populated by
-			// warmer.warmGVR at pod startup). Bypasses the k8s client-side
-			// rate limiter: each user's rest.Config has only 5 QPS / 10
-			// burst, which 20K+ sequential objects.Get calls trivially
-			// exhaust, causing every subsequent call to fail with
-			// "client rate limiter Wait returned an error". Reading from
-			// L2 costs one Redis GET and is rate-limited only by Redis
-			// itself (plenty).
-			var cached unstructured.Unstructured
-			l2Key := cache.GetKey(r.gvr, r.ns, r.name)
-			if hit, cerr := c.Get(rctx, l2Key, &cached); !hit || cerr != nil {
+			// L2-first + unthrottled k8s fallback (see prewarmFetchCR).
+			cached, ok := prewarmFetchCR(rctx, c, prewarmDynClient, r.gvr, r.ns, r.name)
+			if !ok {
 				return
 			}
 
@@ -831,7 +867,7 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			tctx := cache.WithDependencyTracker(rctx, tracker)
 
 			res, resolveErr := widgets.Resolve(tctx, widgets.ResolveOptions{
-				In:      &cached,
+				In:      cached,
 				AuthnNS: authnNS,
 				PerPage: -1,
 				Page:    -1,
@@ -847,7 +883,7 @@ func resolveL1RefsForUser(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			_ = c.SetResolvedRaw(rctx, rKey, raw)
 			cache.RegisterL1Dependencies(rctx, c, tracker, rKey)
 
-			if newDeps := registerApiRefGVRDeps(rctx, c, &cached, rKey, tracker); newDeps > 0 {
+			if newDeps := registerApiRefGVRDeps(rctx, c, cached, rKey, tracker); newDeps > 0 {
 				_ = c.Delete(rctx, rKey)
 			}
 
