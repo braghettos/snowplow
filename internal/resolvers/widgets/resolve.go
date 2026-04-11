@@ -17,11 +17,17 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets/resourcesrefstemplate"
 
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets/widgetdatatemplate"
+	"go.opentelemetry.io/otel"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/rest"
 )
+
+// widgetResolveTracer emits the CPU-phase spans inside widgets.Resolve.
+// These spans are observation-only and live as children of the caller's
+// widget.resolve span.
+var widgetResolveTracer = otel.Tracer("snowplow/resolvers/widgets")
 
 type Widget = unstructured.Unstructured
 
@@ -37,14 +43,18 @@ type ResolveOptions struct {
 func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	log := xcontext.Logger(ctx).With(loggerAttr(opts.In.Object))
 
+	_, apiRefSpan := widgetResolveTracer.Start(ctx, "widget.api_ref")
 	ds, err := resolveApiRef(ctx, opts)
+	apiRefSpan.End()
 	if err != nil {
 		log.Error("unable to resolve api reference", slog.Any("err", err))
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")
 		return opts.In, err
 	}
 
+	_, jqSpan := widgetResolveTracer.Start(ctx, "widget.jq.eval")
 	widgetData, err := resolveWidgetData(ctx, opts.In, ds)
+	jqSpan.End()
 	if err != nil {
 		log.Error("unable to resolve widget data", slog.Any("err", err))
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")
@@ -58,7 +68,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 		return opts.In, err
 	}
 
+	_, rrSpan := widgetResolveTracer.Start(ctx, "widget.resourcerefs")
 	resourcesRefsResults, err := resolveResourceRefs(ctx, opts.In, ds)
+	rrSpan.End()
 	if err != nil {
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")
 		return opts.In, err
@@ -92,11 +104,13 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 		}
 	}
 
+	_, validateSpan := widgetResolveTracer.Start(ctx, "widget.validate")
 	if xenv.TestMode() {
 		err = crdschema.ValidateObjectStatus(ctx, opts.RC, opts.In.Object)
 	} else {
 		err = crdschema.ValidateObjectStatus(ctx, nil, opts.In.Object)
 	}
+	validateSpan.End()
 	if err != nil {
 		maps.SetNestedField(opts.In.Object, err.Error(), "status", "error")
 		return opts.In, &apierrors.StatusError{

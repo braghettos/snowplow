@@ -103,7 +103,13 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 					wri.Header().Set("Cache-Control", "public, max-age=3, stale-while-revalidate=12")
 					wri.WriteHeader(http.StatusOK)
 					profile.Mark(req.Context(), "headers")
+					_, writeSpan := widgetTracer.Start(req.Context(), "http.write",
+						trace.WithAttributes(
+							attribute.Bool("cache.hit", true),
+							attribute.Int("http.response.body.size", len(raw)),
+						))
 					_, _ = wri.Write(raw)
+					writeSpan.End()
 					profile.Mark(req.Context(), "body_write")
 					profile.End(req.Context(), "l1_hit")
 					return
@@ -154,7 +160,14 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			slog.String("duration", util.ETA(start)))
 		wri.Header().Set("Content-Type", "application/json")
 		wri.WriteHeader(http.StatusOK)
+		_, writeSpan := widgetTracer.Start(req.Context(), "http.write",
+			trace.WithAttributes(
+				attribute.Bool("cache.hit", false),
+				attribute.String("path", "singleflight"),
+				attribute.Int("http.response.body.size", len(res.Raw)),
+			))
 		_, _ = wri.Write(res.Raw)
+		writeSpan.End()
 		return
 	}
 
@@ -168,7 +181,14 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		slog.String("duration", util.ETA(start)))
 	wri.Header().Set("Content-Type", "application/json")
 	wri.WriteHeader(http.StatusOK)
+	_, writeSpan := widgetTracer.Start(req.Context(), "http.write",
+		trace.WithAttributes(
+			attribute.Bool("cache.hit", false),
+			attribute.String("path", "inline"),
+			attribute.Int("http.response.body.size", len(res.Raw)),
+		))
 	_, _ = wri.Write(res.Raw)
+	writeSpan.End()
 }
 
 // resolveWidgetFromObject performs the full widget resolution: resolve → marshal
@@ -228,7 +248,12 @@ func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objec
 		}
 	}
 
+	_, marshalSpan := widgetTracer.Start(ctx, "http.marshal")
 	raw, merr := json.Marshal(res)
+	if merr == nil {
+		marshalSpan.SetAttributes(attribute.Int("http.response.body.size", len(raw)))
+	}
+	marshalSpan.End()
 	if merr != nil {
 		return nil, merr
 	}
@@ -238,7 +263,9 @@ func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objec
 	if c != nil && resolvedKey != "" {
 		_ = c.SetResolvedRaw(ctx, resolvedKey, raw)
 		cache.RegisterL1Dependencies(ctx, c, tracker, resolvedKey)
+		_, preWarmSpan := widgetTracer.Start(ctx, "widget.prewarm_children")
 		preWarmChildWidgets(ctx, c, res, authnNS)
+		preWarmSpan.End()
 	}
 
 	return &ResolveWidgetResult{Raw: raw, Resolved: res}, nil
