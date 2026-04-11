@@ -2,8 +2,6 @@ package dispatchers
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -11,16 +9,12 @@ import (
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/plumbing/http/response"
-	"github.com/krateoplatformops/snowplow/apis"
-	v1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
+	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions/l1cache"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
-	"k8s.io/apimachinery/pkg/runtime"
 )
 
 var restactionTracer = otel.Tracer("snowplow/dispatchers")
@@ -75,14 +69,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				}
 				lookupSpan.End()
 				if hit {
-				if httpSpan := trace.SpanFromContext(req.Context()); httpSpan.IsRecording() {
-					httpSpan.AddEvent("cache.hit", trace.WithAttributes(
-						attribute.String("cache.key", resolvedKey),
-						attribute.String("cache.layer", "l1"),
-					))
-				}
-				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
-				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
+					if httpSpan := trace.SpanFromContext(req.Context()); httpSpan.IsRecording() {
+						httpSpan.AddEvent("cache.hit", trace.WithAttributes(
+							attribute.String("cache.key", resolvedKey),
+							attribute.String("cache.layer", "l1"),
+						))
+					}
+					cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
+					cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 					log.Info("RESTAction resolved from cache",
 						slog.String("key", resolvedKey),
 						slog.String("user", user.Username),
@@ -103,14 +97,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 					writeSpan.End()
 					return
 				}
-		if httpSpan := trace.SpanFromContext(req.Context()); httpSpan.IsRecording() {
-			httpSpan.AddEvent("cache.miss", trace.WithAttributes(
-				attribute.String("cache.key", resolvedKey),
-				attribute.String("cache.layer", "l1"),
-			))
-		}
-		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawMisses, "raw_misses")
-		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Misses, "l1_misses")
+				if httpSpan := trace.SpanFromContext(req.Context()); httpSpan.IsRecording() {
+					httpSpan.AddEvent("cache.miss", trace.WithAttributes(
+						attribute.String("cache.key", resolvedKey),
+						attribute.String("cache.layer", "l1"),
+					))
+				}
+				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawMisses, "raw_misses")
+				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Misses, "l1_misses")
 				log.Info("restaction: L1 miss", slog.String("key", resolvedKey))
 			}
 		}
@@ -126,194 +120,86 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		return
 	}
 
-	// ── Singleflight: deduplicate concurrent resolutions of the same key ──────
+	// ── Resolve via the shared l1cache package ─────────────────────────────
+	// The shared foreground singleflight.Group in l1cache dedups against
+	// widget.apiref callers too, killing the cross-path thundering herd
+	// when a dashboard Row spawns 2+ parallel widget requests that all
+	// chase the same compositions-list restaction.
+	//
+	// Non-cacheable path (extras present) passes ResolvedKey="" which
+	// bypasses both singleflight and L1 write.
+	sfCtx := req.Context()
 	if resolvedKey != "" {
-		ctx := context.WithoutCancel(req.Context())
-		result, resolveErr, _ := restactionFlight.Do(resolvedKey, func() (interface{}, error) {
-			return resolveRESTActionFromObject(ctx, c, got.Unstructured.Object, resolvedKey, r.authnNS, perPage, page, extras)
-		})
-		if resolveErr != nil {
-			response.InternalError(wri, resolveErr)
-			return
-		}
-		// Safe type assertion to avoid panic if singleflight returns
-		// an unexpected type (Bug 14).
-		raw, ok := result.([]byte)
-		if !ok || raw == nil {
-			response.InternalError(wri, fmt.Errorf("singleflight returned unexpected type %T", result))
-			return
-		}
-		log.Info("RESTAction successfully resolved (singleflight)",
-			slog.String("key", resolvedKey),
-			slog.String("duration", util.ETA(start)))
-		wri.Header().Set("Content-Type", "application/json")
-		wri.WriteHeader(http.StatusOK)
-		_, writeSpan := restactionTracer.Start(req.Context(), "http.write",
-			trace.WithAttributes(
-				attribute.Bool("cache.hit", false),
-				attribute.String("path", "singleflight"),
-				attribute.Int("http.response.body.size", len(raw)),
-			))
-		_, _ = wri.Write(raw)
-		writeSpan.End()
-		return
+		sfCtx = context.WithoutCancel(req.Context())
 	}
-
-	// Non-cacheable path (extras present): resolve inline without singleflight.
-	raw, resolveErr := resolveRESTActionFromObject(req.Context(), c, got.Unstructured.Object, "", r.authnNS, perPage, page, extras)
+	result, resolveErr := l1cache.ResolveAndCache(sfCtx, l1cache.Input{
+		Cache:       c,
+		Obj:         got.Unstructured.Object,
+		ResolvedKey: resolvedKey,
+		AuthnNS:     r.authnNS,
+		PerPage:     perPage,
+		Page:        page,
+		Extras:      extras,
+	})
 	if resolveErr != nil {
 		response.InternalError(wri, resolveErr)
 		return
 	}
+	if result == nil || result.Raw == nil {
+		response.InternalError(wri, errEmptyResolveResult)
+		return
+	}
+	raw := result.Raw
+
+	pathAttr := "inline"
+	if resolvedKey != "" {
+		pathAttr = "singleflight"
+	}
 	log.Info("RESTAction successfully resolved",
+		slog.String("key", resolvedKey),
+		slog.String("path", pathAttr),
 		slog.String("duration", util.ETA(start)))
 	wri.Header().Set("Content-Type", "application/json")
 	wri.WriteHeader(http.StatusOK)
 	_, writeSpan := restactionTracer.Start(req.Context(), "http.write",
 		trace.WithAttributes(
 			attribute.Bool("cache.hit", false),
-			attribute.String("path", "inline"),
+			attribute.String("path", pathAttr),
 			attribute.Int("http.response.body.size", len(raw)),
 		))
 	_, _ = wri.Write(raw)
 	writeSpan.End()
 }
 
-// resolveRESTActionFromObject performs the full RESTAction resolution: convert →
-// resolve → marshal → strip annotations → cache-set. Called from the HTTP
-// handler (via singleflight) and from L1 refresh (via ResolveRESTActionDirect).
-func resolveRESTActionFromObject(ctx context.Context, c *cache.RedisCache, obj map[string]interface{}, resolvedKey, authnNS string, perPage, page int, extras map[string]any) ([]byte, error) {
-	ctx, span := restactionTracer.Start(ctx, "restaction.resolve")
-	defer span.End()
+// errEmptyResolveResult indicates the shared l1cache helper returned
+// (nil, nil) — should not happen in practice, kept as a typed error so
+// the HTTP path returns 500 cleanly instead of panicking on a nil
+// dereference downstream.
+var errEmptyResolveResult = errEmptyResolve{}
 
-	log := xcontext.Logger(ctx)
+type errEmptyResolve struct{}
 
-	scheme := runtime.NewScheme()
-	if err := apis.AddToScheme(scheme); err != nil {
-		return nil, err
-	}
-
-	var cr v1.RESTAction
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj, &cr); err != nil {
-		log.Error("unable to convert unstructured to typed rest action",
-			slog.Any("err", err))
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return nil, err
-	}
-	if span.IsRecording() {
-		span.SetAttributes(
-			attribute.String("restaction.name", cr.GetName()),
-			attribute.String("restaction.namespace", cr.GetNamespace()),
-		)
-	}
-
-	tracker := cache.NewDependencyTracker()
-	tctx := cache.WithDependencyTracker(xcontext.BuildContext(ctx), tracker)
-	res, err := restactions.Resolve(tctx, restactions.ResolveOptions{
-		In:      &cr,
-		AuthnNS: authnNS,
-		PerPage: perPage,
-		Page:    page,
-		Extras:  extras,
-	})
-	if err != nil {
-		log.Error("unable to resolve rest action",
-			slog.String("name", cr.GetName()),
-			slog.String("namespace", cr.GetNamespace()),
-			slog.Any("err", err))
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return nil, err
-	}
-
-	log.Info("RESTAction resolved",
-		slog.String("name", cr.Name),
-		slog.String("namespace", cr.Namespace))
-
-	_, marshalSpan := restactionTracer.Start(ctx, "http.marshal")
-	raw, merr := json.Marshal(res)
-	if merr == nil {
-		marshalSpan.SetAttributes(attribute.Int("http.response.body.size", len(raw)))
-	}
-	marshalSpan.End()
-	if merr != nil {
-		return nil, merr
-	}
-
-	_, stripSpan := restactionTracer.Start(ctx, "http.strip_bulky",
-		trace.WithAttributes(attribute.Int("input.bytes", len(raw))))
-	raw = cache.StripBulkyAnnotations(raw)
-	stripSpan.SetAttributes(attribute.Int("output.bytes", len(raw)))
-	stripSpan.End()
-
-	if c != nil && resolvedKey != "" {
-		_ = c.SetResolvedRaw(ctx, resolvedKey, raw)
-		cache.RegisterL1Dependencies(ctx, c, tracker, resolvedKey)
-		// Register group-level deps from the API request paths collected
-		// during resolution. This ensures that when any resource in a K8s
-		// API group changes, this RESTAction's L1 key is refreshed.
-		cache.RegisterL1ApiDeps(ctx, c, resolvedKey, extractAPIRequests(raw))
-	}
-
-	return raw, nil
+func (errEmptyResolve) Error() string {
+	return "l1cache.ResolveAndCache returned empty result with no error"
 }
 
-// extractAPIRequests extracts the "apiRequests" string array from the resolved
-// RESTAction JSON output. Returns nil if the field is missing or not an array.
-func extractAPIRequests(raw []byte) []string {
-	// The apiRequests field is at the top level of the resolved output
-	// (inside status.Raw which was marshaled from the api.Resolve dict).
-	// However, the raw here is the full marshaled RESTAction, so we need
-	// to look inside status.apiRequests.
-	var wrapper struct {
-		Status json.RawMessage `json:"status"`
-	}
-	if err := json.Unmarshal(raw, &wrapper); err != nil || wrapper.Status == nil {
-		return nil
-	}
-	var statusMap map[string]json.RawMessage
-	if err := json.Unmarshal(wrapper.Status, &statusMap); err != nil {
-		return nil
-	}
-	reqsRaw, ok := statusMap["apiRequests"]
-	if !ok {
-		return nil
-	}
-	var reqs []string
-	if err := json.Unmarshal(reqsRaw, &reqs); err != nil {
-		return nil
-	}
-	return reqs
-}
-
-// ResolveRESTActionDirect is the entry point for L1 refresh to resolve a
-// RESTAction using the same singleflight group as the HTTP handler.
-func ResolveRESTActionDirect(ctx context.Context, c *cache.RedisCache, obj map[string]interface{}, resolvedKey, authnNS string, perPage, page int) ([]byte, error) {
-	result, err, _ := restactionFlight.Do(resolvedKey, func() (interface{}, error) {
-		return resolveRESTActionFromObject(ctx, c, obj, resolvedKey, authnNS, perPage, page, nil)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return result.([]byte), nil
-}
-
-// ResolveRESTActionBackground resolves a RESTAction using a dedicated background
-// singleflight group. This deduplicates concurrent background L1 refresh
-// attempts for the same key (e.g. l3gen scanner firing every 3s while a
-// 10-15s compositions-list resolution is in progress) without blocking
-// HTTP requests (which use the separate restactionFlight group).
+// ResolveRESTActionBackground is the entry point for the L1 refresh
+// loop. It forwards to l1cache.ResolveAndCacheBackground which uses a
+// separate singleflight group so long background re-resolves do not
+// block foreground HTTP traffic waiting on the same key.
+//
+// Kept here as a thin shim because internal/handlers/dispatchers/
+// l1_refresh.go already imports this package and calls this function;
+// moving the call site to l1cache directly would churn l1_refresh
+// without any correctness or performance benefit.
 func ResolveRESTActionBackground(ctx context.Context, c *cache.RedisCache, obj map[string]interface{}, resolvedKey, authnNS string, perPage, page int) ([]byte, error) {
-	if resolvedKey == "" {
-		return resolveRESTActionFromObject(ctx, c, obj, resolvedKey, authnNS, perPage, page, nil)
-	}
-	// Use WithoutCancel so the resolution doesn't abort if the first caller's
-	// context expires — other callers waiting in the singleflight group may
-	// have longer deadlines.
-	sfCtx := context.WithoutCancel(ctx)
-	result, err, _ := restactionBgFlight.Do(resolvedKey, func() (interface{}, error) {
-		return resolveRESTActionFromObject(sfCtx, c, obj, resolvedKey, authnNS, perPage, page, nil)
+	result, err := l1cache.ResolveAndCacheBackground(ctx, l1cache.Input{
+		Cache:       c,
+		Obj:         obj,
+		ResolvedKey: resolvedKey,
+		AuthnNS:     authnNS,
+		PerPage:     perPage,
+		Page:        page,
 	})
 	if err != nil {
 		return nil, err
@@ -321,5 +207,5 @@ func ResolveRESTActionBackground(ctx context.Context, c *cache.RedisCache, obj m
 	if result == nil {
 		return nil, nil
 	}
-	return result.([]byte), nil
+	return result.Raw, nil
 }

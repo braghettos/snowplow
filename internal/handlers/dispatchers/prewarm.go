@@ -15,14 +15,12 @@ import (
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/plumbing/jwtutil"
-	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
-	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
+	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions/l1cache"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	k8sdynamic "k8s.io/client-go/dynamic"
@@ -664,37 +662,22 @@ func warmL1RestActionsForUser(ctx context.Context, c *cache.RedisCache, dynClien
 			continue
 		}
 
-		var cr templatesv1.RESTAction
-		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(cached.Object, &cr); err != nil {
-			log.Warn("L1 warmup: failed to convert RESTAction",
-				slog.String("name", ra.Name), slog.Any("err", err))
-			continue
-		}
-
-		tracker := cache.NewDependencyTracker()
-		tctx := cache.WithDependencyTracker(rctx, tracker)
-
-		res, err := restactions.Resolve(tctx, restactions.ResolveOptions{
-			In:      &cr,
-			AuthnNS: authnNS,
-			PerPage: -1,
-			Page:    -1,
-		})
-		if err != nil {
+		// Delegate convert → resolve → marshal → strip → L1 write to the
+		// shared l1cache helper. Keeps prewarm, HTTP dispatcher, and
+		// widget apiref paths on one code path — no drift risk on key
+		// schema, dependency registration, or marshal step.
+		if _, err := l1cache.ResolveAndCache(rctx, l1cache.Input{
+			Cache:       c,
+			Obj:         cached.Object,
+			ResolvedKey: rKey,
+			AuthnNS:     authnNS,
+			PerPage:     -1,
+			Page:        -1,
+		}); err != nil {
 			log.Warn("L1 warmup: failed to resolve RESTAction",
 				slog.String("name", ra.Name), slog.Any("err", err))
 			continue
 		}
-
-		raw, merr := json.Marshal(res)
-		if merr != nil {
-			continue
-		}
-
-		strippedRaw := cache.StripBulkyAnnotations(raw)
-		_ = c.SetResolvedRaw(tctx, rKey, strippedRaw)
-		cache.RegisterL1Dependencies(tctx, c, tracker, rKey)
-		cache.RegisterL1ApiDeps(tctx, c, rKey, extractAPIRequests(strippedRaw))
 
 		warmed++
 		log.Info("L1 warmup: warmed RESTAction",

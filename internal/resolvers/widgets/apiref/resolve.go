@@ -4,14 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
-	"golang.org/x/sync/singleflight"
+	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions/l1cache"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
@@ -26,24 +25,23 @@ type ResolveOptions struct {
 }
 
 // restActionGVR is the GVR under which RESTAction L1 entries are stored.
-// Matches the key written by internal/handlers/dispatchers/restactions.go.
+// Matches the key written by the HTTP dispatcher (via l1cache).
 var restActionGVR = schema.GroupVersionResource{
 	Group:    "templates.krateo.io",
 	Version:  "v1",
 	Resource: "restactions",
 }
 
-// apiRefFlight dedups concurrent widget apiref resolutions for the same L1
-// key. Without this, N concurrent widgets that share one RESTAction (e.g.
-// dashboard piechart + table both reading compositions-list) each kick off
-// the full 32 s L3→JQ aggregation, hammering memory and CPU.
+// Resolve fetches (and on L1 miss, resolves + caches) the RESTAction
+// referenced by opts.ApiRef for the current user, returning its status
+// subtree.
 //
-// This singleflight is local to the apiref package and does NOT dedup with
-// the RESTAction HTTP dispatcher's group (dispatchers/restactions.go) — the
-// dispatcher path is rarely hit in practice since widgets never go through
-// it, so cross-path dedup is not worth the import graph complexity.
-var apiRefFlight singleflight.Group
-
+// L1 miss path delegates to the shared l1cache.ResolveAndCache helper,
+// which owns both the write path AND a process-wide foreground
+// singleflight.Group. The group is shared with the RESTAction HTTP
+// dispatcher, so concurrent widget + direct /call requests for the
+// same key dedup against each other — the previous per-package group
+// allowed N parallel resolutions of the same 32 s aggregation.
 func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	if opts.ApiRef.Name == "" || opts.ApiRef.Namespace == "" {
 		return map[string]any{}, nil
@@ -56,99 +54,56 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 		if uerr == nil && user.Username != "" {
 			l1Key = cache.ResolvedKey(user.Username, restActionGVR,
 				opts.ApiRef.Namespace, opts.ApiRef.Name, opts.Page, opts.PerPage)
-			// L1 fast path: when a widget depends on a RESTAction that has
-			// already been resolved for this user, reading the cached output
-			// is orders of magnitude faster than re-running the full
-			// RESTAction pipeline. At 50K compositions this saves ~10-15s
-			// per widget refresh.
+			// L1 fast path: when a widget depends on a RESTAction that
+			// has already been resolved for this user, reading the
+			// cached output is orders of magnitude faster than
+			// re-running the full RESTAction pipeline. At 50K
+			// compositions this saves ~10-15 s per widget refresh.
 			if status, ok := lookupL1(ctx, c, l1Key); ok {
 				return status, nil
 			}
 		}
 	}
 
-	// ── L1 miss: go through singleflight so concurrent widgets for the
-	// same RESTAction share one resolution. The singleflight key is the L1
-	// key, so requests for different pages or different users don't collide.
+	// L1 miss: fall through to shared resolver.
 	if l1Key != "" {
-		sfCtx := context.WithoutCancel(ctx)
-		result, err, _ := apiRefFlight.Do(l1Key, func() (interface{}, error) {
-			return resolveAndCache(sfCtx, c, opts, l1Key)
-		})
-		if err != nil {
-			return map[string]any{}, err
-		}
-		status, _ := result.(map[string]any)
-		if status == nil {
-			return map[string]any{}, nil
-		}
-		return status, nil
+		return resolveViaL1Cache(ctx, c, opts, l1Key)
 	}
 
-	// No cache context: resolve inline without singleflight or L1 write.
+	// No cache context (tests, etc.): inline resolve with no L1 write.
 	return resolveInline(ctx, opts)
 }
 
-// resolveAndCache runs the full RESTAction resolution and writes the result
-// into L1 with dependency tracking. Called inside apiRefFlight so concurrent
-// callers share one execution.
-func resolveAndCache(ctx context.Context, c *cache.RedisCache, opts ResolveOptions, l1Key string) (map[string]any, error) {
-	// Recheck L1 inside singleflight: another flight may have just finished
-	// and populated it between our miss check and our flight acquire.
-	if status, ok := lookupL1(ctx, c, l1Key); ok {
-		return status, nil
-	}
-
+// resolveViaL1Cache fetches the RESTAction CR and hands it off to
+// l1cache.ResolveAndCache, which runs inside the shared foreground
+// singleflight.Group and writes the L1 entry.
+func resolveViaL1Cache(ctx context.Context, c *cache.RedisCache, opts ResolveOptions, l1Key string) (map[string]any, error) {
 	res := objects.Get(ctx, opts.ApiRef)
 	if res.Err != nil {
-		return nil, fmt.Errorf("%s", res.Err.Message)
+		return map[string]any{}, fmt.Errorf("%s", res.Err.Message)
 	}
 
-	ra, err := convertToRESTAction(res.Unstructured.Object)
+	result, err := l1cache.ResolveAndCache(ctx, l1cache.Input{
+		Cache:       c,
+		Obj:         res.Unstructured.Object,
+		ResolvedKey: l1Key,
+		AuthnNS:     opts.AuthnNS,
+		SArc:        opts.RC,
+		PerPage:     opts.PerPage,
+		Page:        opts.Page,
+		Extras:      opts.Extras,
+	})
 	if err != nil {
-		return nil, err
+		return map[string]any{}, err
 	}
-
-	// Wrap ctx with a dependency tracker so restactions.Resolve records
-	// which L3 reads it made. We then register these as L1 deps so watch
-	// events can invalidate this L1 key when any of its inputs change.
-	tracker := cache.NewDependencyTracker()
-	tctx := cache.WithDependencyTracker(ctx, tracker)
-
-	if _, err = restactions.Resolve(tctx, restactions.ResolveOptions{
-		In:      &ra,
-		SArc:    opts.RC,
-		AuthnNS: opts.AuthnNS,
-		PerPage: opts.PerPage,
-		Page:    opts.Page,
-		Extras:  opts.Extras,
-	}); err != nil {
-		return nil, err
+	if result == nil || result.Status == nil {
+		return map[string]any{}, nil
 	}
-
-	// Write the resolved RESTAction CR to L1, mirroring what the RESTAction
-	// HTTP dispatcher does (dispatchers/restactions.go:resolveRESTActionFromObject).
-	// Without this, every subsequent widget call for the same user+RESTAction
-	// would re-run the full L3→JQ aggregation (N+1 problem across paginated
-	// widget pages).
-	if raw, merr := json.Marshal(&ra); merr == nil {
-		raw = cache.StripBulkyAnnotations(raw)
-		if serr := c.SetResolvedRaw(tctx, l1Key, raw); serr != nil {
-			slog.Warn("apiref: SetResolvedRaw failed",
-				slog.String("key", l1Key), slog.Any("err", serr))
-		}
-		cache.RegisterL1Dependencies(tctx, c, tracker, l1Key)
-		cache.RegisterL1ApiDeps(tctx, c, l1Key, extractAPIRequests(raw))
-	} else {
-		slog.Warn("apiref: marshal RESTAction failed, skipping L1 write",
-			slog.String("key", l1Key), slog.Any("err", merr))
-	}
-
-	return rawExtensionToMap(ra.Status)
+	return result.Status, nil
 }
 
-// resolveInline is the non-cached fast path: no L1 lookup, no L1 write,
-// no singleflight. Used when there is no cache context (tests, etc).
+// resolveInline is the no-cache fast path: no L1 lookup, no L1 write,
+// no singleflight. Used when there is no cache context.
 func resolveInline(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	res := objects.Get(ctx, opts.ApiRef)
 	if res.Err != nil {
@@ -190,31 +145,4 @@ func lookupL1(ctx context.Context, c *cache.RedisCache, l1Key string) (map[strin
 		return nil, false
 	}
 	return status, true
-}
-
-// extractAPIRequests extracts the "apiRequests" string array from the
-// resolved RESTAction JSON output. Mirror of the helper in
-// dispatchers/restactions.go — duplicated here to keep the import graph
-// acyclic (resolvers must not import handlers). Returns nil if the field
-// is missing or not an array.
-func extractAPIRequests(raw []byte) []string {
-	var wrapper struct {
-		Status json.RawMessage `json:"status"`
-	}
-	if err := json.Unmarshal(raw, &wrapper); err != nil || wrapper.Status == nil {
-		return nil
-	}
-	var statusMap map[string]json.RawMessage
-	if err := json.Unmarshal(wrapper.Status, &statusMap); err != nil {
-		return nil
-	}
-	reqsRaw, ok := statusMap["apiRequests"]
-	if !ok {
-		return nil
-	}
-	var reqs []string
-	if err := json.Unmarshal(reqsRaw, &reqs); err != nil {
-		return nil
-	}
-	return reqs
 }
