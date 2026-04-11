@@ -122,10 +122,6 @@ type ResourceWatcher struct {
 	// for the next 3s tick.
 	l3genScanNow chan struct{}
 
-	// singleflightStates holds per-GVR l1SingleflightState used by the
-	// P1.2 event-driven coalescer (l1_singleflight.go). Keyed by GVRToKey.
-	// Populated lazily on first event per GVR.
-	singleflightStates sync.Map // map[string]*l1SingleflightState
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -776,13 +772,6 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	if isDynamic {
 		rw.scheduleDynamicReconcile(gvr)
 	}
-
-	// ── P1.2 singleflight L1 refresh (parallel path, feature-flagged) ───────
-	// When SNOWPLOW_SINGLEFLIGHT_L1=1, trigger an event-driven L1 refresh via
-	// the singleflight coalescer in addition to the legacy reconcile/l3gen
-	// paths. No-op when the flag is unset. This lets us canary the new path
-	// without removing the old ones.
-	rw.triggerL1RefreshSingleflight(ctx, gvr, ns, name, eventType)
 
 	// ── Record change for incremental L1 patching (C2) ──────────────────────
 	rw.recentChangesMu.Lock()
