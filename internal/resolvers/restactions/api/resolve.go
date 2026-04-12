@@ -226,6 +226,32 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						}
 					}
 
+					// RBAC gate: verify the user can access this L3 key
+					// before serving cached data. L3 is SA-scoped (stores
+					// everything), but reads on behalf of a user must check
+					// UserCan — same pattern as widget resourcesRefs
+					// (allowed flag). Without this, any user who can reach
+					// the parent widget/restaction sees all data from all
+					// namespaces, bypassing K8s RBAC.
+					if hit {
+						rbacVerb := "list"
+						if pathName != "" {
+							rbacVerb = "get"
+						}
+						if !rbac.UserCan(ctx, rbac.UserCanOptions{
+							Verb:          rbacVerb,
+							GroupResource: schema.GroupResource{Group: pathGVR.Group, Resource: pathGVR.Resource},
+							Namespace:     pathNS,
+						}) {
+							log.Debug("L3 cache hit but user RBAC denied",
+								slog.String("name", id),
+								slog.String("path", call.Path),
+								slog.String("verb", rbacVerb),
+								slog.String("namespace", pathNS))
+							hit = false // fall through — K8s API will enforce natively
+						}
+					}
+
 					if hit {
 						log.Debug("L3 cache hit for K8s API path",
 							slog.String("name", id),
