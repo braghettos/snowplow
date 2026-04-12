@@ -187,21 +187,21 @@ func resolveApiRef(ctx context.Context, opts ResolveOptions) (map[string]any, er
 		return nil, err
 	}
 
-	// Always fetch the underlying RESTAction unpaginated. The widget handles
-	// slicing in its widgetDataTemplate via the `.slice` field injected by
-	// the widget resolver after this call returns. This keeps the apiref L1
-	// cache entry shared across pages (one entry per user+restaction instead
-	// of one entry per page), avoiding 980× redundant storage at 50K scale.
+	// Pass the widget's page/perPage through to the restaction so its JQ
+	// filter can use .slice for server-side pagination (e.g. compositions-
+	// panels slices .compositionspanels by offset+perPage). Each page gets
+	// its own L1 cache key — this is correct because restactions that use
+	// .slice produce different output per page.
 	//
-	// Safe: no existing RESTAction honours `.slice` in its filter today, so
-	// passing PerPage=0/Page=0 is equivalent to passing the widget's actual
-	// pagination params for all current consumers.
+	// Restactions that DON'T use .slice (e.g. compositions-list) produce
+	// identical output regardless of page, so the per-page L1 keys are
+	// redundant but harmless.
 	return apiref.Resolve(ctx, apiref.ResolveOptions{
 		RC:      opts.RC,
 		ApiRef:  apiRef,
 		AuthnNS: opts.AuthnNS,
-		PerPage: 0,
-		Page:    0,
+		PerPage: opts.PerPage,
+		Page:    opts.Page,
 	})
 }
 
