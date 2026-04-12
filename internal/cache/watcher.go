@@ -140,7 +140,18 @@ func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error
 	return &ResourceWatcher{
 		cache:                  c,
 		dynClient:              dynClient,
-		factory:                dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 0),
+		factory: dynamicinformer.NewFilteredDynamicSharedInformerFactory(
+			dynClient, 0, metav1.NamespaceAll,
+			func(opts *metav1.ListOptions) {
+				// Chunk the initial LIST to avoid a transient memory spike
+				// that OOMKills the pod at 50K+ compositions. Without this,
+				// the informer decodes the entire LIST response (~15 GB for
+				// 50K unstructured objects) in one pass. With Limit=500, it
+				// pages through 100 batches of ~150 MB each, keeping peak
+				// transient allocation under 500 MB.
+				opts.Limit = 500
+			},
+		),
 		watched:                make(map[string]bool),
 		eventCh:                make(chan l1Event, 100000),
 		dynamicGVRs:               make(map[string]schema.GroupVersionResource),
