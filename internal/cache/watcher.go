@@ -1231,8 +1231,14 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 				// l1RefreshRunning. If the l3gen scanner is already
 				// refreshing, skip — it will pick up our changes.
 				if rw.l1RefreshRunning.CompareAndSwap(false, true) {
-					// Filter recent changes to only those matching this GVR.
-					// Put unmatched changes back so the next refresh gets them.
+					// Drain recentChanges for this GVR. handleEvent populates
+					// the buffer BEFORE updating L3, so it contains the actual
+					// mutations (add/update/delete) even though L3 is already
+					// in sync by the time reconcileGVR runs.
+					//
+					// Previous approach (synthesize from reconcile diff) failed
+					// because handleEvent already synced L3 before the debounce
+					// timer fired — l3Map matches informerMap, zero diff.
 					rw.recentChangesMu.Lock()
 					var matched, unmatched []L1ChangeInfo
 					if !rw.recentChangesOverflow {
@@ -1247,12 +1253,26 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 					rw.recentChanges = unmatched
 					rw.recentChangesOverflow = false
 					rw.recentChangesMu.Unlock()
-					go func() {
-						defer rw.l1RefreshRunning.Store(false)
-						refreshCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-						defer cancel()
-						fn(refreshCtx, gvr, l1Keys, matched)
-					}()
+
+					// If zero changes were found in the buffer AND the
+					// reconcile diff shows no additions/removals/updates,
+					// skip the L1 refresh entirely. The L3 is already in
+					// sync (handleEvent updated it immediately) and L1 is
+					// still valid. Without this guard, every debounced
+					// reconcile launches a 10-15s full re-resolve at 50K
+					// even when nothing actually changed — the root cause
+					// of the S7 spike.
+					if len(matched) == 0 && added+removed+updated == 0 {
+						slog.Debug("reconcile: skipping L1 refresh (no changes, L3 in sync)")
+						rw.l1RefreshRunning.Store(false)
+					} else {
+						go func() {
+							defer rw.l1RefreshRunning.Store(false)
+							refreshCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+							defer cancel()
+							fn(refreshCtx, gvr, l1Keys, matched)
+						}()
+					}
 				}
 			} else {
 				_ = rw.cache.Delete(ctx, l1Keys...)

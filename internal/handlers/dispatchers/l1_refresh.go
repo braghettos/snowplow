@@ -172,7 +172,16 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 		// Extract only delete changes — status updates from controllers
 		// contaminate the buffer but don't affect L1 output.
 		deleteChanges := filterDeleteChanges(changes)
-		useIncremental := len(deleteChanges) > 0 && len(deleteChanges) <= 20 &&
+		// Always try incremental patch when there are delete changes.
+		// No fixed threshold on delete count — the O(N) JSON scan in
+		// patchRESTActionL1 is always cheaper than a full re-resolve
+		// (L3 MGET + JQ + marshal for the entire list). At 50K items,
+		// even 1000 deletes × JSON scan completes in milliseconds vs
+		// 25s for a full re-resolve.
+		//
+		// The fullRefreshInterval safety net (force full after N
+		// consecutive patches) corrects any accumulated drift.
+		useIncremental := len(deleteChanges) > 0 &&
 			incrementalCount < fullRefreshInterval
 
 		if useIncremental {
