@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
@@ -69,6 +70,14 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 				if tracker := cache.TrackerFromContext(ctx); tracker != nil {
 					tracker.AddGVR(restActionGVR)
 					tracker.AddResource(restActionGVR, opts.ApiRef.Namespace, opts.ApiRef.Name)
+					slog.Debug("apiref: L1 hit, added restaction dep to tracker",
+						slog.String("l1Key", l1Key),
+						slog.String("apiRef", opts.ApiRef.Name),
+						slog.Int("page", opts.Page),
+						slog.Int("perPage", opts.PerPage))
+				} else {
+					slog.Warn("apiref: L1 hit but NO tracker in context",
+						slog.String("l1Key", l1Key))
 				}
 				return status, nil
 			}

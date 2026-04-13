@@ -264,6 +264,11 @@ func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objec
 	// informer events can do targeted invalidation instead of bulk deletes.
 	if c != nil && resolvedKey != "" {
 		_ = c.SetResolvedRaw(ctx, resolvedKey, raw)
+		log.Info("widget: registering L1 deps",
+			slog.String("key", resolvedKey),
+			slog.Int("tracker_gvrs", len(tracker.GVRKeys())),
+			slog.Int("tracker_refs", len(tracker.ResourceRefs())),
+		)
 		cache.RegisterL1Dependencies(ctx, c, tracker, resolvedKey)
 		_, preWarmSpan := widgetTracer.Start(ctx, "widget.prewarm_children")
 		preWarmChildWidgets(ctx, c, res, authnNS)
