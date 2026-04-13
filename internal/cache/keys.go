@@ -90,14 +90,6 @@ func DiscoveryKey(category string) string {
 	return fmt.Sprintf("snowplow:discovery:%s", category)
 }
 
-func GetKeyPattern(gvr schema.GroupVersionResource) string {
-	return fmt.Sprintf("snowplow:get:%s:*", GVRToKey(gvr))
-}
-
-func ListKeyPattern(gvr schema.GroupVersionResource) string {
-	return fmt.Sprintf("snowplow:list:%s:*", GVRToKey(gvr))
-}
-
 // RBACHashKey returns the Redis HASH key for a user's RBAC decisions.
 // All RBAC results for a user are stored as fields in a single hash,
 // reducing per-key overhead from ~70 bytes to near zero per entry.
@@ -114,17 +106,6 @@ func RBACField(verb string, gr schema.GroupResource, namespace string) string {
 		g = "core"
 	}
 	return fmt.Sprintf("%s:%s/%s:%s", verb, g, gr.Resource, namespace)
-}
-
-// RBACKey is kept for backward compatibility during migration. It returns
-// the legacy flat key format. New code should use RBACHashKey + RBACField.
-// Deprecated: use RBACHashKey + RBACField instead.
-func RBACKey(username, verb string, gr schema.GroupResource, namespace string) string {
-	g := gr.Group
-	if g == "" {
-		g = "core"
-	}
-	return fmt.Sprintf("snowplow:rbac:%s:%s:%s/%s:%s", username, verb, g, gr.Resource, namespace)
 }
 
 // UserResolvedIndexKey returns the Redis SET key that tracks all resolved (L1)
@@ -146,11 +127,6 @@ func ResolvedKey(username string, gvr schema.GroupVersionResource, namespace, na
 	}
 	return base
 }
-
-// AllResolvedPattern matches every dispatcher-level resolved cache entry.
-// Used by the resource watcher to bulk-invalidate stale resolved outputs
-// when any watched Kubernetes resource changes.
-const AllResolvedPattern = "snowplow:resolved:*"
 
 // L1GVRKey returns the Redis SET key that maps a GVR to all L1 (resolved)
 // cache entries that depend on it. Used as a fallback for targeted invalidation
@@ -345,20 +321,6 @@ func ParseListIndexKey(key string) (gvr schema.GroupVersionResource, namespace s
 		return
 	}
 	return ParseGVRKey(parts[2]), parts[3], true
-}
-
-// GVRFromKey extracts the GVR from a snowplow:get or snowplow:list cache key.
-func GVRFromKey(key string) schema.GroupVersionResource {
-	parts := strings.SplitN(key, ":", 3)
-	if len(parts) < 3 {
-		return schema.GroupVersionResource{}
-	}
-	typ := parts[1]
-	if typ != "get" && typ != "list" {
-		return schema.GroupVersionResource{}
-	}
-	gvrPart := strings.SplitN(parts[2], ":", 2)[0]
-	return ParseGVRKey(gvrPart)
 }
 
 // ParseCallPath extracts GVR, namespace, and name from a snowplow /call URL

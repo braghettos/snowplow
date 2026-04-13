@@ -457,10 +457,6 @@ func (c *RedisCache) SetWithTTL(ctx context.Context, key string, val any, ttl ti
 	return c.setWithTTL(ctx, key, val, ttl)
 }
 
-func (c *RedisCache) SetPersist(ctx context.Context, key string, val any) error {
-	return c.setWithTTL(ctx, key, val, 0)
-}
-
 func (c *RedisCache) SetRaw(ctx context.Context, key string, val []byte) error {
 	if c == nil {
 		return nil
@@ -658,16 +654,6 @@ func (c *RedisCache) ScanKeys(ctx context.Context, pattern string) ([]string, er
 	return keys, iter.Err()
 }
 
-// DeletePattern deletes all keys matching the given glob pattern using SCAN+DEL.
-// Safe on a nil receiver (no-op).
-func (c *RedisCache) DeletePattern(ctx context.Context, pattern string) error {
-	keys, err := c.ScanKeys(ctx, pattern)
-	if err != nil || len(keys) == 0 {
-		return err
-	}
-	return c.Delete(ctx, keys...)
-}
-
 // SAddWithTTL adds member to a Redis set and refreshes the set's TTL.
 // Uses MULTI/EXEC transaction to ensure atomicity (Bug 5: if Redis
 // crashes between SADD and EXPIRE in a plain pipeline, the set
@@ -842,12 +828,6 @@ func (c *RedisCache) IsRBACAllowed(ctx context.Context, username, verb string, g
 	if err == nil {
 		return val == "true", true
 	}
-	// Fall back to legacy STRING key for migration period.
-	legacyKey := RBACKey(username, verb, gr, namespace)
-	var legacyVal bool
-	if hit, gerr := c.Get(ctx, legacyKey, &legacyVal); hit && gerr == nil {
-		return legacyVal, true
-	}
 	return false, false
 }
 
@@ -930,13 +910,6 @@ func (c *RedisCache) SRemUser(ctx context.Context, username string) error {
 		return nil
 	}
 	return c.client.SRem(ctx, ActiveUsersKey, username).Err()
-}
-
-func (c *RedisCache) SetString(ctx context.Context, key, value string) error {
-	if c == nil {
-		return nil
-	}
-	return c.client.Set(ctx, key, value, 0).Err()
 }
 
 // SetStringWithTTL stores a string value with an explicit TTL.

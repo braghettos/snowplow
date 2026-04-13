@@ -897,51 +897,6 @@ func (rw *ResourceWatcher) matchesAutoDiscoverGroup(group string) bool {
 	return false
 }
 
-// collectAffectedL1Keys returns the deduplicated set of L1 resolved keys that
-// depend on the given K8s resource via per-resource dependency indexes:
-//   - GET dependency:    L1 keys that fetched this specific resource
-//   - LIST (namespaced): L1 keys that listed this GVR in this namespace
-//   - LIST (cluster):    L1 keys that listed this GVR across all namespaces
-func (rw *ResourceWatcher) collectAffectedL1Keys(ctx context.Context, gvrKey, ns, name string) []string {
-	seen := map[string]bool{}
-	collect := func(idxKey string) {
-		if keys, err := rw.cache.SMembers(ctx, idxKey); err == nil {
-			for _, k := range keys {
-				seen[k] = true
-			}
-		}
-	}
-
-	// GET dependency: specific resource
-	collect(L1ResourceDepKey(gvrKey, ns, name))
-	// LIST dependency: namespaced
-	if ns != "" {
-		collect(L1ResourceDepKey(gvrKey, ns, ""))
-	}
-	// LIST dependency: cluster-wide
-	collect(L1ResourceDepKey(gvrKey, "", ""))
-
-	// API-level dependency: RESTActions that declared interest in this
-	// GVR via their apiRequests. The GVR key format is "group/version/resource".
-	collect(L1ApiDepKey(gvrKey))
-
-	if len(seen) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(seen))
-	for k := range seen {
-		out = append(out, k)
-	}
-	return out
-}
-
-// expandDependents walks the L1 dependency tree starting from the given keys.
-// For each L1 key, it parses the key to extract GVR/ns/name, looks up
-// L1ResourceDepKey to find L1 keys that depend on it, and adds them.
-// Repeats up to maxDepth levels. Returns all keys (input + discovered).
-//
-// Example: compositions-get-ns-and-crd → compositions-list → piechart
-
 // scheduleDynamicReconcile debounces reconciliation for a dynamic GVR.
 // Each call resets the timer, but only up to maxReconcileDelay from the first
 // event. This ensures:
@@ -1308,13 +1263,10 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 	return
 }
 
-// rebuildListCaches writes namespace-scoped and cluster-wide LIST keys from
-// the given items. Used by Reconcile to ensure list caches match the
-// informer's authoritative state.
-//
-// Writes BOTH per-item index SETs (new) AND monolithic blobs (legacy)
-// during the migration period. The index SETs are authoritative; the blobs
-// are kept for backward compatibility with readers that haven't migrated.
+// rebuildListCaches writes namespace-scoped and cluster-wide per-item index
+// SETs from the given items. Used by Reconcile to ensure list caches match
+// the informer's authoritative state. Readers consume them via
+// AssembleListFromIndex.
 func (rw *ResourceWatcher) rebuildListCaches(ctx context.Context, gvr schema.GroupVersionResource, items []unstructured.Unstructured) {
 	ttl := rw.cache.TTLForGVR(gvr)
 
@@ -1361,13 +1313,6 @@ func (rw *ResourceWatcher) rebuildListCaches(ctx context.Context, gvr schema.Gro
 	// authoritative and readers consume them via AssembleListFromIndex.
 	_ = byNamespace // silence unused if all paths return
 }
-
-// patchListCache was the monolithic list patching function that used WATCH/MULTI/EXEC
-// to atomically read-modify-write the entire list blob for every informer event.
-// It has been replaced by per-item index SET operations (SADD/SREM) which are O(1)
-// and contention-free. The legacy blob is now only written by rebuildListCaches
-// during periodic reconciliation. This function is retained as dead code during
-// the migration period and can be removed once per-item storage is validated.
 
 // ── Proactive expiry refresh ──────────────────────────────────────────────────
 
