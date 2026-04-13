@@ -60,6 +60,16 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			// re-running the full RESTAction pipeline. At 50K
 			// compositions this saves ~10-15 s per widget refresh.
 			if status, ok := lookupL1(ctx, c, l1Key); ok {
+				// Record the restaction GVR in the dependency tracker
+				// even on L1 hit. The widget dispatcher uses the
+				// tracker to register deps (widgets.go:267). Without
+				// this, the widget L1 key is not connected to the
+				// restaction in the dep graph and never gets refreshed
+				// when the restaction's data changes.
+				if tracker := cache.TrackerFromContext(ctx); tracker != nil {
+					tracker.AddGVR(restActionGVR)
+					tracker.AddResource(restActionGVR, opts.ApiRef.Namespace, opts.ApiRef.Name)
+				}
 				return status, nil
 			}
 		}
