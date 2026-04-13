@@ -98,26 +98,17 @@ func List() http.HandlerFunc {
 		rt := []unstructured.Unstructured{}
 
 		for _, gvr := range gvrs {
-			listCacheKey := cache.ListKey(gvr, ns)
-
 			// Register the GVR for dynamic informer watching early.
 			if c != nil {
 				_ = c.SAddGVR(req.Context(), gvr)
 			}
 
-			// Try list from shared cache: per-item index first, then blob fallback.
+			// Try list from shared cache via per-item index.
 			if c != nil {
 				var cached unstructured.UnstructuredList
 				var listHit bool
-				// Try per-item index assembly.
 				if raw, idxHit, _ := c.AssembleListFromIndex(req.Context(), gvr, ns); idxHit {
 					if jerr := json.Unmarshal(raw, &cached); jerr == nil {
-						listHit = true
-					}
-				}
-				// Fallback to monolithic blob.
-				if !listHit {
-					if hit, rerr := c.Get(req.Context(), listCacheKey, &cached); hit && rerr == nil {
 						listHit = true
 					}
 				}
@@ -147,10 +138,6 @@ func List() http.HandlerFunc {
 					return
 				}
 				continue
-			}
-
-			if c != nil && !c.Exists(req.Context(), listCacheKey) {
-				_ = c.SetForGVR(req.Context(), gvr, listCacheKey, obj)
 			}
 
 			for _, x := range obj.Items {

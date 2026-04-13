@@ -179,15 +179,8 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		listIdxKey := cache.ListIndexKey(opts.gvr, opts.nsn.Namespace)
 		_ = c.Delete(req.Context(), getKey, listKey, cache.ListKey(opts.gvr, ""), listIdxKey, cache.ListIndexKey(opts.gvr, ""))
 
-		gvrKey := cache.GVRToKey(opts.gvr)
-		for _, prefix := range []string{"snowplow:l1gvr:", "snowplow:l2gvr:"} {
-			idxKey := prefix + gvrKey
-			if keys, serr := c.SMembers(req.Context(), idxKey); serr == nil && len(keys) > 0 {
-				_ = c.Delete(req.Context(), append(keys, idxKey)...)
-			}
-		}
 		slog.Debug("cache invalidated after mutation",
-			slog.String("verb", opts.verb), slog.String("gvr", gvrKey))
+			slog.String("verb", opts.verb), slog.String("gvr", cache.GVRToKey(opts.gvr)))
 	}
 
 	wri.Header().Set("Content-Type", "application/json")

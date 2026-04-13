@@ -10,7 +10,6 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	k8sdynamic "k8s.io/client-go/dynamic"
@@ -253,25 +252,6 @@ func (w *Warmer) warmGVR(ctx context.Context, dynClient k8sdynamic.Interface, gv
 	}
 	for ns, members := range nsMembers {
 		_ = w.cache.ReplaceSetWithTTL(ctx, ListIndexKey(gvr, ns), members, ttl)
-	}
-
-	// ── Legacy monolithic blobs (dual-write for migration) ───────────────────
-	if serr := w.cache.SetForGVR(ctx, gvr, ListKey(gvr, ""), list); serr != nil {
-		log.Warn("warmup: failed to cache cluster list", slog.Any("err", serr))
-	}
-
-	for ns, indices := range byNamespace {
-		if ns == "" {
-			continue
-		}
-		filteredList := *list
-		filteredList.Items = make([]unstructured.Unstructured, 0, len(indices))
-		for _, idx := range indices {
-			filteredList.Items = append(filteredList.Items, list.Items[idx])
-		}
-		if serr := w.cache.SetForGVR(ctx, gvr, ListKey(gvr, ns), &filteredList); serr != nil {
-			log.Warn("warmup: failed to cache namespace list", slog.Any("err", serr))
-		}
 	}
 
 	log.Info("warmup: cached GVR", slog.String("gvr", gvr.String()),

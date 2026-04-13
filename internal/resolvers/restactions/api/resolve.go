@@ -207,16 +207,8 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					var hit bool
 
 					if pathName == "" {
-						// LIST operation: try per-item index assembly first (O(1) writes),
-						// then fall back to monolithic blob (legacy).
+						// LIST operation: per-item index assembly.
 						raw, hit, _ = c.AssembleListFromIndex(ctx, pathGVR, pathNS)
-						if !hit {
-							cacheKey := cache.ListKey(pathGVR, pathNS)
-							raw, hit = prefetched[cacheKey]
-							if !hit {
-								raw, hit, _ = c.GetRaw(ctx, cacheKey)
-							}
-						}
 					} else {
 						// GET operation: direct key lookup.
 						cacheKey := cache.GetKey(pathGVR, pathNS, pathName)
@@ -311,15 +303,8 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							l3Raw, l3Hit, _ = c.GetRaw(ctx, l3Key)
 						}
 					} else {
-						// LIST: try per-item index assembly first, then blob.
+						// LIST: per-item index assembly.
 						l3Raw, l3Hit, _ = c.AssembleListFromIndex(ctx, pathGVR, pathNS)
-						if !l3Hit {
-							l3Key := cache.ListKey(pathGVR, pathNS)
-							l3Raw, l3Hit = prefetched[l3Key]
-							if !l3Hit {
-								l3Raw, l3Hit, _ = c.GetRaw(ctx, l3Key)
-							}
-						}
 					}
 					if l3Hit && !cache.IsNotFoundRaw(l3Raw) {
 						rbacVerb := "list"
@@ -410,12 +395,8 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			if c != nil {
 				var l3Keys []string
 				for _, call := range tmp {
-					if pathGVR, pathNS, pathName := cache.ParseK8sAPIPath(call.Path); pathGVR.Resource != "" {
-						if pathName == "" {
-							l3Keys = append(l3Keys, cache.ListKey(pathGVR, pathNS))
-						} else {
-							l3Keys = append(l3Keys, cache.GetKey(pathGVR, pathNS, pathName))
-						}
+					if pathGVR, pathNS, pathName := cache.ParseK8sAPIPath(call.Path); pathGVR.Resource != "" && pathName != "" {
+						l3Keys = append(l3Keys, cache.GetKey(pathGVR, pathNS, pathName))
 					}
 				}
 				if len(l3Keys) > 0 {

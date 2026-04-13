@@ -412,16 +412,10 @@ func getNamespacesFromL3(ctx context.Context, c *cache.RedisCache) []string {
 	nsGVR := schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}
 	var nsList unstructured.UnstructuredList
 
-	// Try per-item index assembly first.
 	if raw, idxHit, _ := c.AssembleListFromIndex(ctx, nsGVR, ""); idxHit {
 		if jerr := json.Unmarshal(raw, &nsList); jerr == nil {
 			return extractNamespaceNames(nsList)
 		}
-	}
-	// Fallback to monolithic blob.
-	nsListKey := cache.ListKey(nsGVR, "")
-	if hit, err := c.Get(ctx, nsListKey, &nsList); hit && err == nil {
-		return extractNamespaceNames(nsList)
 	}
 	return nil
 }
@@ -449,69 +443,24 @@ func WarmRBACForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Conf
 		return
 	}
 
-	gvrKeys, err := c.SMembers(ctx, cache.WatchedGVRsKey)
-	if err != nil || len(gvrKeys) == 0 {
-		log.Info("RBAC warmup: no watched GVRs yet")
-		return
-	}
+	log.Info("RBAC warmup: starting", slog.Int("users", len(users)))
 
-	var namespaces []string
-	nsGVR := schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}
-	var nsList unstructured.UnstructuredList
-	var nsHit bool
-	// Try per-item index assembly first.
-	if raw, idxHit, _ := c.AssembleListFromIndex(ctx, nsGVR, ""); idxHit {
-		if jerr := json.Unmarshal(raw, &nsList); jerr == nil {
-			nsHit = true
-		}
-	}
-	// Fallback to monolithic blob.
-	if !nsHit {
-		nsListKey := cache.ListKey(nsGVR, "")
-		nsHit2, gerr := c.Get(ctx, nsListKey, &nsList)
-		nsHit = nsHit2 && gerr == nil
-	}
-	if nsHit {
-		for _, ns := range nsList.Items {
-			namespaces = append(namespaces, ns.GetName())
-		}
-	}
-	if len(namespaces) == 0 {
-		log.Info("RBAC warmup: no namespaces in L3 cache")
-		return
-	}
-
-	var total int64
+	// Delegate to PreWarmRBACForUser per user — it already has bounded
+	// concurrency (sem of 20), skips cached results, and handles context.
+	var wg sync.WaitGroup
 	for _, u := range users {
-		token := mintJWT(u.userInfo, signKey)
-		rctx := xcontext.BuildContext(ctx,
-			xcontext.WithUserConfig(u.endpoint),
-			xcontext.WithUserInfo(u.userInfo),
-			xcontext.WithAccessToken(token),
-		)
-		rctx = cache.WithCache(rctx, c)
-
-		for _, gvrKeyStr := range gvrKeys {
-			gvr := cache.ParseGVRKey(gvrKeyStr)
-			if gvr.Resource == "" {
-				continue
-			}
-			gr := gvr.GroupResource()
-			for _, ns := range namespaces {
-				for _, verb := range []string{"list", "get", "create", "update", "delete", "patch"} {
-					rbac.UserCan(rctx, rbac.UserCanOptions{
-						Verb: verb, GroupResource: gr, Namespace: ns,
-					})
-					total++
-				}
-			}
+		if ctx.Err() != nil {
+			break
 		}
+		wg.Add(1)
+		go func(username string) {
+			defer wg.Done()
+			PreWarmRBACForUser(ctx, c, rc, authnNS, signKey, username)
+		}(u.userInfo.Username)
 	}
-	log.Info("RBAC warmup: completed",
-		slog.Int("users", len(users)),
-		slog.Int("gvrs", len(gvrKeys)),
-		slog.Int("namespaces", len(namespaces)),
-		slog.Int64("checks", total))
+	wg.Wait()
+
+	log.Info("RBAC warmup: completed", slog.Int("users", len(users)))
 }
 
 // ---------------------------------------------------------------------------
@@ -579,18 +528,12 @@ func warmL1ForUser(ctx context.Context, c *cache.RedisCache, dynClient k8sdynami
 	var allRefs []l1Ref
 	for _, gvr := range gvrs {
 		var list unstructured.UnstructuredList
-		var listFound bool
-		// Try per-item index assembly first.
-		if raw, idxHit, _ := c.AssembleListFromIndex(ctx, gvr, ""); idxHit {
-			if jerr := json.Unmarshal(raw, &list); jerr == nil {
-				listFound = true
-			}
+		raw, idxHit, _ := c.AssembleListFromIndex(ctx, gvr, "")
+		if !idxHit {
+			continue
 		}
-		if !listFound {
-			listKey := cache.ListKey(gvr, "")
-			if hit, err := c.Get(ctx, listKey, &list); !hit || err != nil {
-				continue
-			}
+		if jerr := json.Unmarshal(raw, &list); jerr != nil {
+			continue
 		}
 		for _, obj := range list.Items {
 			rKey := cache.ResolvedKey(user.Username, gvr, obj.GetNamespace(), obj.GetName(), -1, -1)
@@ -872,7 +815,6 @@ func registerApiRefGVRDeps(ctx context.Context, c *cache.RedisCache, widgetObj *
 		if alreadyTracked[gvrKey] {
 			continue
 		}
-		_ = c.SAddWithTTL(ctx, cache.L1GVRKey(gvrKey), l1Key, cache.ReverseIndexTTL)
 		newGVRs = append(newGVRs, gvr)
 	}
 

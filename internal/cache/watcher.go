@@ -1067,17 +1067,16 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 		informerMap[k] = objEntry{uns: uns, rv: uns.GetResourceVersion()}
 	}
 
-	// 2. Read current L3 cluster-wide list from Redis.
+	// 2. Read current L3 from per-item index (authoritative source).
 	var l3List unstructured.UnstructuredList
-	clusterListKey := ListKey(gvr, "")
-	if raw, hit, gerr := rw.cache.GetRaw(ctx, clusterListKey); gerr != nil {
-		slog.Warn("reconcile: failed to read L3 list",
+	if raw, hit, gerr := rw.cache.AssembleListFromIndex(ctx, gvr, ""); gerr != nil {
+		slog.Warn("reconcile: failed to read L3 index",
 			slog.String("gvr", gvr.String()), slog.Any("err", gerr))
 		errs++
 		return
 	} else if hit && raw != nil {
 		if uerr := json.Unmarshal(raw, &l3List); uerr != nil {
-			slog.Warn("reconcile: failed to unmarshal L3 list",
+			slog.Warn("reconcile: failed to unmarshal L3 index",
 				slog.String("gvr", gvr.String()), slog.Any("err", uerr))
 			errs++
 			return
@@ -1360,10 +1359,7 @@ func (rw *ResourceWatcher) handleExpiredKey(ctx context.Context, key string) {
 			rw.refreshListKey(ctx, gvr, ns)
 		}
 	case strings.HasPrefix(key, "snowplow:list:"):
-		gvr, ns, ok := ParseListKey(key)
-		if ok && gvr.Resource != "" {
-			rw.refreshListKey(ctx, gvr, ns)
-		}
+		// Legacy blob keys — no longer written. Ignore expiry.
 	}
 }
 
@@ -1430,11 +1426,7 @@ func (rw *ResourceWatcher) refreshListKey(ctx context.Context, gvr schema.GroupV
 		_ = rw.cache.Delete(ctx, ListIndexKey(gvr, ns))
 	}
 
-	// Dual-write: legacy blob.
-	listKey := ListKey(gvr, ns)
-	if serr := rw.cache.SetForGVR(ctx, gvr, listKey, list); serr == nil {
-		GlobalMetrics.Inc(&GlobalMetrics.ExpiryRefreshes, "expiry_refreshes")
-	}
+	GlobalMetrics.Inc(&GlobalMetrics.ExpiryRefreshes, "expiry_refreshes")
 }
 
 func toUnstructured(obj any) (*unstructured.Unstructured, bool) {

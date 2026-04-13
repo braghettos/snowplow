@@ -182,10 +182,7 @@ func RegisterL1Dependencies(ctx context.Context, c *RedisCache, tracker *Depende
 	type entry struct {
 		key string
 	}
-	entries := make([]entry, 0, len(gvrKeys)+len(refs))
-	for _, gvrKey := range gvrKeys {
-		entries = append(entries, entry{key: L1GVRKey(gvrKey)})
-	}
+	entries := make([]entry, 0, len(refs))
 	for _, ref := range refs {
 		entries = append(entries, entry{key: L1ResourceDepKey(ref.GVRKey, ref.NS, ref.Name)})
 	}
