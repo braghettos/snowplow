@@ -1,4 +1,4 @@
-# Snowplow Cache Stress Test Report — Definitive Run (Run 7)
+# Snowplow Cache Stress Test Report -- Definitive Run (Run 7)
 
 **Test Date**: 2026-04-11, 10:21 UTC -- 14:45 UTC (4 hours 24 minutes)
 **Report Date**: 2026-04-11
@@ -189,9 +189,9 @@ Phase 7 tests the system's ability to handle large numbers of concurrent users a
 
 **N=500 (+400 users)**: The first large burst. 400 users in 280.7 seconds (4.7 minutes). Per-user cost: ~795ms. Admin latency during this burst: 1.6x baseline. This is the only step where existing user performance degrades measurably. The degradation is modest (1.6x, not 10x) because the activity class system limits parallel RBAC warmup to 4 concurrent users while serving existing hot users with priority.
 
-**N=1000 (+500 users)**: 500 additional users in 347.8 seconds (5.8 minutes). Per-user cost: ~688ms. Admin latency drops to 0.4x baseline — meaning the admin is actually faster than baseline. This counter-intuitive result occurs because by this point, the RBAC cache is well-populated (many namespace/verb combinations are shared across users), so the warmup overhead is lower and the L1 cache is fully warmed.
+**N=1000 (+500 users)**: 500 additional users in 347.8 seconds (5.8 minutes). Per-user cost: ~688ms. Admin latency drops to 0.4x baseline -- meaning the admin is actually faster than baseline. This counter-intuitive result occurs because by this point, the RBAC cache is well-populated (many namespace/verb combinations are shared across users), so the warmup overhead is lower and the L1 cache is fully warmed.
 
-**Cold-Start 1K (pod restart with 1,000 users)**: The pod was restarted with 1,000 active users. Time to recover: 1,774ms (1.8 seconds). This measures the cold-start path: reading all user entries from Redis, rebuilding L1 from cached L3 data, and re-establishing informer watches. At 1.8 seconds, this is exceptional — well under the 10-second target. Heap peaks at 3,879 MB during the burst of concurrent L1 rebuilds. Goroutines spike to 2,646 (parallel user refresh processing all 1,000 users) but settle quickly. Redis grows to 406 MB (peak for this test).
+**Cold-Start 1K (pod restart with 1,000 users)**: The pod was restarted with 1,000 active users. Time to recover: 1,774ms (1.8 seconds). This measures the cold-start path: reading all user entries from Redis, rebuilding L1 from cached L3 data, and re-establishing informer watches. At 1.8 seconds, this is exceptional -- well under the 10-second target. Heap peaks at 3,879 MB during the burst of concurrent L1 rebuilds. Goroutines spike to 2,646 (parallel user refresh processing all 1,000 users) but settle quickly. Redis grows to 406 MB (peak for this test).
 
 ### 4.3 Scaling Characteristics
 
@@ -241,16 +241,16 @@ Measured separately at 50K compositions with cache ON (warm) vs cache OFF (direc
 
 ```
 Request flow (warm path, ~100ms):
-  Browser → Frontend → Snowplow /call → L1 check → HIT → return blob
+  Browser -> Frontend -> Snowplow /call -> L1 check -> HIT -> return blob
 
 Request flow (cold path, ~2-3s):
-  Browser → Frontend → Snowplow /call → L1 MISS → L3 assemble (SMEMBERS + MGET)
-  → RBAC filter → JQ evaluate → write L1 → return blob
+  Browser -> Frontend -> Snowplow /call -> L1 MISS -> L3 assemble (SMEMBERS + MGET)
+  -> RBAC filter -> JQ evaluate -> write L1 -> return blob
 
 Background refresh (on K8s change):
-  Informer WATCH → debounce (2s idle / 30s max) → reconcileGVR
-  → diff L3 index vs informer store → patch L3 (SADD/SREM + SET/DEL)
-  → compute affected L1 keys → L1 cascade refresh
+  Informer WATCH -> debounce (2s idle / 30s max) -> reconcileGVR
+  -> diff L3 index vs informer store -> patch L3 (SADD/SREM + SET/DEL)
+  -> compute affected L1 keys -> L1 cascade refresh
 ```
 
 ---
@@ -271,7 +271,7 @@ The heap is dominated by the informer store (50K compositions x ~10 KB = ~500 MB
 
 **GOMEMLIMIT headroom**: With GOMEMLIMIT set to 18 GiB and actual peak at 3.9 GB, there is 14 GiB of headroom (78%). The GOMEMLIMIT is deliberately set above the pod memory limit (16 GiB) to allow the Go runtime to use all available memory before triggering GC pressure, while the Kubernetes OOM killer provides the hard limit. The chunked informer LIST (Limit=500 per page) prevents the allocation spike that caused OOM before v0.25.176.
 
-**GC behavior**: Heap fluctuates between 2.2-3.9 GB across all test steps. The fluctuation is GC-driven: after a burst of allocations (e.g., cold-start 1K), the GC reclaims transient buffers, bringing the heap back to steady state. No monotonic growth was observed — there is no memory leak.
+**GC behavior**: Heap fluctuates between 2.2-3.9 GB across all test steps. The fluctuation is GC-driven: after a burst of allocations (e.g., cold-start 1K), the GC reclaims transient buffers, bringing the heap back to steady state. No monotonic growth was observed -- there is no memory leak.
 
 ### 6.2 Goroutines
 
@@ -319,7 +319,7 @@ Before v0.25.176, the informer initial LIST attempted to fetch all 50,000 compos
 
 **Root cause**: When `reconcileGVR` detects a deletion at 50K scale, it builds a complete diff of the L3 index against the informer store. This diff correctly identifies the single deleted item, but the downstream L1 refresh path was missing the `L1ChangeInfo` synthesis. Without `L1ChangeInfo`, the L1 refresh falls back to a full rebuild of all affected widget blobs (re-resolving the entire 50K list) instead of applying an incremental patch (removing the single deleted item from the existing blob).
 
-**Fix (0.25.179)**: Commit `032dd8f` — `fix(s7): synthesize L1ChangeInfo from reconcile diff for incremental patch`. Additionally: recentChanges buffer drain in reconcileGVR, skip L1 refresh when zero changes + zero diff, remove fixed threshold on incremental patch (always try incremental for deletes).
+**Fix (0.25.179)**: Commit `032dd8f` -- `fix(s7): synthesize L1ChangeInfo from reconcile diff for incremental patch`. Additionally: recentChanges buffer drain in reconcileGVR, skip L1 refresh when zero changes + zero diff, remove fixed threshold on incremental patch (always try incremental for deletes).
 
 **Before (0.25.178):** S7 warm dashboard = 14.8s sustained (ALL samples elevated during refresh).
 
@@ -355,7 +355,7 @@ S7 mutation test results on 0.25.179:
 
 **Impact**: This affects installations with fewer than 20 compositions. The page appears broken (timed out waterfall, HTTP errors). At 50K+ compositions, pagination activates and the page works correctly (1 call, 0 errors, 152ms).
 
-**Status**: Requires investigation of the frontend DataGrid pagination trigger threshold. Not a snowplow cache issue — the cache correctly serves whatever the frontend requests.
+**Status**: Requires investigation of the frontend DataGrid pagination trigger threshold. Not a snowplow cache issue -- the cache correctly serves whatever the frontend requests.
 
 ### 7.4 Core-Provider Webhook Instability (Not a Snowplow Issue)
 
@@ -375,12 +375,12 @@ During the test, the core-provider pod exhibited 305+ restarts due to webhook ce
 | 0.25.171 | `a0cf086` | Bypass K8s rate limiter by reading CRs from L2 cache |
 | 0.25.172 | `457e40f` | Keep K8s fallback for prewarm but unthrottle it |
 | 0.25.173 | `f8e5e72` | Hoist RESTAction L1 caching into shared l1cache package (refactor) |
-| 0.25.174 | `f2229bd` | RBAC gate on L3 cache reads — per-user namespace filtering |
+| 0.25.174 | `f2229bd` | RBAC gate on L3 cache reads -- per-user namespace filtering |
 | 0.25.175 | `3affaef` | Pass page/perPage through to RESTAction handler |
-| 0.25.176 | `dd0ee94` | Chunked informer initial LIST (Limit=500) — fixes 50K OOM |
-| 0.25.177 | `73fcc37` | P0 dead code cleanup — 200 lines removed (resolveL1RefsForUser, collectAffectedL1Keys, unused Redis helpers, legacy RBAC fallback, deprecated RBACKey) |
-| 0.25.178 | `37778be` | Dep tracker on L1 hit — register restaction GVR in tracker even on L1 cache hit, fixing convergence regression where unpaginated widget L1 keys were never refreshed |
-| 0.25.179 | `032dd8f` | S7 incremental patch improvements — recentChanges buffer drain in reconcileGVR, skip L1 refresh when zero changes + zero diff, remove fixed threshold on incremental patch (always try incremental for deletes) |
+| 0.25.176 | `dd0ee94` | Chunked informer initial LIST (Limit=500) -- fixes 50K OOM |
+| 0.25.177 | `73fcc37` | P0 dead code cleanup -- 200 lines removed (resolveL1RefsForUser, collectAffectedL1Keys, unused Redis helpers, legacy RBAC fallback, deprecated RBACKey) |
+| 0.25.178 | `37778be` | Dep tracker on L1 hit -- register restaction GVR in tracker even on L1 cache hit, fixing convergence regression where unpaginated widget L1 keys were never refreshed |
+| 0.25.179 | `032dd8f` | S7 incremental patch improvements -- recentChanges buffer drain in reconcileGVR, skip L1 refresh when zero changes + zero diff, remove fixed threshold on incremental patch (always try incremental for deletes) |
 
 ### 8.2 Helm Chart Tags (0.20.5 through 0.20.16)
 
@@ -397,7 +397,7 @@ During the test, the core-provider pod exhibited 305+ restarts due to webhook ce
 | Tag | Change |
 |-----|--------|
 | 1.0.7 | Generic forPath merge for pagination (Phase 1) |
-| 1.0.8 | `items?.map` null guard — prevents crash on empty paginated responses |
+| 1.0.8 | `items?.map` null guard -- prevents crash on empty paginated responses |
 
 ---
 
