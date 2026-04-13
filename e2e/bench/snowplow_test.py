@@ -62,8 +62,8 @@ SCALE = int(os.environ.get("SCALE", "5000"))
 NS = "krateo-system"
 
 USERS = {
-    "admin": "WopwYooV0F3Z",
-    "cyberjoker": "d1Z5iVRcY0gj",
+    "admin": "zKQAMSGJ3S4S",
+    "cyberjoker": "fUjGILkvvizF",
 }
 
 COMPDEF_NAME = "github-scaffolding-with-composition-page"
@@ -639,9 +639,15 @@ def list_composition_names_from_cache(token):
         for item in items:
             if not isinstance(item, dict):
                 continue
-            md = item.get("metadata") or {}
-            ns = md.get("namespace", "")
-            name = md.get("name", "")
+            # Slim JQ filter (v0.25.140+) outputs flat {uid, name, ns, ...}
+            # without a metadata wrapper. Fall back to metadata.* for
+            # compatibility with pre-slim RESTActions.
+            ns = item.get("ns", "")
+            name = item.get("name", "")
+            if not ns or not name:
+                md = item.get("metadata") or {}
+                ns = ns or md.get("namespace", "")
+                name = name or md.get("name", "")
             if ns and name:
                 names.add(f"{ns}/{name}")
         return names
@@ -1102,40 +1108,45 @@ def delete_bench_rbac():
     Without cleanup the RBACWatcher informer delivers thousands of ADD events
     on every pod start or watch-reconnect, causing a perpetual invalidation storm
     that suppresses L1 cache effectiveness.
+
+    All 4 resource types are deleted in PARALLEL since they are independent.
+    This cuts cleanup from ~56 min (4 × 14 min serial) to ~14 min.
     """
-    # Use large chunks (500) to minimize kubectl round-trips over the network.
-    # kubectl can handle thousands of args; the bottleneck is per-call latency.
     chunk_size = 500
 
-    # Cluster-scoped resources
-    for kind in ("clusterrolebinding", "clusterrole"):
-        rc, out, _ = kubectl("get", kind, "--no-headers", "-o", "name")
+    def _delete_kind(kind, namespace=None):
+        """Delete all bench-app-* resources of a given kind."""
+        if namespace:
+            rc, out, _ = kubectl("get", kind, "-n", namespace, "--no-headers", "-o", "name")
+        else:
+            rc, out, _ = kubectl("get", kind, "--no-headers", "-o", "name")
         names = [
             line.split("/", 1)[-1]
             for line in out.splitlines()
             if "bench-app" in line
         ]
         if not names:
-            continue
+            return
+        ns_args = ["-n", namespace] if namespace else []
         for i in range(0, len(names), chunk_size):
-            kubectl("delete", kind, *names[i:i + chunk_size], "--ignore-not-found",
-                    "--wait=false")
-        log(f"Deleted {len(names)} {kind}s (bench-app-*)")
-
-    # Namespace-scoped resources (compositions create these in krateo-system)
-    for kind in ("rolebinding", "role"):
-        rc, out, _ = kubectl("get", kind, "-n", NS, "--no-headers", "-o", "name")
-        names = [
-            line.split("/", 1)[-1]
-            for line in out.splitlines()
-            if "bench-app" in line
-        ]
-        if not names:
-            continue
-        for i in range(0, len(names), chunk_size):
-            kubectl("delete", kind, "-n", NS, *names[i:i + chunk_size],
+            kubectl("delete", kind, *ns_args, *names[i:i + chunk_size],
                     "--ignore-not-found", "--wait=false")
-        log(f"Deleted {len(names)} {kind}s in {NS} (bench-app-*)")
+        suffix = f" in {namespace}" if namespace else ""
+        log(f"Deleted {len(names)} {kind}s{suffix} (bench-app-*)")
+
+    # Delete all 4 resource types in parallel (they are independent).
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [
+            ex.submit(_delete_kind, "clusterrolebinding"),
+            ex.submit(_delete_kind, "clusterrole"),
+            ex.submit(_delete_kind, "rolebinding", NS),
+            ex.submit(_delete_kind, "role", NS),
+        ]
+        for f in concurrent.futures.as_completed(futures):
+            try:
+                f.result()
+            except Exception as e:
+                log(f"WARNING: RBAC cleanup error: {e}")
 
 
 def clean_environment():
