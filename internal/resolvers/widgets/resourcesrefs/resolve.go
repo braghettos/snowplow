@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"runtime"
 	"strconv"
 	"sync"
 
@@ -29,7 +30,7 @@ func Resolve(ctx context.Context, items []templatesv1.ResourceRef) ([]templatesv
 		return nil, err
 	}
 
-	const concurrency = 20
+	concurrency := runtime.GOMAXPROCS(0)
 
 	slots := make([][]templatesv1.ResourceRefResult, len(items))
 	slotErrs := make([]error, len(items))

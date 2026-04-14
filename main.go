@@ -355,7 +355,6 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 		resourceWatcher.SetAutoDiscoverGroups(warmupCfg.Warmup.AutoDiscoverGroups)
 	}
 
-	resourceWatcher.StartExpiryRefresh(ctx)
 	resourceWatcher.Start(ctx)
 
 	rbacWatcher := cache.NewRBACWatcher(c, rc)

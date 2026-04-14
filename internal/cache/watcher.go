@@ -12,7 +12,6 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -39,7 +38,6 @@ type L1RefreshFunc func(ctx context.Context, triggerGVR schema.GroupVersionResou
 // expiryRefreshWorkers limits the number of concurrent goroutines handling
 // Redis key expiry refresh to prevent unbounded goroutine creation under
 // mass TTL expiry (e.g., after Redis restart or bulk warmup with identical TTLs).
-const expiryRefreshWorkers = 10
 
 // l1Event represents an informer event that needs L1 refresh processing.
 type l1Event struct {
@@ -333,40 +331,6 @@ func (rw *ResourceWatcher) ListObjects(gvr schema.GroupVersionResource, ns strin
 	return result, true
 }
 
-// StartExpiryRefresh subscribes to Redis expired-key events and proactively
-// re-fetches resources so the cache never goes cold from TTL expiry alone.
-// Uses a bounded worker pool to prevent goroutine storms under mass TTL expiry.
-func (rw *ResourceWatcher) StartExpiryRefresh(ctx context.Context) {
-	if err := rw.cache.EnableExpiryNotifications(ctx); err != nil {
-		slog.Warn("resource-watcher: cannot enable Redis expiry notifications",
-			slog.Any("err", err))
-		return
-	}
-	ch := rw.cache.SubscribeExpired(ctx)
-	sem := make(chan struct{}, expiryRefreshWorkers)
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case key, ok := <-ch:
-				if !ok {
-					return
-				}
-				sem <- struct{}{}
-				go func(k string) {
-					defer func() { <-sem }()
-					rw.handleExpiredKey(ctx, k)
-				}(key)
-			}
-		}
-	}()
-	slog.Info("resource-watcher: proactive expiry refresh enabled",
-		slog.Int("workers", expiryRefreshWorkers))
-}
-
-// SetL1Refresher registers a callback that will be used to proactively
-// re-resolve L1 entries in the background instead of deleting them.
 // SetAutoDiscoverGroups configures which CRD groups trigger automatic informer
 // registration. Patterns use suffix matching: "*.krateo.io" matches any group
 // ending in ".krateo.io".
@@ -728,102 +692,6 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 		slog.Int("items", len(objects)))
 
 	return
-}
-
-// ── Proactive expiry refresh ──────────────────────────────────────────────────
-
-func (rw *ResourceWatcher) handleExpiredKey(ctx context.Context, key string) {
-	defer func() {
-		if r := recover(); r != nil {
-			buf := make([]byte, 4096)
-			n := runtime.Stack(buf, false)
-			slog.Error("resource-watcher: panic recovered in handleExpiredKey",
-				slog.Any("error", r),
-				slog.String("key", key),
-				slog.String("stack", string(buf[:n])))
-		}
-	}()
-	switch {
-	case strings.HasPrefix(key, "snowplow:get:"):
-		gvr, ns, name, ok := ParseGetKey(key)
-		if ok && gvr.Resource != "" && name != "" {
-			rw.refreshGetKey(ctx, gvr, ns, name)
-		}
-	case strings.HasPrefix(key, "snowplow:list-idx:"):
-		// Index key expired — refresh the list (which rebuilds both index + blob).
-		gvr, ns, ok := ParseListIndexKey(key)
-		if ok && gvr.Resource != "" {
-			rw.refreshListKey(ctx, gvr, ns)
-		}
-	case strings.HasPrefix(key, "snowplow:list:"):
-		// Legacy blob keys — no longer written. Ignore expiry.
-	}
-}
-
-func (rw *ResourceWatcher) refreshGetKey(ctx context.Context, gvr schema.GroupVersionResource, ns, name string) {
-	var (
-		obj *unstructured.Unstructured
-		err error
-	)
-	if ns != "" {
-		obj, err = rw.dynClient.Resource(gvr).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
-	} else {
-		obj, err = rw.dynClient.Resource(gvr).Get(ctx, name, metav1.GetOptions{})
-	}
-	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			_ = rw.cache.SetNotFound(ctx, GetKey(gvr, ns, name))
-		} else {
-			slog.Warn("resource-watcher: failed to refresh expired GET key",
-				slog.String("gvr", gvr.String()), slog.Any("err", err))
-		}
-		return
-	}
-	key := GetKey(gvr, ns, name)
-	if serr := rw.cache.SetForGVR(ctx, gvr, key, obj); serr == nil {
-		GlobalMetrics.Inc(&GlobalMetrics.ExpiryRefreshes, "expiry_refreshes")
-	}
-}
-
-func (rw *ResourceWatcher) refreshListKey(ctx context.Context, gvr schema.GroupVersionResource, ns string) {
-	var (
-		list *unstructured.UnstructuredList
-		err  error
-	)
-	if ns != "" {
-		list, err = rw.dynClient.Resource(gvr).Namespace(ns).List(ctx, metav1.ListOptions{})
-	} else {
-		list, err = rw.dynClient.Resource(gvr).List(ctx, metav1.ListOptions{})
-	}
-	if err != nil {
-		slog.Warn("resource-watcher: failed to refresh expired LIST key",
-			slog.String("gvr", gvr.String()), slog.Any("err", err))
-		return
-	}
-	ttl := rw.cache.TTLForGVR(gvr)
-
-	// Write per-item GET keys and build index members.
-	var members []string
-	for i := range list.Items {
-		obj := &list.Items[i]
-		_ = rw.cache.SetForGVR(ctx, gvr, GetKey(gvr, obj.GetNamespace(), obj.GetName()), obj)
-		if ns != "" {
-			members = append(members, obj.GetName())
-		} else if obj.GetNamespace() != "" {
-			members = append(members, obj.GetNamespace()+"/"+obj.GetName())
-		} else {
-			members = append(members, obj.GetName())
-		}
-	}
-
-	// Write per-item index SET.
-	if len(members) > 0 {
-		_ = rw.cache.ReplaceSetWithTTL(ctx, ListIndexKey(gvr, ns), members, ttl)
-	} else {
-		_ = rw.cache.Delete(ctx, ListIndexKey(gvr, ns))
-	}
-
-	GlobalMetrics.Inc(&GlobalMetrics.ExpiryRefreshes, "expiry_refreshes")
 }
 
 func toUnstructured(obj any) (*unstructured.Unstructured, bool) {

@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"log/slog"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -81,7 +82,6 @@ func prewarmFetchCR(ctx context.Context, c *cache.RedisCache, dynClient k8sdynam
 }
 
 const (
-	preWarmConcurrency      = 10
 	preWarmTimeout          = 30 * time.Second
 	preWarmMaxDepth         = 5
 	widgetGroup             = "widgets.templates.krateo.io"
@@ -277,15 +277,12 @@ func FilterWidgetGVRs(cfg *cache.WarmupConfig) []schema.GroupVersionResource {
 }
 
 
-// rbacPreWarmConcurrency limits the number of concurrent SelfSubjectAccessReview
-// API calls during per-user RBAC pre-warming to avoid overwhelming the API server.
-const rbacPreWarmConcurrency = 20
 
 // PreWarmRBACForUser pre-populates the RBAC cache for a single user across all
 // watched GVR x namespace x verb combinations. Called by UserSecretWatcher when
 // a -clientconfig secret is created or updated.
 //
-// Uses bounded concurrency (rbacPreWarmConcurrency) for the SelfSubjectAccessReview
+// Uses bounded concurrency (runtime.GOMAXPROCS(0)) for the SelfSubjectAccessReview
 // calls. The function blocks until all checks complete or the context is cancelled.
 func PreWarmRBACForUser(ctx context.Context, c *cache.RedisCache, rc *rest.Config, authnNS, signKey, username string) {
 	log := slog.Default()
@@ -371,7 +368,7 @@ func PreWarmRBACForUser(ctx context.Context, c *cache.RedisCache, rc *rest.Confi
 	// Execute checks with bounded concurrency.
 	var (
 		wg  sync.WaitGroup
-		sem = make(chan struct{}, rbacPreWarmConcurrency)
+		sem = make(chan struct{}, runtime.GOMAXPROCS(0))
 	)
 	for _, check := range checks {
 		if ctx.Err() != nil {
@@ -672,7 +669,7 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 
 	var (
 		wg      sync.WaitGroup
-		sem     = make(chan struct{}, preWarmConcurrency)
+		sem     = make(chan struct{}, runtime.GOMAXPROCS(0))
 		mu      sync.Mutex
 		results []*unstructured.Unstructured
 	)

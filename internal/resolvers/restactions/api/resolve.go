@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -207,7 +208,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					var raw []byte
 					var hit bool
 
-					// Informer-first path: read from in-memory store.
+					// Read from informer's in-memory store (zero I/O).
 					if ir := cache.InformerReaderFromContext(ctx); ir != nil {
 						if pathName == "" {
 							if items, ok := ir.ListObjects(pathGVR, pathNS); ok {
@@ -218,19 +219,6 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							if obj, ok := ir.GetObject(pathGVR, pathNS, pathName); ok {
 								raw, _ = json.Marshal(obj)
 								hit = len(raw) > 0
-							}
-						}
-					}
-
-					// L3 fallback (informer not available or miss).
-					if !hit {
-						if pathName == "" {
-							raw, hit, _ = c.AssembleListFromIndex(ctx, pathGVR, pathNS)
-						} else {
-							cacheKey := cache.GetKey(pathGVR, pathNS, pathName)
-							raw, hit = prefetched[cacheKey]
-							if !hit {
-								raw, hit, _ = c.GetRaw(ctx, cacheKey)
 							}
 						}
 					}
@@ -307,14 +295,13 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				}
 			}
 
-			// ── Cache direct read (informer-first, L3 fallback) ────────────
+			// ── Cache direct read (informer store) ──────────────────────────
 			if c != nil && verb == http.MethodGet {
 				pathGVR, pathNS, pathName := cache.ParseK8sAPIPath(call.Path)
 				if pathGVR.Resource != "" {
 					var l3Raw []byte
 					var l3Hit bool
 
-					// Informer-first path.
 					if ir := cache.InformerReaderFromContext(ctx); ir != nil {
 						if pathName != "" {
 							if obj, ok := ir.GetObject(pathGVR, pathNS, pathName); ok {
@@ -326,19 +313,6 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								l3Raw, _ = marshalUnstructuredList(items)
 								l3Hit = len(l3Raw) > 0
 							}
-						}
-					}
-
-					// L3 fallback.
-					if !l3Hit {
-						if pathName != "" {
-							l3Key := cache.GetKey(pathGVR, pathNS, pathName)
-							l3Raw, l3Hit = prefetched[l3Key]
-							if !l3Hit {
-								l3Raw, l3Hit, _ = c.GetRaw(ctx, l3Key)
-							}
-						} else {
-							l3Raw, l3Hit, _ = c.AssembleListFromIndex(ctx, pathGVR, pathNS)
 						}
 					}
 					if l3Hit && !cache.IsNotFoundRaw(l3Raw) {
@@ -452,8 +426,8 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		return true
 	}
 
-	// Bounded semaphore: max 20 concurrent API resolutions per level.
-	sem := make(chan struct{}, 20)
+	// Bounded semaphore: concurrent API resolutions per level.
+	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
 
 	for levelIdx, level := range levels {
 		if ctx.Err() != nil {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -17,7 +18,6 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-const warmupConcurrency = 4
 
 type WarmupGVR struct {
 	Group    string `yaml:"group"`
@@ -183,7 +183,7 @@ func (w *Warmer) Run(ctx context.Context) {
 		return
 	}
 
-	sem := make(chan struct{}, warmupConcurrency)
+	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
 	var wg sync.WaitGroup
 	for _, gvr := range w.gvrs {
 		wg.Add(1)

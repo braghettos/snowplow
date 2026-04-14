@@ -44,12 +44,9 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 
 		log := slog.Default()
 
-		// Concurrency bounded by 2× CPU cores. Each resolve is CPU-bound
-		// (json.Marshal + JQ). No fixed threshold — adapts to the machine.
-		concurrency := runtime.GOMAXPROCS(0) * 2
-		if concurrency < 4 {
-			concurrency = 4
-		}
+		// Concurrency adapts to available CPUs. Each resolve is CPU-bound
+		// (json.Marshal + JQ evaluation on informer data).
+		concurrency := runtime.GOMAXPROCS(0)
 
 		refreshStart := time.Now()
 
