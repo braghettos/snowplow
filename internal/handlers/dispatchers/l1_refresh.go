@@ -3,9 +3,7 @@ package dispatchers
 import (
 	"context"
 	"log/slog"
-	"runtime"
 	"strconv"
-	"sync"
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
@@ -43,10 +41,6 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 		defer span.End()
 
 		log := slog.Default()
-
-		// Concurrency adapts to available CPUs. Each resolve is CPU-bound
-		// (json.Marshal + JQ evaluation on informer data).
-		concurrency := runtime.GOMAXPROCS(0)
 
 		refreshStart := time.Now()
 
@@ -141,21 +135,11 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 			slog.Int("warm", len(warmUsers)),
 			slog.Int("cold", len(coldUsers)))
 
-		// Global concurrency semaphore shared across ALL users.
-		// Previous attempt (v0.25.135) used nested semaphores (4 outer × 8 inner
-		// = 32 goroutines) which caused resource contention. A single global
-		// semaphore keeps total concurrent work at `concurrency` regardless of
-		// how many users are being refreshed.
-		// All L1 refreshes are full re-resolves. Incremental patching was
-		// removed because JQ aggregation filters (e.g., piechart counts)
-		// require the full pipeline to produce correct results.
-		var (
-			totalRefreshed int64
-			globalSem      = make(chan struct{}, concurrency)
-			globalWg       sync.WaitGroup
-			globalMu       sync.Mutex
-			allCascade     []string
-		)
+		// Resolve each key directly. No sub-goroutines, no semaphores.
+		// The outer goroutine (from triggerL1Refresh) provides concurrency.
+		// The Go scheduler limits actual CPU parallelism to GOMAXPROCS.
+		var totalRefreshed int64
+		var allCascade []string
 
 		for _, cu := range orderedUsers {
 			username := cu.username
@@ -172,30 +156,16 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 			accessToken := mintJWT(user, signKey)
 
 			for _, k := range keys {
-				globalWg.Add(1)
-				globalSem <- struct{}{} // blocks if concurrency limit reached
-				go func(u jwtutil.UserInfo, e endpoints.Endpoint, token string, info cache.ResolvedKeyInfo, rawKey string) {
-					defer globalWg.Done()
-					defer func() { <-globalSem }()
-					ok, cascade := refreshSingleL1(ctx, c, u, e, token, info, rawKey, authnNS)
-					if ok {
-						globalMu.Lock()
-						totalRefreshed++
-						allCascade = append(allCascade, cascade...)
-						globalMu.Unlock()
-					}
-				}(user, ep, accessToken, k.info, k.raw)
+				ok, cascade := refreshSingleL1(ctx, c, user, ep, accessToken, k.info, k.raw, authnNS)
+				if ok {
+					totalRefreshed++
+					allCascade = append(allCascade, cascade...)
+				}
 			}
 		}
 
-		// Wait for ALL initial refreshes across all users to complete.
-		globalWg.Wait()
-
-		// Cascading refresh: iteratively re-resolve L1 keys that depend
-		// on refreshed RESTActions. Each round may discover more dependents
-		// (e.g. CRD event → compositions-get-ns-and-crd → compositions-list
-		// → piechart). Limit depth to avoid infinite loops.
-		// Cascade uses per-user credentials, so we re-load endpoints per key.
+		// Cascading refresh: resolve L1 keys that depend on refreshed
+		// RESTActions (e.g., compositions-list → piechart → table).
 		refreshed := make(map[string]bool, len(l1Keys))
 		for _, key := range l1Keys {
 			refreshed[key] = true
@@ -204,8 +174,6 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 		pending := allCascade
 		for depth := 0; depth < maxCascadeDepth && len(pending) > 0; depth++ {
 			var nextCascade []string
-			var cascadeWg sync.WaitGroup
-			var cascadeMu sync.Mutex
 			for _, ck := range pending {
 				if refreshed[ck] {
 					continue
@@ -215,7 +183,6 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 				if !cok {
 					continue
 				}
-				// Skip if user is not in our active set
 				if _, ok := byUser[ci.Username]; !ok {
 					continue
 				}
@@ -227,21 +194,12 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 				user := jwtutil.UserInfo{Username: ci.Username, Groups: groups}
 				accessToken := mintJWT(user, signKey)
 
-				cascadeWg.Add(1)
-				globalSem <- struct{}{}
-				go func(cInfo cache.ResolvedKeyInfo, cRawKey string, u jwtutil.UserInfo, e endpoints.Endpoint, token string) {
-					defer cascadeWg.Done()
-					defer func() { <-globalSem }()
-					ok, cascade := refreshSingleL1(ctx, c, u, e, token, cInfo, cRawKey, authnNS)
-					if ok {
-						cascadeMu.Lock()
-						totalRefreshed++
-						nextCascade = append(nextCascade, cascade...)
-						cascadeMu.Unlock()
-					}
-				}(ci, ck, user, ep, accessToken)
+				ok, cascade := refreshSingleL1(ctx, c, user, ep, accessToken, ci, ck, authnNS)
+				if ok {
+					totalRefreshed++
+					nextCascade = append(nextCascade, cascade...)
+				}
 			}
-			cascadeWg.Wait()
 			pending = nextCascade
 		}
 
