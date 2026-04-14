@@ -44,12 +44,11 @@ const expiryRefreshWorkers = 10
 
 // l1Event represents an informer event that needs L1 refresh processing.
 type l1Event struct {
-	gvr             schema.GroupVersionResource
-	gvrKey          string
-	ns              string
-	name            string
-	eventType       string
-	resourceVersion string // K8s resourceVersion of the object that triggered this event
+	gvr       schema.GroupVersionResource
+	gvrKey    string
+	ns        string
+	name      string
+	eventType string
 }
 
 // ResourceWatcher maintains dynamic informers for every GVR in the watched set.
@@ -542,41 +541,11 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		slog.String("gvr", gvr.String()),
 		slog.String("ns", ns),
 		slog.String("name", name))
-	getKey := GetKey(gvr, ns, name)
-	ttl := rw.cache.TTLForGVR(gvr)
 
-	switch eventType {
-	case "delete":
-		_ = rw.cache.Delete(ctx, getKey)
-		// Per-item index: remove from namespace and cluster-wide index SETs.
-		// O(1) — no read-modify-write of a blob.
-		nsIdxKey := ListIndexKey(gvr, ns)
-		_ = rw.cache.SRemMembers(ctx, nsIdxKey, name)
-		if ns != "" {
-			clusterIdxKey := ListIndexKey(gvr, "")
-			_ = rw.cache.SRemMembers(ctx, clusterIdxKey, ns+"/"+name)
-		}
-
-	case "add", "update":
-		// Safe to use directly: SetTransform already stripped at ingestion,
-		// and SetForGVR only reads (json.Marshal) without mutating.
-		if serr := rw.cache.SetForGVR(ctx, gvr, getKey, uns); serr != nil {
-			slog.Warn("resource-watcher: failed to update GET cache",
-				slog.String("key", getKey), slog.Any("err", serr))
-		}
-		// Per-item index: add to namespace and cluster-wide index SETs.
-		// O(1) — no read-modify-write of a blob. The GET key written above
-		// holds the item data; the index SET just tracks membership.
-		nsIdxKey := ListIndexKey(gvr, ns)
-		_ = rw.cache.SAddWithTTL(ctx, nsIdxKey, name, ttl)
-		if ns != "" {
-			clusterIdxKey := ListIndexKey(gvr, "")
-			_ = rw.cache.SAddWithTTL(ctx, clusterIdxKey, ns+"/"+name, ttl)
-		}
-	}
+	// No L3 Redis writes. The informer store IS the data source.
+	// L1 refresh reads directly from the informer via InformerReader.
 
 	gvrKey := GVRToKey(gvr)
-	rv := uns.GetResourceVersion()
 
 	// ── Auto-register informers for new CRDs ────────────────────────────────
 	if gvr.Resource == "customresourcedefinitions" && gvr.Group == "apiextensions.k8s.io" && (eventType == "add" || eventType == "update") {
@@ -592,12 +561,11 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	// updated; the next event for this GVR will trigger a refresh).
 	select {
 	case rw.eventCh <- l1Event{
-		gvr:             gvr,
-		gvrKey:          gvrKey,
-		ns:              ns,
-		name:            name,
-		eventType:       eventType,
-		resourceVersion: rv,
+		gvr:       gvr,
+		gvrKey:    gvrKey,
+		ns:        ns,
+		name:      name,
+		eventType: eventType,
 	}:
 	default:
 		slog.Warn("resource-watcher: L1 event queue full, dropping event",
