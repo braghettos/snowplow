@@ -34,12 +34,7 @@ const (
 // the background instead of deleting them. Old values keep being served while
 // the refresh runs (stale-while-revalidate).
 func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey string) cache.L1RefreshFunc {
-	// incrementalCount tracks how many consecutive incremental patches have
-	// been applied. After fullRefreshInterval incremental patches, force a
-	// full re-resolve to correct any drift (safety net).
-	var incrementalCount int64
-
-	return func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string, changes []cache.L1ChangeInfo) {
+	return func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string) {
 		ctx, span := l1RefreshTracer.Start(ctx, "l1.refresh",
 			trace.WithAttributes(
 				attribute.String("trigger", triggerGVR.String()),
@@ -59,16 +54,10 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 
 		refreshStart := time.Now()
 
-		changeOps := map[string]int{}
-		for _, ch := range changes {
-			changeOps[ch.Operation]++
-		}
 		log.Info("L1 refresh: starting",
 			slog.String("trigger", triggerGVR.String()),
 			slog.Int("keys", len(l1Keys)),
-			slog.Int("concurrency", concurrency),
-			slog.Int("changes", len(changes)),
-			slog.Any("ops", changeOps))
+			slog.Int("concurrency", concurrency))
 
 		type userKeys struct {
 			info cache.ResolvedKeyInfo
@@ -162,45 +151,11 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 		// = 32 goroutines) which caused resource contention. A single global
 		// semaphore keeps total concurrent work at `concurrency` regardless of
 		// how many users are being refreshed.
-		// ── Incremental L1 patch (C2) ─────────────────────────────────────────
-		// When changes are small (delete-only, ≤20 items), try JSON-level patching
-		// on RESTAction L1 values before doing full resolution. This avoids the
-		// O(N) L3 assembly + JQ evaluation for the common single-delete case.
-		//
-		// Safety net: after fullRefreshInterval consecutive incremental patches,
-		// force a full re-resolve to correct any accumulated drift.
-		// Extract only delete changes — status updates from controllers
-		// contaminate the buffer but don't affect L1 output.
-		deleteChanges := filterDeleteChanges(changes)
-		// Always try incremental patch when there are delete changes.
-		// No fixed threshold on delete count — the O(N) JSON scan in
-		// patchRESTActionL1 is always cheaper than a full re-resolve
-		// (L3 MGET + JQ + marshal for the entire list). At 50K items,
-		// even 1000 deletes × JSON scan completes in milliseconds vs
-		// 25s for a full re-resolve.
-		//
-		// The fullRefreshInterval safety net (force full after N
-		// consecutive patches) corrects any accumulated drift.
-		useIncremental := len(deleteChanges) > 0 &&
-			incrementalCount < fullRefreshInterval
-
-		if useIncremental {
-			incrementalCount++
-			span.AddEvent("l1.refresh.incremental", trace.WithAttributes(
-				attribute.Int("changes", len(changes)),
-				attribute.Int64("consecutive", incrementalCount),
-			))
-		} else {
-			if incrementalCount > 0 {
-				log.Info("L1 refresh: safety-net full resolve",
-					slog.Int64("after_incremental", incrementalCount))
-			}
-			incrementalCount = 0
-		}
-
+		// All L1 refreshes are full re-resolves. Incremental patching was
+		// removed because JQ aggregation filters (e.g., piechart counts)
+		// require the full pipeline to produce correct results.
 		var (
 			totalRefreshed int64
-			totalPatched   int64
 			globalSem      = make(chan struct{}, concurrency)
 			globalWg       sync.WaitGroup
 			globalMu       sync.Mutex
@@ -210,35 +165,6 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 		for _, cu := range orderedUsers {
 			username := cu.username
 			keys := byUser[username]
-
-			// For incremental patches on RESTAction keys, try patching
-			// before loading user credentials (which is expensive).
-			if useIncremental {
-				remaining := make([]userKeys, 0, len(keys))
-				for _, k := range keys {
-					if k.info.GVR.Group == templatesGroup && k.info.GVR.Resource == restactionResource {
-						if patchRESTActionL1(ctx, c, k.raw, deleteChanges) {
-							globalMu.Lock()
-							totalPatched++
-							totalRefreshed++
-							// Cascade: find L1 keys that depend on this RESTAction.
-							depKey := cache.L1ResourceDepKey(
-								cache.GVRToKey(k.info.GVR), k.info.NS, k.info.Name,
-							)
-							if cascade, err := c.SMembers(ctx, depKey); err == nil {
-								allCascade = append(allCascade, cascade...)
-							}
-							globalMu.Unlock()
-							continue
-						}
-					}
-					remaining = append(remaining, k)
-				}
-				keys = remaining
-				if len(keys) == 0 {
-					continue
-				}
-			}
 
 			ep, err := endpoints.FromSecret(ctx, rc, username+clientConfigSecretSuffix, authnNS)
 			if err != nil {
@@ -345,7 +271,6 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 		log.Info("L1 refresh: done",
 			slog.String("trigger", triggerGVR.String()),
 			slog.Int64("refreshed", totalRefreshed),
-			slog.Int64("patched", totalPatched),
 			slog.Int("total", len(l1Keys)),
 			slog.String("duration", refreshDuration.String()))
 		// Use a fresh background context so the sentinel is always written,
@@ -430,27 +355,3 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 // filterDeleteChanges extracts changes whose net effect is a delete.
 // K8s informers fire UPDATE before DELETE (adding deletionTimestamp),
 // so we track the last operation per namespace/name. Items whose last
-// operation is "delete" are included; background controller updates
-// on other items are ignored.
-func filterDeleteChanges(changes []cache.L1ChangeInfo) []cache.L1ChangeInfo {
-	type nsName struct{ ns, name string }
-	lastOp := make(map[nsName]string, len(changes))
-	for _, ch := range changes {
-		lastOp[nsName{ch.Namespace, ch.Name}] = ch.Operation
-	}
-	var deletes []cache.L1ChangeInfo
-	seen := make(map[nsName]bool)
-	for _, ch := range changes {
-		key := nsName{ch.Namespace, ch.Name}
-		if lastOp[key] == "delete" && !seen[key] {
-			seen[key] = true
-			deletes = append(deletes, cache.L1ChangeInfo{
-				GVR:       ch.GVR,
-				Namespace: ch.Namespace,
-				Name:      ch.Name,
-				Operation: "delete",
-			})
-		}
-	}
-	return deletes
-}

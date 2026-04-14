@@ -10,7 +10,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -30,35 +29,18 @@ var watcherTracer = otel.Tracer("snowplow/watcher")
 // L1ChangeInfo describes a single L3 change that triggered an L1 refresh.
 // Used by the incremental L1 patch path (C2) to avoid full re-resolution
 // when only one item changed.
-type L1ChangeInfo struct {
-	GVR       schema.GroupVersionResource
-	Namespace string
-	Name      string
-	Operation string // "add", "update", "delete"
-}
-
 // L1RefreshFunc is invoked by the ResourceWatcher to proactively re-resolve
-// L1 cache entries instead of deleting them. The function receives the GVR
-// that triggered the refresh (for logging), the list of L1 keys to refresh,
-// recent L3 changes (for incremental patching), and a long-lived context.
+// L1 cache entries. The function receives the GVR that triggered the refresh
+// (for logging) and the list of L1 keys to refresh. All refreshes are full
+// re-resolves — incremental patching was removed because JQ aggregation
+// filters (e.g., piechart counts) require the full pipeline.
 // It must run synchronously; the caller invokes it in a goroutine.
-type L1RefreshFunc func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string, changes []L1ChangeInfo)
+type L1RefreshFunc func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string)
 
 // expiryRefreshWorkers limits the number of concurrent goroutines handling
 // Redis key expiry refresh to prevent unbounded goroutine creation under
 // mass TTL expiry (e.g., after Redis restart or bulk warmup with identical TTLs).
 const expiryRefreshWorkers = 10
-
-// dynamicReconcileDebounce is how long to wait after the last informer event
-// for a dynamic GVR before running reconcileGVR. This collapses rapid events
-// into fewer reconciliation passes.
-const dynamicReconcileDebounce = 2 * time.Second
-
-// maxReconcileDelay caps how long reconciliation can be deferred during a
-// sustained burst. Even if events keep arriving, reconcileGVR fires at least
-// every maxReconcileDelay to keep L3 list caches reasonably fresh.
-const maxReconcileDelay = 30 * time.Second
-
 
 // l1Event represents an informer event that needs L1 refresh processing.
 type l1Event struct {
@@ -84,43 +66,14 @@ type ResourceWatcher struct {
 	autoDiscoverGroups []string     // CRD group suffix patterns for auto-registration
 
 	// dynamicGVRs tracks GVRs registered at runtime via autoRegisterCRDInformer.
-	// When events fire for these GVRs, a debounced reconciliation is scheduled
-	// so that rapid deployment bursts collapse into a single reconcileGVR call.
 	dynamicGVRs   map[string]schema.GroupVersionResource
 	dynamicGVRsMu sync.Mutex
 
-	// dynamicReconcileTimers holds per-GVR debounce state. When an event fires
-	// for a dynamic GVR, the timer is reset — but only up to maxReconcileDelay
-	// from the first event. This ensures reconciliation fires at least every
-	// maxReconcileDelay even during sustained bursts.
-	dynamicReconcileTimers    map[string]*time.Timer
-	dynamicReconcileDeadlines map[string]time.Time
-
-	// reconcileMu serializes reconcileGVR calls per GVR. Without this,
-	// startInformer and scheduleDynamicReconcile can run reconcileGVR
-	// concurrently for the same GVR, causing TOCTOU on L3 list writes (Bug 4).
-	reconcileMu   sync.Map // map[string]*sync.Mutex — keyed by GVR string
-
 	// l1RefreshRunning is a non-blocking mutex for L1 refresh. At most one
 	// refresh goroutine runs at a time. If a refresh is already running,
-	// new requests are skipped (the next l3gen tick will retry).
-	// This prevents both goroutine accumulation (Bug 7) and scanner
-	// blocking (synchronous approach regressed S4/S5 convergence).
+	// new events are coalesced — the next event after completion triggers
+	// a fresh refresh that reads the latest informer state.
 	l1RefreshRunning atomic.Bool
-
-	// recentChanges tracks recent L3 changes for incremental L1 patching (C2).
-	// handleEvent appends; scanL3Gens/reconcileGVR drains. Protected by
-	// recentChangesMu. No capacity cap — the drain cycle (every 1-30s) is
-	// the natural bound. Even 50K entries between drains is ~5MB.
-	recentChanges   []L1ChangeInfo
-	recentChangesMu sync.Mutex
-
-	// l3genScanNow is a signal channel to trigger an immediate l3gen scan.
-	// Used by scheduleDynamicReconcile after reconcileGVR updates L3, so
-	// the l3gen scanner detects the changes instantly instead of waiting
-	// for the next 3s tick.
-	l3genScanNow chan struct{}
-
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -152,11 +105,8 @@ func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error
 			},
 		),
 		watched:                make(map[string]bool),
-		eventCh:                make(chan l1Event, 100000),
-		dynamicGVRs:               make(map[string]schema.GroupVersionResource),
-		dynamicReconcileTimers:    make(map[string]*time.Timer),
-		dynamicReconcileDeadlines: make(map[string]time.Time),
-		l3genScanNow:              make(chan struct{}, 1),
+		eventCh:     make(chan l1Event, 100000),
+		dynamicGVRs: make(map[string]schema.GroupVersionResource),
 	}, nil
 }
 
@@ -214,164 +164,67 @@ func (rw *ResourceWatcher) registerFromRedis(ctx context.Context) {
 // This is fully agnostic — no GVR-specific logic. Any L3 change triggers
 // the corresponding L1 refresh automatically.
 func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
-	// Event consumer goroutine: handles DELETE dep index cleanup.
-	// Runs independently so the event channel doesn't starve the ticker.
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case evt, ok := <-rw.eventCh:
-				if !ok {
-					return
-				}
-				if evt.eventType == "delete" {
-					resDepKey := L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)
-					_ = rw.cache.Delete(ctx, resDepKey)
-				}
-			}
-		}
-	}()
-
-	// L3gen scanner: runs every 1s independently of event volume.
-	// Detects L3 changes via generation keys and refreshes affected L1 keys.
-	lastSeen := make(map[string]string)
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			rw.scanL3Gens(ctx, lastSeen)
-		case <-rw.l3genScanNow:
-			rw.scanL3Gens(ctx, lastSeen)
+		case evt, ok := <-rw.eventCh:
+			if !ok {
+				return
+			}
+			// DELETE dep index cleanup.
+			if evt.eventType == "delete" {
+				resDepKey := L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)
+				_ = rw.cache.Delete(ctx, resDepKey)
+			}
+			// Trigger L1 refresh for affected keys. l1RefreshRunning CAS
+			// naturally coalesces: if a refresh is running, this event is
+			// skipped. The running refresh reads the latest informer state,
+			// which includes this event's changes. The next event after
+			// the refresh completes will trigger a new refresh.
+			rw.triggerL1Refresh(ctx, evt)
 		}
 	}
 }
 
-// scanL3Gens scans all snowplow:l3gen:* keys, detects changes since the last
-// scan, and refreshes affected L1 keys via the dependency indexes.
-func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]string) {
-	ctx, span := watcherTracer.Start(ctx, "l3gen.scan")
-	defer span.End()
-
+// triggerL1Refresh collects affected L1 keys for the event's GVR and
+// launches a background refresh if none is running. Event-driven: no
+// polling, no debounce. l1RefreshRunning CAS coalesces concurrent events.
+func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 	fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
 	if !ok || fn == nil {
-		// Don't update lastSeen — accumulate changes until fn is available.
 		return
 	}
 
-	// Scan all l3gen keys using SCAN (non-blocking) instead of KEYS (blocks Redis).
-	genKeys, err := rw.cache.ScanKeys(ctx, "snowplow:l3gen:*")
-	if err != nil || len(genKeys) == 0 {
-		return
-	}
-
-	// Read current values in a pipeline for efficiency.
-	pipe := rw.cache.client.Pipeline()
-	cmds := make(map[string]*redis.StringCmd, len(genKeys))
-	for _, gk := range genKeys {
-		cmds[gk] = pipe.Get(ctx, gk)
-	}
-	_, _ = pipe.Exec(ctx)
-
-	// Prune expired keys from lastSeen to prevent unbounded memory growth.
-	currentKeys := make(map[string]bool, len(genKeys))
-	for _, gk := range genKeys {
-		currentKeys[gk] = true
-	}
-	for gk := range lastSeen {
-		if !currentKeys[gk] {
-			delete(lastSeen, gk)
-		}
-	}
-
-	// Snapshot current l3gen values for stability comparison.
-	currentObserved := make(map[string]string, len(cmds))
-	for gk, cmd := range cmds {
-		if curVal, _ := cmd.Result(); curVal != "" {
-			currentObserved[gk] = curVal
-		}
-	}
-
-	// L3 is updated per-item atomically by handleEvent (index SETs are
-	// O(1)). The old two-tick stability check was designed for monolithic
-	// blob writes where partial data was possible — those writes were
-	// removed in v0.25.180. Process changes immediately.
-
-	// Find which GVR+ns changed. Stage lastSeen updates — only commit them
-	// when the refresh actually launches (CAS succeeds). If CAS fails,
-	// lastSeen stays stale so the next tick re-detects the changes.
-	changedGVRNS := make(map[string]bool)
-	pendingLastSeen := make(map[string]string)
-	for gk, curVal := range currentObserved {
-		if lastSeen[gk] != curVal {
-			pendingLastSeen[gk] = curVal
-			// Extract GVR+ns from key: "snowplow:l3gen:{gvrKey}:{ns}"
-			// The gvrKey is "group/version/resource", ns is the namespace.
-			suffix := strings.TrimPrefix(gk, "snowplow:l3gen:")
-			changedGVRNS[suffix] = true
-		}
-	}
-
-	if len(changedGVRNS) == 0 {
-		slog.Debug("resource-watcher: l3gen scan — no changes",
-			slog.Int("total_keys", len(genKeys)))
-		return
-	}
-
-	// For each changed GVR+ns, find affected L1 keys via dependency indexes.
+	// Collect affected L1 keys via dependency indexes.
 	affected := make(map[string]bool)
-	for gvrNS := range changedGVRNS {
-		// Parse "group/version/resource:namespace" into gvrKey and ns.
-		// The gvrKey contains slashes, ns is after the last colon.
-		lastColon := strings.LastIndex(gvrNS, ":")
-		if lastColon < 0 {
-			continue
-		}
-		gvrKey := gvrNS[:lastColon]
-		ns := gvrNS[lastColon+1:]
-
-		// Collect L1 keys that depend on this GVR+ns via precise indexes only.
-		// Deliberately excludes L1GVRKey (too broad — 5000+ keys for popular GVRs).
-		collect := func(idxKey string) {
-			if keys, err := rw.cache.SMembers(ctx, idxKey); err == nil {
-				for _, k := range keys {
-					affected[k] = true
-				}
+	collect := func(idxKey string) {
+		if keys, err := rw.cache.SMembers(ctx, idxKey); err == nil {
+			for _, k := range keys {
+				affected[k] = true
 			}
 		}
-		collect(L1ResourceDepKey(gvrKey, ns, ""))   // namespaced LIST
-		collect(L1ResourceDepKey(gvrKey, "", ""))    // cluster-wide LIST
-		collect(L1ApiDepKey(gvrKey))                 // API-level dep
+	}
+	collect(L1ResourceDepKey(evt.gvrKey, evt.ns, ""))  // namespaced LIST
+	collect(L1ResourceDepKey(evt.gvrKey, "", ""))       // cluster-wide LIST
+	collect(L1ApiDepKey(evt.gvrKey))                    // API-level dep
 
-		// CRD-based chain: for any GVR, also look up L1 keys that depend on
-		// the cluster-wide CRD LIST. This handles zero-state agnostically —
-		// e.g. composition ADD → CRD LIST dep → compositions-get-ns-and-crd.
-		//
-		// Use the cluster-wide LIST dep (typically 1-2 keys: compositions-get-ns-and-crd
-		// per user). Do NOT use the specific CRD GET dep (40+ form widgets that
-		// check CRD schema for validation — they don't need refresh on data changes).
-		gvr := ParseGVRKey(gvrKey)
-		if gvr.Group != "" && gvr.Resource != "" {
-			crdGVRKey := GVRToKey(schema.GroupVersionResource{
-				Group:    "apiextensions.k8s.io",
-				Version:  "v1",
-				Resource: "customresourcedefinitions",
-			})
-			collect(L1ResourceDepKey(crdGVRKey, "", ""))
-		}
+	// CRD chain: also refresh keys depending on the CRD LIST.
+	gvr := ParseGVRKey(evt.gvrKey)
+	if gvr.Group != "" && gvr.Resource != "" {
+		crdGVRKey := GVRToKey(schema.GroupVersionResource{
+			Group:    "apiextensions.k8s.io",
+			Version:  "v1",
+			Resource: "customresourcedefinitions",
+		})
+		collect(L1ResourceDepKey(crdGVRKey, "", ""))
 	}
 
 	if len(affected) == 0 {
 		return
 	}
 
-	// Walk dependency tree to find transitively affected L1 keys.
-	// Starting from ~2-6 keys (e.g. compositions-get-ns-and-crd),
-	// expand to compositions-list → piechart → table (~10 keys total).
+	// Walk dependency tree (e.g., RESTAction → widget → piechart).
 	rw.expandDependents(ctx, affected, 5)
 
 	keys := make([]string, 0, len(affected))
@@ -379,38 +232,11 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 		keys = append(keys, k)
 	}
 
-	slog.Info("resource-watcher: l3gen scan refresh",
-		slog.Int("changed_gvr_ns", len(changedGVRNS)),
-		slog.Int("l1_keys", len(keys)))
-	span.AddEvent("l3gen.scan.refresh", trace.WithAttributes(
-		attribute.Int("changed_gvr_ns", len(changedGVRNS)),
-		attribute.Int("l1_keys", len(keys)),
-	))
-
-	// Launch at most ONE async refresh. If a refresh is already running,
-	// skip this tick — the running refresh is processing changes, and the
-	// next tick will catch any new ones. This prevents both goroutine
-	// accumulation (Bug 7, unbounded go func) and scanner blocking
-	// (synchronous approach regressed S4/S5 convergence from 3s to 40s).
+	// CAS: at most one refresh at a time. If one is running, skip —
+	// the running refresh reads the latest informer state.
 	if !rw.l1RefreshRunning.CompareAndSwap(false, true) {
-		slog.Debug("resource-watcher: l3gen refresh skipped (already running)")
-		span.AddEvent("l1.refresh.skipped", trace.WithAttributes(
-			attribute.String("reason", "already_running"),
-		))
 		return
 	}
-	// Commit staged lastSeen values now that the refresh is launching.
-	// If CAS had failed above, lastSeen would stay stale and the next tick
-	// would re-detect the changes, ensuring no events are dropped.
-	for gk, v := range pendingLastSeen {
-		lastSeen[gk] = v
-	}
-
-	// Drain recent changes for incremental L1 patching (C2).
-	rw.recentChangesMu.Lock()
-	changes := rw.recentChanges
-	rw.recentChanges = nil
-	rw.recentChangesMu.Unlock()
 
 	go func() {
 		defer rw.l1RefreshRunning.Store(false)
@@ -418,14 +244,14 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]s
 			if r := recover(); r != nil {
 				buf := make([]byte, 4096)
 				n := runtime.Stack(buf, false)
-				slog.Error("resource-watcher: panic in l3gen refresh",
+				slog.Error("resource-watcher: panic in L1 refresh",
 					slog.Any("error", r),
 					slog.String("stack", string(buf[:n])))
 			}
 		}()
 		refreshCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		defer cancel()
-		fn(refreshCtx, schema.GroupVersionResource{}, keys, changes)
+		fn(refreshCtx, evt.gvr, keys)
 	}()
 }
 
@@ -750,68 +576,17 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	}
 
 	gvrKey := GVRToKey(gvr)
-
-	// Check if GVR is dynamic once for both l3gen bump and reconcile decisions.
-	rw.dynamicGVRsMu.Lock()
-	_, isDynamic := rw.dynamicGVRs[gvrKey]
-	rw.dynamicGVRsMu.Unlock()
-
-	// ── Update L3 generation (resourceVersion) ──────────────────────────────
-	// Store the latest resourceVersion for this GVR+ns so the l3gen scanner
-	// can detect L3 changes without re-reading the full list.
-	//
-	// SKIP for dynamic GVRs: per-item index updates are fast and contention-free,
-	// but the l3gen bump can still race with the debounced reconciliation.
-	// For dynamic GVRs, reconcileGVR (debounced below) is the sole trigger:
-	// it rebuilds the L3 index + blob from the informer's authoritative state,
-	// then triggers the L1 refresh from consistent data.
 	rv := uns.GetResourceVersion()
-	if !isDynamic && rv != "" {
-		l3GenKey := L3GenKey(gvrKey, ns)
-		// Only update if new rv is greater (monotonic). Prevents out-of-order
-		// events from lowering the generation, which would block the dirty ticker.
-		luaMaxSet := `
-			local cur = redis.call('GET', KEYS[1])
-			if not cur or ARGV[1] > cur then
-				redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
-				return 1
-			end
-			return 0`
-		ttlSec := int(rw.cache.TTLForGVR(gvr).Seconds())
-		_ = rw.cache.client.Eval(ctx, luaMaxSet, []string{l3GenKey}, rv, ttlSec).Err()
-	}
 
 	// ── Auto-register informers for new CRDs ────────────────────────────────
-	// When the CRD informer fires an ADD event for a new CustomResourceDefinition,
-	// extract the GVR from the CRD spec and register an informer for it.
-	// This ensures snowplow watches new CR types immediately when the CRD
-	// appears — e.g. when a CompositionDefinition creates a new CRD.
 	if gvr.Resource == "customresourcedefinitions" && gvr.Group == "apiextensions.k8s.io" && (eventType == "add" || eventType == "update") {
 		rw.autoRegisterCRDInformer(uns)
 	}
 
-	// ── Debounced reconciliation for dynamic GVRs ────────────────────────────
-	// Per-item index updates (SADD/SREM) are O(1) and contention-free, but
-	// during rapid deployment bursts the index may temporarily have members
-	// whose GET keys haven't been written yet. For dynamic GVRs, schedule a
-	// debounced reconciliation that rebuilds all indexes from the informer's
-	// authoritative store once the burst settles, then triggers L1 refresh.
-	if isDynamic {
-		rw.scheduleDynamicReconcile(gvr)
-	}
-
-	// ── Record change for incremental L1 patching (C2) ──────────────────────
-	rw.recentChangesMu.Lock()
-	rw.recentChanges = append(rw.recentChanges, L1ChangeInfo{
-		GVR:       gvr,
-		Namespace: ns,
-		Name:      name,
-		Operation: eventType,
-	})
-	rw.recentChangesMu.Unlock()
-
 	// ── Enqueue L1 refresh event ─────────────────────────────────────────────
-	// L3 was just patched above. Enqueue the event for the L1 worker to
+	// The informer store is already updated (the event means it changed).
+	// Enqueue the event for the l1Worker to trigger an L1 refresh.
+	// Non-blocking: if the channel is full, drop the event — the next
 	// process sequentially. The worker will read the latest L3 state.
 	// Non-blocking: if the channel is full, drop the event (L3 is already
 	// updated; the next event for this GVR will trigger a refresh).
@@ -909,71 +684,6 @@ func (rw *ResourceWatcher) matchesAutoDiscoverGroup(group string) bool {
 	return false
 }
 
-// scheduleDynamicReconcile debounces reconciliation for a dynamic GVR.
-// Each call resets the timer, but only up to maxReconcileDelay from the first
-// event. This ensures:
-//   - Quiet periods: reconciliation fires 5s after the last event
-//   - Sustained bursts: reconciliation fires every 30s regardless
-func (rw *ResourceWatcher) scheduleDynamicReconcile(gvr schema.GroupVersionResource) {
-	key := GVRToKey(gvr)
-
-	rw.dynamicGVRsMu.Lock()
-	defer rw.dynamicGVRsMu.Unlock()
-
-	deadline, hasDeadline := rw.dynamicReconcileDeadlines[key]
-	now := time.Now()
-
-	if t, ok := rw.dynamicReconcileTimers[key]; ok {
-		// Timer exists — reset it, but cap at the deadline.
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			// Deadline already passed — let the timer fire immediately.
-			return
-		}
-		delay := dynamicReconcileDebounce
-		if delay > remaining {
-			delay = remaining
-		}
-		t.Reset(delay)
-		return
-	}
-
-	// First event — set the deadline and start the timer.
-	if !hasDeadline {
-		rw.dynamicReconcileDeadlines[key] = now.Add(maxReconcileDelay)
-	}
-
-	rw.dynamicReconcileTimers[key] = time.AfterFunc(dynamicReconcileDebounce, func() {
-		// Clean up BEFORE running reconcileGVR so that new events
-		// arriving during reconciliation create a fresh timer instead
-		// of calling Reset() on this fired AfterFunc timer (Bug 3:
-		// Reset on a fired AfterFunc is undefined per Go docs and can
-		// silently drop events or schedule duplicate callbacks).
-		rw.dynamicGVRsMu.Lock()
-		delete(rw.dynamicReconcileTimers, key)
-		delete(rw.dynamicReconcileDeadlines, key)
-		rw.dynamicGVRsMu.Unlock()
-
-		ctx := rw.appCtx
-		added, removed, updated, errs := rw.reconcileGVR(ctx, gvr)
-		if added+removed+updated > 0 {
-			slog.Info("reconcile-dynamic: patched L3",
-				slog.String("gvr", gvr.String()),
-				slog.Int("added", added),
-				slog.Int("removed", removed),
-				slog.Int("updated", updated),
-				slog.Int("errors", errs))
-		}
-
-		// Note: we do NOT signal l3genScanNow here. reconcileGVR
-		// already triggers its own L1 refresh (lines 1066+), so
-		// also waking the l3gen scanner would cause a redundant
-		// second L1 refresh for the same L3 changes (Bug 11).
-		// The scanner will still detect the l3gen bump on its
-		// next 3s tick, but l1RefreshRunning prevents duplicate work.
-	})
-}
-
 // ReconcileStats holds aggregate results from a startup reconciliation pass.
 type ReconcileStats struct {
 	GVRs     int
@@ -1045,14 +755,8 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 		span.End()
 	}()
 
-	// Per-GVR mutex: prevent concurrent reconciliation for the same GVR (Bug 4).
-	// startInformer and scheduleDynamicReconcile can both call reconcileGVR
-	// simultaneously, causing TOCTOU on L3 list cache writes.
-	muKey := GVRToKey(gvr)
-	muVal, _ := rw.reconcileMu.LoadOrStore(muKey, &sync.Mutex{})
-	mu := muVal.(*sync.Mutex)
-	mu.Lock()
-	defer mu.Unlock()
+	// No per-GVR mutex needed: scheduleDynamicReconcile was removed.
+	// reconcileGVR is only called from Reconcile() at startup (serial).
 
 	// 1. Read authoritative state from informer store (in-memory, no API call).
 	lister := rw.factory.ForResource(gvr).Lister()
@@ -1240,49 +944,15 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 				l1Keys = append(l1Keys, k)
 			}
 			if fn, ok := rw.l1Refresh.Load().(L1RefreshFunc); ok && fn != nil {
-				// Bounded async: at most one refresh at a time via
-				// l1RefreshRunning. If the l3gen scanner is already
-				// refreshing, skip — it will pick up our changes.
-				if rw.l1RefreshRunning.CompareAndSwap(false, true) {
-					// Drain recentChanges for this GVR. handleEvent populates
-					// the buffer BEFORE updating L3, so it contains the actual
-					// mutations (add/update/delete) even though L3 is already
-					// in sync by the time reconcileGVR runs.
-					//
-					// Previous approach (synthesize from reconcile diff) failed
-					// because handleEvent already synced L3 before the debounce
-					// timer fired — l3Map matches informerMap, zero diff.
-					rw.recentChangesMu.Lock()
-					var matched, unmatched []L1ChangeInfo
-					for _, ch := range rw.recentChanges {
-						if ch.GVR == gvr {
-							matched = append(matched, ch)
-						} else {
-							unmatched = append(unmatched, ch)
-						}
-					}
-					rw.recentChanges = unmatched
-					rw.recentChangesMu.Unlock()
-
-					// If zero changes were found in the buffer AND the
-					// reconcile diff shows no additions/removals/updates,
-					// skip the L1 refresh entirely. The L3 is already in
-					// sync (handleEvent updated it immediately) and L1 is
-					// still valid. Without this guard, every debounced
-					// reconcile launches a 10-15s full re-resolve at 50K
-					// even when nothing actually changed — the root cause
-					// of the S7 spike.
-					if len(matched) == 0 && added+removed+updated == 0 {
-						slog.Debug("reconcile: skipping L1 refresh (no changes, L3 in sync)")
-						rw.l1RefreshRunning.Store(false)
-					} else {
-						go func() {
-							defer rw.l1RefreshRunning.Store(false)
-							refreshCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
-							defer cancel()
-							fn(refreshCtx, gvr, l1Keys, matched)
-						}()
-					}
+				if added+removed+updated == 0 {
+					slog.Debug("reconcile: skipping L1 refresh (no changes)")
+				} else if rw.l1RefreshRunning.CompareAndSwap(false, true) {
+					go func() {
+						defer rw.l1RefreshRunning.Store(false)
+						refreshCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+						defer cancel()
+						fn(refreshCtx, gvr, l1Keys)
+					}()
 				}
 			} else {
 				_ = rw.cache.Delete(ctx, l1Keys...)
