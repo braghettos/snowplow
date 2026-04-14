@@ -165,6 +165,34 @@ func jsonHandlerDirect(ctx context.Context, opts jsonHandlerOptions, data any) e
 	return nil
 }
 
+// normalizeForJQ recursively converts types that gojq cannot handle
+// (e.g., int64 from K8s unstructured) to JSON-compatible types (float64).
+// Returns a new tree — does NOT modify the input (safe for informer data).
+func normalizeForJQ(v any) any {
+	switch val := v.(type) {
+	case map[string]interface{}:
+		cp := make(map[string]interface{}, len(val))
+		for k, vv := range val {
+			cp[k] = normalizeForJQ(vv)
+		}
+		return cp
+	case []interface{}:
+		cp := make([]interface{}, len(val))
+		for i, vv := range val {
+			cp[i] = normalizeForJQ(vv)
+		}
+		return cp
+	case int64:
+		return float64(val)
+	case int32:
+		return float64(val)
+	case int:
+		return float64(val)
+	default:
+		return v
+	}
+}
+
 func wrapAsSlice(value any) []any {
 	switch v := value.(type) {
 	case []any:

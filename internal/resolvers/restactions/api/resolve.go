@@ -3,7 +3,6 @@ package api
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -21,7 +20,6 @@ import (
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
@@ -214,9 +212,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						if pathName == "" {
 							if items, ok := ir.ListObjects(pathGVR, pathNS); ok && len(items) > 0 {
 								// Build K8s-style list as map[string]any directly.
+								// normalizeForJQ converts int64→float64 so gojq can
+								// encode the values. Works on a shallow copy of each
+								// item's Object to avoid mutating the informer store.
 								itemsList := make([]any, len(items))
 								for i, item := range items {
-									itemsList[i] = item.Object
+									itemsList[i] = normalizeForJQ(item.Object)
 								}
 								directData = map[string]any{
 									"apiVersion": "v1",
@@ -237,7 +238,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							}
 						} else {
 							if obj, ok := ir.GetObject(pathGVR, pathNS, pathName); ok {
-								directData = obj.Object
+								directData = normalizeForJQ(obj.Object)
 								directHit = true
 							}
 						}
@@ -302,14 +303,14 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 
 						if pathName != "" {
 							if obj, ok := ir.GetObject(pathGVR, pathNS, pathName); ok {
-								directData = obj.Object
+								directData = normalizeForJQ(obj.Object)
 								directHit = true
 							}
 						} else {
 							if items, ok := ir.ListObjects(pathGVR, pathNS); ok {
 								itemsList := make([]any, len(items))
 								for i, item := range items {
-									itemsList[i] = item.Object
+									itemsList[i] = normalizeForJQ(item.Object)
 								}
 								directData = map[string]any{
 									"apiVersion": "v1",
@@ -523,21 +524,3 @@ func removeManagedFields(data any) {
 	}
 }
 
-// marshalUnstructuredList serializes a slice of Unstructured objects into a
-// K8s-style JSON list: {"items": [...], "metadata": {}}. This produces the
-// same JSON shape that the K8s API server returns for LIST calls, so the
-// existing response handlers (jsonHandler) can consume it transparently.
-func marshalUnstructuredList(items []*unstructured.Unstructured) ([]byte, error) {
-	list := &unstructured.UnstructuredList{
-		Object: map[string]interface{}{
-			"apiVersion": "v1",
-			"kind":       "List",
-			"metadata":   map[string]interface{}{},
-		},
-	}
-	list.Items = make([]unstructured.Unstructured, len(items))
-	for i, item := range items {
-		list.Items[i] = *item
-	}
-	return json.Marshal(list)
-}
