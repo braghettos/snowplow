@@ -2,7 +2,6 @@ package cache
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"runtime"
 	"strings"
@@ -68,11 +67,6 @@ type ResourceWatcher struct {
 	dynamicGVRs   map[string]schema.GroupVersionResource
 	dynamicGVRsMu sync.Mutex
 
-	// l1RefreshRunning is a non-blocking mutex for L1 refresh. At most one
-	// refresh goroutine runs at a time. If a refresh is already running,
-	// new events are coalesced — the next event after completion triggers
-	// a fresh refresh that reads the latest informer state.
-	l1RefreshRunning atomic.Bool
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -176,11 +170,7 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 				resDepKey := L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)
 				_ = rw.cache.Delete(ctx, resDepKey)
 			}
-			// Trigger L1 refresh for affected keys. l1RefreshRunning CAS
-			// naturally coalesces: if a refresh is running, this event is
-			// skipped. The running refresh reads the latest informer state,
-			// which includes this event's changes. The next event after
-			// the refresh completes will trigger a new refresh.
+			// Trigger L1 refresh for affected keys.
 			rw.triggerL1Refresh(ctx, evt)
 		}
 	}
@@ -188,7 +178,7 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 
 // triggerL1Refresh collects affected L1 keys for the event's GVR and
 // launches a background refresh if none is running. Event-driven: no
-// polling, no debounce. l1RefreshRunning CAS coalesces concurrent events.
+// polling, no debounce. Each event triggers its own refresh goroutine.
 func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 	fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
 	if !ok || fn == nil {
@@ -231,14 +221,7 @@ func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 		keys = append(keys, k)
 	}
 
-	// CAS: at most one refresh at a time. If one is running, skip —
-	// the running refresh reads the latest informer state.
-	if !rw.l1RefreshRunning.CompareAndSwap(false, true) {
-		return
-	}
-
 	go func() {
-		defer rw.l1RefreshRunning.Store(false)
 		defer func() {
 			if r := recover(); r != nil {
 				buf := make([]byte, 4096)
@@ -736,250 +719,15 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 		return
 	}
 
-	// Build map of informer objects keyed by ns/name.
-	type objEntry struct {
-		uns *unstructured.Unstructured
-		rv  string
-	}
-	informerMap := make(map[string]objEntry, len(objects))
-	for _, obj := range objects {
-		uns, ok := obj.(*unstructured.Unstructured)
-		if !ok {
-			continue
-		}
-		k := uns.GetNamespace() + "/" + uns.GetName()
-		informerMap[k] = objEntry{uns: uns, rv: uns.GetResourceVersion()}
-	}
+	// No L3 diff or writes. The informer store IS the authoritative source.
+	// reconcileGVR at startup just counts items for logging.
+	added = len(objects)
 
-	// 2. Read current L3 from per-item index (authoritative source).
-	var l3List unstructured.UnstructuredList
-	if raw, hit, gerr := rw.cache.AssembleListFromIndex(ctx, gvr, ""); gerr != nil {
-		slog.Warn("reconcile: failed to read L3 index",
-			slog.String("gvr", gvr.String()), slog.Any("err", gerr))
-		errs++
-		return
-	} else if hit && raw != nil {
-		if uerr := json.Unmarshal(raw, &l3List); uerr != nil {
-			slog.Warn("reconcile: failed to unmarshal L3 index",
-				slog.String("gvr", gvr.String()), slog.Any("err", uerr))
-			errs++
-			return
-		}
-	}
-
-	// Build map of L3 objects.
-	l3Map := make(map[string]string, len(l3List.Items)) // ns/name → resourceVersion
-	for i := range l3List.Items {
-		item := &l3List.Items[i]
-		k := item.GetNamespace() + "/" + item.GetName()
-		l3Map[k] = item.GetResourceVersion()
-	}
-
-	// 3. Diff: find additions, removals, and updates.
-	// Track which namespaces have changes for precise L1 refresh.
-	var keysToDelete []string
-	changedNamespaces := make(map[string]bool)
-
-	// Objects in L3 but NOT in informer → ghost objects (missed DELETEs).
-	for k := range l3Map {
-		if _, exists := informerMap[k]; !exists {
-			parts := strings.SplitN(k, "/", 2)
-			ns, name := parts[0], parts[1]
-			keysToDelete = append(keysToDelete, GetKey(gvr, ns, name))
-			changedNamespaces[ns] = true
-			removed++
-		}
-	}
-
-	// Objects in informer but NOT in L3, or with different resourceVersion.
-	// Collect all writes and flush in pipelined batches to avoid 5055
-	// sequential Redis round-trips at large scale (was ~7s per round at 50K).
-	const batchSize = 500
-	pendingWrites := make(map[string]any, batchSize)
-	flushPending := func() {
-		if len(pendingWrites) == 0 {
-			return
-		}
-		if serr := rw.cache.SetMultiForGVR(ctx, gvr, pendingWrites); serr != nil {
-			errs++
-		}
-		pendingWrites = make(map[string]any, batchSize)
-	}
-	for k, entry := range informerMap {
-		l3RV, inL3 := l3Map[k]
-		if !inL3 {
-			added++
-		} else if l3RV != entry.rv {
-			updated++
-		} else {
-			continue // identical, skip
-		}
-		// Safe to use directly: SetTransform already stripped at ingestion,
-		// and SetMultiForGVR only reads (json.Marshal) without mutating.
-		getKey := GetKey(gvr, entry.uns.GetNamespace(), entry.uns.GetName())
-		pendingWrites[getKey] = entry.uns
-		changedNamespaces[entry.uns.GetNamespace()] = true
-		if len(pendingWrites) >= batchSize {
-			flushPending()
-		}
-	}
-	flushPending()
-
-	// 4. Delete orphaned GET keys.
-	if len(keysToDelete) > 0 {
-		if derr := rw.cache.Delete(ctx, keysToDelete...); derr != nil {
-			slog.Warn("reconcile: failed to delete orphaned GET keys",
-				slog.String("gvr", gvr.String()), slog.Any("err", derr))
-			errs++
-		}
-	}
-
-	// 5. Rebuild list caches from informer state if anything changed.
-	if added+removed+updated > 0 {
-		// Safe to reference directly: SetTransform already stripped at
-		// ingestion, and rebuildListCaches only reads (GetNamespace,
-		// GetName) without mutating. Eliminates ~3GB transient allocation
-		// at 50K scale.
-		allItems := make([]unstructured.Unstructured, 0, len(informerMap))
-		for _, entry := range informerMap {
-			allItems = append(allItems, *entry.uns)
-		}
-		rw.rebuildListCaches(ctx, gvr, allItems)
-		span.AddEvent("l3.rebuilt", trace.WithAttributes(
-			attribute.String("gvr", gvr.String()),
-			attribute.Int("items", len(allItems)),
-		))
-
-		// Clear per-namespace list keys for namespaces that had changes but
-		// now have 0 items in the informer (e.g. namespace deleted with all
-		// its resources). rebuildListCaches only WRITES lists for namespaces
-		// WITH items, so stale per-ns list keys with ghost entries would
-		// otherwise persist until TTL expiry (causing the S8 21s tail bug).
-		nsWithItems := make(map[string]bool)
-		for _, it := range allItems {
-			if ns := it.GetNamespace(); ns != "" {
-				nsWithItems[ns] = true
-			}
-		}
-		for ns := range changedNamespaces {
-			if ns != "" && !nsWithItems[ns] {
-				_ = rw.cache.Delete(ctx, ListKey(gvr, ns), ListIndexKey(gvr, ns))
-				span.AddEvent("stale_ns_key.cleared", trace.WithAttributes(
-					attribute.String("gvr", gvr.String()),
-					attribute.String("namespace", ns),
-				))
-				slog.Debug("reconcile: cleared stale empty-ns list key",
-					slog.String("gvr", gvr.String()),
-					slog.String("ns", ns))
-			}
-		}
-
-		// Trigger L1 refresh using PRECISE dependency indexes (same approach
-		// as the l3gen scanner). The broad L1GVRKey index can yield 2000+
-		// keys for popular GVRs (e.g. every per-composition widget/button),
-		// causing the refresh to time out. The precise indexes yield only
-		// the RESTAction + widget keys that aggregate compositions
-		// (typically 6-10 keys), which complete in <1s.
-		gvrKey := GVRToKey(gvr)
-		affected := make(map[string]bool)
-		collect := func(idxKey string) {
-			if keys, serr := rw.cache.SMembers(ctx, idxKey); serr == nil {
-				for _, k := range keys {
-					affected[k] = true
-				}
-			}
-		}
-		// Namespace-scoped list deps — only for namespaces that actually changed.
-		// For S7 (delete 1 composition from bench-ns-01), this collects deps from
-		// bench-ns-01 only (~6 keys) instead of all 120 namespaces.
-		for ns := range changedNamespaces {
-			collect(L1ResourceDepKey(gvrKey, ns, ""))
-		}
-		collect(L1ResourceDepKey(gvrKey, "", "")) // cluster-wide LIST dep
-		collect(L1ApiDepKey(gvrKey))              // API-level dep
-		// CRD-based chain (same as l3gen scanner).
-		crdGVRKey := GVRToKey(schema.GroupVersionResource{
-			Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions",
-		})
-		collect(L1ResourceDepKey(crdGVRKey, "", ""))
-
-		// Expand transitive dependencies (e.g. compositions-list → piechart).
-		rw.expandDependents(ctx, affected, 5)
-
-		if len(affected) > 0 {
-			l1Keys := make([]string, 0, len(affected))
-			for k := range affected {
-				l1Keys = append(l1Keys, k)
-			}
-			if fn, ok := rw.l1Refresh.Load().(L1RefreshFunc); ok && fn != nil {
-				if added+removed+updated == 0 {
-					slog.Debug("reconcile: skipping L1 refresh (no changes)")
-				} else if rw.l1RefreshRunning.CompareAndSwap(false, true) {
-					go func() {
-						defer rw.l1RefreshRunning.Store(false)
-						refreshCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
-						defer cancel()
-						fn(refreshCtx, gvr, l1Keys)
-					}()
-				}
-			} else {
-				_ = rw.cache.Delete(ctx, l1Keys...)
-			}
-		}
-	}
+	slog.Info("reconcile: informer store synced",
+		slog.String("gvr", gvr.String()),
+		slog.Int("items", len(objects)))
 
 	return
-}
-
-// rebuildListCaches writes namespace-scoped and cluster-wide per-item index
-// SETs from the given items. Used by Reconcile to ensure list caches match
-// the informer's authoritative state. Readers consume them via
-// AssembleListFromIndex.
-func (rw *ResourceWatcher) rebuildListCaches(ctx context.Context, gvr schema.GroupVersionResource, items []unstructured.Unstructured) {
-	ttl := rw.cache.TTLForGVR(gvr)
-
-	byNamespace := make(map[string][]unstructured.Unstructured)
-	for i := range items {
-		ns := items[i].GetNamespace()
-		byNamespace[ns] = append(byNamespace[ns], items[i])
-	}
-
-	// ── Per-item index SETs ──────────────────────────────────────────────────
-
-	// Build cluster-wide index: members are "ns/name" for namespaced resources.
-	var clusterMembers []string
-	for i := range items {
-		ns := items[i].GetNamespace()
-		name := items[i].GetName()
-		if ns != "" {
-			clusterMembers = append(clusterMembers, ns+"/"+name)
-		} else {
-			clusterMembers = append(clusterMembers, name)
-		}
-	}
-	if len(clusterMembers) > 0 {
-		_ = rw.cache.ReplaceSetWithTTL(ctx, ListIndexKey(gvr, ""), clusterMembers, ttl)
-	} else {
-		_ = rw.cache.Delete(ctx, ListIndexKey(gvr, ""))
-	}
-
-	// Build per-namespace indexes: members are just "name".
-	for ns, nsItems := range byNamespace {
-		if ns == "" {
-			continue
-		}
-		members := make([]string, len(nsItems))
-		for i := range nsItems {
-			members[i] = nsItems[i].GetName()
-		}
-		_ = rw.cache.ReplaceSetWithTTL(ctx, ListIndexKey(gvr, ns), members, ttl)
-	}
-
-	// Legacy monolithic blob writes (cluster-wide + per-namespace) REMOVED.
-	// At 50K scale, these writes added ~6-9s per reconcile round and ~100MB
-	// Redis memory. The per-item index SETs above (ListIndexKey) are
-	// authoritative and readers consume them via AssembleListFromIndex.
-	_ = byNamespace // silence unused if all paths return
 }
 
 // ── Proactive expiry refresh ──────────────────────────────────────────────────

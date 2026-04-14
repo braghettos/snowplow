@@ -3,6 +3,7 @@ package dispatchers
 import (
 	"context"
 	"log/slog"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
@@ -24,8 +25,6 @@ import (
 var l1RefreshTracer = otel.Tracer("snowplow/l1refresh")
 
 const (
-	refreshConcurrency         = 20 // warmup and HTTP-triggered refreshes
-	refreshConcurrencyBackground = 8  // l3gen scanner refreshes (fewer keys, less RBAC pressure)
 	restactionResource         = "restactions"
 	templatesGroup             = "templates.krateo.io"
 )
@@ -45,19 +44,18 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 
 		log := slog.Default()
 
-		// Use lower concurrency for background l3gen scans (empty triggerGVR)
-		// to reduce RBAC API pressure. Warmup uses full concurrency.
-		concurrency := refreshConcurrency
-		if triggerGVR.Resource == "" {
-			concurrency = refreshConcurrencyBackground
+		// Concurrency bounded by 2× CPU cores. Each resolve is CPU-bound
+		// (json.Marshal + JQ). No fixed threshold — adapts to the machine.
+		concurrency := runtime.GOMAXPROCS(0) * 2
+		if concurrency < 4 {
+			concurrency = 4
 		}
 
 		refreshStart := time.Now()
 
 		log.Info("L1 refresh: starting",
 			slog.String("trigger", triggerGVR.String()),
-			slog.Int("keys", len(l1Keys)),
-			slog.Int("concurrency", concurrency))
+			slog.Int("keys", len(l1Keys)))
 
 		type userKeys struct {
 			info cache.ResolvedKeyInfo

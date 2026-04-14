@@ -34,7 +34,6 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
-	"golang.org/x/sync/singleflight"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 )
@@ -47,12 +46,6 @@ var tracer = otel.Tracer("snowplow/resolvers/restactions/l1cache")
 // cross-path thundering herd.
 //
 // backgroundFlight is separate so the L1 refresh loop can do long
-// (10-30 s) re-resolves of popular keys without holding up foreground
-// HTTP callers waiting on the same key.
-var (
-	foregroundFlight singleflight.Group
-	backgroundFlight singleflight.Group
-)
 
 // Input is everything the resolver + cache layer need from a caller.
 // The same struct shape serves both HTTP and widget paths; empty
@@ -104,52 +97,16 @@ type Result struct {
 	Status map[string]any
 }
 
-// ResolveAndCache runs the full RESTAction resolution on the foreground
-// path: convert → resolve → marshal → strip → L1 write. Concurrent
-// calls with the same ResolvedKey are deduplicated via one process-wide
-// singleflight.Group — HTTP dispatcher requests and widget apiref
-// requests share the same group, so a widget-triggered resolve
-// piggy-backs on a simultaneous HTTP-triggered one for the same key
-// (and vice versa).
-//
-// ResolvedKey == "" bypasses both singleflight and L1 write and runs
-// the resolve path inline.
+// ResolveAndCache runs the full RESTAction resolution:
+// convert → resolve → marshal → strip → L1 write.
+// L1 keys are per-user so there is no thundering herd.
 func ResolveAndCache(ctx context.Context, in Input) (*Result, error) {
-	if in.ResolvedKey == "" {
-		return resolveAndCacheInner(ctx, in)
-	}
-	v, err, _ := foregroundFlight.Do(in.ResolvedKey, func() (interface{}, error) {
-		return resolveAndCacheInner(ctx, in)
-	})
-	if err != nil {
-		return nil, err
-	}
-	if v == nil {
-		return nil, nil
-	}
-	return v.(*Result), nil
+	return resolveAndCacheInner(ctx, in)
 }
 
-// ResolveAndCacheBackground is the entry point for the L1 refresh loop.
-// It uses a separate singleflight.Group (backgroundFlight) so long
-// re-resolves do not block foreground HTTP traffic waiting on the same
-// key, and detaches ctx via context.WithoutCancel so the re-resolve
-// survives the caller's lifetime.
+// ResolveAndCacheBackground is the entry point for the background L1 refresh.
 func ResolveAndCacheBackground(ctx context.Context, in Input) (*Result, error) {
-	if in.ResolvedKey == "" {
-		return resolveAndCacheInner(ctx, in)
-	}
-	sfCtx := context.WithoutCancel(ctx)
-	v, err, _ := backgroundFlight.Do(in.ResolvedKey, func() (interface{}, error) {
-		return resolveAndCacheInner(sfCtx, in)
-	})
-	if err != nil {
-		return nil, err
-	}
-	if v == nil {
-		return nil, nil
-	}
-	return v.(*Result), nil
+	return resolveAndCacheInner(ctx, in)
 }
 
 func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {

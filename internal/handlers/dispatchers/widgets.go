@@ -138,43 +138,9 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// ── Singleflight: deduplicate concurrent resolutions of the same key ──────
-	if resolvedKey != "" {
-		// Use context.WithoutCancel so that if the HTTP client disconnects,
-		// the resolution still completes for other waiters.
-		ctx := context.WithoutCancel(req.Context())
-		result, resolveErr, _ := widgetFlight.Do(resolvedKey, func() (interface{}, error) {
-			return resolveWidgetFromObject(ctx, c, got, resolvedKey, r.authnNS, perPage, page, extras)
-		})
-		if resolveErr != nil {
-			writeWidgetError(wri, resolveErr)
-			return
-		}
-		// Safe type assertion to avoid panic if singleflight returns
-		// an unexpected type (Bug 14).
-		res, ok := result.(*ResolveWidgetResult)
-		if !ok || res == nil {
-			writeWidgetError(wri, fmt.Errorf("singleflight returned unexpected type %T", result))
-			return
-		}
-		log.Info("Widget successfully resolved (singleflight)",
-			slog.String("key", resolvedKey),
-			slog.String("duration", util.ETA(start)))
-		wri.Header().Set("Content-Type", "application/json")
-		wri.WriteHeader(http.StatusOK)
-		_, writeSpan := widgetTracer.Start(req.Context(), "http.write",
-			trace.WithAttributes(
-				attribute.Bool("cache.hit", false),
-				attribute.String("path", "singleflight"),
-				attribute.Int("http.response.body.size", len(res.Raw)),
-			))
-		_, _ = wri.Write(res.Raw)
-		writeSpan.End()
-		return
-	}
-
-	// Non-cacheable path (extras present): resolve inline without singleflight.
-	res, resolveErr := resolveWidgetFromObject(req.Context(), c, got, "", r.authnNS, perPage, page, extras)
+	// Resolve the widget. L1 keys are per-user so there is no
+	// thundering herd — each user resolves their own key.
+	res, resolveErr := resolveWidgetFromObject(req.Context(), c, got, resolvedKey, r.authnNS, perPage, page, extras)
 	if resolveErr != nil {
 		writeWidgetError(wri, resolveErr)
 		return
@@ -278,41 +244,14 @@ func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objec
 	return &ResolveWidgetResult{Raw: raw, Resolved: res}, nil
 }
 
-// ResolveWidgetDirect is the entry point for L1 refresh to resolve a widget
-// using the same singleflight group as the HTTP handler. Returns both the raw
-// JSON and the resolved unstructured for child pre-warming.
+// ResolveWidgetDirect resolves a widget and writes L1. Used by prewarm.
 func ResolveWidgetDirect(ctx context.Context, c *cache.RedisCache, got objects.Result, resolvedKey, authnNS string, perPage, page int) (*ResolveWidgetResult, error) {
-	result, err, _ := widgetFlight.Do(resolvedKey, func() (interface{}, error) {
-		return resolveWidgetFromObject(ctx, c, got, resolvedKey, authnNS, perPage, page, nil)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return result.(*ResolveWidgetResult), nil
+	return resolveWidgetFromObject(ctx, c, got, resolvedKey, authnNS, perPage, page, nil)
 }
 
-// ResolveWidgetBackground resolves a widget using a dedicated background
-// singleflight group. This deduplicates concurrent background L1 refresh
-// attempts for the same key without blocking HTTP requests (which use the
-// separate widgetFlight group).
+// ResolveWidgetBackground resolves a widget for the background L1 refresh path.
 func ResolveWidgetBackground(ctx context.Context, c *cache.RedisCache, got objects.Result, resolvedKey, authnNS string, perPage, page int) (*ResolveWidgetResult, error) {
-	if resolvedKey == "" {
-		return resolveWidgetFromObject(ctx, c, got, resolvedKey, authnNS, perPage, page, nil)
-	}
-	// Use WithoutCancel so the resolution doesn't abort if the first caller's
-	// context expires — other callers waiting in the singleflight group may
-	// have longer deadlines.
-	sfCtx := context.WithoutCancel(ctx)
-	result, err, _ := widgetBgFlight.Do(resolvedKey, func() (interface{}, error) {
-		return resolveWidgetFromObject(sfCtx, c, got, resolvedKey, authnNS, perPage, page, nil)
-	})
-	if err != nil {
-		return nil, err
-	}
-	if result == nil {
-		return nil, nil
-	}
-	return result.(*ResolveWidgetResult), nil
+	return resolveWidgetFromObject(ctx, c, got, resolvedKey, authnNS, perPage, page, nil)
 }
 
 func writeWidgetError(wri http.ResponseWriter, err error) {
