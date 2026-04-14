@@ -109,12 +109,11 @@ type ResourceWatcher struct {
 	l1RefreshRunning atomic.Bool
 
 	// recentChanges tracks recent L3 changes for incremental L1 patching (C2).
-	// handleEvent appends; scanL3Gens drains. Protected by recentChangesMu.
-	// recentChangesOverflow is set when the buffer reaches capacity, signaling
-	// that some changes were lost and full resolution is needed.
-	recentChanges         []L1ChangeInfo
-	recentChangesOverflow bool
-	recentChangesMu       sync.Mutex
+	// handleEvent appends; scanL3Gens/reconcileGVR drains. Protected by
+	// recentChangesMu. No capacity cap — the drain cycle (every 1-30s) is
+	// the natural bound. Even 50K entries between drains is ~5MB.
+	recentChanges   []L1ChangeInfo
+	recentChangesMu sync.Mutex
 
 	// l3genScanNow is a signal channel to trigger an immediate l3gen scan.
 	// Used by scheduleDynamicReconcile after reconcileGVR updates L3, so
@@ -236,11 +235,7 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 
 	// L3gen scanner: runs every 1s independently of event volume.
 	// Detects L3 changes via generation keys and refreshes affected L1 keys.
-	// prevObserved tracks l3gen values from the previous tick — we only
-	// launch a refresh when values are stable (no change from prev tick).
-	// This avoids refreshing with partial L3 data during event bursts.
 	lastSeen := make(map[string]string)
-	prevObserved := make(map[string]string)
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -249,16 +244,16 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			rw.scanL3Gens(ctx, lastSeen, prevObserved)
+			rw.scanL3Gens(ctx, lastSeen)
 		case <-rw.l3genScanNow:
-			rw.scanL3Gens(ctx, lastSeen, prevObserved)
+			rw.scanL3Gens(ctx, lastSeen)
 		}
 	}
 }
 
 // scanL3Gens scans all snowplow:l3gen:* keys, detects changes since the last
 // scan, and refreshes affected L1 keys via the dependency indexes.
-func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen, prevObserved map[string]string) {
+func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen map[string]string) {
 	ctx, span := watcherTracer.Start(ctx, "l3gen.scan")
 	defer span.End()
 
@@ -301,33 +296,10 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen, prevObserve
 		}
 	}
 
-	// Stable-tick debounce: only launch a refresh if l3gen values match
-	// what we saw last tick. If values changed since prev tick, events
-	// are still arriving — wait for quiescence to avoid refreshing with
-	// partial L3 data during bursts.
-	stable := true
-	if len(currentObserved) != len(prevObserved) {
-		stable = false
-	} else {
-		for gk, v := range currentObserved {
-			if prevObserved[gk] != v {
-				stable = false
-				break
-			}
-		}
-	}
-	// Update prevObserved for next tick (swap contents in place).
-	for gk := range prevObserved {
-		delete(prevObserved, gk)
-	}
-	for gk, v := range currentObserved {
-		prevObserved[gk] = v
-	}
-	if !stable {
-		slog.Debug("resource-watcher: l3gen unstable — waiting for next tick",
-			slog.Int("observed", len(currentObserved)))
-		return
-	}
+	// L3 is updated per-item atomically by handleEvent (index SETs are
+	// O(1)). The old two-tick stability check was designed for monolithic
+	// blob writes where partial data was possible — those writes were
+	// removed in v0.25.180. Process changes immediately.
 
 	// Find which GVR+ns changed. Stage lastSeen updates — only commit them
 	// when the refresh actually launches (CAS succeeds). If CAS fails,
@@ -435,16 +407,10 @@ func (rw *ResourceWatcher) scanL3Gens(ctx context.Context, lastSeen, prevObserve
 	}
 
 	// Drain recent changes for incremental L1 patching (C2).
-	// If the buffer overflowed, pass nil to force full resolution.
 	rw.recentChangesMu.Lock()
 	changes := rw.recentChanges
-	overflow := rw.recentChangesOverflow
 	rw.recentChanges = nil
-	rw.recentChangesOverflow = false
 	rw.recentChangesMu.Unlock()
-	if overflow {
-		changes = nil // force full resolution
-	}
 
 	go func() {
 		defer rw.l1RefreshRunning.Store(false)
@@ -714,11 +680,9 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		}
 
 	case "add", "update":
-		stripped := uns.DeepCopy()
-		// Note: StripAnnotationsFromUnstructured is already applied by
-		// SetTransform at informer ingestion time. No need to strip again.
-
-		if serr := rw.cache.SetForGVR(ctx, gvr, getKey, stripped); serr != nil {
+		// Safe to use directly: SetTransform already stripped at ingestion,
+		// and SetForGVR only reads (json.Marshal) without mutating.
+		if serr := rw.cache.SetForGVR(ctx, gvr, getKey, uns); serr != nil {
 			slog.Warn("resource-watcher: failed to update GET cache",
 				slog.String("key", getKey), slog.Any("err", serr))
 		}
@@ -786,16 +750,12 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 
 	// ── Record change for incremental L1 patching (C2) ──────────────────────
 	rw.recentChangesMu.Lock()
-	if len(rw.recentChanges) < 1000 {
-		rw.recentChanges = append(rw.recentChanges, L1ChangeInfo{
-			GVR:       gvr,
-			Namespace: ns,
-			Name:      name,
-			Operation: eventType,
-		})
-	} else {
-		rw.recentChangesOverflow = true
-	}
+	rw.recentChanges = append(rw.recentChanges, L1ChangeInfo{
+		GVR:       gvr,
+		Namespace: ns,
+		Name:      name,
+		Operation: eventType,
+	})
 	rw.recentChangesMu.Unlock()
 
 	// ── Enqueue L1 refresh event ─────────────────────────────────────────────
@@ -1130,11 +1090,11 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 		} else {
 			continue // identical, skip
 		}
-		stripped := entry.uns.DeepCopy()
-		// Already stripped by SetTransform at informer ingestion.
-		getKey := GetKey(gvr, stripped.GetNamespace(), stripped.GetName())
-		pendingWrites[getKey] = stripped
-		changedNamespaces[stripped.GetNamespace()] = true
+		// Safe to use directly: SetTransform already stripped at ingestion,
+		// and SetMultiForGVR only reads (json.Marshal) without mutating.
+		getKey := GetKey(gvr, entry.uns.GetNamespace(), entry.uns.GetName())
+		pendingWrites[getKey] = entry.uns
+		changedNamespaces[entry.uns.GetNamespace()] = true
 		if len(pendingWrites) >= batchSize {
 			flushPending()
 		}
@@ -1152,11 +1112,13 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 
 	// 5. Rebuild list caches from informer state if anything changed.
 	if added+removed+updated > 0 {
-		var allItems []unstructured.Unstructured
+		// Safe to reference directly: SetTransform already stripped at
+		// ingestion, and rebuildListCaches only reads (GetNamespace,
+		// GetName) without mutating. Eliminates ~3GB transient allocation
+		// at 50K scale.
+		allItems := make([]unstructured.Unstructured, 0, len(informerMap))
 		for _, entry := range informerMap {
-			stripped := entry.uns.DeepCopy()
-			// Already stripped by SetTransform at informer ingestion.
-			allItems = append(allItems, *stripped)
+			allItems = append(allItems, *entry.uns)
 		}
 		rw.rebuildListCaches(ctx, gvr, allItems)
 		span.AddEvent("l3.rebuilt", trace.WithAttributes(
@@ -1240,17 +1202,14 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 					// timer fired — l3Map matches informerMap, zero diff.
 					rw.recentChangesMu.Lock()
 					var matched, unmatched []L1ChangeInfo
-					if !rw.recentChangesOverflow {
-						for _, ch := range rw.recentChanges {
-							if ch.GVR == gvr {
-								matched = append(matched, ch)
-							} else {
-								unmatched = append(unmatched, ch)
-							}
+					for _, ch := range rw.recentChanges {
+						if ch.GVR == gvr {
+							matched = append(matched, ch)
+						} else {
+							unmatched = append(unmatched, ch)
 						}
 					}
 					rw.recentChanges = unmatched
-					rw.recentChangesOverflow = false
 					rw.recentChangesMu.Unlock()
 
 					// If zero changes were found in the buffer AND the
