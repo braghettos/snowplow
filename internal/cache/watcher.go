@@ -181,7 +181,7 @@ func (rw *ResourceWatcher) Start(ctx context.Context) {
 			}
 		}
 	}()
-	go rw.l1Worker(ctx)
+	go rw.l1Worker(rw.appCtx) // appCtx carries InformerReader for background refreshes
 }
 
 // registerFromRedis reads the watched-gvrs set from Redis and registers
@@ -1278,7 +1278,7 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 					} else {
 						go func() {
 							defer rw.l1RefreshRunning.Store(false)
-							refreshCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+							refreshCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 							defer cancel()
 							fn(refreshCtx, gvr, l1Keys, matched)
 						}()
