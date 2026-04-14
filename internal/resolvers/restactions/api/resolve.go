@@ -202,83 +202,80 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				}
 
 				// ── Cache intercept for K8s API GET calls ─────────────────
-				// Try informer store first (in-memory, zero I/O), then
-				// fall back to L3 Redis, then to live K8s API.
+				// Read from informer store (in-memory, zero I/O, zero-copy).
 				if c != nil && verb == http.MethodGet {
-					var raw []byte
-					var hit bool
-
-					// Read from informer's in-memory store (zero I/O).
+					// Read from informer's in-memory store.
+					// Data is already map[string]interface{} — feed directly
+					// to JQ without json.Marshal/Unmarshal round-trip.
 					if ir := cache.InformerReaderFromContext(ctx); ir != nil {
+						var directData any
+						var directHit bool
+
 						if pathName == "" {
-							if items, ok := ir.ListObjects(pathGVR, pathNS); ok {
-								raw, _ = marshalUnstructuredList(items)
-								hit = len(raw) > 0
+							if items, ok := ir.ListObjects(pathGVR, pathNS); ok && len(items) > 0 {
+								// Build K8s-style list as map[string]any directly.
+								itemsList := make([]any, len(items))
+								for i, item := range items {
+									itemsList[i] = item.Object
+								}
+								directData = map[string]any{
+									"apiVersion": "v1",
+									"kind":       "List",
+									"metadata":   map[string]any{},
+									"items":      itemsList,
+								}
+								directHit = true
+							} else if ok {
+								// Registered but empty — still a hit.
+								directData = map[string]any{
+									"apiVersion": "v1",
+									"kind":       "List",
+									"metadata":   map[string]any{},
+									"items":      []any{},
+								}
+								directHit = true
 							}
 						} else {
 							if obj, ok := ir.GetObject(pathGVR, pathNS, pathName); ok {
-								raw, _ = json.Marshal(obj)
-								hit = len(raw) > 0
+								directData = obj.Object
+								directHit = true
 							}
 						}
-					}
 
-					// RBAC gate: verify the user can access this L3 key
-					// before serving cached data. L3 is SA-scoped (stores
-					// everything), but reads on behalf of a user must check
-					// UserCan — same pattern as widget resourcesRefs
-					// (allowed flag). Without this, any user who can reach
-					// the parent widget/restaction sees all data from all
-					// namespaces, bypassing K8s RBAC.
-					if hit {
-						rbacVerb := "list"
-						if pathName != "" {
-							rbacVerb = "get"
+						if directHit {
+							// RBAC gate.
+							rbacVerb := "list"
+							if pathName != "" {
+								rbacVerb = "get"
+							}
+							if !rbac.UserCan(ctx, rbac.UserCanOptions{
+								Verb:          rbacVerb,
+								GroupResource: schema.GroupResource{Group: pathGVR.Group, Resource: pathGVR.Resource},
+								Namespace:     pathNS,
+							}) {
+								directHit = false
+							}
 						}
-						if !rbac.UserCan(ctx, rbac.UserCanOptions{
-							Verb:          rbacVerb,
-							GroupResource: schema.GroupResource{Group: pathGVR.Group, Resource: pathGVR.Resource},
-							Namespace:     pathNS,
-						}) {
-							log.Debug("L3 cache hit but user RBAC denied",
-								slog.String("name", id),
-								slog.String("path", call.Path),
-								slog.String("verb", rbacVerb),
-								slog.String("namespace", pathNS))
-							hit = false // fall through — K8s API will enforce natively
-						}
-					}
 
-					if hit {
-						log.Debug("L3 cache hit for K8s API path",
-							slog.String("name", id),
-							slog.String("path", call.Path))
-						// Feed the cached JSON through the response handler
-						// as if it came from the K8s API.
-						handler := call.ResponseHandler
-						if handler == nil {
-							handler = jsonHandler(ctx, jsonHandlerOptions{
+						if directHit {
+							// Zero-copy: feed map[string]any directly to JQ.
+							// No json.Marshal, no json.Unmarshal.
+							handlerOpts := jsonHandlerOptions{
 								key: id, out: dict, filter: apiCall.Filter,
-							})
+							}
 							if mu != nil {
-								origHandler := handler
-								handler = func(r io.ReadCloser) error {
-									data, rerr := io.ReadAll(r)
-									if rerr != nil {
-										return rerr
-									}
-									mu.Lock()
-									defer mu.Unlock()
-									return origHandler(io.NopCloser(bytes.NewReader(data)))
+								mu.Lock()
+								herr := jsonHandlerDirect(ctx, handlerOpts, directData)
+								mu.Unlock()
+								if herr == nil {
+									return true
+								}
+							} else {
+								if herr := jsonHandlerDirect(ctx, handlerOpts, directData); herr == nil {
+									return true
 								}
 							}
 						}
-						if herr := handler(io.NopCloser(bytes.NewReader(raw))); herr == nil {
-							return true // L3 cache hit — skip httpcall.Do
-						}
-						log.Debug("L3 cache hit but handler failed, falling through to API",
-							slog.String("name", id),
-							slog.String("path", call.Path))
 					} else {
 						log.Debug("L3 cache miss for K8s API path",
 							slog.String("name", id),
@@ -295,42 +292,50 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				}
 			}
 
-			// ── Cache direct read (informer store) ──────────────────────────
+			// ── Cache direct read (informer store, zero-copy) ───────────────
 			if c != nil && verb == http.MethodGet {
 				pathGVR, pathNS, pathName := cache.ParseK8sAPIPath(call.Path)
 				if pathGVR.Resource != "" {
-					var l3Raw []byte
-					var l3Hit bool
-
 					if ir := cache.InformerReaderFromContext(ctx); ir != nil {
+						var directData any
+						var directHit bool
+
 						if pathName != "" {
 							if obj, ok := ir.GetObject(pathGVR, pathNS, pathName); ok {
-								l3Raw, _ = json.Marshal(obj)
-								l3Hit = len(l3Raw) > 0
+								directData = obj.Object
+								directHit = true
 							}
 						} else {
 							if items, ok := ir.ListObjects(pathGVR, pathNS); ok {
-								l3Raw, _ = marshalUnstructuredList(items)
-								l3Hit = len(l3Raw) > 0
+								itemsList := make([]any, len(items))
+								for i, item := range items {
+									itemsList[i] = item.Object
+								}
+								directData = map[string]any{
+									"apiVersion": "v1",
+									"kind":       "List",
+									"metadata":   map[string]any{},
+									"items":      itemsList,
+								}
+								directHit = true
 							}
 						}
-					}
-					if l3Hit && !cache.IsNotFoundRaw(l3Raw) {
-						rbacVerb := "list"
-						if pathName != "" {
-							rbacVerb = "get"
-						}
-						if rbac.UserCan(ctx, rbac.UserCanOptions{
-							Verb:          rbacVerb,
-							GroupResource: schema.GroupResource{Group: pathGVR.Group, Resource: pathGVR.Resource},
-							Namespace:     pathNS,
-						}) {
-							cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L3Promotions, "l3_promotions")
-							handler := jsonHandler(ctx, jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter})
-							mu.Lock()
-							_ = handler(io.NopCloser(bytes.NewReader(l3Raw)))
-							mu.Unlock()
-							return true
+
+						if directHit {
+							rbacVerb := "list"
+							if pathName != "" {
+								rbacVerb = "get"
+							}
+							if rbac.UserCan(ctx, rbac.UserCanOptions{
+								Verb:          rbacVerb,
+								GroupResource: schema.GroupResource{Group: pathGVR.Group, Resource: pathGVR.Resource},
+								Namespace:     pathNS,
+							}) {
+								mu.Lock()
+								_ = jsonHandlerDirect(ctx, jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter}, directData)
+								mu.Unlock()
+								return true
+							}
 						}
 					}
 				}

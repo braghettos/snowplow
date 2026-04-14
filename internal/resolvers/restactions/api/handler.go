@@ -99,6 +99,72 @@ func jsonHandler(ctx context.Context, opts jsonHandlerOptions) func(io.ReadClose
 	}
 }
 
+// jsonHandlerDirect is the zero-copy equivalent of jsonHandler for data
+// that is already in Go memory (e.g., from the informer store). Skips
+// json.Marshal → io.ReadAll → json.Unmarshal, eliminating ~2GB of
+// transient allocation at 50K items.
+func jsonHandlerDirect(ctx context.Context, opts jsonHandlerOptions, data any) error {
+	log := xcontext.Logger(ctx)
+
+	pig := map[string]any{
+		opts.key: data,
+	}
+	if si, ok := opts.out["slice"]; ok {
+		pig["slice"] = si
+	}
+
+	tmp := data
+	if opts.filter != nil {
+		q := ptr.Deref(opts.filter, "")
+		log.Debug("found local filter on api result", slog.String("filter", q))
+		_, jqSpan := apiHandlerTracer.Start(ctx, "restaction.api.jq_eval",
+			trace.WithAttributes(
+				attribute.String("api.call.key", opts.key),
+				attribute.Int("api.call.filter_len", len(q)),
+			))
+		s, err := jqutil.Eval(context.TODO(), jqutil.EvalOptions{
+			Query: q, Data: pig,
+			ModuleLoader: jqsupport.ModuleLoader(),
+		})
+		if err == nil {
+			jqSpan.SetAttributes(attribute.Int("api.call.output_bytes", len(s)))
+		}
+		jqSpan.End()
+		if err != nil {
+			log.Error("unable to evaluate JQ filter",
+				slog.String("filter", q), slog.Any("error", err))
+		} else {
+			if err := json.Unmarshal([]byte(s), &tmp); err != nil {
+				return err
+			}
+		}
+	}
+
+	got, ok := opts.out[opts.key]
+	if !ok {
+		opts.out[opts.key] = tmp
+		return nil
+	}
+
+	switch existingSlice := got.(type) {
+	case []any:
+		if v := wrapAsSlice(tmp); len(v) > 0 {
+			opts.out[opts.key] = append(existingSlice, v...)
+		}
+	default:
+		switch v := tmp.(type) {
+		case []any:
+			all := []any{got}
+			all = append(all, v...)
+			opts.out[opts.key] = all
+		default:
+			opts.out[opts.key] = []any{got, v}
+		}
+	}
+
+	return nil
+}
+
 func wrapAsSlice(value any) []any {
 	switch v := value.(type) {
 	case []any:
