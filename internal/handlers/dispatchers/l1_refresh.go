@@ -3,7 +3,7 @@ package dispatchers
 import (
 	"context"
 	"log/slog"
-	"strconv"
+	"sync"
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
@@ -27,10 +27,59 @@ const (
 	templatesGroup             = "templates.krateo.io"
 )
 
+// userContext holds cached credentials for a user. Loaded once,
+// shared across all goroutines. Refreshed when the underlying
+// secret changes (via UserSecretWatcher).
+type userContext struct {
+	endpoint    endpoints.Endpoint
+	user        jwtutil.UserInfo
+	accessToken string
+	loadedAt    int64 // unix seconds
+}
+
 // MakeL1Refresher returns a cache.L1RefreshFunc that re-resolves L1 keys in
 // the background instead of deleting them. Old values keep being served while
 // the refresh runs (stale-while-revalidate).
 func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey string) cache.L1RefreshFunc {
+	// User context cache: loaded once per user, shared across all goroutines.
+	// Avoids 50K K8s Secret GETs when 50K events arrive for the same users.
+	var (
+		userCtxMu    sync.RWMutex
+		userCtxCache = make(map[string]*userContext)
+	)
+
+	getUserContext := func(ctx context.Context, username string) (*userContext, error) {
+		now := time.Now().Unix()
+
+		// Fast path: read from cache.
+		userCtxMu.RLock()
+		uc, ok := userCtxCache[username]
+		userCtxMu.RUnlock()
+		if ok && (now-uc.loadedAt) < 300 { // 5 min TTL
+			return uc, nil
+		}
+
+		// Slow path: load from K8s secret.
+		ep, err := endpoints.FromSecret(ctx, rc, username+clientConfigSecretSuffix, authnNS)
+		if err != nil {
+			return nil, err
+		}
+		groups := extractGroupsFromClientCert(ep.ClientCertificateData)
+		user := jwtutil.UserInfo{Username: username, Groups: groups}
+		accessToken := mintJWT(user, signKey)
+
+		uc = &userContext{
+			endpoint:    ep,
+			user:        user,
+			accessToken: accessToken,
+			loadedAt:    now,
+		}
+		userCtxMu.Lock()
+		userCtxCache[username] = uc
+		userCtxMu.Unlock()
+		return uc, nil
+	}
+
 	return func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string) {
 		ctx, span := l1RefreshTracer.Start(ctx, "l1.refresh",
 			trace.WithAttributes(
@@ -41,12 +90,7 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 		defer span.End()
 
 		log := slog.Default()
-
 		refreshStart := time.Now()
-
-		log.Info("L1 refresh: starting",
-			slog.String("trigger", triggerGVR.String()),
-			slog.Int("keys", len(l1Keys)))
 
 		type userKeys struct {
 			info cache.ResolvedKeyInfo
@@ -61,102 +105,21 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 			byUser[info.Username] = append(byUser[info.Username], userKeys{info: info, raw: key})
 		}
 
-		// Only refresh L1 for users with a valid -clientconfig secret
-		// (i.e., users who logged in while their certificate is still valid).
-		// authn removes the secret when the cert expires, so the active-users
-		// set tracks exactly who should get eager refresh.
-		// Users without a secret are skipped — their L1 expires via TTL and
-		// gets re-resolved on next login.
-		//
-		// FAIL-OPEN: if we cannot read the active-users set (Redis error,
-		// context cancelled, empty set), refresh ALL users rather than
-		// skipping everyone. Silent skip caused the S7 regression in v0.25.131.
-		activeUsers, err := c.SMembers(ctx, cache.ActiveUsersKey)
-		if err != nil || len(activeUsers) == 0 {
-			if err != nil {
-				log.Warn("L1 refresh: cannot read active-users set, refreshing all users",
-					slog.Any("err", err))
-			}
-			// Fall through — byUser is unchanged, all users refreshed
-		} else {
-			activeSet := make(map[string]bool, len(activeUsers))
-			for _, u := range activeUsers {
-				activeSet[u] = true
-			}
-			skippedUsers := 0
-			for username := range byUser {
-				if !activeSet[username] {
-					delete(byUser, username)
-					skippedUsers++
-				}
-			}
-			if skippedUsers > 0 {
-				log.Info("L1 refresh: skipped inactive users",
-					slog.Int("skipped", skippedUsers),
-					slog.Int("active", len(byUser)))
-			}
-		}
-
-		// Classify users by activity and build a priority-ordered refresh list.
-		// Hot users first, warm second, cold last. ALL users get refreshed —
-		// just in priority order so active users see fresh data sooner.
-		now := time.Now().Unix()
-		type classifiedUser struct {
-			username string
-			class    string
-		}
-		var hotUsers, warmUsers, coldUsers []classifiedUser
-		for username := range byUser {
-			raw, _, _ := c.GetRaw(ctx, "snowplow:last-seen:"+username)
-			if raw == nil {
-				coldUsers = append(coldUsers, classifiedUser{username, "cold"})
-				continue
-			}
-			lastSeen, _ := strconv.ParseInt(string(raw), 10, 64)
-			age := now - lastSeen
-			switch {
-			case age < 300: // 5 min
-				hotUsers = append(hotUsers, classifiedUser{username, "hot"})
-			case age < 3600: // 60 min
-				warmUsers = append(warmUsers, classifiedUser{username, "warm"})
-			default:
-				coldUsers = append(coldUsers, classifiedUser{username, "cold"})
-			}
-		}
-
-		// Priority-ordered: hot first, warm second, cold last
-		orderedUsers := make([]classifiedUser, 0, len(hotUsers)+len(warmUsers)+len(coldUsers))
-		orderedUsers = append(orderedUsers, hotUsers...)
-		orderedUsers = append(orderedUsers, warmUsers...)
-		orderedUsers = append(orderedUsers, coldUsers...)
-
-		log.Info("L1 refresh: user activity classes",
-			slog.Int("hot", len(hotUsers)),
-			slog.Int("warm", len(warmUsers)),
-			slog.Int("cold", len(coldUsers)))
-
 		// Resolve each key directly. No sub-goroutines, no semaphores.
-		// The outer goroutine (from triggerL1Refresh) provides concurrency.
-		// The Go scheduler limits actual CPU parallelism to GOMAXPROCS.
+		// User credentials are cached — no K8s API call per goroutine.
 		var totalRefreshed int64
 		var allCascade []string
 
-		for _, cu := range orderedUsers {
-			username := cu.username
-			keys := byUser[username]
-
-			ep, err := endpoints.FromSecret(ctx, rc, username+clientConfigSecretSuffix, authnNS)
+		for username, keys := range byUser {
+			uc, err := getUserContext(ctx, username)
 			if err != nil {
-				log.Warn("L1 refresh: cannot load user endpoint",
+				log.Warn("L1 refresh: cannot load user context",
 					slog.String("user", username), slog.Any("err", err))
 				continue
 			}
-			groups := extractGroupsFromClientCert(ep.ClientCertificateData)
-			user := jwtutil.UserInfo{Username: username, Groups: groups}
-			accessToken := mintJWT(user, signKey)
 
 			for _, k := range keys {
-				ok, cascade := refreshSingleL1(ctx, c, user, ep, accessToken, k.info, k.raw, authnNS)
+				ok, cascade := refreshSingleL1(ctx, c, uc.user, uc.endpoint, uc.accessToken, k.info, k.raw, authnNS)
 				if ok {
 					totalRefreshed++
 					allCascade = append(allCascade, cascade...)

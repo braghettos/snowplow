@@ -211,9 +211,10 @@ func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 		return
 	}
 
-	// Walk dependency tree (e.g., RESTAction → widget → piechart).
-	rw.expandDependents(ctx, affected, 5)
-
+	// Only pass DIRECT deps. The cascade mechanism inside fn resolves
+	// transitive deps in level order: C (RESTAction) first, then B
+	// (widget that reads C's fresh L1 output). expandDependents was
+	// flattening the tree, breaking this ordering.
 	keys := make([]string, 0, len(affected))
 	for k := range affected {
 		keys = append(keys, k)
