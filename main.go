@@ -39,6 +39,12 @@ const (
 
 var (
 	build string
+
+	// globalInformerReader is set by startBackgroundServices after the
+	// ResourceWatcher is created. The HTTP middleware injects it into
+	// every request context so resolve.go can read from the informer
+	// store instead of L3 Redis.
+	globalInformerReader cache.InformerReader
 )
 
 func init() {
@@ -187,12 +193,19 @@ func main() {
 		slog.SetDefault(log)
 	}
 
-	// Middleware that injects the cache into every request context.
+	// Middleware that injects the cache and informer reader into every
+	// request context. globalInformerReader is set by startBackgroundServices
+	// after the ResourceWatcher is created.
 	withCache := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := r.Context()
 			if redisCache != nil {
-				r = r.WithContext(cache.WithCache(r.Context(), redisCache))
+				ctx = cache.WithCache(ctx, redisCache)
 			}
+			if globalInformerReader != nil {
+				ctx = cache.WithInformerReader(ctx, globalInformerReader)
+			}
+			r = r.WithContext(ctx)
 			next.ServeHTTP(w, r)
 		})
 	}
@@ -330,6 +343,7 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 	}
 
 	c.SetGVRNotifier(resourceWatcher.AddGVR)
+	globalInformerReader = resourceWatcher // InformerReader interface — reads from informer store
 	resourceWatcher.SetL1Refresher(dispatchers.MakeL1Refresher(c, rc, authnNS, signKey))
 
 	// Load warmup config early to get autoDiscoverGroups for CRD informer filtering.
@@ -406,6 +420,11 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 
 	// Phase 4b: Pre-populate RBAC cache for all users so L3→L2 promotions
 	// and the watcher's cache-only RBAC checks work from the start.
+	// Inject informer reader into warmup contexts so resolve.go can
+	// read from informer store instead of L3 Redis.
+	if globalInformerReader != nil {
+		warmupCtx = cache.WithInformerReader(warmupCtx, globalInformerReader)
+	}
 	dispatchers.WarmRBACForAllUsers(warmupCtx, c, rc, authnNS, signKey)
 
 	// Phase 5: Pre-warm L1 (resolved widget + RESTAction output) for every
@@ -417,6 +436,9 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 		go func() {
 			l1Ctx, l1Cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer l1Cancel()
+			if globalInformerReader != nil {
+				l1Ctx = cache.WithInformerReader(l1Ctx, globalInformerReader)
+			}
 			dispatchers.WarmL1ForAllUsers(l1Ctx, c, rc, authnNS, signKey, widgetGVRs, restActions)
 		}()
 	}

@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,6 +20,7 @@ import (
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
@@ -198,23 +200,38 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					_ = c.SAddGVR(ctx, pathGVR)
 				}
 
-				// ── L3 cache intercept for K8s API GET calls ──────────────
-				// If this is a read (GET) and we have a cache, try to serve
-				// from L3 instead of hitting the K8s API. The informer keeps
-				// L3 up-to-date via per-item index SETs + SetForGVR.
+				// ── Cache intercept for K8s API GET calls ─────────────────
+				// Try informer store first (in-memory, zero I/O), then
+				// fall back to L3 Redis, then to live K8s API.
 				if c != nil && verb == http.MethodGet {
 					var raw []byte
 					var hit bool
 
-					if pathName == "" {
-						// LIST operation: per-item index assembly.
-						raw, hit, _ = c.AssembleListFromIndex(ctx, pathGVR, pathNS)
-					} else {
-						// GET operation: direct key lookup.
-						cacheKey := cache.GetKey(pathGVR, pathNS, pathName)
-						raw, hit = prefetched[cacheKey]
-						if !hit {
-							raw, hit, _ = c.GetRaw(ctx, cacheKey)
+					// Informer-first path: read from in-memory store.
+					if ir := cache.InformerReaderFromContext(ctx); ir != nil {
+						if pathName == "" {
+							if items, ok := ir.ListObjects(pathGVR, pathNS); ok {
+								raw, _ = marshalUnstructuredList(items)
+								hit = len(raw) > 0
+							}
+						} else {
+							if obj, ok := ir.GetObject(pathGVR, pathNS, pathName); ok {
+								raw, _ = json.Marshal(obj)
+								hit = len(raw) > 0
+							}
+						}
+					}
+
+					// L3 fallback (informer not available or miss).
+					if !hit {
+						if pathName == "" {
+							raw, hit, _ = c.AssembleListFromIndex(ctx, pathGVR, pathNS)
+						} else {
+							cacheKey := cache.GetKey(pathGVR, pathNS, pathName)
+							raw, hit = prefetched[cacheKey]
+							if !hit {
+								raw, hit, _ = c.GetRaw(ctx, cacheKey)
+							}
 						}
 					}
 
@@ -290,21 +307,39 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				}
 			}
 
-			// ── L3 direct read ──────────────────────────────────────────────
+			// ── Cache direct read (informer-first, L3 fallback) ────────────
 			if c != nil && verb == http.MethodGet {
 				pathGVR, pathNS, pathName := cache.ParseK8sAPIPath(call.Path)
 				if pathGVR.Resource != "" {
 					var l3Raw []byte
 					var l3Hit bool
-					if pathName != "" {
-						l3Key := cache.GetKey(pathGVR, pathNS, pathName)
-						l3Raw, l3Hit = prefetched[l3Key]
-						if !l3Hit {
-							l3Raw, l3Hit, _ = c.GetRaw(ctx, l3Key)
+
+					// Informer-first path.
+					if ir := cache.InformerReaderFromContext(ctx); ir != nil {
+						if pathName != "" {
+							if obj, ok := ir.GetObject(pathGVR, pathNS, pathName); ok {
+								l3Raw, _ = json.Marshal(obj)
+								l3Hit = len(l3Raw) > 0
+							}
+						} else {
+							if items, ok := ir.ListObjects(pathGVR, pathNS); ok {
+								l3Raw, _ = marshalUnstructuredList(items)
+								l3Hit = len(l3Raw) > 0
+							}
 						}
-					} else {
-						// LIST: per-item index assembly.
-						l3Raw, l3Hit, _ = c.AssembleListFromIndex(ctx, pathGVR, pathNS)
+					}
+
+					// L3 fallback.
+					if !l3Hit {
+						if pathName != "" {
+							l3Key := cache.GetKey(pathGVR, pathNS, pathName)
+							l3Raw, l3Hit = prefetched[l3Key]
+							if !l3Hit {
+								l3Raw, l3Hit, _ = c.GetRaw(ctx, l3Key)
+							}
+						} else {
+							l3Raw, l3Hit, _ = c.AssembleListFromIndex(ctx, pathGVR, pathNS)
+						}
 					}
 					if l3Hit && !cache.IsNotFoundRaw(l3Raw) {
 						rbacVerb := "list"
@@ -507,4 +542,23 @@ func removeManagedFields(data any) {
 	default:
 		return
 	}
+}
+
+// marshalUnstructuredList serializes a slice of Unstructured objects into a
+// K8s-style JSON list: {"items": [...], "metadata": {}}. This produces the
+// same JSON shape that the K8s API server returns for LIST calls, so the
+// existing response handlers (jsonHandler) can consume it transparently.
+func marshalUnstructuredList(items []*unstructured.Unstructured) ([]byte, error) {
+	list := &unstructured.UnstructuredList{
+		Object: map[string]interface{}{
+			"apiVersion": "v1",
+			"kind":       "List",
+			"metadata":   map[string]interface{}{},
+		},
+	}
+	list.Items = make([]unstructured.Unstructured, len(items))
+	for i, item := range items {
+		list.Items[i] = *item
+	}
+	return json.Marshal(list)
 }

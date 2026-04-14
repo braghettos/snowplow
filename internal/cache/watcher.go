@@ -161,7 +161,7 @@ func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error
 }
 
 func (rw *ResourceWatcher) Start(ctx context.Context) {
-	rw.appCtx = ctx
+	rw.appCtx = WithInformerReader(ctx, rw)
 	// Register all known informers from Redis BEFORE starting the factory.
 	// This ensures event handlers are attached before the initial LIST/WATCH,
 	// so existing objects trigger ADD callbacks during the first sync.
@@ -471,6 +471,58 @@ func (rw *ResourceWatcher) WaitForSync(ctx context.Context) bool {
 		}
 	}
 	return true
+}
+
+// GetObject returns a single object from the informer's in-memory store.
+// Returns (nil, false) if the GVR has no registered informer or the object
+// does not exist. Zero I/O — reads from the informer's synced cache.
+func (rw *ResourceWatcher) GetObject(gvr schema.GroupVersionResource, ns, name string) (*unstructured.Unstructured, bool) {
+	key := ns + "/" + name
+	if ns == "" {
+		key = name
+	}
+	item, exists, err := rw.factory.ForResource(gvr).Informer().GetStore().GetByKey(key)
+	if err != nil || !exists {
+		return nil, false
+	}
+	uns, ok := item.(*unstructured.Unstructured)
+	if !ok {
+		return nil, false
+	}
+	return uns, true
+}
+
+// ListObjects returns all objects for a GVR from the informer's in-memory
+// store, optionally scoped to a namespace (ns="" means cluster-wide).
+// Returns (nil, false) if the GVR has no registered informer.
+func (rw *ResourceWatcher) ListObjects(gvr schema.GroupVersionResource, ns string) ([]*unstructured.Unstructured, bool) {
+	store := rw.factory.ForResource(gvr).Informer().GetStore()
+	items := store.List()
+	if len(items) == 0 {
+		// Distinguish "informer exists but empty" from "no informer".
+		// If the factory has no informer for this GVR, List() returns nil.
+		// Return empty slice (true) for registered-but-empty, nil (false)
+		// for unregistered. Check watched map.
+		rw.mu.Lock()
+		_, registered := rw.watched[GVRToKey(gvr)]
+		rw.mu.Unlock()
+		if !registered {
+			return nil, false
+		}
+		return []*unstructured.Unstructured{}, true
+	}
+	result := make([]*unstructured.Unstructured, 0, len(items))
+	for _, item := range items {
+		uns, ok := item.(*unstructured.Unstructured)
+		if !ok {
+			continue
+		}
+		if ns != "" && uns.GetNamespace() != ns {
+			continue
+		}
+		result = append(result, uns)
+	}
+	return result, true
 }
 
 // StartExpiryRefresh subscribes to Redis expired-key events and proactively
