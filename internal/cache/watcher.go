@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -65,6 +66,10 @@ type ResourceWatcher struct {
 	dynamicGVRs   map[string]schema.GroupVersionResource
 	dynamicGVRsMu sync.Mutex
 
+	// refreshStates tracks RUNNING/STALE per dep key set. Events producing
+	// the same dep keys coalesce into one goroutine. Different dep key sets
+	// run in parallel.
+	refreshStates sync.Map // map[string]*refreshState
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -174,9 +179,19 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 	}
 }
 
+// refreshState tracks the RUNNING/STALE state for a set of dep keys.
+// Events producing the same dep keys are coalesced: if a refresh is
+// running, the event marks it stale. When the goroutine finishes, it
+// re-runs if stale (reading the latest informer state).
+// Events with DIFFERENT dep keys run in parallel (separate goroutines).
+type refreshState struct {
+	stale atomic.Bool
+}
+
 // triggerL1Refresh collects affected L1 keys for the event's GVR and
-// launches a background refresh if none is running. Event-driven: no
-// polling, no debounce. Each event triggers its own refresh goroutine.
+// launches a refresh goroutine. Events producing the same dep keys are
+// coalesced via RUNNING/STALE: only one goroutine runs per dep key set,
+// re-running when marked stale. Different dep key sets run in parallel.
 func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 	fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
 	if !ok || fn == nil {
@@ -211,16 +226,29 @@ func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 		return
 	}
 
-	// Only pass DIRECT deps. The cascade mechanism inside fn resolves
-	// transitive deps in level order: C (RESTAction) first, then B
-	// (widget that reads C's fresh L1 output). expandDependents was
-	// flattening the tree, breaking this ordering.
+	// Build a stable identity for this dep key set. Events for the same
+	// GVR produce the same dep keys → same identity → coalesced.
 	keys := make([]string, 0, len(affected))
 	for k := range affected {
 		keys = append(keys, k)
 	}
+	sort.Strings(keys)
+	identity := strings.Join(keys, "\n")
 
+	// Check if a goroutine is already running for this dep key set.
+	// If yes, mark it stale so it re-runs after completing.
+	// If no, create a new state and launch a goroutine.
+	val, loaded := rw.refreshStates.LoadOrStore(identity, &refreshState{})
+	state := val.(*refreshState)
+	if loaded {
+		// Goroutine already running for these keys. Mark stale.
+		state.stale.Store(true)
+		return
+	}
+
+	// First event for this dep key set. Launch goroutine.
 	go func() {
+		defer rw.refreshStates.Delete(identity)
 		defer func() {
 			if r := recover(); r != nil {
 				buf := make([]byte, 4096)
@@ -230,9 +258,19 @@ func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 					slog.String("stack", string(buf[:n])))
 			}
 		}()
-		refreshCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-		defer cancel()
-		fn(refreshCtx, evt.gvr, keys)
+
+		for {
+			state.stale.Store(false)
+			refreshCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+			fn(refreshCtx, evt.gvr, keys)
+			cancel()
+
+			// If no new events arrived during the resolve, we're done.
+			// If stale, re-run with the latest informer state.
+			if !state.stale.Load() {
+				return
+			}
+		}
 	}()
 }
 
