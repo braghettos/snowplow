@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,7 +33,10 @@ var watcherTracer = otel.Tracer("snowplow/watcher")
 // re-resolves — incremental patching was removed because JQ aggregation
 // filters (e.g., piechart counts) require the full pipeline.
 // It must run synchronously; the caller invokes it in a goroutine.
-type L1RefreshFunc func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string)
+// L1RefreshFunc resolves the given L1 keys and returns cascade keys
+// (transitive dependencies that also need refresh, e.g., a widget
+// that depends on a RESTAction). The caller handles cascade ordering.
+type L1RefreshFunc func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string) []string
 
 // expiryRefreshWorkers limits the number of concurrent goroutines handling
 // Redis key expiry refresh to prevent unbounded goroutine creation under
@@ -66,10 +68,10 @@ type ResourceWatcher struct {
 	dynamicGVRs   map[string]schema.GroupVersionResource
 	dynamicGVRsMu sync.Mutex
 
-	// refreshStates tracks RUNNING/STALE per dep key set. Events producing
-	// the same dep keys coalesce into one goroutine. Different dep key sets
-	// run in parallel.
-	refreshStates sync.Map // map[string]*refreshState
+	// dirtyKeys tracks per-L1-key refresh state. At most one goroutine
+	// runs per L1 key. Events marking the same key dirty while a resolve
+	// is running cause a re-run with the latest informer state.
+	dirtyKeys sync.Map // map[string]*dirtyState
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -179,19 +181,16 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 	}
 }
 
-// refreshState tracks the RUNNING/STALE state for a set of dep keys.
-// Events producing the same dep keys are coalesced: if a refresh is
-// running, the event marks it stale. When the goroutine finishes, it
-// re-runs if stale (reading the latest informer state).
-// Events with DIFFERENT dep keys run in parallel (separate goroutines).
-type refreshState struct {
-	stale atomic.Bool
+// dirtyState tracks whether an L1 key needs (re-)resolve.
+type dirtyState struct {
+	pending atomic.Bool
 }
 
-// triggerL1Refresh collects affected L1 keys for the event's GVR and
-// launches a refresh goroutine. Events producing the same dep keys are
-// coalesced via RUNNING/STALE: only one goroutine runs per dep key set,
-// re-running when marked stale. Different dep key sets run in parallel.
+// triggerL1Refresh collects affected L1 keys and ensures each one has
+// a refresh goroutine running. Per-L1-key coalescing: at most one
+// goroutine per L1 key. If a resolve is running and a new event marks
+// the key dirty, the goroutine re-runs with the latest informer state.
+// Different L1 keys run in parallel.
 func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 	fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
 	if !ok || fn == nil {
@@ -226,29 +225,28 @@ func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 		return
 	}
 
-	// Build a stable identity for this dep key set. Events for the same
-	// GVR produce the same dep keys → same identity → coalesced.
-	keys := make([]string, 0, len(affected))
-	for k := range affected {
-		keys = append(keys, k)
+	// For each affected L1 key, ensure a refresh goroutine is running.
+	for l1Key := range affected {
+		rw.markDirty(ctx, evt.gvr, l1Key, fn)
 	}
-	sort.Strings(keys)
-	identity := strings.Join(keys, "\n")
+}
 
-	// Check if a goroutine is already running for this dep key set.
-	// If yes, mark it stale so it re-runs after completing.
-	// If no, create a new state and launch a goroutine.
-	val, loaded := rw.refreshStates.LoadOrStore(identity, &refreshState{})
-	state := val.(*refreshState)
+// markDirty marks an L1 key as needing refresh. If no goroutine is
+// running for this key, launches one. If one is already running, sets
+// pending=true so it re-runs after the current resolve completes.
+func (rw *ResourceWatcher) markDirty(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Key string, fn L1RefreshFunc) {
+	val, loaded := rw.dirtyKeys.LoadOrStore(l1Key, &dirtyState{})
+	state := val.(*dirtyState)
+	state.pending.Store(true)
+
 	if loaded {
-		// Goroutine already running for these keys. Mark stale.
-		state.stale.Store(true)
+		// Goroutine already running for this key. It will see pending=true.
 		return
 	}
 
-	// First event for this dep key set. Launch goroutine.
+	// Launch resolve loop for this L1 key.
 	go func() {
-		defer rw.refreshStates.Delete(identity)
+		defer rw.dirtyKeys.Delete(l1Key)
 		defer func() {
 			if r := recover(); r != nil {
 				buf := make([]byte, 4096)
@@ -259,16 +257,17 @@ func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 			}
 		}()
 
-		for {
-			state.stale.Store(false)
+		for state.pending.Swap(false) {
 			refreshCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-			fn(refreshCtx, evt.gvr, keys)
+			cascade := fn(refreshCtx, triggerGVR, []string{l1Key})
 			cancel()
 
-			// If no new events arrived during the resolve, we're done.
-			// If stale, re-run with the latest informer state.
-			if !state.stale.Load() {
-				return
+			// Cascade: mark dependent L1 keys dirty (e.g., piechart
+			// depends on compositions-list). This ensures correct
+			// ordering: C is resolved and written to L1 before B
+			// reads it.
+			for _, ck := range cascade {
+				rw.markDirty(ctx, triggerGVR, ck, fn)
 			}
 		}
 	}()

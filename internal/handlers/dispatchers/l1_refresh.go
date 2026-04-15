@@ -80,7 +80,7 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 		return uc, nil
 	}
 
-	return func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string) {
+	return func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string) []string {
 		ctx, span := l1RefreshTracer.Start(ctx, "l1.refresh",
 			trace.WithAttributes(
 				attribute.String("trigger", triggerGVR.String()),
@@ -127,44 +127,8 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 			}
 		}
 
-		// Cascading refresh: resolve L1 keys that depend on refreshed
-		// RESTActions (e.g., compositions-list → piechart → table).
-		refreshed := make(map[string]bool, len(l1Keys))
-		for _, key := range l1Keys {
-			refreshed[key] = true
-		}
-		const maxCascadeDepth = 5
-		pending := allCascade
-		for depth := 0; depth < maxCascadeDepth && len(pending) > 0; depth++ {
-			var nextCascade []string
-			for _, ck := range pending {
-				if refreshed[ck] {
-					continue
-				}
-				refreshed[ck] = true
-				ci, cok := cache.ParseResolvedKey(ck)
-				if !cok {
-					continue
-				}
-				if _, ok := byUser[ci.Username]; !ok {
-					continue
-				}
-				ep, err := endpoints.FromSecret(ctx, rc, ci.Username+clientConfigSecretSuffix, authnNS)
-				if err != nil {
-					continue
-				}
-				groups := extractGroupsFromClientCert(ep.ClientCertificateData)
-				user := jwtutil.UserInfo{Username: ci.Username, Groups: groups}
-				accessToken := mintJWT(user, signKey)
-
-				ok, cascade := refreshSingleL1(ctx, c, user, ep, accessToken, ci, ck, authnNS)
-				if ok {
-					totalRefreshed++
-					nextCascade = append(nextCascade, cascade...)
-				}
-			}
-			pending = nextCascade
-		}
+		// Cascade keys are returned to the caller (markDirty in watcher.go)
+		// which handles ordering: C is resolved before B reads C's fresh L1.
 
 		// Record OTel metrics
 		refreshDuration := time.Since(refreshStart)
@@ -192,6 +156,8 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 		// Use a fresh background context so the sentinel is always written,
 		// even if the refresh context has expired.
 		cache.MarkL1Ready(context.Background(), c)
+
+		return allCascade
 	}
 }
 
