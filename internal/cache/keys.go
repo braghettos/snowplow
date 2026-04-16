@@ -128,6 +128,12 @@ func ResolvedKey(username string, gvr schema.GroupVersionResource, namespace, na
 	return base
 }
 
+// ResolvedKeyBase returns the base key without pagination suffix.
+// Used to group paginated variants for sequential resolution.
+func ResolvedKeyBase(username string, gvr schema.GroupVersionResource, namespace, name string) string {
+	return fmt.Sprintf("snowplow:resolved:%s:%s:%s:%s", username, GVRToKey(gvr), namespace, name)
+}
+
 // L1GVRKey returns the Redis SET key that maps a GVR to all L1 (resolved)
 // cache entries that depend on it. Used as a fallback for targeted invalidation
 // when per-resource dependency indexes are not yet populated.

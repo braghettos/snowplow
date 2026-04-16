@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -186,6 +187,12 @@ type dirtyState struct {
 	pending atomic.Bool
 }
 
+// pageKey identifies a paginated L1 key with its page number for sorting.
+type pageKey struct {
+	key  string
+	page int
+}
+
 // triggerL1Refresh collects affected L1 keys and ensures each one has
 // a refresh goroutine running. Per-L1-key coalescing: at most one
 // goroutine per L1 key. If a resolve is running and a new event marks
@@ -218,28 +225,58 @@ func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 		return
 	}
 
-	// For each affected L1 key, ensure a refresh goroutine is running.
+	// Group paginated keys by base key (user:gvr:ns:name without page suffix).
+	// Paginated variants of the same resource resolve the same underlying data
+	// — only the page parameter changes the output. Resolving them sequentially
+	// (p1 → p2 → ... → pN) avoids N concurrent goroutines each doing a full
+	// O(N) resolve of the same 49K items.
+	groups := make(map[string][]pageKey) // baseKey → sorted page keys
 	for l1Key := range affected {
-		rw.markDirty(ctx, evt.gvr, l1Key, fn)
+		info, ok := ParseResolvedKey(l1Key)
+		if !ok {
+			// Unparseable key — treat as its own group.
+			groups[l1Key] = append(groups[l1Key], pageKey{key: l1Key, page: 0})
+			continue
+		}
+		baseKey := ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
+		groups[baseKey] = append(groups[baseKey], pageKey{key: l1Key, page: info.Page})
+	}
+
+	// For each base key group, launch one goroutine that resolves all pages
+	// sequentially. Different base keys run in parallel.
+	for _, pages := range groups {
+		// Sort by page number so earlier pages are resolved first.
+		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
+		// Mark the first page dirty — the goroutine will resolve it,
+		// then resolve subsequent pages inline.
+		rw.markDirtySequential(ctx, evt.gvr, pages, fn)
 	}
 }
 
-// markDirty marks an L1 key as needing refresh. If no goroutine is
-// running for this key, launches one. If one is already running, sets
-// pending=true so it re-runs after the current resolve completes.
-func (rw *ResourceWatcher) markDirty(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Key string, fn L1RefreshFunc) {
-	val, loaded := rw.dirtyKeys.LoadOrStore(l1Key, &dirtyState{})
+// markDirtySequential resolves a group of paginated L1 keys sequentially
+// in a single goroutine. Uses the first key's base as the dirty key
+// identity so the entire group is coalesced.
+func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR schema.GroupVersionResource, pages []pageKey, fn L1RefreshFunc) {
+	if len(pages) == 0 {
+		return
+	}
+	// Use the base key (first page's key stripped of pagination) as identity.
+	// All pagination variants coalesce into one goroutine.
+	identity := pages[0].key
+	if info, ok := ParseResolvedKey(identity); ok {
+		identity = ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
+	}
+
+	val, loaded := rw.dirtyKeys.LoadOrStore(identity, &dirtyState{})
 	state := val.(*dirtyState)
 	state.pending.Store(true)
 
 	if loaded {
-		// Goroutine already running for this key. It will see pending=true.
 		return
 	}
 
-	// Launch resolve loop for this L1 key.
 	go func() {
-		defer rw.dirtyKeys.Delete(l1Key)
+		defer rw.dirtyKeys.Delete(identity)
 		defer func() {
 			if r := recover(); r != nil {
 				buf := make([]byte, 4096)
@@ -251,16 +288,35 @@ func (rw *ResourceWatcher) markDirty(ctx context.Context, triggerGVR schema.Grou
 		}()
 
 		for state.pending.Swap(false) {
-			refreshCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-			cascade := fn(refreshCtx, triggerGVR, []string{l1Key})
-			cancel()
+			// Resolve each page sequentially: p1 → p2 → ... → pN.
+			// The underlying data is the same — only the page parameter
+			// changes the JQ output. Sequential avoids N concurrent
+			// goroutines each doing O(items) work.
+			var allCascade []string
+			for _, pg := range pages {
+				refreshCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+				cascade := fn(refreshCtx, triggerGVR, []string{pg.key})
+				cancel()
+				allCascade = append(allCascade, cascade...)
+			}
 
-			// Cascade: mark dependent L1 keys dirty (e.g., piechart
-			// depends on compositions-list). This ensures correct
-			// ordering: C is resolved and written to L1 before B
-			// reads it.
-			for _, ck := range cascade {
-				rw.markDirty(ctx, triggerGVR, ck, fn)
+			// Cascade: group dependent keys the same way and resolve
+			// sequentially within each group.
+			if len(allCascade) > 0 {
+				cascadeGroups := make(map[string][]pageKey)
+				for _, ck := range allCascade {
+					info, ok := ParseResolvedKey(ck)
+					if !ok {
+						cascadeGroups[ck] = append(cascadeGroups[ck], pageKey{key: ck, page: 0})
+						continue
+					}
+					baseKey := ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
+					cascadeGroups[baseKey] = append(cascadeGroups[baseKey], pageKey{key: ck, page: info.Page})
+				}
+				for _, cPages := range cascadeGroups {
+					sort.Slice(cPages, func(i, j int) bool { return cPages[i].page < cPages[j].page })
+					rw.markDirtySequential(ctx, triggerGVR, cPages, fn)
+				}
 			}
 		}
 	}()
