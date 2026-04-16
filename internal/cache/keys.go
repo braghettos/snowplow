@@ -165,9 +165,14 @@ func L3GenKey(gvrKey, ns string) string {
 	return "snowplow:l3gen:" + gvrKey + ":" + ns
 }
 
-// RegisterL1Dependencies registers the L1 resolved key in both the GVR-level
-// and per-resource reverse indexes based on dependencies captured by the tracker.
-// All SADD + EXPIRE commands are batched into a single Redis pipeline round-trip.
+// RegisterL1Dependencies registers the L1 resolved key in reverse indexes
+// based on dependencies captured by the tracker. Writes:
+// - Per-resource deps: L1ResourceDepKey(gvr, ns, name) for each specific resource
+// - Cluster-wide deps: L1ResourceDepKey(gvr, "", "") for each GVR accessed
+//
+// The cluster-wide dep ensures that when ANY resource of a GVR changes in
+// ANY namespace, the L1 key is found by triggerL1Refresh. This is critical
+// for RESTActions like compositions-list that iterate all namespaces.
 func RegisterL1Dependencies(ctx context.Context, c *RedisCache, tracker *DependencyTracker, l1Key string) {
 	if c == nil || tracker == nil {
 		return
@@ -178,23 +183,34 @@ func RegisterL1Dependencies(ctx context.Context, c *RedisCache, tracker *Depende
 		return
 	}
 
-	// Collect all (setKey, member, ttl) tuples, then flush in one pipeline.
-	type entry struct {
-		key string
-	}
-	entries := make([]entry, 0, len(refs))
-	for _, ref := range refs {
-		entries = append(entries, entry{key: L1ResourceDepKey(ref.GVRKey, ref.NS, ref.Name)})
-	}
-
+	seen := make(map[string]bool)
 	pipe := c.Pipeline(ctx)
 	if pipe == nil {
 		return
 	}
-	for _, e := range entries {
-		pipe.SAdd(ctx, e.key, l1Key)
-		pipe.Expire(ctx, e.key, ReverseIndexTTL)
+
+	// Per-resource deps (ns + name specific).
+	for _, ref := range refs {
+		key := L1ResourceDepKey(ref.GVRKey, ref.NS, ref.Name)
+		if !seen[key] {
+			seen[key] = true
+			pipe.SAdd(ctx, key, l1Key)
+			pipe.Expire(ctx, key, ReverseIndexTTL)
+		}
 	}
+
+	// Cluster-wide deps: one per GVR (ns="", name="").
+	// Ensures triggerL1Refresh finds this L1 key when ANY resource
+	// of this GVR changes, regardless of namespace.
+	for _, gvrKey := range gvrKeys {
+		key := L1ResourceDepKey(gvrKey, "", "")
+		if !seen[key] {
+			seen[key] = true
+			pipe.SAdd(ctx, key, l1Key)
+			pipe.Expire(ctx, key, ReverseIndexTTL)
+		}
+	}
+
 	_, _ = pipe.Exec(ctx)
 }
 
