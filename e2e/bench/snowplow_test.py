@@ -742,7 +742,15 @@ def delete_all_compositions():
 
 
 def delete_all_compositiondefinitions():
-    """Delete all CompositionDefinitions, patching finalizers if stuck."""
+    """Delete CompositionDefinitions and let the core provider clean up CRD + controller.
+
+    Natural deletion order:
+    1. Compositions are already deleted by delete_all_compositions (called first)
+    2. Delete CompositionDefinition → core provider reconciles → deletes CRD + controller
+    3. Wait for CRD to disappear (confirms clean state)
+
+    Do NOT force-delete the CRD — let the platform handle it.
+    """
     rc, out, _ = kubectl("get", "compositiondefinitions.core.krateo.io", "--all-namespaces",
                          "--no-headers", "-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
     if rc != 0 or not out.strip():
@@ -753,39 +761,34 @@ def delete_all_compositiondefinitions():
     if not items:
         log("No CompositionDefinitions to delete")
         return
-    # Patch finalizers first so deletion isn't blocked
-    for ns, name in items:
-        kubectl("patch", "compositiondefinitions.core.krateo.io", name, "-n", ns,
-                "--type=json", '-p=[{"op":"remove","path":"/metadata/finalizers"}]')
     for ns, name in items:
         kubectl("delete", "compositiondefinitions.core.krateo.io", name, "-n", ns,
-                "--ignore-not-found", "--wait=false", "--force", "--grace-period=0")
+                "--ignore-not-found", "--wait=false")
     log(f"Triggered deletion of {len(items)} CompositionDefinitions")
 
-    deadline = time.time() + 120
+    # Wait for CDs to be gone
+    deadline = time.time() + 300
     while time.time() < deadline:
         rc, out, _ = kubectl("get", "compositiondefinitions.core.krateo.io", "--all-namespaces",
                              "--no-headers")
         remaining = len([l for l in (out or "").strip().split("\n") if l.strip()])
         if remaining == 0:
             log("All CompositionDefinitions deleted")
-            return
+            break
         log(f"  {remaining} CompositionDefinitions remaining ...")
-        # Re-patch finalizers on stuck ones
-        for line in (out or "").strip().split("\n"):
-            parts = line.split(None, 1)
-            if len(parts) >= 2:
-                kubectl("patch", "compositiondefinitions.core.krateo.io", parts[1].strip(),
-                        "-n", parts[0].strip(), "--type=json",
-                        '-p=[{"op":"remove","path":"/metadata/finalizers"}]')
         time.sleep(10)
-    log("WARNING: CompositionDefinitions still remaining after timeout")
+    else:
+        log("WARNING: CompositionDefinitions still remaining after timeout")
 
-    # Also delete the CRD to cascade-delete any orphaned compositions
-    kubectl("delete", "crd", f"{COMP_RES}.{COMP_GVR}", "--wait=false", "--ignore-not-found")
-    kubectl("patch", "crd", f"{COMP_RES}.{COMP_GVR}", "--type=json",
-            '-p=[{"op":"remove","path":"/metadata/finalizers"}]')
-    time.sleep(10)
+    # Wait for CRD to disappear (core provider deletes it after CD is gone)
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        rc, _, _ = kubectl("get", "crd", f"{COMP_RES}.{COMP_GVR}", "--no-headers")
+        if rc != 0:
+            log("CRD deleted by core provider")
+            return
+        time.sleep(5)
+    log("WARNING: CRD still exists after CD deletion — may need manual cleanup")
 
 
 def delete_bench_namespaces():
@@ -855,16 +858,6 @@ spec:
     url: https://marketplace.krateo.io
     version: 1.2.2
 """
-    # Wait for any old CRD to fully disappear first
-    for _ in range(30):
-        rc, out, _ = kubectl("get", "crd", f"{COMP_RES}.{COMP_GVR}",
-                             "-o", "jsonpath={.metadata.deletionTimestamp}")
-        if rc != 0:
-            break  # CRD doesn't exist — good
-        if not out.strip():
-            break  # CRD exists and is NOT being deleted — good
-        time.sleep(5)  # CRD is being deleted — wait
-
     kubectl("apply", "--server-side", "-f", "-", input_data=yaml_str)
     log(f"Applied CompositionDefinition in {ns}")
     deadline = time.time() + 300
@@ -1194,14 +1187,18 @@ def clean_environment():
         log("WARNING: skipping CompositionDefinition deletion — compositions still exist")
     delete_bench_namespaces()
     delete_bench_rbac()
-    # Restart snowplow pod to flush Redis (sidecar). This ensures all L3/L1
-    # cache keys from deleted resources are gone. Without this, warmup reads
-    # stale L3 list cache and populates L1 with wrong data.
+    # Deploy expected image tag (if set) and restart pod to flush Redis.
+    tag = os.environ.get("EXPECTED_IMAGE_TAG")
+    if tag:
+        log(f"Deploying snowplow image tag {tag} ...")
+        kubectl("set", "image", f"deployment/snowplow", f"snowplow=ghcr.io/braghettos/snowplow:{tag}",
+                "-n", "krateo-system")
+    # Restart to flush Redis sidecar and pick up new image.
     log("Restarting snowplow pod to flush Redis cache ...")
     rc, _, err = kubectl("rollout", "restart", "deployment/snowplow", "-n", "krateo-system")
     if rc == 0:
         kubectl("rollout", "status", "deployment/snowplow", "-n", "krateo-system",
-                "--timeout=120s")
+                "--timeout=300s")
         log("  Snowplow pod restarted — Redis flushed")
     else:
         log(f"  WARNING: failed to restart snowplow: {err[:100]}")
@@ -2402,6 +2399,33 @@ def run_phase_browser_scaling(tokens):
                     log(f"    POD restarts at {SCALE} scale: {out.strip()}")
             except Exception:
                 pass
+
+            # S6b — Restart snowplow pod with 50K compositions in place.
+            # Tests resilience of warming up cache with existing data.
+            log("Restarting snowplow pod to test warm-up resilience ...")
+            kubectl("rollout", "restart", "deployment/snowplow", "-n", NS)
+            time.sleep(10)
+            # Wait for new pod to be ready (2/2)
+            deadline = time.time() + 600
+            while time.time() < deadline:
+                rc, out, _ = kubectl("get", "pods", "-n", NS,
+                                     "-l", "app.kubernetes.io/name=snowplow",
+                                     "--no-headers")
+                if rc == 0:
+                    lines = [l for l in out.strip().split("\n") if l.strip()]
+                    ready = [l for l in lines if "2/2" in l and "Running" in l]
+                    if len(ready) == 1 and len(lines) == 1:
+                        log(f"  Snowplow pod restarted — {ready[0].split()[0]}")
+                        break
+                time.sleep(10)
+            else:
+                log("WARNING: snowplow pod not ready after restart")
+            # Re-acquire token (pod restart may have flushed auth state)
+            admin_token = get_jwt("admin")
+            # Measure dashboard after restart
+            r = _browser_measure_stage(page, "6b", "Post-restart (50K)", cache_mode, token=admin_token)
+            if r:
+                all_results.append(r)
 
             # S7 — Delete 1 composition
             ts = _snapshot_l1()

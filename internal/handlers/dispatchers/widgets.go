@@ -226,14 +226,14 @@ func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objec
 		return nil, merr
 	}
 
-	// Write resolved output to L1. Widget deps are NOT registered here —
-	// only RESTActions register deps (via l1cache.go). Widgets that depend
-	// on RESTActions are refreshed via cascade (RESTAction → widget).
-	// Previously, registering deps at widget level caused container widgets
-	// (navmenuitem, page) to be registered as depending on ALL GVRs accessed
-	// by their child tree, spawning 200+ refresh goroutines for 20 compositions.
+	// Write resolved output to L1. Register ONLY the apiRef cascade dep
+	// (widget → RESTAction), not the broad GVR deps from the tracker.
+	// This ensures the widget L1 key appears in the RESTAction's dep index
+	// for cascade refresh, without registering container widgets as
+	// depending on all GVRs in their child tree.
 	if c != nil && resolvedKey != "" {
 		_ = c.SetResolvedRaw(ctx, resolvedKey, raw)
+		registerApiRefGVRDeps(ctx, c, got.Unstructured, resolvedKey, tracker)
 		_, preWarmSpan := widgetTracer.Start(ctx, "widget.prewarm_children")
 		preWarmChildWidgets(ctx, c, res, authnNS)
 		preWarmSpan.End()

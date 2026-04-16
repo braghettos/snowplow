@@ -726,8 +726,8 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			}
 
 			_ = c.SetResolvedRaw(rctx, rKey, raw)
-			// Widget deps NOT registered here — only RESTActions register deps.
-			// Widgets are refreshed via cascade (RESTAction → widget).
+			// Register apiRef cascade dep only (widget → RESTAction).
+			registerApiRefGVRDeps(rctx, c, cached, rKey, tracker)
 
 			if newDeps := registerApiRefGVRDeps(rctx, c, cached, rKey, tracker); newDeps > 0 {
 				_ = c.Delete(rctx, rKey)
