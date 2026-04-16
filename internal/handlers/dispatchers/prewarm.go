@@ -775,11 +775,16 @@ func registerApiRefGVRDeps(ctx context.Context, c *cache.RedisCache, widgetObj *
 	raGVR := schema.GroupVersionResource{
 		Group: "templates.krateo.io", Version: "v1", Resource: "restactions",
 	}
-	raKey := cache.GetKey(raGVR, raNS, raName)
-	var raObj unstructured.Unstructured
-	if hit, err := c.Get(ctx, raKey, &raObj); !hit || err != nil {
+	// Read RESTAction from informer store.
+	ir := cache.InformerReaderFromContext(ctx)
+	if ir == nil {
 		return 0
 	}
+	obj, ok := ir.GetObject(raGVR, raNS, raName)
+	if !ok || obj == nil {
+		return 0
+	}
+	raObj := *obj
 
 	apis, found, _ := unstructured.NestedSlice(raObj.Object, "spec", "api")
 	if !found {
