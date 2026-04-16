@@ -226,13 +226,33 @@ func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objec
 		return nil, merr
 	}
 
-	// Write resolved output to L1. Register ONLY the apiRef cascade dep
-	// (widget → RESTAction), not the broad GVR deps from the tracker.
-	// This ensures the widget L1 key appears in the RESTAction's dep index
-	// for cascade refresh, without registering container widgets as
-	// depending on all GVRs in their child tree.
+	// Write resolved output to L1. Register cascade deps so that:
+	// 1. The widget appears in the RESTAction's per-resource dep index
+	//    (for cascade: compositions-list → piechart)
+	// 2. The widget appears in the composition GVR dep index
+	//    (for triggerL1Refresh to find compositions-list)
+	//
+	// Only write deps from the tracker's ResourceRefs that are RESTAction
+	// refs (from apiRef resolution). Container widgets without apiRef
+	// have no RESTAction refs in the tracker, so nothing is registered.
 	if c != nil && resolvedKey != "" {
 		_ = c.SetResolvedRaw(ctx, resolvedKey, raw)
+		// Register per-resource cascade dep (widget → specific RESTAction).
+		// The tracker records AddResource(restactionGVR, ns, name) during
+		// apiref.Resolve. This puts the widget L1 key in the RESTAction's
+		// dep index so refreshSingleL1's cascade finds it.
+		refs := tracker.ResourceRefs()
+		if len(refs) > 0 {
+			pipe := c.Pipeline(ctx)
+			if pipe != nil {
+				for _, ref := range refs {
+					key := cache.L1ResourceDepKey(ref.GVRKey, ref.NS, ref.Name)
+					pipe.SAdd(ctx, key, resolvedKey)
+					pipe.Expire(ctx, key, cache.ReverseIndexTTL)
+				}
+				_, _ = pipe.Exec(ctx)
+			}
+		}
 		registerApiRefGVRDeps(ctx, c, got.Unstructured, resolvedKey, tracker)
 		_, preWarmSpan := widgetTracer.Start(ctx, "widget.prewarm_children")
 		preWarmChildWidgets(ctx, c, res, authnNS)
