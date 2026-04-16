@@ -724,6 +724,19 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			}
 
 			_ = c.SetResolvedRaw(rctx, rKey, raw)
+			// Register cascade deps: widget → RESTAction (from tracker refs).
+			// Same logic as widgets.go:244-255.
+			if refs := tracker.ResourceRefs(); len(refs) > 0 {
+				pipe := c.Pipeline(rctx)
+				if pipe != nil {
+					for _, ref := range refs {
+						key := cache.L1ResourceDepKey(ref.GVRKey, ref.NS, ref.Name)
+						pipe.SAdd(rctx, key, rKey)
+						pipe.Expire(rctx, key, cache.ReverseIndexTTL)
+					}
+					_, _ = pipe.Exec(rctx)
+				}
+			}
 
 			mu.Lock()
 			results = append(results, res)

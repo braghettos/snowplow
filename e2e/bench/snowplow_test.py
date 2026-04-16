@@ -2421,7 +2421,8 @@ def run_phase_browser_scaling(tokens):
             else:
                 log("WARNING: snowplow pod not ready after restart")
             # Re-acquire token (pod restart may have flushed auth state)
-            admin_token = get_jwt("admin")
+            tokens_fresh = login_all()
+            admin_token = tokens_fresh.get("admin")
             # Measure dashboard after restart
             r = _browser_measure_stage(page, "6b", "Post-restart (50K)", cache_mode, token=admin_token)
             if r:
