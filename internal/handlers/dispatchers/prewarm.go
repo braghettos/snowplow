@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"log/slog"
-	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -23,7 +22,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/discovery"
 	k8sdynamic "k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -726,12 +724,6 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			}
 
 			_ = c.SetResolvedRaw(rctx, rKey, raw)
-			// Register apiRef cascade dep only (widget → RESTAction).
-			registerApiRefGVRDeps(rctx, c, cached, rKey, tracker)
-
-			if newDeps := registerApiRefGVRDeps(rctx, c, cached, rKey, tracker); newDeps > 0 {
-				_ = c.Delete(rctx, rKey)
-			}
 
 			mu.Lock()
 			results = append(results, res)
@@ -741,97 +733,6 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 
 	wg.Wait()
 	return results
-}
-
-// registerApiRefGVRDeps ensures that widgets with an apiRef (which always
-// points to a RESTAction) are registered in the L1 GVR reverse indexes for
-// the RESTAction's transitive dependencies — even when those dependencies
-// returned empty data during warmup.
-//
-// During startup warmup, dynamic CRD data may not yet be in L3, causing the
-// RESTAction to resolve with empty results. The DependencyTracker only
-// captures GVRs that were actually visited, so the dynamic CRD GVRs are
-// missed. Without this function, L1 refresh would never fire for those
-// missing dependencies because the widget's L1 key would not appear in
-// their reverse indexes.
-//
-// The fix: fetch the RESTAction CR from L3, parse its API items' paths to
-// extract K8s API groups (both static paths and JQ template strings), use
-// the K8s discovery API to find all resources belonging to those groups,
-// register informers (SAddGVR) and add the widget's L1 key to the GVR
-// reverse indexes. This works even during early startup because CRDs are
-// already registered in the cluster API server.
-func registerApiRefGVRDeps(ctx context.Context, c *cache.RedisCache, widgetObj *unstructured.Unstructured, l1Key string, tracker *cache.DependencyTracker) int {
-	if c == nil {
-		return 0
-	}
-
-	raName, _, _ := unstructured.NestedString(widgetObj.Object, "spec", "apiRef", "name")
-	raNS, _, _ := unstructured.NestedString(widgetObj.Object, "spec", "apiRef", "namespace")
-	if raName == "" {
-		return 0
-	}
-
-	raGVR := schema.GroupVersionResource{
-		Group: "templates.krateo.io", Version: "v1", Resource: "restactions",
-	}
-	// Read RESTAction from informer store.
-	ir := cache.InformerReaderFromContext(ctx)
-	if ir == nil {
-		return 0
-	}
-	obj, ok := ir.GetObject(raGVR, raNS, raName)
-	if !ok || obj == nil {
-		return 0
-	}
-	raObj := *obj
-
-	apis, found, _ := unstructured.NestedSlice(raObj.Object, "spec", "api")
-	if !found {
-		return 0
-	}
-
-	alreadyTracked := make(map[string]bool)
-	if tracker != nil {
-		for _, k := range tracker.GVRKeys() {
-			alreadyTracked[k] = true
-		}
-	}
-
-	groups := extractAPIGroups(apis)
-	if len(groups) == 0 {
-		return 0
-	}
-
-	rc, err := rest.InClusterConfig()
-	if err != nil {
-		return 0
-	}
-	discoveredGVRs := discoverGVRsForGroups(rc, groups)
-	if len(discoveredGVRs) == 0 {
-		return 0
-	}
-
-	var newGVRs []schema.GroupVersionResource
-	for _, gvr := range discoveredGVRs {
-		gvrKey := cache.GVRToKey(gvr)
-		if alreadyTracked[gvrKey] {
-			continue
-		}
-		newGVRs = append(newGVRs, gvr)
-	}
-
-	for _, gvr := range newGVRs {
-		_ = c.SAddGVR(ctx, gvr)
-	}
-
-	if len(newGVRs) > 0 {
-		slog.Debug("L1 warmup: registered apiRef transitive GVR deps",
-			slog.String("widget", l1Key),
-			slog.String("restaction", raName),
-			slog.Int("registered", len(newGVRs)))
-	}
-	return len(newGVRs)
 }
 
 // mintJWT creates a short-lived JWT for internal use during L1 warmup and
@@ -852,80 +753,4 @@ func mintJWT(user jwtutil.UserInfo, signKey string) string {
 		return ""
 	}
 	return tok
-}
-
-// discoverGVRsForGroups queries the K8s discovery API and returns all GVRs
-// whose group matches one of the requested groups. Only list-capable
-// resources are returned (subresources and non-listable resources are
-// excluded).
-func discoverGVRsForGroups(rc *rest.Config, groups []string) []schema.GroupVersionResource {
-	dc, err := discovery.NewDiscoveryClientForConfig(rc)
-	if err != nil {
-		return nil
-	}
-	lists, err := dc.ServerPreferredResources()
-	if err != nil && lists == nil {
-		return nil
-	}
-	wantGroup := make(map[string]bool, len(groups))
-	for _, g := range groups {
-		wantGroup[g] = true
-	}
-	var out []schema.GroupVersionResource
-	for _, list := range lists {
-		gv, perr := schema.ParseGroupVersion(list.GroupVersion)
-		if perr != nil {
-			continue
-		}
-		for _, res := range list.APIResources {
-			g := res.Group
-			if g == "" {
-				g = gv.Group
-			}
-			if !wantGroup[g] {
-				continue
-			}
-			if strings.Contains(res.Name, "/") {
-				continue
-			}
-			v := res.Version
-			if v == "" {
-				v = gv.Version
-			}
-			out = append(out, schema.GroupVersionResource{Group: g, Version: v, Resource: res.Name})
-		}
-	}
-	return out
-}
-
-// apisGroupRe matches "/apis/{group}/" in both static paths and JQ template
-// strings (where the path is embedded in a string literal).
-var apisGroupRe = regexp.MustCompile(`/apis/([a-zA-Z0-9][a-zA-Z0-9._-]*\.[a-zA-Z]{2,})/`)
-
-// extractAPIGroups scans RESTAction API items' paths and returns unique K8s
-// API group names found in them. It handles both direct paths
-// ("/apis/composition.krateo.io/v1/...") and JQ template strings that embed
-// such paths ("${ \"/apis/composition.krateo.io/\" + ... }").
-func extractAPIGroups(apis []interface{}) []string {
-	seen := map[string]bool{}
-	for _, item := range apis {
-		m, ok := item.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		path, _ := m["path"].(string)
-		if path == "" {
-			continue
-		}
-		for _, match := range apisGroupRe.FindAllStringSubmatch(path, -1) {
-			if len(match) > 1 {
-				seen[match[1]] = true
-			}
-		}
-	}
-	var out []string
-	for g := range seen {
-		out = append(out, g)
-	}
-	return out
 }

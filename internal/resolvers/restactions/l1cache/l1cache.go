@@ -179,10 +179,6 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 	if in.Cache != nil && in.ResolvedKey != "" {
 		_ = in.Cache.SetResolvedRaw(tctx, in.ResolvedKey, raw)
 		cache.RegisterL1Dependencies(tctx, in.Cache, tracker, in.ResolvedKey)
-		// Register group-level deps from the API request paths collected
-		// during resolution. This ensures that when any resource in a K8s
-		// API group changes, this RESTAction's L1 key is refreshed.
-		cache.RegisterL1ApiDeps(tctx, in.Cache, in.ResolvedKey, extractAPIRequests(raw))
 	}
 
 	// Decode the status subtree from the serialized form. This is
@@ -199,26 +195,3 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 
 // extractAPIRequests extracts the "apiRequests" string array from the
 // resolved RESTAction JSON output. Used to populate the L1 API-level
-// dependency index so watch events on any resource in those API groups
-// trigger an L1 refresh of this key.
-func extractAPIRequests(raw []byte) []string {
-	var wrapper struct {
-		Status json.RawMessage `json:"status"`
-	}
-	if err := json.Unmarshal(raw, &wrapper); err != nil || wrapper.Status == nil {
-		return nil
-	}
-	var statusMap map[string]json.RawMessage
-	if err := json.Unmarshal(wrapper.Status, &statusMap); err != nil {
-		return nil
-	}
-	reqsRaw, ok := statusMap["apiRequests"]
-	if !ok {
-		return nil
-	}
-	var reqs []string
-	if err := json.Unmarshal(reqsRaw, &reqs); err != nil {
-		return nil
-	}
-	return reqs
-}

@@ -86,7 +86,19 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 
 	// L1 miss: fall through to shared resolver.
 	if l1Key != "" {
-		return resolveViaL1Cache(ctx, c, opts, l1Key)
+		status, err := resolveViaL1Cache(ctx, c, opts, l1Key)
+		// Register the restaction dep in the CALLER's tracker even on
+		// L1 miss. l1cache.ResolveAndCache creates its own tracker, so
+		// the widget's tracker doesn't get the restaction ref automatically.
+		// Without this, the widget → RESTAction cascade dep is never
+		// written on cold start (first resolve).
+		if err == nil {
+			if tracker := cache.TrackerFromContext(ctx); tracker != nil {
+				tracker.AddGVR(restActionGVR)
+				tracker.AddResource(restActionGVR, opts.ApiRef.Namespace, opts.ApiRef.Name)
+			}
+		}
+		return status, err
 	}
 
 	// No cache context (tests, etc.): inline resolve with no L1 write.

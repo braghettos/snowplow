@@ -197,7 +197,9 @@ func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 		return
 	}
 
-	// Collect affected L1 keys via dependency indexes.
+	// Collect affected L1 keys from the dependency graph.
+	// The dep indexes are populated by RegisterL1Dependencies during
+	// RESTAction resolution (tracker-based, no hardcoded logic).
 	affected := make(map[string]bool)
 	collect := func(idxKey string) {
 		if keys, err := rw.cache.SMembers(ctx, idxKey); err == nil {
@@ -208,17 +210,8 @@ func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 	}
 	collect(L1ResourceDepKey(evt.gvrKey, evt.ns, ""))  // namespaced LIST
 	collect(L1ResourceDepKey(evt.gvrKey, "", ""))       // cluster-wide LIST
-	collect(L1ApiDepKey(evt.gvrKey))                    // API-level dep
-
-	// CRD chain: also refresh keys depending on the CRD LIST.
-	gvr := ParseGVRKey(evt.gvrKey)
-	if gvr.Group != "" && gvr.Resource != "" {
-		crdGVRKey := GVRToKey(schema.GroupVersionResource{
-			Group:    "apiextensions.k8s.io",
-			Version:  "v1",
-			Resource: "customresourcedefinitions",
-		})
-		collect(L1ResourceDepKey(crdGVRKey, "", ""))
+	if evt.name != "" {
+		collect(L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)) // per-resource GET
 	}
 
 	if len(affected) == 0 {

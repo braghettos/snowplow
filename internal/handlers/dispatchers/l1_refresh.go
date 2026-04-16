@@ -203,19 +203,13 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 			return false, nil
 		}
 		_ = result
-		// Only register apiRef cascade dep (widget → RESTAction), not the
-		// broad GVR dep that would register container widgets as depending
-		// on all GVRs in their child tree.
-		registerApiRefGVRDeps(rctx, c, got.Unstructured, rawKey, nil)
 		return true, nil
 
 	case info.GVR.Group == templatesGroup && info.GVR.Resource == restactionResource:
-		// Use ResolveRESTActionBackground to avoid blocking HTTP requests.
 		_, err := ResolveRESTActionBackground(rctx, c, got.Unstructured.Object, rawKey, authnNS, info.PerPage, info.Page)
 		if err != nil {
 			return false, nil
 		}
-		registerApiRefGVRDeps(rctx, c, got.Unstructured, rawKey, nil)
 
 		// Cascading refresh: find L1 keys that depend on this RESTAction
 		// as a resource (e.g. piechart depends on compositions-list).

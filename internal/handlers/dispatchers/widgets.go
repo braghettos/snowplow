@@ -253,7 +253,6 @@ func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objec
 				_, _ = pipe.Exec(ctx)
 			}
 		}
-		registerApiRefGVRDeps(ctx, c, got.Unstructured, resolvedKey, tracker)
 		_, preWarmSpan := widgetTracer.Start(ctx, "widget.prewarm_children")
 		preWarmChildWidgets(ctx, c, res, authnNS)
 		preWarmSpan.End()
