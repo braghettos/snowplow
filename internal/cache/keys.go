@@ -199,15 +199,20 @@ func RegisterL1Dependencies(ctx context.Context, c *RedisCache, tracker *Depende
 		}
 	}
 
-	// Cluster-wide deps: one per GVR (ns="", name="").
-	// Ensures triggerL1Refresh finds this L1 key when ANY resource
-	// of this GVR changes, regardless of namespace.
-	for _, gvrKey := range gvrKeys {
-		key := L1ResourceDepKey(gvrKey, "", "")
-		if !seen[key] {
-			seen[key] = true
-			pipe.SAdd(ctx, key, l1Key)
-			pipe.Expire(ctx, key, ReverseIndexTTL)
+	// Cluster-wide deps: only for GVRs that were LISTed (name="").
+	// A RESTAction that lists ALL compositions across namespaces gets a
+	// cluster-wide dep so ANY composition change triggers a refresh.
+	// A per-composition RESTAction (GET with specific name) does NOT get
+	// a cluster-wide dep — it only depends on that one resource.
+	for _, ref := range refs {
+		if ref.Name == "" {
+			// LIST access → cluster-wide dep
+			key := L1ResourceDepKey(ref.GVRKey, "", "")
+			if !seen[key] {
+				seen[key] = true
+				pipe.SAdd(ctx, key, l1Key)
+				pipe.Expire(ctx, key, ReverseIndexTTL)
+			}
 		}
 	}
 
