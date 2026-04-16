@@ -198,19 +198,15 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 		// re-registered. To guarantee the dep chain survives across L1
 		// refresh cycles, we explicitly re-register the apiRef GVR dep
 		// AFTER the resolve completes, using a fresh tracker.
-		tracker := cache.NewDependencyTracker()
-		tctx := cache.WithDependencyTracker(rctx, tracker)
-		result, err := ResolveWidgetBackground(tctx, c, got, rawKey, authnNS, info.PerPage, info.Page)
+		result, err := ResolveWidgetBackground(rctx, c, got, rawKey, authnNS, info.PerPage, info.Page)
 		if err != nil {
 			return false, nil
 		}
 		_ = result
-		// Re-register deps unconditionally. The tracker may have been
-		// populated by resolveWidgetFromObject (singleflight winner) or
-		// by apiref.Resolve's L1-hit dep tracking (0.25.178 fix). Either
-		// way, SADD is idempotent — re-adding the same dep is a no-op.
-		cache.RegisterL1Dependencies(rctx, c, tracker, rawKey)
-		registerApiRefGVRDeps(rctx, c, got.Unstructured, rawKey, tracker)
+		// Only register apiRef cascade dep (widget → RESTAction), not the
+		// broad GVR dep that would register container widgets as depending
+		// on all GVRs in their child tree.
+		registerApiRefGVRDeps(rctx, c, got.Unstructured, rawKey, nil)
 		return true, nil
 
 	case info.GVR.Group == templatesGroup && info.GVR.Resource == restactionResource:

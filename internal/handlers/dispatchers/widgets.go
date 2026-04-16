@@ -226,16 +226,14 @@ func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objec
 		return nil, merr
 	}
 
-	// Populate the resolved cache and register GVR reverse indexes so that
-	// informer events can do targeted invalidation instead of bulk deletes.
+	// Write resolved output to L1. Widget deps are NOT registered here —
+	// only RESTActions register deps (via l1cache.go). Widgets that depend
+	// on RESTActions are refreshed via cascade (RESTAction → widget).
+	// Previously, registering deps at widget level caused container widgets
+	// (navmenuitem, page) to be registered as depending on ALL GVRs accessed
+	// by their child tree, spawning 200+ refresh goroutines for 20 compositions.
 	if c != nil && resolvedKey != "" {
 		_ = c.SetResolvedRaw(ctx, resolvedKey, raw)
-		log.Info("widget: registering L1 deps",
-			slog.String("key", resolvedKey),
-			slog.Int("tracker_gvrs", len(tracker.GVRKeys())),
-			slog.Int("tracker_refs", len(tracker.ResourceRefs())),
-		)
-		cache.RegisterL1Dependencies(ctx, c, tracker, resolvedKey)
 		_, preWarmSpan := widgetTracer.Start(ctx, "widget.prewarm_children")
 		preWarmChildWidgets(ctx, c, res, authnNS)
 		preWarmSpan.End()

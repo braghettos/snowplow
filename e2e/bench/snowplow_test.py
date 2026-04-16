@@ -742,34 +742,50 @@ def delete_all_compositions():
 
 
 def delete_all_compositiondefinitions():
-    """Delete all bench CompositionDefinitions normally (let controllers reconcile)."""
+    """Delete all CompositionDefinitions, patching finalizers if stuck."""
     rc, out, _ = kubectl("get", "compositiondefinitions.core.krateo.io", "--all-namespaces",
                          "--no-headers", "-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
     if rc != 0 or not out.strip():
         log("No CompositionDefinitions to delete")
         return
     items = [(p[0], p[1]) for line in out.strip().split("\n")
-             if (p := line.split(None, 1)) and len(p) >= 2 and p[0].startswith("bench-")]
+             if (p := line.split(None, 1)) and len(p) >= 2]
     if not items:
-        log("No bench CompositionDefinitions to delete")
+        log("No CompositionDefinitions to delete")
         return
+    # Patch finalizers first so deletion isn't blocked
+    for ns, name in items:
+        kubectl("patch", "compositiondefinitions.core.krateo.io", name, "-n", ns,
+                "--type=json", '-p=[{"op":"remove","path":"/metadata/finalizers"}]')
     for ns, name in items:
         kubectl("delete", "compositiondefinitions.core.krateo.io", name, "-n", ns,
-                "--ignore-not-found", "--wait=false")
+                "--ignore-not-found", "--wait=false", "--force", "--grace-period=0")
     log(f"Triggered deletion of {len(items)} CompositionDefinitions")
 
-    # Wait for deletion
-    deadline = time.time() + 300
+    deadline = time.time() + 120
     while time.time() < deadline:
         rc, out, _ = kubectl("get", "compositiondefinitions.core.krateo.io", "--all-namespaces",
                              "--no-headers")
-        remaining = len([l for l in (out or "").strip().split("\n") if l.strip() and "bench-" in l])
+        remaining = len([l for l in (out or "").strip().split("\n") if l.strip()])
         if remaining == 0:
             log("All CompositionDefinitions deleted")
             return
         log(f"  {remaining} CompositionDefinitions remaining ...")
+        # Re-patch finalizers on stuck ones
+        for line in (out or "").strip().split("\n"):
+            parts = line.split(None, 1)
+            if len(parts) >= 2:
+                kubectl("patch", "compositiondefinitions.core.krateo.io", parts[1].strip(),
+                        "-n", parts[0].strip(), "--type=json",
+                        '-p=[{"op":"remove","path":"/metadata/finalizers"}]')
         time.sleep(10)
     log("WARNING: CompositionDefinitions still remaining after timeout")
+
+    # Also delete the CRD to cascade-delete any orphaned compositions
+    kubectl("delete", "crd", f"{COMP_RES}.{COMP_GVR}", "--wait=false", "--ignore-not-found")
+    kubectl("patch", "crd", f"{COMP_RES}.{COMP_GVR}", "--type=json",
+            '-p=[{"op":"remove","path":"/metadata/finalizers"}]')
+    time.sleep(10)
 
 
 def delete_bench_namespaces():
@@ -839,6 +855,16 @@ spec:
     url: https://marketplace.krateo.io
     version: 1.2.2
 """
+    # Wait for any old CRD to fully disappear first
+    for _ in range(30):
+        rc, out, _ = kubectl("get", "crd", f"{COMP_RES}.{COMP_GVR}",
+                             "-o", "jsonpath={.metadata.deletionTimestamp}")
+        if rc != 0:
+            break  # CRD doesn't exist — good
+        if not out.strip():
+            break  # CRD exists and is NOT being deleted — good
+        time.sleep(5)  # CRD is being deleted — wait
+
     kubectl("apply", "--server-side", "-f", "-", input_data=yaml_str)
     log(f"Applied CompositionDefinition in {ns}")
     deadline = time.time() + 300
@@ -1082,8 +1108,10 @@ def wait_for_crd(timeout=120):
     log(f"Waiting for CRD {COMP_RES}.{COMP_GVR} ...")
     deadline = time.time() + timeout
     while time.time() < deadline:
-        rc, _, _ = kubectl("get", "crd", f"{COMP_RES}.{COMP_GVR}", "--no-headers")
-        if rc == 0:
+        rc, out, _ = kubectl("get", "crd", f"{COMP_RES}.{COMP_GVR}",
+                             "-o", "jsonpath={.metadata.deletionTimestamp}")
+        if rc == 0 and not out.strip():
+            # CRD exists and is NOT being deleted
             log("CRD exists")
             return True
         time.sleep(5)
