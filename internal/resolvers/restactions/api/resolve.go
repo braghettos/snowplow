@@ -306,7 +306,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 									if c != nil {
 										apiCacheKey := cache.APIResultKey(user.Username, pathGVR, pathNS, pathName)
 										if raw, merr := json.Marshal(directData); merr == nil {
-											_ = c.SetResolvedRaw(ctx, apiCacheKey, raw)
+											_ = c.SetAPIResultRaw(ctx, apiCacheKey, raw)
 											// Register API result key in dep index so it's
 											// invalidated when this GVR+ns changes.
 											gvrKey := cache.GVRToKey(pathGVR)
@@ -325,7 +325,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 									if c != nil {
 										apiCacheKey := cache.APIResultKey(user.Username, pathGVR, pathNS, pathName)
 										if raw, merr := json.Marshal(directData); merr == nil {
-											_ = c.SetResolvedRaw(ctx, apiCacheKey, raw)
+											_ = c.SetAPIResultRaw(ctx, apiCacheKey, raw)
 											gvrKey := cache.GVRToKey(pathGVR)
 											depKey := cache.L1ResourceDepKey(gvrKey, pathNS, pathName)
 											_ = c.SAddWithTTL(ctx, depKey, apiCacheKey, cache.ReverseIndexTTL)
