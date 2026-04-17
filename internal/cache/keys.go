@@ -178,7 +178,7 @@ func L1ResourceDepKey(gvrKey, ns, name string) string {
 // - Cluster-wide deps: L1ResourceDepKey(gvr, "", "") for each GVR accessed
 //
 // The cluster-wide dep ensures that when ANY resource of a GVR changes in
-// ANY namespace, the L1 key is found by triggerL1Refresh. This is critical
+// ANY namespace, the L1 key is found by triggerL1RefreshBatch. This is critical
 // for RESTActions like compositions-list that iterate all namespaces.
 func RegisterL1Dependencies(ctx context.Context, c *RedisCache, tracker *DependencyTracker, l1Key string) {
 	if c == nil || tracker == nil {

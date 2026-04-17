@@ -151,34 +151,51 @@ func (rw *ResourceWatcher) registerFromRedis(ctx context.Context) {
 	}
 }
 
-// l1Worker has two responsibilities:
+// l1Worker consumes events from eventCh, batches them, and triggers L1
+// refreshes with deduplicated Redis lookups. Events are drained in batches:
+// the first event is received via blocking select, then all pending events
+// are drained non-blockingly. The batch is processed as a unit, deduplicating
+// the SMembers calls across all events.
 //
-//  1. Consume events from eventCh so handleEvent doesn't block. Events are
-//     currently only used for delete-related L1 dep cleanup.
-//
-//  2. Every 3s, scan all snowplow:l3gen:* keys in Redis. If any generation
-//     changed since the last scan, find ALL L1 keys that depend on that
-//     GVR+ns via the reverse dependency indexes and refresh them.
-//
-// This is fully agnostic — no GVR-specific logic. Any L3 change triggers
+// This is fully agnostic — no GVR-specific logic. Any informer change triggers
 // the corresponding L1 refresh automatically.
 func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 	for {
+		// Block until at least one event arrives or context is cancelled.
+		var first l1Event
+		var ok bool
 		select {
 		case <-ctx.Done():
 			return
-		case evt, ok := <-rw.eventCh:
+		case first, ok = <-rw.eventCh:
 			if !ok {
 				return
 			}
-			// DELETE dep index cleanup.
-			if evt.eventType == "delete" {
-				resDepKey := L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)
+		}
+
+		// Drain all pending events non-blockingly to form a batch.
+		batch := []l1Event{first}
+	drain:
+		for {
+			select {
+			case evt, ok := <-rw.eventCh:
+				if !ok {
+					break drain
+				}
+				batch = append(batch, evt)
+			default:
+				break drain
+			}
+		}
+
+		// Process the batch: DELETE cleanup first, then batched L1 refresh.
+		for i := range batch {
+			if batch[i].eventType == "delete" {
+				resDepKey := L1ResourceDepKey(batch[i].gvrKey, batch[i].ns, batch[i].name)
 				_ = rw.cache.Delete(ctx, resDepKey)
 			}
-			// Trigger L1 refresh for affected keys.
-			rw.triggerL1Refresh(ctx, evt)
 		}
+		rw.triggerL1RefreshBatch(ctx, batch)
 	}
 }
 
@@ -213,20 +230,85 @@ type pageKey struct {
 	page int
 }
 
-// triggerL1Refresh collects affected L1 keys and ensures each one has
-// a refresh goroutine running. Per-L1-key coalescing: at most one
-// goroutine per L1 key. If a resolve is running and a new event marks
-// the key dirty, the goroutine re-runs with the latest informer state.
-// Different L1 keys run in parallel.
-func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
+// gvrNS identifies a GVR+namespace pair for dirty tracking across batched events.
+type gvrNS struct {
+	gvrKey string
+	ns     string
+}
+
+// triggerL1RefreshBatch processes a batch of informer events with deduplicated
+// Redis dependency lookups. Instead of calling SMembers per event (O(events)),
+// it collects unique dependency keys across the batch and calls SMembers once
+// per unique key (O(unique namespaces + unique cluster-wide GVRs + unique GET resources)).
+//
+// At 50K scale with 10 namespaces: ~11 SMembers instead of 150K.
+//
+// The dedup key for dependency lookups is:
+//   - LIST deps:  (gvrKey, ns)     — one per unique GVR+namespace pair
+//   - Cluster:    (gvrKey, "")     — one per unique GVR (cluster-wide)
+//   - GET deps:   (gvrKey, ns, name) — one per unique resource (preserves per-resource granularity)
+//
+// For DELETE events, API result keys are collected and removed.
+func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l1Event) {
 	fn, ok := rw.l1Refresh.Load().(L1RefreshFunc)
 	if !ok || fn == nil {
 		return
 	}
 
-	// Collect affected L1 keys from the dependency graph.
-	// The dep indexes are populated by RegisterL1Dependencies during
-	// RESTAction resolution (tracker-based, no hardcoded logic).
+	// ── Phase 1: Collect unique dependency index keys across all events ──
+	// Each dep index key maps to one SMembers call. By deduplicating the
+	// keys here, we avoid redundant Redis round-trips.
+	type depLookup struct {
+		redisKey string
+	}
+	listDeps := make(map[string]depLookup)     // "gvrKey\x00ns" → dep key (namespaced LIST)
+	clusterDeps := make(map[string]depLookup)   // "gvrKey" → dep key (cluster-wide LIST)
+	getDeps := make(map[string]depLookup)        // "gvrKey\x00ns\x00name" → dep key (per-resource GET)
+
+	// Track which events are deletes (need API result key cleanup).
+	hasDelete := false
+
+	// Track all unique (gvrKey, ns) pairs for DirtySet entries.
+	dirtyPairs := make(map[gvrNS]bool)
+
+	// Track GVR for markDirtySequential. Use the first event's GVR as representative.
+	// All events in a batch typically share the same GVR (informer fires per-GVR),
+	// but if mixed, we use a representative — markDirtySequential only uses it for logging.
+	var representativeGVR schema.GroupVersionResource
+	if len(events) > 0 {
+		representativeGVR = events[0].gvr
+	}
+
+	for _, evt := range events {
+		// Namespaced LIST dep: one per unique (gvrKey, ns).
+		nsKey := evt.gvrKey + "\x00" + evt.ns
+		if _, ok := listDeps[nsKey]; !ok {
+			listDeps[nsKey] = depLookup{redisKey: L1ResourceDepKey(evt.gvrKey, evt.ns, "")}
+		}
+
+		// Cluster-wide LIST dep: one per unique gvrKey.
+		if _, ok := clusterDeps[evt.gvrKey]; !ok {
+			clusterDeps[evt.gvrKey] = depLookup{redisKey: L1ResourceDepKey(evt.gvrKey, "", "")}
+		}
+
+		// Per-resource GET dep: one per unique (gvrKey, ns, name).
+		// Preserves per-resource granularity for cluster-scoped resources (ns="")
+		// and for any resource individually fetched via objects.Get().
+		if evt.name != "" {
+			getKey := evt.gvrKey + "\x00" + evt.ns + "\x00" + evt.name
+			if _, ok := getDeps[getKey]; !ok {
+				getDeps[getKey] = depLookup{redisKey: L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)}
+			}
+		}
+
+		if evt.eventType == "delete" {
+			hasDelete = true
+		}
+
+		dirtyPairs[gvrNS{gvrKey: evt.gvrKey, ns: evt.ns}] = true
+	}
+
+	// ── Phase 2: Execute deduplicated SMembers lookups ───────────────────
 	affected := make(map[string]bool)
 	collect := func(idxKey string) {
 		if keys, err := rw.cache.SMembers(ctx, idxKey); err == nil {
@@ -235,25 +317,34 @@ func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 			}
 		}
 	}
-	collect(L1ResourceDepKey(evt.gvrKey, evt.ns, ""))  // namespaced LIST
-	collect(L1ResourceDepKey(evt.gvrKey, "", ""))       // cluster-wide LIST
-	if evt.name != "" {
-		collect(L1ResourceDepKey(evt.gvrKey, evt.ns, evt.name)) // per-resource GET
+
+	for _, dep := range listDeps {
+		collect(dep.redisKey)
+	}
+	for _, dep := range clusterDeps {
+		collect(dep.redisKey)
+	}
+	for _, dep := range getDeps {
+		collect(dep.redisKey)
 	}
 
 	if len(affected) == 0 {
-		slog.Debug("triggerL1Refresh: no affected keys",
-			slog.String("gvr", evt.gvrKey), slog.String("ns", evt.ns),
-			slog.String("name", evt.name), slog.String("event", evt.eventType))
+		slog.Debug("triggerL1RefreshBatch: no affected keys",
+			slog.Int("events", len(events)),
+			slog.Int("listDeps", len(listDeps)),
+			slog.Int("clusterDeps", len(clusterDeps)),
+			slog.Int("getDeps", len(getDeps)))
 		return
 	}
 
-	slog.Info("triggerL1Refresh: affected keys",
-		slog.String("event", evt.eventType),
-		slog.String("gvr", evt.gvrKey), slog.String("ns", evt.ns),
-		slog.String("name", evt.name), slog.Int("total", len(affected)))
+	slog.Info("triggerL1RefreshBatch: affected keys",
+		slog.Int("events", len(events)),
+		slog.Int("listDeps", len(listDeps)),
+		slog.Int("clusterDeps", len(clusterDeps)),
+		slog.Int("getDeps", len(getDeps)),
+		slog.Int("total", len(affected)))
 
-	// Separate API result cache keys from resolved keys.
+	// ── Phase 3: Separate API result keys from resolved keys ─────────────
 	// Stale-while-refresh: on ADD/UPDATE, API result keys are left untouched —
 	// the dirty resolve goroutine bypasses them and overwrites with fresh data.
 	// On DELETE, the resource no longer exists so API result keys must be removed.
@@ -263,7 +354,7 @@ func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 			resolvedKeys[key] = true
 		}
 	}
-	if evt.eventType == "delete" {
+	if hasDelete {
 		var apiResultKeys []string
 		for key := range affected {
 			if IsAPIResultKey(key) {
@@ -280,6 +371,7 @@ func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 		return
 	}
 
+	// ── Phase 4: Group paginated keys and trigger dirty resolves ─────────
 	// Group paginated keys by base key (user:gvr:ns:name without page suffix).
 	// Paginated variants of the same resource resolve the same underlying data
 	// — only the page parameter changes the output. Resolving them sequentially
@@ -302,10 +394,89 @@ func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 	for _, pages := range groups {
 		// Sort by page number so earlier pages are resolved first.
 		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
-		// Mark the first page dirty — the goroutine will resolve it,
-		// then resolve subsequent pages inline.
-		rw.markDirtySequential(ctx, evt.gvr, evt.gvrKey, evt.ns, pages, fn)
+		// Mark dirty with ALL affected GVR+ns pairs so the DirtySet
+		// covers every dependency that changed in this batch.
+		rw.markDirtySequentialBatch(ctx, representativeGVR, dirtyPairs, pages, fn)
 	}
+}
+
+// markDirtySequentialBatch is like markDirtySequential but registers ALL
+// GVR+ns pairs from the batch as dirty entries, not just a single pair.
+// This ensures the DirtySet built during refresh correctly bypasses the
+// API result cache for every dependency that changed in the batch.
+func (rw *ResourceWatcher) markDirtySequentialBatch(ctx context.Context, triggerGVR schema.GroupVersionResource, dirtyPairs map[gvrNS]bool, pages []pageKey, fn L1RefreshFunc) {
+	if len(pages) == 0 {
+		return
+	}
+	// Use the base key (first page's key stripped of pagination) as identity.
+	// All pagination variants coalesce into one goroutine.
+	identity := pages[0].key
+	if info, ok := ParseResolvedKey(identity); ok {
+		identity = ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
+	}
+
+	val, loaded := rw.dirtyKeys.LoadOrStore(identity, &dirtyState{})
+	state := val.(*dirtyState)
+	// Record ALL GVR+ns pairs that triggered this dirty mark BEFORE setting pending,
+	// so the goroutine's drain always sees every entry.
+	for pair := range dirtyPairs {
+		state.addEntry(pair.gvrKey, pair.ns)
+	}
+	state.pending.Store(true)
+
+	if loaded {
+		return
+	}
+
+	go func() {
+		defer rw.dirtyKeys.Delete(identity)
+		defer func() {
+			if r := recover(); r != nil {
+				buf := make([]byte, 4096)
+				n := runtime.Stack(buf, false)
+				slog.Error("resource-watcher: panic in L1 refresh",
+					slog.Any("error", r),
+					slog.String("stack", string(buf[:n])))
+			}
+		}()
+
+		for state.pending.Swap(false) {
+			// Drain accumulated dirty entries and build a targeted DirtySet
+			// so only the affected GVR+ns pairs bypass the API result cache.
+			entries := state.drainEntries()
+			dirtySet := NewDirtySet(entries)
+
+			// Resolve each page sequentially: p1 → p2 → ... → pN.
+			var allCascade []string
+			for _, pg := range pages {
+				refreshCtx, cancel := context.WithTimeout(WithDirtySet(ctx, dirtySet), 60*time.Second)
+				cascade := fn(refreshCtx, triggerGVR, []string{pg.key})
+				cancel()
+				allCascade = append(allCascade, cascade...)
+			}
+
+			// Cascade: group dependent keys the same way and resolve
+			// sequentially within each group. Cascades get no bypass
+			// (gvrKey="" ns="") because they are transitive dependencies
+			// that don't directly correspond to the triggering event.
+			if len(allCascade) > 0 {
+				cascadeGroups := make(map[string][]pageKey)
+				for _, ck := range allCascade {
+					info, ok := ParseResolvedKey(ck)
+					if !ok {
+						cascadeGroups[ck] = append(cascadeGroups[ck], pageKey{key: ck, page: 0})
+						continue
+					}
+					baseKey := ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
+					cascadeGroups[baseKey] = append(cascadeGroups[baseKey], pageKey{key: ck, page: info.Page})
+				}
+				for _, cPages := range cascadeGroups {
+					sort.Slice(cPages, func(i, j int) bool { return cPages[i].page < cPages[j].page })
+					rw.markDirtySequential(ctx, triggerGVR, "", "", cPages, fn)
+				}
+			}
+		}
+	}()
 }
 
 // markDirtySequential resolves a group of paginated L1 keys sequentially

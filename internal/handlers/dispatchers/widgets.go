@@ -230,7 +230,7 @@ func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objec
 	// 1. The widget appears in the RESTAction's per-resource dep index
 	//    (for cascade: compositions-list → piechart)
 	// 2. The widget appears in the composition GVR dep index
-	//    (for triggerL1Refresh to find compositions-list)
+	//    (for triggerL1RefreshBatch to find compositions-list)
 	//
 	// Only write deps from the tracker's ResourceRefs that are RESTAction
 	// refs (from apiRef resolution). Container widgets without apiRef
