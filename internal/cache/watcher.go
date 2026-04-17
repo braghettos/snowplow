@@ -242,8 +242,16 @@ func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 	}
 
 	if len(affected) == 0 {
+		slog.Debug("triggerL1Refresh: no affected keys",
+			slog.String("gvr", evt.gvrKey), slog.String("ns", evt.ns),
+			slog.String("name", evt.name), slog.String("event", evt.eventType))
 		return
 	}
+
+	slog.Info("triggerL1Refresh: affected keys",
+		slog.String("event", evt.eventType),
+		slog.String("gvr", evt.gvrKey), slog.String("ns", evt.ns),
+		slog.String("name", evt.name), slog.Int("total", len(affected)))
 
 	// Separate API result cache keys from resolved keys.
 	// Stale-while-refresh: on ADD/UPDATE, API result keys are left untouched —
