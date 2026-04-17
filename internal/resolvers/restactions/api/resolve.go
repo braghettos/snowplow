@@ -207,7 +207,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					// RESTAction is cached per-user so subsequent pages (or
 					// resolves) reuse the cached result. Only the changed
 					// namespace re-resolves from the informer.
-					if c != nil {
+					if c != nil && !cache.IsDirtyBypass(ctx) {
 						apiCacheKey := cache.APIResultKey(user.Username, pathGVR, pathNS, pathName)
 						if raw, hit, _ := c.GetRaw(ctx, apiCacheKey); hit {
 							rbacVerb := "list"

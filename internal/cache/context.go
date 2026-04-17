@@ -48,3 +48,18 @@ func InformerReaderFromContext(ctx context.Context) InformerReader {
 	ir, _ := ctx.Value(informerReaderKey{}).(InformerReader)
 	return ir
 }
+
+type dirtyBypassKey struct{}
+
+// WithDirtyBypass returns a context that signals the resolve pipeline to
+// bypass the API result cache and read directly from the informer.
+// Set when resolving a dirty L1 key (background refresh).
+func WithDirtyBypass(ctx context.Context) context.Context {
+	return context.WithValue(ctx, dirtyBypassKey{}, true)
+}
+
+// IsDirtyBypass returns true if the context signals API result cache bypass.
+func IsDirtyBypass(ctx context.Context) bool {
+	v, _ := ctx.Value(dirtyBypassKey{}).(bool)
+	return v
+}

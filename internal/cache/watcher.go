@@ -225,21 +225,26 @@ func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 		return
 	}
 
-	// Separate API result cache keys (invalidate only) from resolved keys
-	// (refresh). API result keys are intermediate cache entries written
-	// during RESTAction resolution — they don't have resolve functions.
-	// Deleting them forces the next resolve to re-read from the informer.
-	var apiResultKeys []string
+	// Separate API result cache keys from resolved keys.
+	// Stale-while-refresh: on ADD/UPDATE, API result keys are left untouched —
+	// the dirty resolve goroutine bypasses them and overwrites with fresh data.
+	// On DELETE, the resource no longer exists so API result keys must be removed.
 	resolvedKeys := make(map[string]bool)
 	for key := range affected {
-		if IsAPIResultKey(key) {
-			apiResultKeys = append(apiResultKeys, key)
-		} else {
+		if !IsAPIResultKey(key) {
 			resolvedKeys[key] = true
 		}
 	}
-	if len(apiResultKeys) > 0 {
-		_ = rw.cache.Delete(ctx, apiResultKeys...)
+	if evt.eventType == "delete" {
+		var apiResultKeys []string
+		for key := range affected {
+			if IsAPIResultKey(key) {
+				apiResultKeys = append(apiResultKeys, key)
+			}
+		}
+		if len(apiResultKeys) > 0 {
+			_ = rw.cache.Delete(ctx, apiResultKeys...)
+		}
 	}
 	affected = resolvedKeys
 
@@ -316,7 +321,7 @@ func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR s
 			// goroutines each doing O(items) work.
 			var allCascade []string
 			for _, pg := range pages {
-				refreshCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+				refreshCtx, cancel := context.WithTimeout(WithDirtyBypass(ctx), 60*time.Second)
 				cascade := fn(refreshCtx, triggerGVR, []string{pg.key})
 				cancel()
 				allCascade = append(allCascade, cascade...)

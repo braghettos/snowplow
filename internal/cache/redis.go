@@ -524,9 +524,7 @@ func (c *RedisCache) SetResolvedRaw(ctx context.Context, key string, val []byte)
 }
 
 // SetAPIResultRaw stores a compressed API result with APIResultCacheTTL.
-// The short TTL is a safety net: all CRD UPDATE events may arrive within
-// the first resolve's window (before deps are registered), leaving stale
-// entries that no subsequent event can invalidate.
+// The short TTL ensures eviction of entries that are no longer being resolved.
 func (c *RedisCache) SetAPIResultRaw(ctx context.Context, key string, val []byte) error {
 	if c == nil {
 		return nil
