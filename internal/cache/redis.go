@@ -28,10 +28,11 @@ var redisTracer = otel.Tracer("snowplow/redis")
 type gvrNotifyFunc = func(context.Context, schema.GroupVersionResource)
 
 const (
-	DefaultResourceTTL = time.Hour
-	ResolvedCacheTTL   = time.Hour
-	ReverseIndexTTL    = 2 * time.Hour
-	notFoundTTL        = 30 * time.Second
+	DefaultResourceTTL  = time.Hour
+	ResolvedCacheTTL    = time.Hour
+	APIResultCacheTTL   = 60 * time.Second
+	ReverseIndexTTL     = 2 * time.Hour
+	notFoundTTL         = 30 * time.Second
 )
 
 // ── Transparent zstd compression (with gzip read-back for migration) ────────
@@ -520,6 +521,17 @@ func (c *RedisCache) SetResolvedRaw(ctx context.Context, key string, val []byte)
 		return err
 	}
 	return c.client.Set(ctx, key, compressed, ResolvedCacheTTL).Err()
+}
+
+// SetAPIResultRaw stores a compressed API result with APIResultCacheTTL.
+// The short TTL is a safety net: all CRD UPDATE events may arrive within
+// the first resolve's window (before deps are registered), leaving stale
+// entries that no subsequent event can invalidate.
+func (c *RedisCache) SetAPIResultRaw(ctx context.Context, key string, val []byte) error {
+	if c == nil {
+		return nil
+	}
+	return c.client.Set(ctx, key, compressValue(val), APIResultCacheTTL).Err()
 }
 
 func (c *RedisCache) setWithTTL(ctx context.Context, key string, val any, ttl time.Duration) error {
