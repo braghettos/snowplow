@@ -128,6 +128,23 @@ func ResolvedKey(username string, gvr schema.GroupVersionResource, namespace, na
 	return base
 }
 
+// APIResultKey builds the L1 cache key for a K8s API result within a
+// RESTAction resolve pipeline. Cached per-user so RBAC is respected.
+// LIST: name="" → snowplow:api-result:{user}:{gvr}:{ns}
+// GET:  name!="" → snowplow:api-result:{user}:{gvr}:{ns}:{name}
+func APIResultKey(username string, gvr schema.GroupVersionResource, namespace, name string) string {
+	base := fmt.Sprintf("snowplow:api-result:%s:%s:%s", username, GVRToKey(gvr), namespace)
+	if name != "" {
+		return base + ":" + name
+	}
+	return base
+}
+
+// IsAPIResultKey returns true if the key is an API result cache key.
+func IsAPIResultKey(key string) bool {
+	return strings.HasPrefix(key, "snowplow:api-result:")
+}
+
 // ResolvedKeyBase returns the base key without pagination suffix.
 // Used to group paginated variants for sequential resolution.
 func ResolvedKeyBase(username string, gvr schema.GroupVersionResource, namespace, name string) string {

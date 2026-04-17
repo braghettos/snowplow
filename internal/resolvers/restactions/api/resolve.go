@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -177,7 +178,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		// all writes to the shared dict so that JQ handlers can safely append.
 		//
 		// For single-call entries (the common case) we skip goroutine overhead.
-		runOne := func(call httpcall.RequestOptions, mu *sync.Mutex, prefetched map[string][]byte) (continueOnErr bool) {
+		runOne := func(call httpcall.RequestOptions, mu *sync.Mutex) (continueOnErr bool) {
 			call.Endpoint = &ep
 			verb := strings.ToUpper(ptr.Deref(call.Verb, http.MethodGet))
 
@@ -202,19 +203,55 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				// ── Cache intercept for K8s API GET calls ─────────────────
 				// Read from informer store (in-memory, zero I/O, zero-copy).
 				if c != nil && verb == http.MethodGet {
-					// Read from informer's in-memory store.
-					// Data is already map[string]interface{} — feed directly
-					// to JQ without json.Marshal/Unmarshal round-trip.
+					// L1 cache for K8s API results. Each API call within a
+					// RESTAction is cached per-user so subsequent pages (or
+					// resolves) reuse the cached result. Only the changed
+					// namespace re-resolves from the informer.
+					if c != nil {
+						apiCacheKey := cache.APIResultKey(user.Username, pathGVR, pathNS, pathName)
+						if raw, hit, _ := c.GetRaw(ctx, apiCacheKey); hit {
+							rbacVerb := "list"
+							if pathName != "" {
+								rbacVerb = "get"
+							}
+							if rbac.UserCan(ctx, rbac.UserCanOptions{
+								Verb:          rbacVerb,
+								GroupResource: schema.GroupResource{Group: pathGVR.Group, Resource: pathGVR.Resource},
+								Namespace:     pathNS,
+							}) {
+								handler := call.ResponseHandler
+								if handler == nil {
+									handler = jsonHandler(ctx, jsonHandlerOptions{
+										key: id, out: dict, filter: apiCall.Filter,
+									})
+									if mu != nil {
+										origHandler := handler
+										handler = func(r io.ReadCloser) error {
+											data, rerr := io.ReadAll(r)
+											if rerr != nil {
+												return rerr
+											}
+											mu.Lock()
+											defer mu.Unlock()
+											return origHandler(io.NopCloser(bytes.NewReader(data)))
+										}
+									}
+								}
+								if herr := handler(io.NopCloser(bytes.NewReader(raw))); herr == nil {
+									return true // L1 API cache hit
+								}
+							}
+						}
+					}
+
+					// L1 miss: read from informer, normalize, resolve, then
+					// write to L1 API cache for subsequent pages/resolves.
 					if ir := cache.InformerReaderFromContext(ctx); ir != nil {
 						var directData any
 						var directHit bool
 
 						if pathName == "" {
 							if items, ok := ir.ListObjects(pathGVR, pathNS); ok && len(items) > 0 {
-								// Build K8s-style list as map[string]any directly.
-								// normalizeForJQ converts int64→float64 so gojq can
-								// encode the values. Works on a shallow copy of each
-								// item's Object to avoid mutating the informer store.
 								itemsList := make([]any, len(items))
 								for i, item := range items {
 									itemsList[i] = normalizeForJQ(item.Object)
@@ -227,7 +264,6 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								}
 								directHit = true
 							} else if ok {
-								// Registered but empty — still a hit.
 								directData = map[string]any{
 									"apiVersion": "v1",
 									"kind":       "List",
@@ -244,7 +280,6 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						}
 
 						if directHit {
-							// RBAC gate.
 							rbacVerb := "list"
 							if pathName != "" {
 								rbacVerb = "get"
@@ -259,8 +294,6 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						}
 
 						if directHit {
-							// Zero-copy: feed map[string]any directly to JQ.
-							// No json.Marshal, no json.Unmarshal.
 							handlerOpts := jsonHandlerOptions{
 								key: id, out: dict, filter: apiCall.Filter,
 							}
@@ -269,18 +302,43 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								herr := jsonHandlerDirect(ctx, handlerOpts, directData)
 								mu.Unlock()
 								if herr == nil {
+									// Write to L1 API cache for subsequent pages.
+									if c != nil {
+										apiCacheKey := cache.APIResultKey(user.Username, pathGVR, pathNS, pathName)
+										if raw, merr := json.Marshal(directData); merr == nil {
+											_ = c.SetResolvedRaw(ctx, apiCacheKey, raw)
+											// Register API result key in dep index so it's
+											// invalidated when this GVR+ns changes.
+											gvrKey := cache.GVRToKey(pathGVR)
+											depKey := cache.L1ResourceDepKey(gvrKey, pathNS, pathName)
+											_ = c.SAddWithTTL(ctx, depKey, apiCacheKey, cache.ReverseIndexTTL)
+											if pathName == "" {
+												clusterDep := cache.L1ResourceDepKey(gvrKey, "", "")
+												_ = c.SAddWithTTL(ctx, clusterDep, apiCacheKey, cache.ReverseIndexTTL)
+											}
+										}
+									}
 									return true
 								}
 							} else {
 								if herr := jsonHandlerDirect(ctx, handlerOpts, directData); herr == nil {
+									if c != nil {
+										apiCacheKey := cache.APIResultKey(user.Username, pathGVR, pathNS, pathName)
+										if raw, merr := json.Marshal(directData); merr == nil {
+											_ = c.SetResolvedRaw(ctx, apiCacheKey, raw)
+											gvrKey := cache.GVRToKey(pathGVR)
+											depKey := cache.L1ResourceDepKey(gvrKey, pathNS, pathName)
+											_ = c.SAddWithTTL(ctx, depKey, apiCacheKey, cache.ReverseIndexTTL)
+											if pathName == "" {
+												clusterDep := cache.L1ResourceDepKey(gvrKey, "", "")
+												_ = c.SAddWithTTL(ctx, clusterDep, apiCacheKey, cache.ReverseIndexTTL)
+											}
+										}
+									}
 									return true
 								}
 							}
 						}
-					} else {
-						log.Debug("L3 cache miss for K8s API path",
-							slog.String("name", id),
-							slog.String("path", call.Path))
 					}
 				}
 			} else if callGVR, callNS, callName := cache.ParseCallPath(call.Path); callGVR.Resource != "" {
@@ -293,54 +351,8 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				}
 			}
 
-			// ── Cache direct read (informer store, zero-copy) ───────────────
+			// ── /call path L1 lookup ────────────────────────────────────────
 			if c != nil && verb == http.MethodGet {
-				pathGVR, pathNS, pathName := cache.ParseK8sAPIPath(call.Path)
-				if pathGVR.Resource != "" {
-					if ir := cache.InformerReaderFromContext(ctx); ir != nil {
-						var directData any
-						var directHit bool
-
-						if pathName != "" {
-							if obj, ok := ir.GetObject(pathGVR, pathNS, pathName); ok {
-								directData = normalizeForJQ(obj.Object)
-								directHit = true
-							}
-						} else {
-							if items, ok := ir.ListObjects(pathGVR, pathNS); ok {
-								itemsList := make([]any, len(items))
-								for i, item := range items {
-									itemsList[i] = normalizeForJQ(item.Object)
-								}
-								directData = map[string]any{
-									"apiVersion": "v1",
-									"kind":       "List",
-									"metadata":   map[string]any{},
-									"items":      itemsList,
-								}
-								directHit = true
-							}
-						}
-
-						if directHit {
-							rbacVerb := "list"
-							if pathName != "" {
-								rbacVerb = "get"
-							}
-							if rbac.UserCan(ctx, rbac.UserCanOptions{
-								Verb:          rbacVerb,
-								GroupResource: schema.GroupResource{Group: pathGVR.Group, Resource: pathGVR.Resource},
-								Namespace:     pathNS,
-							}) {
-								mu.Lock()
-								_ = jsonHandlerDirect(ctx, jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter}, directData)
-								mu.Unlock()
-								return true
-							}
-						}
-					}
-				}
-
 				if callGVR, callNS, callName := cache.ParseCallPath(call.Path); callGVR.Resource != "" && callName != "" {
 					l1Key := cache.ResolvedKey(user.Username, callGVR, callNS, callName, 0, 0)
 					if l1Raw, l1Hit, _ := c.GetRaw(ctx, l1Key); l1Hit {
@@ -353,7 +365,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					}
 				}
 			}
-			// ── L3 miss → live HTTP call ───────────────────────────────────
+			// ── Fallback → live HTTP call ──────────────────────────────────
 			{
 				plain := jsonHandler(ctx, jsonHandlerOptions{
 					key: id, out: dict, filter: apiCall.Filter,
@@ -399,31 +411,17 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		if len(tmp) == 1 {
 			// Single call: run inline to avoid goroutine overhead.
 			// Still pass dictMu since we're inside a parallel level.
-			if !runOne(tmp[0], dictMu, nil) {
+			if !runOne(tmp[0], dictMu) {
 				return false
 			}
 		} else {
 			// Iterator: N independent calls — run concurrently.
-			// Pre-fetch all L3 cache keys in a single MGET to avoid 120+
-			// sequential Redis round-trips (2-5ms each = 240-600ms).
-			var prefetchedL3 map[string][]byte
-			if c != nil {
-				var l3Keys []string
-				for _, call := range tmp {
-					if pathGVR, pathNS, pathName := cache.ParseK8sAPIPath(call.Path); pathGVR.Resource != "" && pathName != "" {
-						l3Keys = append(l3Keys, cache.GetKey(pathGVR, pathNS, pathName))
-					}
-				}
-				if len(l3Keys) > 0 {
-					prefetchedL3 = c.GetRawMulti(ctx, l3Keys)
-				}
-			}
 			var wg sync.WaitGroup
 			for _, call := range tmp {
 				wg.Add(1)
 				go func(c httpcall.RequestOptions) {
 					defer wg.Done()
-					runOne(c, dictMu, prefetchedL3)
+					runOne(c, dictMu)
 				}(call)
 			}
 			wg.Wait()
@@ -485,9 +483,6 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		}
 	}
 
-	removeManagedFields(dict)
-	//delete(dict, "slice")
-
 	// Store the collected API request paths in the resolved output.
 	// Deduplicate to keep the list compact (iterator calls often share
 	// the same path pattern across namespaces — we only need unique paths).
@@ -506,21 +501,4 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	return dict
 }
 
-func removeManagedFields(data any) {
-	switch v := data.(type) {
-	case map[string]any:
-		delete(v, "managedFields")
-		// scansiona tutte le altre chiavi
-		for _, val := range v {
-			removeManagedFields(val)
-		}
-	case []any:
-		for _, elem := range v {
-			removeManagedFields(elem)
-		}
-	// other types (string, int, ecc.) -> do nothing
-	default:
-		return
-	}
-}
 

@@ -225,6 +225,28 @@ func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 		return
 	}
 
+	// Separate API result cache keys (invalidate only) from resolved keys
+	// (refresh). API result keys are intermediate cache entries written
+	// during RESTAction resolution — they don't have resolve functions.
+	// Deleting them forces the next resolve to re-read from the informer.
+	var apiResultKeys []string
+	resolvedKeys := make(map[string]bool)
+	for key := range affected {
+		if IsAPIResultKey(key) {
+			apiResultKeys = append(apiResultKeys, key)
+		} else {
+			resolvedKeys[key] = true
+		}
+	}
+	if len(apiResultKeys) > 0 {
+		_ = rw.cache.Delete(ctx, apiResultKeys...)
+	}
+	affected = resolvedKeys
+
+	if len(affected) == 0 {
+		return
+	}
+
 	// Group paginated keys by base key (user:gvr:ns:name without page suffix).
 	// Paginated variants of the same resource resolve the same underlying data
 	// — only the page parameter changes the output. Resolving them sequentially
