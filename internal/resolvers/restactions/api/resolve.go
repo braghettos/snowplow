@@ -306,7 +306,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 									if c != nil {
 										apiCacheKey := cache.APIResultKey(user.Username, pathGVR, pathNS, pathName)
 										if raw, merr := json.Marshal(directData); merr == nil {
-											_ = c.SetAPIResultRaw(ctx, apiCacheKey, raw)
+											_ = c.SetResolvedRaw(ctx, apiCacheKey, raw)
 											// Register API result key in dep index so it's
 											// invalidated when this GVR+ns changes.
 											gvrKey := cache.GVRToKey(pathGVR)
@@ -325,7 +325,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 									if c != nil {
 										apiCacheKey := cache.APIResultKey(user.Username, pathGVR, pathNS, pathName)
 										if raw, merr := json.Marshal(directData); merr == nil {
-											_ = c.SetAPIResultRaw(ctx, apiCacheKey, raw)
+											_ = c.SetResolvedRaw(ctx, apiCacheKey, raw)
 											gvrKey := cache.GVRToKey(pathGVR)
 											depKey := cache.L1ResourceDepKey(gvrKey, pathNS, pathName)
 											_ = c.SAddWithTTL(ctx, depKey, apiCacheKey, cache.ReverseIndexTTL)
@@ -365,6 +365,18 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					}
 				}
 			}
+			// ── Skip malformed K8s API paths ───────────────────────────────
+			// No endpointRef means the call goes directly to the K8s API server.
+			// If the resource type is missing (empty .plural from stale CRD
+			// data), skip instead of hitting a guaranteed 404.
+			if apiCall.EndpointRef == nil {
+				if _, _, r := cache.ExtractAPIGVR(call.Path); r == "" {
+					log.Warn("skipping K8s API call with missing resource type",
+						slog.String("name", id), slog.String("path", call.Path))
+					return call.ContinueOnError
+				}
+			}
+
 			// ── Fallback → live HTTP call ──────────────────────────────────
 			{
 				plain := jsonHandler(ctx, jsonHandlerOptions{
