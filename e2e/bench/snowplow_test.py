@@ -69,6 +69,7 @@ USERS = {
 COMPDEF_NAME = "github-scaffolding-with-composition-page"
 COMP_GVR = "composition.krateo.io"
 COMP_RES = "githubscaffoldingwithcompositionpages"
+COMP_CONTROLLER_DEPLOY = f"{COMP_RES}-v1-2-2-controller"
 
 WIDGET_ENDPOINTS = [
     ("page/dashboard",
@@ -171,7 +172,7 @@ FINALIZER_RESOURCES = [
     "repoes.git.krateo.io",
     "repoes.github.ogen.krateo.io",
 ]
-FINALIZER_PATCH = '{"metadata":{"finalizers":[]}}'
+FINALIZER_PATCH = '{"metadata":{"finalizers":null}}'
 
 # ═════════════════════════════════════════════════════════════════════════════
 # FORMATTING
@@ -723,7 +724,6 @@ def delete_all_compositions():
                              "-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
         stuck = [(p[0], p[1]) for line in (out or "").strip().split("\n")
                  if (p := line.split(None, 1)) and len(p) >= 2]
-        FINALIZER_PATCH = '{"metadata":{"finalizers":null}}'
 
         def patch_finalizer(item):
             kubectl("patch", f"{COMP_RES}.{COMP_GVR}", item[1], "-n", item[0],
@@ -1015,37 +1015,130 @@ spec:
         namespace: demo-system"""
 
 
+def ensure_composition_controller(ns):
+    """Ensure the composition-dynamic-controller deployment is running in ns.
+
+    If the deployment exists but has 0 ready replicas or is in CrashLoopBackOff,
+    restart it. If it does not exist at all, log and continue (the composition
+    was likely created before the controller was deployed into this namespace).
+    """
+    deploy = COMP_CONTROLLER_DEPLOY
+    rc, out, _ = kubectl("get", f"deployment/{deploy}", "-n", ns,
+                         "-o", "jsonpath={.status.readyReplicas}", "--ignore-not-found")
+    if rc != 0 or not out.strip():
+        # Deployment missing or 0 ready replicas — check if it exists
+        rc2, _, _ = kubectl("get", f"deployment/{deploy}", "-n", ns, "--no-headers",
+                            "--ignore-not-found")
+        if rc2 != 0:
+            log(f"Controller {deploy} not found in {ns} (skipping)")
+            return
+        # Exists but not ready — restart it
+        log(f"Controller {deploy} in {ns} has 0 ready replicas, restarting ...")
+        kubectl("rollout", "restart", f"deployment/{deploy}", "-n", ns)
+        kubectl("rollout", "status", f"deployment/{deploy}", "-n", ns,
+                "--timeout=60s")
+        return
+
+    ready = int(out.strip()) if out.strip().isdigit() else 0
+    if ready > 0:
+        log(f"Controller {deploy} in {ns} is healthy ({ready} ready)")
+    else:
+        log(f"Controller {deploy} in {ns} reports readyReplicas={out}, restarting ...")
+        kubectl("rollout", "restart", f"deployment/{deploy}", "-n", ns)
+        kubectl("rollout", "status", f"deployment/{deploy}", "-n", ns,
+                "--timeout=60s")
+
+
+def delete_argo_apps_in_ns(ns):
+    """Delete all Argo applications in a namespace, patching finalizers first."""
+    rc, out, _ = kubectl("get", "applications.argoproj.io", "-n", ns,
+                         "--no-headers", "-o", "custom-columns=NAME:.metadata.name",
+                         "--ignore-not-found")
+    if rc != 0 or not out.strip():
+        return
+    apps = [a.strip() for a in out.strip().split("\n") if a.strip()]
+    for app_name in apps:
+        kubectl("patch", "applications.argoproj.io", app_name, "-n", ns,
+                "--type=merge", f"-p={FINALIZER_PATCH}")
+        kubectl("delete", "applications.argoproj.io", app_name, "-n", ns,
+                "--ignore-not-found", "--wait=false")
+    log(f"Deleted {len(apps)} Argo app(s) in {ns}")
+
+
+def force_finalize_namespace(ns_name):
+    """Force-finalize a stuck Terminating namespace via /finalize subresource."""
+    body = json.dumps({
+        'apiVersion': 'v1', 'kind': 'Namespace',
+        'metadata': {'name': ns_name}, 'spec': {'finalizers': []}
+    })
+    kubectl("replace", "--raw", f"/api/v1/namespaces/{ns_name}/finalize",
+            "-f", "-", input_data=body)
+    log(f"Force-finalized namespace {ns_name}")
+
+
 def delete_one_composition(ns, name):
+    """Delete a single composition, patching its finalizer first."""
     kubectl("patch", f"{COMP_RES}.{COMP_GVR}", name, "-n", ns,
             "--type=merge", f"-p={FINALIZER_PATCH}")
     kubectl("delete", f"{COMP_RES}.{COMP_GVR}", name, "-n", ns,
             "--ignore-not-found", "--wait=false")
-    log(f"Deleted composition {ns}/{name}")
+    # Also delete the matching Argo application (same name in same namespace)
+    kubectl("patch", "applications.argoproj.io", name, "-n", ns,
+            "--type=merge", f"-p={FINALIZER_PATCH}")
+    kubectl("delete", "applications.argoproj.io", name, "-n", ns,
+            "--ignore-not-found", "--wait=false")
+    log(f"Deleted composition {ns}/{name} (+ Argo app)")
 
 
 def wait_for_composition_gone(ns, name, timeout=60):
-    """Wait until a specific composition no longer exists in K8s."""
+    """Wait until a specific composition no longer exists in K8s.
+
+    If the composition is still present after 30s, forcefully patch finalizers
+    again and delete the associated Argo app as a fallback.
+    """
     fqn = f"{ns}/{name}"
     deadline = time.time() + timeout
+    fallback_applied = False
     while time.time() < deadline:
         rc, _, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", name, "-n", ns,
                            "--no-headers")
         if rc != 0:
             log(f"Composition {fqn} confirmed gone from K8s")
             return True
+        # After 30s, apply fallback: re-patch finalizers and delete Argo app
+        elapsed = timeout - (deadline - time.time())
+        if elapsed >= 30 and not fallback_applied:
+            log(f"Composition {fqn} still present after 30s — applying fallback")
+            kubectl("patch", f"{COMP_RES}.{COMP_GVR}", name, "-n", ns,
+                    "--type=merge", f"-p={FINALIZER_PATCH}")
+            kubectl("patch", "applications.argoproj.io", name, "-n", ns,
+                    "--type=merge", f"-p={FINALIZER_PATCH}")
+            kubectl("delete", "applications.argoproj.io", name, "-n", ns,
+                    "--ignore-not-found", "--wait=false")
+            fallback_applied = True
         time.sleep(2)
     log(f"WARNING: composition {fqn} still exists after {timeout}s")
     return False
 
 
 def wait_for_namespace_gone(ns_name, timeout=120):
-    """Wait until a namespace no longer exists in K8s."""
+    """Wait until a namespace no longer exists in K8s.
+
+    If the namespace is stuck in Terminating after 60s, force-finalize it.
+    """
     deadline = time.time() + timeout
+    force_finalized = False
     while time.time() < deadline:
-        rc, _, _ = kubectl("get", "ns", ns_name, "--no-headers")
+        rc, out, _ = kubectl("get", "ns", ns_name, "--no-headers")
         if rc != 0:
             log(f"Namespace {ns_name} confirmed gone from K8s")
             return True
+        # After 60s, force-finalize if stuck in Terminating
+        elapsed = timeout - (deadline - time.time())
+        if elapsed >= 60 and not force_finalized and "Terminating" in (out or ""):
+            log(f"Namespace {ns_name} stuck in Terminating after 60s — force-finalizing")
+            force_finalize_namespace(ns_name)
+            force_finalized = True
         time.sleep(3)
     log(f"WARNING: namespace {ns_name} still exists after {timeout}s")
     return False
@@ -1066,7 +1159,17 @@ def wait_for_l1_key_gone(pattern, timeout=60):
 
 
 def delete_one_bench_namespace(ns_name):
-    # Delete compositions in this namespace first (otherwise ns gets stuck)
+    """Delete a single bench namespace with all its compositions and Argo apps.
+
+    Steps:
+    1. Patch finalizers on all compositions in the namespace
+    2. Delete all compositions
+    3. Delete all Argo applications (patch finalizers first)
+    4. Patch finalizers on all other blocking resources
+    5. Delete the namespace
+    6. If namespace is stuck in Terminating, force-finalize via /finalize API
+    """
+    # Step 1+2: Delete compositions in this namespace
     rc, out, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "-n", ns_name,
                          "--no-headers", "-o", "custom-columns=NAME:.metadata.name")
     if rc == 0 and out.strip():
@@ -1077,21 +1180,42 @@ def delete_one_bench_namespace(ns_name):
             kubectl("delete", f"{COMP_RES}.{COMP_GVR}", comp_name, "-n", ns_name,
                     "--ignore-not-found", "--wait=false")
         log(f"Deleted {len(comps)} compositions in {ns_name}")
-        # Wait for compositions to be gone before deleting the namespace
-        deadline = time.time() + 60
+        # Wait for compositions to be gone
+        deadline = time.time() + 30
         while time.time() < deadline:
             remaining = count_compositions_in_ns(ns_name)
             if remaining == 0:
                 break
             time.sleep(2)
+        # If still stuck, re-patch finalizers
+        remaining = count_compositions_in_ns(ns_name)
+        if remaining > 0:
+            log(f"Force-patching {remaining} stuck compositions in {ns_name}")
+            rc2, out2, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "-n", ns_name,
+                                   "--no-headers",
+                                   "-o", "custom-columns=NAME:.metadata.name")
+            if rc2 == 0 and out2.strip():
+                for c in out2.strip().split("\n"):
+                    c = c.strip()
+                    if c:
+                        kubectl("patch", f"{COMP_RES}.{COMP_GVR}", c, "-n", ns_name,
+                                "--type=merge", f"-p={FINALIZER_PATCH}")
 
+    # Step 3: Delete Argo applications
+    delete_argo_apps_in_ns(ns_name)
+
+    # Step 4: Patch finalizers on other blocking resources
     for resource in FINALIZER_RESOURCES:
-        rc, objs, _ = kubectl("get", resource, "-n", ns_name, "-o", "name")
+        rc, objs, _ = kubectl("get", resource, "-n", ns_name, "-o", "name",
+                              "--ignore-not-found")
         if rc == 0 and objs.strip():
             for obj in objs.strip().split("\n"):
-                name = obj.split("/")[-1] if "/" in obj else obj
-                kubectl("patch", resource, name, "-n", ns_name,
-                        "--type=merge", f"-p={FINALIZER_PATCH}")
+                obj_name = obj.split("/")[-1] if "/" in obj else obj
+                if obj_name.strip():
+                    kubectl("patch", resource, obj_name.strip(), "-n", ns_name,
+                            "--type=merge", f"-p={FINALIZER_PATCH}")
+
+    # Step 5: Delete the namespace
     kubectl("delete", "ns", ns_name, "--ignore-not-found", "--wait=false",
             "--force", "--grace-period=0")
     log(f"Triggered deletion of namespace {ns_name}")
@@ -1233,9 +1357,9 @@ def clean_environment():
         for line in (out or "").strip().split("\n"):
             parts = line.split(None, 1)
             if len(parts) == 2 and "composition" in parts[1] and "controller" in parts[1]:
-                kubectl("scale", "deployment/githubscaffoldingwithcompositionpages-v1-2-2-controller",
+                kubectl("scale", f"deployment/{COMP_CONTROLLER_DEPLOY}",
                         "--replicas=0", "-n", parts[0])
-                kubectl("delete", "deployment", "githubscaffoldingwithcompositionpages-v1-2-2-controller",
+                kubectl("delete", "deployment", COMP_CONTROLLER_DEPLOY,
                         "-n", parts[0], "--ignore-not-found", "--wait=false")
 
     rc, out, _ = kubectl("get", "applications.argoproj.io", "--all-namespaces",
@@ -2537,6 +2661,11 @@ def run_phase_browser_scaling(tokens):
             log("Argo scaled up for delete tests")
             time.sleep(60)  # let Argo pods start + sync
 
+            # Ensure composition-dynamic-controller is healthy in the target namespaces
+            ensure_composition_controller("bench-ns-01")
+            s8_ns = f"bench-ns-{s5_ns_end:02d}"
+            ensure_composition_controller(s8_ns)
+
             # S7 — Delete 1 composition
             ts = _snapshot_l1()
             delete_one_composition("bench-ns-01", "bench-app-01-01")
@@ -2547,7 +2676,7 @@ def run_phase_browser_scaling(tokens):
                 all_results.append(r)
 
             # S8 — Delete 1 namespace (~comps_per_ns compositions)
-            s8_ns = f"bench-ns-{s5_ns_end:02d}"
+            # s8_ns was computed before S7 for the controller health check
             ts = _snapshot_l1()
             delete_one_bench_namespace(s8_ns)
             wait_for_namespace_gone(s8_ns)

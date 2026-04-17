@@ -182,9 +182,29 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 	}
 }
 
-// dirtyState tracks whether an L1 key needs (re-)resolve.
+// dirtyState tracks whether an L1 key needs (re-)resolve and which
+// GVR+namespace pairs triggered the dirty mark so the refresh can
+// do targeted API result cache bypass instead of blanket bypass.
 type dirtyState struct {
 	pending atomic.Bool
+	mu      sync.Mutex
+	entries []DirtyEntry
+}
+
+// addEntry appends a dirty entry under lock. Called before pending.Store(true).
+func (ds *dirtyState) addEntry(gvrKey, ns string) {
+	ds.mu.Lock()
+	ds.entries = append(ds.entries, DirtyEntry{GVRKey: gvrKey, NS: ns})
+	ds.mu.Unlock()
+}
+
+// drainEntries returns and resets the accumulated dirty entries under lock.
+func (ds *dirtyState) drainEntries() []DirtyEntry {
+	ds.mu.Lock()
+	out := ds.entries
+	ds.entries = nil
+	ds.mu.Unlock()
+	return out
 }
 
 // pageKey identifies a paginated L1 key with its page number for sorting.
@@ -276,14 +296,16 @@ func (rw *ResourceWatcher) triggerL1Refresh(ctx context.Context, evt l1Event) {
 		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
 		// Mark the first page dirty — the goroutine will resolve it,
 		// then resolve subsequent pages inline.
-		rw.markDirtySequential(ctx, evt.gvr, pages, fn)
+		rw.markDirtySequential(ctx, evt.gvr, evt.gvrKey, evt.ns, pages, fn)
 	}
 }
 
 // markDirtySequential resolves a group of paginated L1 keys sequentially
 // in a single goroutine. Uses the first key's base as the dirty key
 // identity so the entire group is coalesced.
-func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR schema.GroupVersionResource, pages []pageKey, fn L1RefreshFunc) {
+// gvrKey and ns identify the GVR+namespace that triggered the dirty mark
+// so the refresh context carries a targeted DirtySet instead of a blanket bypass.
+func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR schema.GroupVersionResource, gvrKey string, ns string, pages []pageKey, fn L1RefreshFunc) {
 	if len(pages) == 0 {
 		return
 	}
@@ -296,6 +318,11 @@ func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR s
 
 	val, loaded := rw.dirtyKeys.LoadOrStore(identity, &dirtyState{})
 	state := val.(*dirtyState)
+	// Record which GVR+ns triggered this dirty mark BEFORE setting pending,
+	// so the goroutine's drain always sees the entry.
+	if gvrKey != "" {
+		state.addEntry(gvrKey, ns)
+	}
 	state.pending.Store(true)
 
 	if loaded {
@@ -315,20 +342,27 @@ func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR s
 		}()
 
 		for state.pending.Swap(false) {
+			// Drain accumulated dirty entries and build a targeted DirtySet
+			// so only the affected GVR+ns pairs bypass the API result cache.
+			entries := state.drainEntries()
+			dirtySet := NewDirtySet(entries)
+
 			// Resolve each page sequentially: p1 → p2 → ... → pN.
 			// The underlying data is the same — only the page parameter
 			// changes the JQ output. Sequential avoids N concurrent
 			// goroutines each doing O(items) work.
 			var allCascade []string
 			for _, pg := range pages {
-				refreshCtx, cancel := context.WithTimeout(WithDirtyBypass(ctx), 60*time.Second)
+				refreshCtx, cancel := context.WithTimeout(WithDirtySet(ctx, dirtySet), 60*time.Second)
 				cascade := fn(refreshCtx, triggerGVR, []string{pg.key})
 				cancel()
 				allCascade = append(allCascade, cascade...)
 			}
 
 			// Cascade: group dependent keys the same way and resolve
-			// sequentially within each group.
+			// sequentially within each group. Cascades get no bypass
+			// (gvrKey="" ns="") because they are transitive dependencies
+			// that don't directly correspond to the triggering event.
 			if len(allCascade) > 0 {
 				cascadeGroups := make(map[string][]pageKey)
 				for _, ck := range allCascade {
@@ -342,7 +376,7 @@ func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR s
 				}
 				for _, cPages := range cascadeGroups {
 					sort.Slice(cPages, func(i, j int) bool { return cPages[i].page < cPages[j].page })
-					rw.markDirtySequential(ctx, triggerGVR, cPages, fn)
+					rw.markDirtySequential(ctx, triggerGVR, "", "", cPages, fn)
 				}
 			}
 		}
