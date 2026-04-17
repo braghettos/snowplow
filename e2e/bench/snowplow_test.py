@@ -1171,29 +1171,127 @@ def delete_bench_rbac():
 
 
 def clean_environment():
+    """Robust cleanup that handles every dirty state from crashed runs.
+
+    Order matters:
+    1. Patch composition finalizers (so they can be deleted without controller)
+    2. Delete compositions (wait for drain)
+    3. Delete CompositionDefinition (core provider removes CRD + controller)
+    4. Wait for CRD to disappear
+    5. Delete Argo apps (in all namespaces, patch finalizers first)
+    6. Delete bench namespaces (normal delete, not force-finalize)
+    7. Delete RBAC (roles/rolebindings in krateo-system + clusterroles/bindings)
+    8. Deploy image + restart pod (flushes Redis)
+    """
     section("Cleaning environment")
-    # NOTE: clientconfig secrets are NOT deleted — they contain per-user K8s API
-    # credentials needed by the L1 refresh mechanism. Deleting them causes all
-    # background L1 refreshes to fail ("secrets X-clientconfig not found") until
-    # the user re-authenticates via the browser, leading to stale piechart counts
-    # and non-deterministic convergence times (4s vs 60s+ depending on timing).
-    # Correct deletion order: compositions → CompositionDefinitions → namespaces
-    # CompositionDefinition must only be deleted after ALL compositions are gone,
-    # otherwise the controller can't reconcile finalizer removal.
-    delete_all_compositions()
-    if count_compositions() == 0:
-        delete_all_compositiondefinitions()
+
+    # Step 1+2: Delete compositions (patch finalizers, then delete)
+    # If CRD doesn't exist, skip (no compositions to delete)
+    rc, _, _ = kubectl("get", "crd", f"{COMP_RES}.{COMP_GVR}", "--no-headers")
+    if rc == 0:
+        # Recreate any missing bench namespaces so kubectl can reach orphans
+        rc2, out2, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "--all-namespaces",
+                               "--no-headers", "-o", "jsonpath={range .items[*]}{.metadata.namespace}{\"\\n\"}{end}")
+        if rc2 == 0 and out2.strip():
+            for ns in sorted(set(out2.strip().split("\n"))):
+                if ns.startswith("bench-"):
+                    kubectl("create", "ns", ns, "--dry-run=client", "-o", "yaml",
+                            input_data=None)
+                    kubectl("create", "ns", ns)
+
+        # Patch finalizers in parallel
+        rc3, out3, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "--all-namespaces",
+                               "--no-headers", "-o",
+                               "custom-columns=NS:.metadata.namespace")
+        if rc3 == 0 and out3.strip():
+            namespaces = sorted(set(l.strip() for l in out3.strip().split("\n") if l.strip()))
+            def patch_ns(ns):
+                kubectl("patch", f"{COMP_RES}.{COMP_GVR}", "--all", "-n", ns,
+                        "--type=json", '-p=[{"op":"remove","path":"/metadata/finalizers"}]')
+            with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
+                list(ex.map(patch_ns, namespaces))
+            log(f"Patched finalizers in {len(namespaces)} namespaces")
+
+        # Delete compositions
+        delete_all_compositions()
     else:
-        log("WARNING: skipping CompositionDefinition deletion — compositions still exist")
+        log("No composition CRD — skipping composition deletion")
+
+    # Step 3+4: Delete CompositionDefinition → core provider cleans CRD
+    delete_all_compositiondefinitions()
+
+    # Step 5: Scale Argo + CD parser to 0 (prevents re-creation during cleanup),
+    # delete all apps (patch finalizers), then clean
+    for deploy in ("argocd-server", "argocd-applicationset-controller", "argocd-repo-server",
+                    "finops-composition-definition-parser"):
+        kubectl("scale", f"deployment/{deploy}", "--replicas=0", "-n", NS)
+    kubectl("scale", "statefulset/argocd-application-controller", "--replicas=0", "-n", NS)
+    # Also stop composition-dynamic-controller if running
+    rc, out, _ = kubectl("get", "pods", "--all-namespaces", "--no-headers",
+                         "-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
+    if rc == 0:
+        for line in (out or "").strip().split("\n"):
+            parts = line.split(None, 1)
+            if len(parts) == 2 and "composition" in parts[1] and "controller" in parts[1]:
+                kubectl("scale", "deployment/githubscaffoldingwithcompositionpages-v1-2-2-controller",
+                        "--replicas=0", "-n", parts[0])
+                kubectl("delete", "deployment", "githubscaffoldingwithcompositionpages-v1-2-2-controller",
+                        "-n", parts[0], "--ignore-not-found", "--wait=false")
+
+    rc, out, _ = kubectl("get", "applications.argoproj.io", "--all-namespaces",
+                         "--no-headers", "-o",
+                         "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
+    if rc == 0 and out.strip():
+        items = [(p[0], p[1]) for line in out.strip().split("\n")
+                 if (p := line.split(None, 1)) and len(p) >= 2]
+        if items:
+            # Batch patch in krateo-system (most apps are there)
+            kubectl("patch", "applications.argoproj.io", "--all", "-n", NS,
+                    "--type=merge", '-p={"metadata":{"finalizers":null}}')
+            kubectl("delete", "applications.argoproj.io", "--all", "-n", NS,
+                    "--ignore-not-found", "--wait=false", "--force", "--grace-period=0")
+            # Patch remaining in other namespaces
+            other_items = [i for i in items if i[0] != NS]
+            def patch_app(item):
+                kubectl("patch", "applications.argoproj.io", item[1], "-n", item[0],
+                        "--type=json", '-p=[{"op":"remove","path":"/metadata/finalizers"}]')
+                kubectl("delete", "applications.argoproj.io", item[1], "-n", item[0],
+                        "--ignore-not-found", "--wait=false", "--force", "--grace-period=0")
+            if other_items:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
+                    list(ex.map(patch_app, other_items))
+            # Wait for apps to drain
+            deadline = time.time() + 120
+            while time.time() < deadline:
+                rc2, out2, _ = kubectl("get", "applications.argoproj.io", "--all-namespaces",
+                                       "--no-headers")
+                remaining = len([l for l in (out2 or "").strip().split("\n") if l.strip()])
+                if remaining == 0:
+                    break
+                time.sleep(10)
+            log(f"Deleted {len(items)} Argo applications")
+
+    # Step 6: Delete bench namespaces (normal delete, wait for termination)
     delete_bench_namespaces()
+
+    # Step 7: Delete RBAC (in krateo-system and cluster-scoped)
     delete_bench_rbac()
-    # Deploy expected image tag (if set) and restart pod to flush Redis.
+    # Also clean roles/rolebindings in krateo-system that match bench-app-*
+    for res in ("roles", "rolebindings"):
+        rc, out, _ = kubectl("get", res, "-n", "krateo-system", "--no-headers", "-o", "name")
+        if rc == 0 and out.strip():
+            bench_items = [l.strip() for l in out.strip().split("\n") if "bench-app-" in l]
+            if bench_items:
+                kubectl("delete", *bench_items, "-n", "krateo-system",
+                        "--ignore-not-found", "--wait=false")
+                log(f"Deleted {len(bench_items)} {res} in krateo-system")
+
+    # Step 8: Deploy image + restart pod (flushes Redis sidecar)
     tag = os.environ.get("EXPECTED_IMAGE_TAG")
     if tag:
         log(f"Deploying snowplow image tag {tag} ...")
-        kubectl("set", "image", f"deployment/snowplow", f"snowplow=ghcr.io/braghettos/snowplow:{tag}",
-                "-n", "krateo-system")
-    # Restart to flush Redis sidecar and pick up new image.
+        kubectl("set", "image", "deployment/snowplow",
+                f"snowplow=ghcr.io/braghettos/snowplow:{tag}", "-n", "krateo-system")
     log("Restarting snowplow pod to flush Redis cache ...")
     rc, _, err = kubectl("rollout", "restart", "deployment/snowplow", "-n", "krateo-system")
     if rc == 0:
@@ -1202,6 +1300,9 @@ def clean_environment():
         log("  Snowplow pod restarted — Redis flushed")
     else:
         log(f"  WARNING: failed to restart snowplow: {err[:100]}")
+
+    # Scale CD parser back up (was stopped to prevent re-creation during cleanup)
+    kubectl("scale", "deployment/finops-composition-definition-parser", "--replicas=1", "-n", NS)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2427,6 +2528,14 @@ def run_phase_browser_scaling(tokens):
             r = _browser_measure_stage(page, "6b", "Post-restart (50K)", cache_mode, token=admin_token)
             if r:
                 all_results.append(r)
+
+            # Scale Argo back up for S7/S8 delete tests (finalizer processing)
+            for deploy in ("argocd-server", "argocd-applicationset-controller", "argocd-repo-server"):
+                kubectl("scale", f"deployment/{deploy}", "--replicas=1", "-n", NS)
+            # The application controller is a StatefulSet, not a Deployment
+            kubectl("scale", "statefulset/argocd-application-controller", "--replicas=1", "-n", NS)
+            log("Argo scaled up for delete tests")
+            time.sleep(60)  # let Argo pods start + sync
 
             # S7 — Delete 1 composition
             ts = _snapshot_l1()
