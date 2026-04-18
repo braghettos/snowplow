@@ -2710,7 +2710,7 @@ def run_phase_browser_scaling(tokens):
               f"│ {'Speedup':>8s} {'Conv':>7s}")
         print(f"  {'─' * 125}")
 
-        for s in sorted(stages.keys()):
+        for s in sorted(stages.keys(), key=str):
             info = stages[s]
             on_e = info.get("ON")
             off_e = info.get("OFF")
