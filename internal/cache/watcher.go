@@ -534,7 +534,6 @@ func (rw *ResourceWatcher) markDirtySequentialBatch(ctx context.Context, trigger
 	}
 
 	go func() {
-		defer rw.dirtyKeys.Delete(identity)
 		defer func() {
 			if r := recover(); r != nil {
 				buf := make([]byte, 4096)
@@ -545,42 +544,7 @@ func (rw *ResourceWatcher) markDirtySequentialBatch(ctx context.Context, trigger
 			}
 		}()
 
-		for state.pending.Swap(false) {
-			// Drain accumulated dirty entries and build a targeted DirtySet
-			// so only the affected GVR+ns pairs bypass the API result cache.
-			entries := state.drainEntries()
-			dirtySet := NewDirtySet(entries)
-
-			// Resolve each page sequentially: p1 → p2 → ... → pN.
-			var allCascade []string
-			for _, pg := range pages {
-				refreshCtx, cancel := context.WithTimeout(WithDirtySet(ctx, dirtySet), 60*time.Second)
-				cascade := fn(refreshCtx, triggerGVR, []string{pg.key})
-				cancel()
-				allCascade = append(allCascade, cascade...)
-			}
-
-			// Cascade: group dependent keys the same way and resolve
-			// sequentially within each group. Cascades get no bypass
-			// (gvrKey="" ns="") because they are transitive dependencies
-			// that don't directly correspond to the triggering event.
-			if len(allCascade) > 0 {
-				cascadeGroups := make(map[string][]pageKey)
-				for _, ck := range allCascade {
-					info, ok := ParseResolvedKey(ck)
-					if !ok {
-						cascadeGroups[ck] = append(cascadeGroups[ck], pageKey{key: ck, page: 0})
-						continue
-					}
-					baseKey := ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
-					cascadeGroups[baseKey] = append(cascadeGroups[baseKey], pageKey{key: ck, page: info.Page})
-				}
-				for _, cPages := range cascadeGroups {
-					sort.Slice(cPages, func(i, j int) bool { return cPages[i].page < cPages[j].page })
-					rw.markDirtySequential(ctx, triggerGVR, "", "", cPages, fn)
-				}
-			}
-		}
+		rw.runDirtyLoop(ctx, identity, state, triggerGVR, pages, fn)
 	}()
 }
 
@@ -614,7 +578,6 @@ func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR s
 	}
 
 	go func() {
-		defer rw.dirtyKeys.Delete(identity)
 		defer func() {
 			if r := recover(); r != nil {
 				buf := make([]byte, 4096)
@@ -625,46 +588,99 @@ func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR s
 			}
 		}()
 
-		for state.pending.Swap(false) {
-			// Drain accumulated dirty entries and build a targeted DirtySet
-			// so only the affected GVR+ns pairs bypass the API result cache.
-			entries := state.drainEntries()
-			dirtySet := NewDirtySet(entries)
+		rw.runDirtyLoop(ctx, identity, state, triggerGVR, pages, fn)
+	}()
+}
 
-			// Resolve each page sequentially: p1 → p2 → ... → pN.
-			// The underlying data is the same — only the page parameter
-			// changes the JQ output. Sequential avoids N concurrent
-			// goroutines each doing O(items) work.
-			var allCascade []string
-			for _, pg := range pages {
-				refreshCtx, cancel := context.WithTimeout(WithDirtySet(ctx, dirtySet), 60*time.Second)
-				cascade := fn(refreshCtx, triggerGVR, []string{pg.key})
-				cancel()
-				allCascade = append(allCascade, cascade...)
+// runDirtyLoop is the shared resolve loop for both markDirtySequentialBatch
+// and markDirtySequential. It processes pending dirty entries until none
+// remain, then safely removes the identity from dirtyKeys.
+//
+// RACE FIX: The previous code used `defer rw.dirtyKeys.Delete(identity)`
+// with `for state.pending.Swap(false)`. This had a race window between
+// the final pending.Swap(false) returning false and the defer deleting the
+// identity. During this window, a producer calling LoadOrStore would find
+// the existing state (loaded=true), set pending=true, and return without
+// launching a goroutine. Then the defer would delete the identity, losing
+// the pending mark forever. This caused stale L1 cache entries that never
+// converged (e.g., 97 stale compositions after namespace deletion).
+//
+// The fix: delete the identity FIRST, then check pending one more time.
+// If pending was set between the final Swap and the Delete (by a producer
+// that saw our state before the Delete), we re-register our state and
+// continue processing. If a producer arrives after the Delete, it creates
+// a new state and launches a new goroutine via LoadOrStore(loaded=false).
+func (rw *ResourceWatcher) runDirtyLoop(ctx context.Context, identity string, state *dirtyState, triggerGVR schema.GroupVersionResource, pages []pageKey, fn L1RefreshFunc) {
+	for {
+		if !state.pending.Swap(false) {
+			// No pending work. Delete identity first, then verify.
+			rw.dirtyKeys.Delete(identity)
+
+			// Check if a producer set pending between our Swap and Delete.
+			// The producer would have found our state via LoadOrStore
+			// (loaded=true), added entries, and set pending=true.
+			// After our Delete, new producers create their own state.
+			if !state.pending.Load() {
+				return // Truly no pending work. Safe to exit.
 			}
 
-			// Cascade: group dependent keys the same way and resolve
-			// sequentially within each group. Cascades get no bypass
-			// (gvrKey="" ns="") because they are transitive dependencies
-			// that don't directly correspond to the triggering event.
-			if len(allCascade) > 0 {
-				cascadeGroups := make(map[string][]pageKey)
-				for _, ck := range allCascade {
-					info, ok := ParseResolvedKey(ck)
-					if !ok {
-						cascadeGroups[ck] = append(cascadeGroups[ck], pageKey{key: ck, page: 0})
-						continue
+			// Pending was set on our state. Re-register it so new
+			// producers coalesce with us rather than launching a
+			// competing goroutine.
+			if _, alreadyTaken := rw.dirtyKeys.LoadOrStore(identity, state); alreadyTaken {
+				// Another goroutine is already handling this identity.
+				// Our pending entries were set on the old state (us),
+				// not theirs. Drain our entries into the new state.
+				entries := state.drainEntries()
+				if val, ok := rw.dirtyKeys.Load(identity); ok {
+					newState := val.(*dirtyState)
+					for _, e := range entries {
+						newState.addEntry(e.GVRKey, e.NS)
 					}
-					baseKey := ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
-					cascadeGroups[baseKey] = append(cascadeGroups[baseKey], pageKey{key: ck, page: info.Page})
+					newState.pending.Store(true)
 				}
-				for _, cPages := range cascadeGroups {
-					sort.Slice(cPages, func(i, j int) bool { return cPages[i].page < cPages[j].page })
-					rw.markDirtySequential(ctx, triggerGVR, "", "", cPages, fn)
+				return
+			}
+			// Successfully re-registered. Continue the loop to process
+			// the pending work.
+			continue
+		}
+
+		// Drain accumulated dirty entries and build a targeted DirtySet
+		// so only the affected GVR+ns pairs bypass the API result cache.
+		entries := state.drainEntries()
+		dirtySet := NewDirtySet(entries)
+
+		// Resolve each page sequentially: p1 → p2 → ... → pN.
+		var allCascade []string
+		for _, pg := range pages {
+			refreshCtx, cancel := context.WithTimeout(WithDirtySet(ctx, dirtySet), 60*time.Second)
+			cascade := fn(refreshCtx, triggerGVR, []string{pg.key})
+			cancel()
+			allCascade = append(allCascade, cascade...)
+		}
+
+		// Cascade: group dependent keys the same way and resolve
+		// sequentially within each group. Cascades get no bypass
+		// (gvrKey="" ns="") because they are transitive dependencies
+		// that don't directly correspond to the triggering event.
+		if len(allCascade) > 0 {
+			cascadeGroups := make(map[string][]pageKey)
+			for _, ck := range allCascade {
+				info, ok := ParseResolvedKey(ck)
+				if !ok {
+					cascadeGroups[ck] = append(cascadeGroups[ck], pageKey{key: ck, page: 0})
+					continue
 				}
+				baseKey := ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
+				cascadeGroups[baseKey] = append(cascadeGroups[baseKey], pageKey{key: ck, page: info.Page})
+			}
+			for _, cPages := range cascadeGroups {
+				sort.Slice(cPages, func(i, j int) bool { return cPages[i].page < cPages[j].page })
+				rw.markDirtySequential(ctx, triggerGVR, "", "", cPages, fn)
 			}
 		}
-	}()
+	}
 }
 
 // WaitForSync blocks until all started informers have completed their initial sync.
