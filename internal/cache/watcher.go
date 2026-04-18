@@ -174,9 +174,14 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 		}
 
 		// Drain all pending events non-blockingly to form a batch.
+		// Cap at 10K events per batch to bound the processing time.
+		// Remaining events are picked up in the next iteration.
+		// This prevents the l1Worker from being blocked for minutes
+		// when 50K+ events arrive (e.g., during mass deployment).
+		const maxBatchSize = 10000
 		batch := []l1Event{first}
 	drain:
-		for {
+		for len(batch) < maxBatchSize {
 			select {
 			case evt, ok := <-rw.eventCh:
 				if !ok {
@@ -188,14 +193,38 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 			}
 		}
 
-		// Process the batch: DELETE cleanup first, then batched L1 refresh.
+		// Count event types for logging.
+		var nDelete int
+		for i := range batch {
+			if batch[i].eventType == "delete" {
+				nDelete++
+			}
+		}
+		if len(batch) > 1 || nDelete > 0 {
+			slog.Info("l1Worker: processing batch",
+				slog.Int("size", len(batch)),
+				slog.Int("deletes", nDelete))
+		}
+
+		// Process the batch: L1 refresh first, then DELETE dep cleanup.
+		// ORDER MATTERS: triggerL1RefreshBatch calls SMembers on per-resource
+		// GET dep keys. If we delete those keys first (for DELETE events),
+		// the SMembers returns empty and we lose the dep chain for individually
+		// GET'd resources. By running the refresh first, the dep lookup
+		// succeeds; then we clean up the stale dep key.
+		batchStart := time.Now()
+		rw.triggerL1RefreshBatch(ctx, batch)
+		if elapsed := time.Since(batchStart); elapsed > 5*time.Second {
+			slog.Warn("l1Worker: batch processing slow",
+				slog.Int("size", len(batch)),
+				slog.String("elapsed", elapsed.String()))
+		}
 		for i := range batch {
 			if batch[i].eventType == "delete" {
 				resDepKey := L1ResourceDepKey(batch[i].gvrKey, batch[i].ns, batch[i].name)
 				_ = rw.cache.Delete(ctx, resDepKey)
 			}
 		}
-		rw.triggerL1RefreshBatch(ctx, batch)
 	}
 }
 
@@ -309,6 +338,13 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 	}
 
 	// ── Phase 2: Execute deduplicated SMembers lookups ───────────────────
+	// LIST + cluster deps are always looked up (O(namespaces) + O(GVRs)).
+	// GET deps are only looked up if their GVR+ns is NOT already covered by
+	// a LIST dep. At 50K scale this avoids 50K redundant SMembers calls —
+	// the LIST dep already captures all resolved keys for that namespace.
+	// GET deps only add value for resources individually fetched via
+	// objects.Get() (e.g., single-resource widgets), not for LIST-based
+	// widgets that already depend on the namespace LIST dep key.
 	affected := make(map[string]bool)
 	collect := func(idxKey string) {
 		if keys, err := rw.cache.SMembers(ctx, idxKey); err == nil {
@@ -324,7 +360,22 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 	for _, dep := range clusterDeps {
 		collect(dep.redisKey)
 	}
-	for _, dep := range getDeps {
+	// Only look up GET deps whose GVR+ns is NOT already covered by a LIST dep.
+	// This is the critical optimisation: at 50K scale with 50 namespaces,
+	// we skip ~50K SMembers calls (one per unique resource name) because
+	// the LIST dep for each namespace already captures all dependent keys.
+	var getSkipped, getLookedUp int
+	for dedup, dep := range getDeps {
+		// dedup format: "gvrKey\x00ns\x00name" — extract "gvrKey\x00ns"
+		lastSep := strings.LastIndexByte(dedup, '\x00')
+		if lastSep > 0 {
+			nsDedup := dedup[:lastSep]
+			if _, coveredByList := listDeps[nsDedup]; coveredByList {
+				getSkipped++
+				continue // LIST dep already covers this GVR+ns
+			}
+		}
+		getLookedUp++
 		collect(dep.redisKey)
 	}
 
@@ -333,7 +384,8 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 			slog.Int("events", len(events)),
 			slog.Int("listDeps", len(listDeps)),
 			slog.Int("clusterDeps", len(clusterDeps)),
-			slog.Int("getDeps", len(getDeps)))
+			slog.Int("getDeps", len(getDeps)),
+			slog.Int("getSkipped", getSkipped))
 		return
 	}
 
@@ -341,8 +393,10 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 		slog.Int("events", len(events)),
 		slog.Int("listDeps", len(listDeps)),
 		slog.Int("clusterDeps", len(clusterDeps)),
-		slog.Int("getDeps", len(getDeps)),
-		slog.Int("total", len(affected)))
+		slog.Int("getDeps.total", len(getDeps)),
+		slog.Int("getDeps.skipped", getSkipped),
+		slog.Int("getDeps.lookedUp", getLookedUp),
+		slog.Int("affected", len(affected)))
 
 	// ── Phase 3: Separate API result keys from resolved keys ─────────────
 	// Stale-while-refresh: on ADD/UPDATE, API result keys are left untouched —
