@@ -56,8 +56,8 @@ type Input struct {
 	// that case L1 writes are skipped.
 	Cache *cache.RedisCache
 
-	// Obj is the unstructured RESTAction CR as fetched from L2/L3
-	// or the k8s API. Marshaled shape: map[string]any.
+	// Obj is the unstructured RESTAction CR as fetched from L2 Redis
+	// or the informer store. Marshaled shape: map[string]any.
 	Obj map[string]any
 
 	// ResolvedKey is the L1 cache key (from cache.ResolvedKey).
@@ -101,11 +101,6 @@ type Result struct {
 // convert → resolve → marshal → strip → L1 write.
 // L1 keys are per-user so there is no thundering herd.
 func ResolveAndCache(ctx context.Context, in Input) (*Result, error) {
-	return resolveAndCacheInner(ctx, in)
-}
-
-// ResolveAndCacheBackground is the entry point for the background L1 refresh.
-func ResolveAndCacheBackground(ctx context.Context, in Input) (*Result, error) {
 	return resolveAndCacheInner(ctx, in)
 }
 

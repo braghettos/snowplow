@@ -16,7 +16,6 @@ import (
 	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/plumbing/jwtutil"
 	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/rbac"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions/l1cache"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -276,186 +275,76 @@ func FilterWidgetGVRs(cfg *cache.WarmupConfig) []schema.GroupVersionResource {
 
 
 
-// PreWarmRBACForUser pre-populates the RBAC cache for a single user across all
-// watched GVR x namespace x verb combinations. Called by UserSecretWatcher when
-// a -clientconfig secret is created or updated.
-//
-// Uses bounded concurrency (runtime.GOMAXPROCS(0)) for the SelfSubjectAccessReview
-// calls. The function blocks until all checks complete or the context is cancelled.
-func PreWarmRBACForUser(ctx context.Context, c *cache.RedisCache, rc *rest.Config, authnNS, signKey, username string) {
+// WarmL1FromEntryPoints discovers the widget tree starting from the frontend
+// entry points (INIT, ROUTES_LOADER) and resolves them for each active user.
+// RBAC decisions are populated organically during resolution -- no explicit
+// pre-warming of the GVR x NS x verbs cartesian product.
+func WarmL1FromEntryPoints(ctx context.Context, c *cache.RedisCache, rc *rest.Config,
+	authnNS, signKey string, entryPoints []cache.EntryPoint) {
 	log := slog.Default()
-	if authnNS == "" || username == "" {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-
-	// Load the user's endpoint from their -clientconfig secret.
-	ep, err := endpoints.FromSecret(ctx, rc, username+clientConfigSecretSuffix, authnNS)
-	if err != nil {
-		log.Warn("RBAC pre-warm: failed to load user endpoint",
-			slog.String("username", username), slog.Any("err", err))
-		return
-	}
-	groups := extractGroupsFromClientCert(ep.ClientCertificateData)
-	user := jwtutil.UserInfo{Username: username, Groups: groups}
-	token := mintJWT(user, signKey)
-
-	rctx := xcontext.BuildContext(ctx,
-		xcontext.WithUserConfig(ep),
-		xcontext.WithUserInfo(user),
-		xcontext.WithAccessToken(token),
-	)
-	rctx = cache.WithCache(rctx, c)
-
-	// Get all watched GVRs.
-	gvrKeys, err := c.SMembers(ctx, cache.WatchedGVRsKey)
-	if err != nil || len(gvrKeys) == 0 {
-		log.Debug("RBAC pre-warm: no watched GVRs", slog.String("username", username))
-		return
-	}
-
-	// Get all namespaces from L3 cache.
-	namespaces := getNamespacesFromL3(ctx, c)
-	if len(namespaces) == 0 {
-		log.Debug("RBAC pre-warm: no namespaces in L3", slog.String("username", username))
-		return
-	}
-
-	verbs := []string{"list", "get", "create", "update", "delete", "patch"}
-
-	// Build the work items.
-	type rbacCheck struct {
-		verb string
-		gr   schema.GroupResource
-		ns   string
-	}
-	var checks []rbacCheck
-	for _, gvrKeyStr := range gvrKeys {
-		gvr := cache.ParseGVRKey(gvrKeyStr)
-		if gvr.Resource == "" {
-			continue
-		}
-		gr := gvr.GroupResource()
-		for _, ns := range namespaces {
-			for _, verb := range verbs {
-				// Skip if already cached.
-				if allowed, cached := c.IsRBACAllowed(ctx, username, verb, gr, ns); cached {
-					_ = allowed // already in cache, skip
-					continue
-				}
-				checks = append(checks, rbacCheck{verb: verb, gr: gr, ns: ns})
-			}
-		}
-	}
-
-	if len(checks) == 0 {
-		log.Debug("RBAC pre-warm: all checks already cached",
-			slog.String("username", username))
-		return
-	}
-
-	log.Info("RBAC pre-warm: starting",
-		slog.String("username", username),
-		slog.Int("checks", len(checks)),
-		slog.Int("gvrs", len(gvrKeys)),
-		slog.Int("namespaces", len(namespaces)),
-	)
-
-	// Execute checks with bounded concurrency.
-	var (
-		wg  sync.WaitGroup
-		sem = make(chan struct{}, runtime.GOMAXPROCS(0))
-	)
-	for _, check := range checks {
-		if ctx.Err() != nil {
-			break
-		}
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(ch rbacCheck) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			rbac.UserCan(rctx, rbac.UserCanOptions{
-				Verb:          ch.verb,
-				GroupResource: ch.gr,
-				Namespace:     ch.ns,
-			})
-		}(check)
-	}
-	wg.Wait()
-
-	log.Info("RBAC pre-warm: completed",
-		slog.String("username", username),
-		slog.Int("checks", len(checks)),
-	)
-}
-
-// MakeRBACPreWarmer returns a UserReadyFunc suitable for use with
-// UserSecretWatcher.SetOnUserReady. It captures the dependencies needed
-// to perform per-user RBAC pre-warming.
-func MakeRBACPreWarmer(c *cache.RedisCache, rc *rest.Config, authnNS, signKey string) cache.UserReadyFunc {
-	return func(ctx context.Context, username string) {
-		PreWarmRBACForUser(ctx, c, rc, authnNS, signKey, username)
-	}
-}
-
-// getNamespacesFromL3 retrieves the list of namespace names from L3 cache.
-// Tries per-item index first, falls back to monolithic blob.
-func getNamespacesFromL3(ctx context.Context, c *cache.RedisCache) []string {
-	nsGVR := schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}
-	var nsList unstructured.UnstructuredList
-
-	if raw, idxHit, _ := c.AssembleListFromIndex(ctx, nsGVR, ""); idxHit {
-		if jerr := json.Unmarshal(raw, &nsList); jerr == nil {
-			return extractNamespaceNames(nsList)
-		}
-	}
-	return nil
-}
-
-func extractNamespaceNames(nsList unstructured.UnstructuredList) []string {
-	names := make([]string, 0, len(nsList.Items))
-	for _, ns := range nsList.Items {
-		names = append(names, ns.GetName())
-	}
-	return names
-}
-
-// WarmRBACForAllUsers pre-populates the RBAC cache for all discovered users
-// so that the watcher's cache-only RBAC checks and L1 warmup's L3→L2
-// promotions have permission data available from the start.
-func WarmRBACForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config, authnNS, signKey string) {
-	log := slog.Default()
-	if authnNS == "" {
+	if len(entryPoints) == 0 || authnNS == "" {
+		log.Info("L1 entry-point warmup: skipped (no entry points or authn namespace)")
 		return
 	}
 
 	users, err := discoverUsers(ctx, rc, authnNS)
-	if err != nil || len(users) == 0 {
-		log.Warn("RBAC warmup: no users discovered", slog.Any("err", err))
+	if err != nil {
+		log.Warn("L1 entry-point warmup: failed to discover users", slog.Any("err", err))
+		return
+	}
+	if len(users) == 0 {
+		log.Info("L1 entry-point warmup: no users found")
 		return
 	}
 
-	log.Info("RBAC warmup: starting", slog.Int("users", len(users)))
-
-	// Delegate to PreWarmRBACForUser per user — it already has bounded
-	// concurrency (sem of 20), skips cached results, and handles context.
-	var wg sync.WaitGroup
-	for _, u := range users {
-		if ctx.Err() != nil {
-			break
-		}
-		wg.Add(1)
-		go func(username string) {
-			defer wg.Done()
-			PreWarmRBACForUser(ctx, c, rc, authnNS, signKey, username)
-		}(u.userInfo.Username)
+	dynClient, dcErr := newUnthrottledDynClient(rc)
+	if dcErr != nil {
+		log.Warn("L1 entry-point warmup: unable to build unthrottled dyn client",
+			slog.Any("err", dcErr))
 	}
-	wg.Wait()
+	prewarmDynClient = dynClient
 
-	log.Info("RBAC warmup: completed", slog.Int("users", len(users)))
+	log.Info("L1 entry-point warmup: starting",
+		slog.Int("users", len(users)),
+		slog.Int("entryPoints", len(entryPoints)),
+	)
+
+	// Convert entry points to l1Refs.
+	var epRefs []l1Ref
+	for _, ep := range entryPoints {
+		epRefs = append(epRefs, l1Ref{gvr: ep.GVR, ns: ep.Namespace, name: ep.Name})
+	}
+
+	var totalWarmed int64
+	for _, u := range users {
+		token := mintJWT(u.userInfo, signKey)
+		visited := make(map[string]bool)
+		recursivePreWarm(ctx, u.userInfo, u.endpoint, token, c, dynClient, epRefs, authnNS, visited, 1)
+		warmed := int64(len(visited))
+		totalWarmed += warmed
+		log.Info("L1 entry-point warmup: user done",
+			slog.String("user", u.userInfo.Username),
+			slog.Int64("warmed", warmed),
+		)
+	}
+
+	log.Info("L1 entry-point warmup: completed",
+		slog.Int("users", len(users)),
+		slog.Int64("totalWarmed", totalWarmed),
+	)
+
+	preWarmComplete.Store(true)
+	cache.MarkL1Ready(ctx, c)
+	log.Info("L1 entry-point warmup: pre-warm disabled, switching to event-driven updates")
+}
+
+// MakeRBACPreWarmer returns a no-op UserReadyFunc. RBAC decisions are now
+// populated organically during widget/RESTAction resolution rather than
+// pre-warmed via the GVR x NS x verb cartesian product.
+func MakeRBACPreWarmer(c *cache.RedisCache, rc *rest.Config, authnNS, signKey string) cache.UserReadyFunc {
+	return func(ctx context.Context, username string) {
+		// RBAC warms organically during resolution -- no explicit pre-warm.
+	}
 }
 
 // ---------------------------------------------------------------------------

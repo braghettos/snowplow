@@ -189,16 +189,9 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 
 	switch {
 	case info.GVR.Group == widgetGroup:
-		// Use ResolveWidgetBackground to avoid blocking HTTP requests that
-		// resolve the same key via singleflight.
-		//
-		// IMPORTANT: resolveWidgetFromObject (called inside) registers deps
-		// via RegisterL1Dependencies. But if the singleflight dedup skips
-		// the resolve fn (another caller already running), deps are NOT
-		// re-registered. To guarantee the dep chain survives across L1
-		// refresh cycles, we explicitly re-register the apiRef GVR dep
-		// AFTER the resolve completes, using a fresh tracker.
-		result, err := ResolveWidgetBackground(rctx, c, got, rawKey, authnNS, info.PerPage, info.Page)
+		// resolveWidgetFromObject (called inside) registers deps via
+		// RegisterL1Dependencies.
+		result, err := ResolveWidget(rctx, c, got, rawKey, authnNS, info.PerPage, info.Page)
 		if err != nil {
 			return false, nil
 		}

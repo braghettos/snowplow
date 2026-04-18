@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -120,6 +121,24 @@ func Disabled() bool {
 }
 
 func New(resourceTTL time.Duration) *RedisCache {
+	poolSize := 50
+	if v := os.Getenv("REDIS_POOL_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			poolSize = n
+		}
+	}
+	minIdle := 5
+	if v := os.Getenv("REDIS_MIN_IDLE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			minIdle = n
+		}
+	}
+	maxRetries := 2
+	if v := os.Getenv("REDIS_MAX_RETRIES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			maxRetries = n
+		}
+	}
 	return &RedisCache{
 		client: redis.NewClient(&redis.Options{
 			Addr:         redisAddr(),
@@ -127,9 +146,9 @@ func New(resourceTTL time.Duration) *RedisCache {
 			DialTimeout:  3 * time.Second,
 			ReadTimeout:  2 * time.Second,
 			WriteTimeout: 2 * time.Second,
-			PoolSize:     50,
-			MinIdleConns: 5,
-			MaxRetries:   2,
+			PoolSize:     poolSize,
+			MinIdleConns: minIdle,
+			MaxRetries:   maxRetries,
 		}),
 		ResourceTTL: resourceTTL,
 	}
@@ -966,36 +985,3 @@ func (c *RedisCache) DiskFileCount() int64 {
 	return c.diskStore.FileCount()
 }
 
-// ── Expiry notifications ──────────────────────────────────────────────────────
-
-func (c *RedisCache) EnableExpiryNotifications(ctx context.Context) error {
-	if c == nil {
-		return nil
-	}
-	return c.client.ConfigSet(ctx, "notify-keyspace-events", "Kx").Err()
-}
-
-func (c *RedisCache) SubscribeExpired(ctx context.Context) <-chan string {
-	ch := make(chan string, 128)
-	go func() {
-		defer close(ch)
-		pubsub := c.client.Subscribe(ctx, "__keyevent@0__:expired")
-		defer pubsub.Close()
-		msgs := pubsub.Channel()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case msg, ok := <-msgs:
-				if !ok {
-					return
-				}
-				select {
-				case ch <- msg.Payload:
-				default:
-				}
-			}
-		}
-	}()
-	return ch
-}

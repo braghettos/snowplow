@@ -43,7 +43,7 @@ var (
 	// globalInformerReader is set by startBackgroundServices after the
 	// ResourceWatcher is created. The HTTP middleware injects it into
 	// every request context so resolve.go can read from the informer
-	// store instead of L3 Redis.
+	// store instead of Redis.
 	globalInformerReader cache.InformerReader
 )
 
@@ -281,7 +281,7 @@ func main() {
 
 	// Run cache warmup in background so /health responds immediately.
 	// Previously this ran before ListenAndServe, causing startup probe failures
-	// when informer sync + L3/RBAC warmup exceeded the probe timeout.
+	// when informer sync + L2/RBAC warmup exceeded the probe timeout.
 	if redisCache != nil {
 		go startBackgroundServices(ctx, log, redisCache, *authnNS, *warmupConfigPath, *signKey)
 	}
@@ -400,16 +400,16 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 		log.Warn("informer caches did not sync within timeout; proceeding with warmup anyway")
 	}
 
-	// Phase 4: Run L3 warmup using the background context.
+	// Phase 4: Run L2 warmup using the background context.
 	log.Info("starting cache warmup")
 	warmer.Run(warmupCtx)
 
-	// Phase 4a: Reconcile L3 from informer stores — fixes stale data from pod restart.
+	// Phase 4a: Reconcile L2 from informer stores -- fixes stale data from pod restart.
 	// Informers have an active WATCH, so their in-memory store is authoritative.
 	// Any ghost objects (missed DELETEs during downtime) are removed, and missing
 	// or stale objects are patched.
 	reconcileStats := resourceWatcher.Reconcile(warmupCtx)
-	log.Info("L3 reconciliation completed",
+	log.Info("L2 reconciliation completed",
 		slog.Int("gvrs", reconcileStats.GVRs),
 		slog.Int("added", reconcileStats.Added),
 		slog.Int("removed", reconcileStats.Removed),
@@ -417,28 +417,48 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 		slog.Int("errors", reconcileStats.Errors),
 		slog.Duration("duration", reconcileStats.Duration))
 
-	// Phase 4b: Pre-populate RBAC cache for all users so L3→L2 promotions
-	// and the watcher's cache-only RBAC checks work from the start.
-	// Inject informer reader into warmup contexts so resolve.go can
-	// read from informer store instead of L3 Redis.
+	// Phase 4b: RBAC decisions are now populated organically during
+	// resolution rather than pre-warmed via the GVR x NS x verb cartesian
+	// product. Inject informer reader into warmup contexts so resolve.go
 	if globalInformerReader != nil {
 		warmupCtx = cache.WithInformerReader(warmupCtx, globalInformerReader)
 	}
-	dispatchers.WarmRBACForAllUsers(warmupCtx, c, rc, authnNS, signKey)
 
 	// Phase 5: Pre-warm L1 (resolved widget + RESTAction output) for every
 	// known user. Uses its own context because warmupCtx is cancelled when
 	// this function returns, but the L1 warmup continues in the background.
-	if warmupCfg != nil && authnNS != "" {
-		widgetGVRs := dispatchers.FilterWidgetGVRs(warmupCfg)
-		restActions := warmupCfg.Warmup.L1RestActions
-		go func() {
-			l1Ctx, l1Cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			defer l1Cancel()
-			if globalInformerReader != nil {
-				l1Ctx = cache.WithInformerReader(l1Ctx, globalInformerReader)
+	//
+	// When a frontend config is available, WarmL1FromEntryPoints walks the
+	// widget tree starting from the INIT/ROUTES_LOADER entry points. This
+	// warms exactly the paths the frontend will request. Falls back to the
+	// GVR-based WarmL1ForAllUsers when the config is missing.
+	frontendConfigPath := env.String("FRONTEND_CONFIG", "/etc/frontend-config/config.json")
+	go func() {
+		l1Ctx, l1Cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer l1Cancel()
+		if globalInformerReader != nil {
+			l1Ctx = cache.WithInformerReader(l1Ctx, globalInformerReader)
+		}
+
+		if feCfg, feErr := cache.LoadFrontendConfig(frontendConfigPath); feErr == nil {
+			eps := feCfg.EntryPoints()
+			if len(eps) > 0 {
+				log.Info("L1 warmup: using frontend entry points",
+					slog.Int("entryPoints", len(eps)),
+					slog.String("configPath", frontendConfigPath))
+				dispatchers.WarmL1FromEntryPoints(l1Ctx, c, rc, authnNS, signKey, eps)
+				return
 			}
+		} else {
+			log.Info("L1 warmup: frontend config not available, falling back to GVR-based warmup",
+				slog.String("path", frontendConfigPath), slog.Any("err", feErr))
+		}
+
+		// Fallback: GVR-based warmup when frontend config is not available.
+		if warmupCfg != nil && authnNS != "" {
+			widgetGVRs := dispatchers.FilterWidgetGVRs(warmupCfg)
+			restActions := warmupCfg.Warmup.L1RestActions
 			dispatchers.WarmL1ForAllUsers(l1Ctx, c, rc, authnNS, signKey, widgetGVRs, restActions)
-		}()
-	}
+		}
+	}()
 }

@@ -24,7 +24,6 @@ type Metrics struct {
 	L1Misses        atomic.Int64
 	CallHits        atomic.Int64
 	CallMisses      atomic.Int64
-	L3Promotions    atomic.Int64
 	NegativeHits    atomic.Int64
 	ExpiryRefreshes atomic.Int64
 
@@ -71,7 +70,7 @@ func (m *Metrics) StartMetricsFlusher(ctx context.Context, interval time.Duratio
 					"raw_hits", s.RawHits, "raw_misses", s.RawMisses,
 					"l1_hits", s.L1Hits, "l1_misses", s.L1Misses,
 					"call_hits", s.CallHits, "call_misses", s.CallMisses,
-					"l3_promotions", s.L3Promotions, "negative_hits", s.NegativeHits,
+					"negative_hits", s.NegativeHits,
 					"expiry_refreshes", s.ExpiryRefreshes)
 			}
 		}
@@ -91,7 +90,6 @@ type MetricsSnapshot struct {
 	L1Misses        int64   `json:"l1_misses"`
 	CallHits        int64   `json:"call_hits"`
 	CallMisses      int64   `json:"call_misses"`
-	L3Promotions    int64   `json:"l3_promotions"`
 	NegativeHits    int64   `json:"negative_hits"`
 	ExpiryRefreshes int64   `json:"expiry_refreshes"`
 	GetHitRate      float64 `json:"get_hit_rate"`
@@ -127,7 +125,6 @@ func (m *Metrics) snapshotFromAtomics() MetricsSnapshot {
 		L1Misses:        m.L1Misses.Load(),
 		CallHits:        m.CallHits.Load(),
 		CallMisses:      m.CallMisses.Load(),
-		L3Promotions:    m.L3Promotions.Load(),
 		NegativeHits:    m.NegativeHits.Load(),
 		ExpiryRefreshes: m.ExpiryRefreshes.Load(),
 	}
@@ -160,7 +157,6 @@ func (m *Metrics) snapshotFromRedis(c *RedisCache) (MetricsSnapshot, bool) {
 		L1Misses:        r("l1_misses"),
 		CallHits:        r("call_hits"),
 		CallMisses:      r("call_misses"),
-		L3Promotions:    r("l3_promotions"),
 		NegativeHits:    r("negative_hits"),
 		ExpiryRefreshes: r("expiry_refreshes"),
 	}

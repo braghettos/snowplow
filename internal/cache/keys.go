@@ -151,13 +151,6 @@ func ResolvedKeyBase(username string, gvr schema.GroupVersionResource, namespace
 	return fmt.Sprintf("snowplow:resolved:%s:%s:%s:%s", username, GVRToKey(gvr), namespace, name)
 }
 
-// L1GVRKey returns the Redis SET key that maps a GVR to all L1 (resolved)
-// cache entries that depend on it. Used as a fallback for targeted invalidation
-// when per-resource dependency indexes are not yet populated.
-func L1GVRKey(gvrKey string) string {
-	return "snowplow:l1gvr:" + gvrKey
-}
-
 // L1ResourceDepKey returns the Redis SET key for a per-resource L1 dependency.
 // It maps a specific K8s resource (GVR + namespace + name) to the L1 resolved
 // keys that accessed it during resolution.

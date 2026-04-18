@@ -183,7 +183,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			verb := strings.ToUpper(ptr.Deref(call.Verb, http.MethodGet))
 
 			// Record the GVR and per-resource dependency for targeted invalidation
-			// and register the GVR for informer watching so L3 gets populated.
+			// and register the GVR for informer watching so the store gets populated.
 			// RESTAction paths can be either K8s API paths (/apis/group/version/...)
 			// or snowplow /call paths (/call?resource=...&apiVersion=...).
 			// Record the path for the apiRequests list in the resolved output.

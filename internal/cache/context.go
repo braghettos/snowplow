@@ -21,7 +21,7 @@ func FromContext(ctx context.Context) *RedisCache {
 }
 
 // InformerReader provides read access to the informer's in-memory store.
-// This is the interface that replaces L3 Redis reads — the informer
+// This is the interface that replaced L3 Redis reads -- the informer
 // already holds all K8s objects via WATCH, so reading from it is
 // zero-I/O and zero-copy (returns pointers to live objects).
 type InformerReader interface {

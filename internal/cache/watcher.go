@@ -26,9 +26,6 @@ import (
 
 var watcherTracer = otel.Tracer("snowplow/watcher")
 
-// L1ChangeInfo describes a single L3 change that triggered an L1 refresh.
-// Used by the incremental L1 patch path (C2) to avoid full re-resolution
-// when only one item changed.
 // L1RefreshFunc is invoked by the ResourceWatcher to proactively re-resolve
 // L1 cache entries. The function receives the GVR that triggered the refresh
 // (for logging) and the list of L1 keys to refresh. All refreshes are full
@@ -105,7 +102,7 @@ func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error
 			},
 		),
 		watched:                make(map[string]bool),
-		eventCh:     make(chan l1Event, 100000),
+		eventCh:     make(chan l1Event, 1000000),
 		dynamicGVRs: make(map[string]schema.GroupVersionResource),
 	}, nil
 }
@@ -670,39 +667,6 @@ func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR s
 	}()
 }
 
-// expandDependents walks the L1 dependency tree and adds all transitively
-// dependent keys to the affected set. For example, refreshing compositions-list
-// also needs to refresh piechart which depends on it.
-func (rw *ResourceWatcher) expandDependents(ctx context.Context, affected map[string]bool, maxDepth int) {
-	pending := make([]string, 0, len(affected))
-	for k := range affected {
-		pending = append(pending, k)
-	}
-
-	for depth := 0; depth < maxDepth && len(pending) > 0; depth++ {
-		var nextPending []string
-		for _, l1Key := range pending {
-			info, ok := ParseResolvedKey(l1Key)
-			if !ok {
-				continue
-			}
-			gvrKey := GVRToKey(info.GVR)
-			depKey := L1ResourceDepKey(gvrKey, info.NS, info.Name)
-			dependents, err := rw.cache.SMembers(ctx, depKey)
-			if err != nil || len(dependents) == 0 {
-				continue
-			}
-			for _, dep := range dependents {
-				if !affected[dep] {
-					affected[dep] = true
-					nextPending = append(nextPending, dep)
-				}
-			}
-		}
-		pending = nextPending
-	}
-}
-
 // WaitForSync blocks until all started informers have completed their initial sync.
 func (rw *ResourceWatcher) WaitForSync(ctx context.Context) bool {
 	synced := rw.factory.WaitForCacheSync(ctx.Done())
@@ -843,8 +807,8 @@ func (rw *ResourceWatcher) registerInformer(gvr schema.GroupVersionResource) boo
 
 // startInformer registers the informer and immediately starts the factory.
 // Used by AddGVR when a new GVR is discovered at request time.
-// After starting, it waits for the informer to sync and then patches L3
-// from the informer's cache to ensure all existing objects are in L3.
+// After starting, it waits for the informer to sync and then reconciles
+// the L2 Redis cache from the informer's authoritative in-memory store.
 func (rw *ResourceWatcher) startInformer(gvr schema.GroupVersionResource) {
 	if !rw.registerInformer(gvr) {
 		return
@@ -865,13 +829,13 @@ func (rw *ResourceWatcher) startInformer(gvr schema.GroupVersionResource) {
 		return
 	}
 
-	// Reconcile L3 from the informer's authoritative store in a single pass.
+	// Reconcile L2 from the informer's authoritative store in a single pass.
 	// This replaces the old event-by-event replay which caused sustained
 	// AtomicUpdateJSON contention on list keys (e.g. 4759 RESTActions each
 	// hitting 20 retries on the cluster-wide list key).
 	// reconcileGVR writes individual GET keys + rebuilds all list caches at once.
 	storeSize := len(informer.GetStore().List())
-	slog.Info("resource-watcher: reconciling new informer with L3",
+	slog.Info("resource-watcher: reconciling new informer with L2 Redis",
 		slog.String("gvr", gvr.String()),
 		slog.Int("storeSize", storeSize))
 	added, removed, updated, errs := rw.reconcileGVR(rw.appCtx, gvr)
@@ -887,7 +851,7 @@ func (rw *ResourceWatcher) startInformer(gvr schema.GroupVersionResource) {
 
 // noisyConfigMapNamespaces are namespaces whose configmaps update very
 // frequently (e.g. cluster-kubestore every 2s) but are never referenced
-// by any widget. Skipping these avoids unnecessary L3 cache churn.
+// by any widget. Skipping these avoids unnecessary cache churn.
 var noisyConfigMapNamespaces = map[string]bool{
 	"kube-system": true,
 	"gmp-system":  true,
@@ -913,7 +877,7 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 
 	// Skip noisy configmap updates from system namespaces (e.g. cluster-kubestore
 	// updates every 2s) that no widget depends on. These generate continuous
-	// L3 cache churn with no benefit.
+	// cache churn with no benefit.
 	if gvr.Resource == "configmaps" && noisyConfigMapNamespaces[ns] {
 		return
 	}
@@ -924,7 +888,7 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		slog.String("ns", ns),
 		slog.String("name", name))
 
-	// No L3 Redis writes. The informer store IS the data source.
+	// No Redis writes for raw K8s data. The informer store IS the data source.
 	// L1 refresh reads directly from the informer via InformerReader.
 
 	gvrKey := GVRToKey(gvr)
@@ -938,9 +902,9 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	// The informer store is already updated (the event means it changed).
 	// Enqueue the event for the l1Worker to trigger an L1 refresh.
 	// Non-blocking: if the channel is full, drop the event — the next
-	// process sequentially. The worker will read the latest L3 state.
-	// Non-blocking: if the channel is full, drop the event (L3 is already
-	// updated; the next event for this GVR will trigger a refresh).
+	// process sequentially. The worker will read the latest informer state.
+	// Non-blocking: if the channel is full, drop the event (the informer
+	// is already updated; the next event for this GVR will trigger a refresh).
 	select {
 	case rw.eventCh <- l1Event{
 		gvr:       gvr,
@@ -1044,13 +1008,13 @@ type ReconcileStats struct {
 	Duration time.Duration
 }
 
-// Reconcile compares L3 cache (Redis) with informer stores (in-memory, authoritative)
-// for every watched GVR. Any differences — ghost objects from missed DELETEs during
-// pod downtime, missing objects, stale versions — are patched in L3. This ensures the
+// Reconcile compares the L2 Redis cache with informer stores (in-memory, authoritative)
+// for every watched GVR. Any differences -- ghost objects from missed DELETEs during
+// pod downtime, missing objects, stale versions -- are patched in L2. This ensures the
 // cache is correct even when events were lost between restarts.
 //
 // Must be called after WaitForSync (informers have completed initial LIST/WATCH) and
-// after L3 warmup (baseline data exists in Redis).
+// after L2 warmup (baseline data exists in Redis).
 func (rw *ResourceWatcher) Reconcile(ctx context.Context) ReconcileStats {
 	start := time.Now()
 	var stats ReconcileStats
@@ -1076,7 +1040,7 @@ func (rw *ResourceWatcher) Reconcile(ctx context.Context) ReconcileStats {
 		stats.Errors += errs
 
 		if added+removed+updated > 0 {
-			slog.Info("reconcile: patched L3",
+			slog.Info("reconcile: patched L2",
 				slog.String("gvr", gvr.String()),
 				slog.Int("added", added),
 				slog.Int("removed", removed),
@@ -1118,7 +1082,7 @@ func (rw *ResourceWatcher) reconcileGVR(ctx context.Context, gvr schema.GroupVer
 		return
 	}
 
-	// No L3 diff or writes. The informer store IS the authoritative source.
+	// No L2 diff or writes. The informer store IS the authoritative source.
 	// reconcileGVR at startup just counts items for logging.
 	added = len(objects)
 

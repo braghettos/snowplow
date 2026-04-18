@@ -161,7 +161,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 
 // resolveWidgetFromObject performs the full widget resolution: resolve → marshal
 // → cache-set → pre-warm children. It is called both from the HTTP handler
-// (via singleflight) and from L1 refresh (via ResolveWidgetDirect).
+// and from L1 refresh (via ResolveWidget).
 //
 // Returns a *ResolveWidgetResult so singleflight callers can access both the
 // raw JSON (for HTTP response) and the resolved unstructured (for child pre-warming).
@@ -261,13 +261,9 @@ func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objec
 	return &ResolveWidgetResult{Raw: raw, Resolved: res}, nil
 }
 
-// ResolveWidgetDirect resolves a widget and writes L1. Used by prewarm.
-func ResolveWidgetDirect(ctx context.Context, c *cache.RedisCache, got objects.Result, resolvedKey, authnNS string, perPage, page int) (*ResolveWidgetResult, error) {
-	return resolveWidgetFromObject(ctx, c, got, resolvedKey, authnNS, perPage, page, nil)
-}
-
-// ResolveWidgetBackground resolves a widget for the background L1 refresh path.
-func ResolveWidgetBackground(ctx context.Context, c *cache.RedisCache, got objects.Result, resolvedKey, authnNS string, perPage, page int) (*ResolveWidgetResult, error) {
+// ResolveWidget resolves a widget and writes L1. Used by prewarm and
+// background L1 refresh.
+func ResolveWidget(ctx context.Context, c *cache.RedisCache, got objects.Result, resolvedKey, authnNS string, perPage, page int) (*ResolveWidgetResult, error) {
 	return resolveWidgetFromObject(ctx, c, got, resolvedKey, authnNS, perPage, page, nil)
 }
 

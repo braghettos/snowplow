@@ -184,16 +184,14 @@ func (errEmptyResolve) Error() string {
 }
 
 // ResolveRESTActionBackground is the entry point for the L1 refresh
-// loop. It forwards to l1cache.ResolveAndCacheBackground which uses a
-// separate singleflight group so long background re-resolves do not
-// block foreground HTTP traffic waiting on the same key.
+// loop. It forwards to l1cache.ResolveAndCache.
 //
 // Kept here as a thin shim because internal/handlers/dispatchers/
 // l1_refresh.go already imports this package and calls this function;
 // moving the call site to l1cache directly would churn l1_refresh
 // without any correctness or performance benefit.
 func ResolveRESTActionBackground(ctx context.Context, c *cache.RedisCache, obj map[string]interface{}, resolvedKey, authnNS string, perPage, page int) ([]byte, error) {
-	result, err := l1cache.ResolveAndCacheBackground(ctx, l1cache.Input{
+	result, err := l1cache.ResolveAndCache(ctx, l1cache.Input{
 		Cache:       c,
 		Obj:         obj,
 		ResolvedKey: resolvedKey,
