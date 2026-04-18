@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -337,19 +338,29 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 		dirtyPairs[gvrNS{gvrKey: evt.gvrKey, ns: evt.ns}] = true
 	}
 
-	// ── Phase 2: Execute deduplicated SMembers lookups ───────────────────
-	// LIST + cluster deps are always looked up (O(namespaces) + O(GVRs)).
-	// GET deps are only looked up if their GVR+ns is NOT already covered by
-	// a LIST dep. At 50K scale this avoids 50K redundant SMembers calls —
-	// the LIST dep already captures all resolved keys for that namespace.
-	// GET deps only add value for resources individually fetched via
-	// objects.Get() (e.g., single-resource widgets), not for LIST-based
-	// widgets that already depend on the namespace LIST dep key.
-	affected := make(map[string]bool)
+	// ── Phase 2: Execute deduplicated SMembers lookups (HOT + WARM) ─────
+	//
+	// HOT keys (from LIST + cluster deps): resolved immediately via goroutine.
+	//   These are dashboard-level widgets (e.g., compositions-list) that must
+	//   update promptly when resources change.
+	//
+	// WARM keys (from GET deps, not already HOT): marked pending only, no
+	//   goroutine. These are per-resource detail page widgets (e.g.,
+	//   composition-values, composition-panel) that resolve lazily on next
+	//   HTTP request.
+	//
+	// GET deps MUST be looked up because they point to DIFFERENT L1 keys than
+	// LIST deps. A LIST dep key (snowplow:l1dep:gvr:ns:) contains list-page
+	// resolved keys. A GET dep key (snowplow:l1dep:gvr:ns:name) contains
+	// per-resource resolved keys. Skipping GET deps leaves detail pages stale.
+	//
+	// To avoid 50K individual SMembers calls at scale, GET dep lookups use a
+	// Redis pipeline: one round-trip for all GET deps (~1-2s for 50K commands).
+	hotKeys := make(map[string]bool)
 	collect := func(idxKey string) {
 		if keys, err := rw.cache.SMembers(ctx, idxKey); err == nil {
 			for _, k := range keys {
-				affected[k] = true
+				hotKeys[k] = true
 			}
 		}
 	}
@@ -360,32 +371,48 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 	for _, dep := range clusterDeps {
 		collect(dep.redisKey)
 	}
-	// Only look up GET deps whose GVR+ns is NOT already covered by a LIST dep.
-	// This is the critical optimisation: at 50K scale with 50 namespaces,
-	// we skip ~50K SMembers calls (one per unique resource name) because
-	// the LIST dep for each namespace already captures all dependent keys.
-	var getSkipped, getLookedUp int
-	for dedup, dep := range getDeps {
-		// dedup format: "gvrKey\x00ns\x00name" — extract "gvrKey\x00ns"
-		lastSep := strings.LastIndexByte(dedup, '\x00')
-		if lastSep > 0 {
-			nsDedup := dedup[:lastSep]
-			if _, coveredByList := listDeps[nsDedup]; coveredByList {
-				getSkipped++
-				continue // LIST dep already covers this GVR+ns
+
+	// Pipeline all GET dep SMembers into one Redis round-trip.
+	warmKeys := make(map[string]bool)
+	if len(getDeps) > 0 {
+		pipe := rw.cache.Pipeline(ctx)
+		if pipe != nil {
+			// Collect pipeline commands keyed by their dep index for result retrieval.
+			type pipeCmd struct {
+				cmd *redis.StringSliceCmd
+			}
+			pipeCmds := make([]pipeCmd, 0, len(getDeps))
+			for _, dep := range getDeps {
+				cmd := pipe.SMembers(ctx, dep.redisKey)
+				pipeCmds = append(pipeCmds, pipeCmd{cmd: cmd})
+			}
+			_, execErr := pipe.Exec(ctx)
+			if execErr != nil && execErr != redis.Nil {
+				slog.Warn("triggerL1RefreshBatch: GET dep pipeline failed",
+					slog.Any("err", execErr),
+					slog.Int("getDeps", len(getDeps)))
+			}
+			// Collect results: keys not already HOT go into WARM.
+			for _, pc := range pipeCmds {
+				members, err := pc.cmd.Result()
+				if err != nil {
+					continue
+				}
+				for _, k := range members {
+					if !hotKeys[k] {
+						warmKeys[k] = true
+					}
+				}
 			}
 		}
-		getLookedUp++
-		collect(dep.redisKey)
 	}
 
-	if len(affected) == 0 {
+	if len(hotKeys) == 0 && len(warmKeys) == 0 {
 		slog.Debug("triggerL1RefreshBatch: no affected keys",
 			slog.Int("events", len(events)),
 			slog.Int("listDeps", len(listDeps)),
 			slog.Int("clusterDeps", len(clusterDeps)),
-			slog.Int("getDeps", len(getDeps)),
-			slog.Int("getSkipped", getSkipped))
+			slog.Int("getDeps", len(getDeps)))
 		return
 	}
 
@@ -393,24 +420,32 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 		slog.Int("events", len(events)),
 		slog.Int("listDeps", len(listDeps)),
 		slog.Int("clusterDeps", len(clusterDeps)),
-		slog.Int("getDeps.total", len(getDeps)),
-		slog.Int("getDeps.skipped", getSkipped),
-		slog.Int("getDeps.lookedUp", getLookedUp),
-		slog.Int("affected", len(affected)))
+		slog.Int("getDeps", len(getDeps)),
+		slog.Int("hotKeys", len(hotKeys)),
+		slog.Int("warmKeys", len(warmKeys)))
 
 	// ── Phase 3: Separate API result keys from resolved keys ─────────────
 	// Stale-while-refresh: on ADD/UPDATE, API result keys are left untouched —
 	// the dirty resolve goroutine bypasses them and overwrites with fresh data.
 	// On DELETE, the resource no longer exists so API result keys must be removed.
-	resolvedKeys := make(map[string]bool)
-	for key := range affected {
-		if !IsAPIResultKey(key) {
-			resolvedKeys[key] = true
+	// Process both HOT and WARM keys for API result cleanup.
+	filterResolved := func(keys map[string]bool) map[string]bool {
+		resolved := make(map[string]bool, len(keys))
+		for key := range keys {
+			if !IsAPIResultKey(key) {
+				resolved[key] = true
+			}
 		}
+		return resolved
 	}
 	if hasDelete {
 		var apiResultKeys []string
-		for key := range affected {
+		for key := range hotKeys {
+			if IsAPIResultKey(key) {
+				apiResultKeys = append(apiResultKeys, key)
+			}
+		}
+		for key := range warmKeys {
 			if IsAPIResultKey(key) {
 				apiResultKeys = append(apiResultKeys, key)
 			}
@@ -419,9 +454,10 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 			_ = rw.cache.Delete(ctx, apiResultKeys...)
 		}
 	}
-	affected = resolvedKeys
+	hotKeys = filterResolved(hotKeys)
+	warmKeys = filterResolved(warmKeys)
 
-	if len(affected) == 0 {
+	if len(hotKeys) == 0 && len(warmKeys) == 0 {
 		return
 	}
 
@@ -431,27 +467,45 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 	// — only the page parameter changes the output. Resolving them sequentially
 	// (p1 → p2 → ... → pN) avoids N concurrent goroutines each doing a full
 	// O(N) resolve of the same 49K items.
-	groups := make(map[string][]pageKey) // baseKey → sorted page keys
-	for l1Key := range affected {
-		info, ok := ParseResolvedKey(l1Key)
-		if !ok {
-			// Unparseable key — treat as its own group.
-			groups[l1Key] = append(groups[l1Key], pageKey{key: l1Key, page: 0})
-			continue
+	//
+	// HOT keys: launch goroutine for immediate resolve (dashboard widgets).
+	// WARM keys: mark pending only, no goroutine (detail page widgets resolve
+	// lazily on next HTTP request via L1 miss path).
+	groupKeys := func(keys map[string]bool) map[string][]pageKey {
+		groups := make(map[string][]pageKey)
+		for l1Key := range keys {
+			info, ok := ParseResolvedKey(l1Key)
+			if !ok {
+				groups[l1Key] = append(groups[l1Key], pageKey{key: l1Key, page: 0})
+				continue
+			}
+			baseKey := ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
+			groups[baseKey] = append(groups[baseKey], pageKey{key: l1Key, page: info.Page})
 		}
-		baseKey := ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
-		groups[baseKey] = append(groups[baseKey], pageKey{key: l1Key, page: info.Page})
+		return groups
 	}
 
-	// For each base key group, launch one goroutine that resolves all pages
-	// sequentially. Different base keys run in parallel.
-	for _, pages := range groups {
-		// Sort by page number so earlier pages are resolved first.
+	// HOT: immediate goroutine-based resolve.
+	for _, pages := range groupKeys(hotKeys) {
 		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
-		// Mark dirty with ALL affected GVR+ns pairs so the DirtySet
-		// covers every dependency that changed in this batch.
 		rw.markDirtySequentialBatch(ctx, representativeGVR, dirtyPairs, pages, fn)
 	}
+
+	// WARM: background refresh with lower priority (after HOT keys).
+	// Stale-while-refresh: L1 keys stay in cache, users always hit.
+	// The goroutine overwrites stale data with fresh data.
+	for _, pages := range groupKeys(warmKeys) {
+		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
+		rw.markWarmRefresh(ctx, representativeGVR, dirtyPairs, pages, fn)
+	}
+}
+
+// markWarmRefresh refreshes WARM keys (per-resource detail page widgets) in
+// the background, just like HOT keys, but using the same markDirtySequentialBatch
+// mechanism. Stale-while-refresh: L1 keys are NOT deleted — users always hit
+// cache (even if stale). The goroutine overwrites with fresh data.
+func (rw *ResourceWatcher) markWarmRefresh(ctx context.Context, triggerGVR schema.GroupVersionResource, dirtyPairs map[gvrNS]bool, pages []pageKey, fn L1RefreshFunc) {
+	rw.markDirtySequentialBatch(ctx, triggerGVR, dirtyPairs, pages, fn)
 }
 
 // markDirtySequentialBatch is like markDirtySequential but registers ALL
