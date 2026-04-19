@@ -187,6 +187,9 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 		return false, nil
 	}
 
+	// Touch the key so actively-refreshed keys stay HOT.
+	touchBase := cache.ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
+
 	switch {
 	case info.GVR.Group == widgetGroup:
 		// resolveWidgetFromObject (called inside) registers deps via
@@ -196,6 +199,7 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 			return false, nil
 		}
 		_ = result
+		cache.TouchKey(touchBase)
 		return true, nil
 
 	case info.GVR.Group == templatesGroup && info.GVR.Resource == restactionResource:
@@ -203,6 +207,7 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 		if err != nil {
 			return false, nil
 		}
+		cache.TouchKey(touchBase)
 
 		// Cascading refresh: find L1 keys that depend on this RESTAction
 		// as a resource (e.g. piechart depends on compositions-list).

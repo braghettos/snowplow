@@ -506,6 +506,11 @@ func warmL1RestActionsForUser(ctx context.Context, c *cache.RedisCache, dynClien
 			continue
 		}
 
+		// Touch the key so prewarm-resolved RESTActions start HOT.
+		if rki, ok := cache.ParseResolvedKey(rKey); ok {
+			cache.TouchKey(cache.ResolvedKeyBase(rki.Username, rki.GVR, rki.NS, rki.Name))
+		}
+
 		warmed++
 		log.Info("L1 warmup: warmed RESTAction",
 			slog.String("user", user.Username),
@@ -613,6 +618,10 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			}
 
 			_ = c.SetResolvedRaw(rctx, rKey, raw)
+			// Touch the key so prewarm-resolved keys start HOT.
+			if rki, ok := cache.ParseResolvedKey(rKey); ok {
+				cache.TouchKey(cache.ResolvedKeyBase(rki.Username, rki.GVR, rki.NS, rki.Name))
+			}
 			// Register cascade deps: widget → RESTAction (from tracker refs).
 			// Same logic as widgets.go:244-255.
 			if refs := tracker.ResourceRefs(); len(refs) > 0 {

@@ -173,6 +173,10 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 
 	if in.Cache != nil && in.ResolvedKey != "" {
 		_ = in.Cache.SetResolvedRaw(tctx, in.ResolvedKey, raw)
+		// Touch the key so it starts HOT for refresh priority.
+		if rki, ok := cache.ParseResolvedKey(in.ResolvedKey); ok {
+			cache.TouchKey(cache.ResolvedKeyBase(rki.Username, rki.GVR, rki.NS, rki.Name))
+		}
 		cache.RegisterL1Dependencies(tctx, in.Cache, tracker, in.ResolvedKey)
 	}
 

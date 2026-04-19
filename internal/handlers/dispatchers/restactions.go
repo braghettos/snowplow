@@ -77,6 +77,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 					}
 					cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
 					cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
+					cache.TouchKey(cache.ResolvedKeyBase(user.Username, gvr, nsn.Namespace, nsn.Name))
 					log.Info("RESTAction resolved from cache",
 						slog.String("key", resolvedKey),
 						slog.String("user", user.Username),
@@ -150,6 +151,13 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		return
 	}
 	raw := result.Raw
+
+	// Touch the key so it starts HOT for refresh priority.
+	if resolvedKey != "" {
+		if rki, ok := cache.ParseResolvedKey(resolvedKey); ok {
+			cache.TouchKey(cache.ResolvedKeyBase(rki.Username, rki.GVR, rki.NS, rki.Name))
+		}
+	}
 
 	pathAttr := "inline"
 	if resolvedKey != "" {

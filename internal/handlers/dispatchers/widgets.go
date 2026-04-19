@@ -90,6 +90,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
 				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 				profile.Mark(req.Context(), "metrics")
+					cache.TouchKey(cache.ResolvedKeyBase(user.Username, gvr, nsn.Namespace, nsn.Name))
 					log.Info("Widget resolved from cache",
 						slog.String("key", resolvedKey),
 						slog.String("user", user.Username),
@@ -237,6 +238,10 @@ func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objec
 	// have no RESTAction refs in the tracker, so nothing is registered.
 	if c != nil && resolvedKey != "" {
 		_ = c.SetResolvedRaw(ctx, resolvedKey, raw)
+		// Touch the key so it starts HOT for refresh priority.
+		if rki, ok := cache.ParseResolvedKey(resolvedKey); ok {
+			cache.TouchKey(cache.ResolvedKeyBase(rki.Username, rki.GVR, rki.NS, rki.Name))
+		}
 		// Register per-resource cascade dep (widget → specific RESTAction).
 		// The tracker records AddResource(restactionGVR, ns, name) during
 		// apiref.Resolve. This puts the widget L1 key in the RESTAction's

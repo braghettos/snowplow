@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"log/slog"
+	"os"
 	"runtime"
 	"sort"
 	"strings"
@@ -25,6 +26,69 @@ import (
 )
 
 var watcherTracer = otel.Tracer("snowplow/watcher")
+
+// ---------------------------------------------------------------------------
+// Access-recency tracking for HOT / WARM / COLD refresh priority
+// ---------------------------------------------------------------------------
+
+var (
+	// hotThreshold: keys accessed within this duration are HOT (highest priority).
+	// Configurable via CACHE_HOT_THRESHOLD (e.g. "5m"). Default 5 minutes.
+	hotThreshold = envDuration("CACHE_HOT_THRESHOLD", 5*time.Minute)
+	// warmThreshold: keys accessed within this duration (but older than hotThreshold)
+	// are WARM (medium priority). Keys older than this are COLD.
+	// Configurable via CACHE_WARM_THRESHOLD (e.g. "60m"). Default 60 minutes.
+	warmThreshold = envDuration("CACHE_WARM_THRESHOLD", 60*time.Minute)
+	// accessCleanupCutoff: entries older than this are pruned to prevent unbounded
+	// growth of the keyAccess map. Set to 2x warmThreshold.
+	accessCleanupCutoff = 2 * warmThreshold
+)
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return fallback
+}
+
+// keyAccess tracks the last access time for each resolved key base.
+// Used to classify keys as HOT/WARM/COLD for refresh priority.
+var keyAccess sync.Map // map[string]int64 (unix nano)
+
+// TouchKey records that a resolved key was just accessed (HTTP request or prewarm).
+func TouchKey(resolvedKeyBase string) {
+	keyAccess.Store(resolvedKeyBase, time.Now().UnixNano())
+}
+
+// keyTemperature returns "hot", "warm", or "cold" based on last access time.
+func keyTemperature(resolvedKeyBase string) string {
+	v, ok := keyAccess.Load(resolvedKeyBase)
+	if !ok {
+		return "cold"
+	}
+	elapsed := time.Since(time.Unix(0, v.(int64)))
+	if elapsed < hotThreshold {
+		return "hot"
+	}
+	if elapsed < warmThreshold {
+		return "warm"
+	}
+	return "cold"
+}
+
+// cleanupKeyAccess prunes entries older than accessCleanupCutoff to prevent
+// unbounded growth of the keyAccess sync.Map.
+func cleanupKeyAccess() {
+	cutoff := time.Now().Add(-accessCleanupCutoff).UnixNano()
+	keyAccess.Range(func(key, value any) bool {
+		if value.(int64) < cutoff {
+			keyAccess.Delete(key)
+		}
+		return true
+	})
+}
 
 // L1RefreshFunc is invoked by the ResourceWatcher to proactively re-resolve
 // L1 cache entries. The function receives the GVR that triggered the refresh
@@ -129,6 +193,19 @@ func (rw *ResourceWatcher) Start(ctx context.Context) {
 		}
 	}()
 	go rw.l1Worker(rw.appCtx) // appCtx carries InformerReader for background refreshes
+	// Periodically prune stale keyAccess entries to prevent unbounded map growth.
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				cleanupKeyAccess()
+			}
+		}
+	}()
 }
 
 // registerFromRedis reads the watched-gvrs set from Redis and registers
@@ -335,16 +412,11 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 		dirtyPairs[gvrNS{gvrKey: evt.gvrKey, ns: evt.ns}] = true
 	}
 
-	// ── Phase 2: Execute deduplicated SMembers lookups (HOT + WARM) ─────
+	// ── Phase 2: Collect ALL affected keys from ALL dep lookups ──────────
 	//
-	// HOT keys (from LIST + cluster deps): resolved immediately via goroutine.
-	//   These are dashboard-level widgets (e.g., compositions-list) that must
-	//   update promptly when resources change.
-	//
-	// WARM keys (from GET deps, not already HOT): marked pending only, no
-	//   goroutine. These are per-resource detail page widgets (e.g.,
-	//   composition-values, composition-panel) that resolve lazily on next
-	//   HTTP request.
+	// All dep types (LIST, cluster, GET) are collected into a single allKeys
+	// map. Keys are then classified by access recency into HOT/WARM/COLD tiers
+	// for priority-ordered refresh.
 	//
 	// GET deps MUST be looked up because they point to DIFFERENT L1 keys than
 	// LIST deps. A LIST dep key (snowplow:l1dep:gvr:ns:) contains list-page
@@ -353,11 +425,11 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 	//
 	// To avoid 50K individual SMembers calls at scale, GET dep lookups use a
 	// Redis pipeline: one round-trip for all GET deps (~1-2s for 50K commands).
-	hotKeys := make(map[string]bool)
+	allKeys := make(map[string]bool)
 	collect := func(idxKey string) {
 		if keys, err := rw.cache.SMembers(ctx, idxKey); err == nil {
 			for _, k := range keys {
-				hotKeys[k] = true
+				allKeys[k] = true
 			}
 		}
 	}
@@ -370,11 +442,9 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 	}
 
 	// Pipeline all GET dep SMembers into one Redis round-trip.
-	warmKeys := make(map[string]bool)
 	if len(getDeps) > 0 {
 		pipe := rw.cache.Pipeline(ctx)
 		if pipe != nil {
-			// Collect pipeline commands keyed by their dep index for result retrieval.
 			type pipeCmd struct {
 				cmd *redis.StringSliceCmd
 			}
@@ -389,22 +459,19 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 					slog.Any("err", execErr),
 					slog.Int("getDeps", len(getDeps)))
 			}
-			// Collect results: keys not already HOT go into WARM.
 			for _, pc := range pipeCmds {
 				members, err := pc.cmd.Result()
 				if err != nil {
 					continue
 				}
 				for _, k := range members {
-					if !hotKeys[k] {
-						warmKeys[k] = true
-					}
+					allKeys[k] = true
 				}
 			}
 		}
 	}
 
-	if len(hotKeys) == 0 && len(warmKeys) == 0 {
+	if len(allKeys) == 0 {
 		slog.Debug("triggerL1RefreshBatch: no affected keys",
 			slog.Int("events", len(events)),
 			slog.Int("listDeps", len(listDeps)),
@@ -413,19 +480,44 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 		return
 	}
 
+	// ── Phase 2b: Classify keys by access recency (HOT/WARM/COLD) ───────
+	// HOT  (accessed < 5min):  refreshed first, highest priority
+	// WARM (accessed 5-60min): refreshed after HOT completes
+	// COLD (accessed >60min or never): refreshed after WARM completes
+	hotKeys := make(map[string]bool)
+	warmKeys := make(map[string]bool)
+	coldKeys := make(map[string]bool)
+	for k := range allKeys {
+		info, ok := ParseResolvedKey(k)
+		if !ok {
+			// Cannot classify — treat as HOT (safe default).
+			hotKeys[k] = true
+			continue
+		}
+		base := ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
+		switch keyTemperature(base) {
+		case "hot":
+			hotKeys[k] = true
+		case "warm":
+			warmKeys[k] = true
+		default:
+			coldKeys[k] = true
+		}
+	}
+
 	slog.Info("triggerL1RefreshBatch: affected keys",
 		slog.Int("events", len(events)),
 		slog.Int("listDeps", len(listDeps)),
 		slog.Int("clusterDeps", len(clusterDeps)),
 		slog.Int("getDeps", len(getDeps)),
-		slog.Int("hotKeys", len(hotKeys)),
-		slog.Int("warmKeys", len(warmKeys)))
+		slog.Int("hot", len(hotKeys)),
+		slog.Int("warm", len(warmKeys)),
+		slog.Int("cold", len(coldKeys)))
 
 	// ── Phase 3: Separate API result keys from resolved keys ─────────────
 	// Stale-while-refresh: on ADD/UPDATE, API result keys are left untouched —
 	// the dirty resolve goroutine bypasses them and overwrites with fresh data.
 	// On DELETE, the resource no longer exists so API result keys must be removed.
-	// Process both HOT and WARM keys for API result cleanup.
 	filterResolved := func(keys map[string]bool) map[string]bool {
 		resolved := make(map[string]bool, len(keys))
 		for key := range keys {
@@ -437,12 +529,7 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 	}
 	if hasDelete {
 		var apiResultKeys []string
-		for key := range hotKeys {
-			if IsAPIResultKey(key) {
-				apiResultKeys = append(apiResultKeys, key)
-			}
-		}
-		for key := range warmKeys {
+		for key := range allKeys {
 			if IsAPIResultKey(key) {
 				apiResultKeys = append(apiResultKeys, key)
 			}
@@ -453,8 +540,9 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 	}
 	hotKeys = filterResolved(hotKeys)
 	warmKeys = filterResolved(warmKeys)
+	coldKeys = filterResolved(coldKeys)
 
-	if len(hotKeys) == 0 && len(warmKeys) == 0 {
+	if len(hotKeys) == 0 && len(warmKeys) == 0 && len(coldKeys) == 0 {
 		return
 	}
 
@@ -465,9 +553,9 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 	// (p1 → p2 → ... → pN) avoids N concurrent goroutines each doing a full
 	// O(N) resolve of the same 49K items.
 	//
-	// HOT keys: launch goroutine for immediate resolve (dashboard widgets).
-	// WARM keys: mark pending only, no goroutine (detail page widgets resolve
-	// lazily on next HTTP request via L1 miss path).
+	// HOT:  refreshed first via WaitGroup-guarded goroutines
+	// WARM: refreshed after HOT completes via WaitGroup-guarded goroutines
+	// COLD: refreshed after WARM completes, sequentially (lowest priority)
 	groupKeys := func(keys map[string]bool) map[string][]pageKey {
 		groups := make(map[string][]pageKey)
 		for l1Key := range keys {
@@ -482,27 +570,117 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 		return groups
 	}
 
-	// HOT: immediate goroutine-based resolve.
+	// Phase 4a: HOT — highest priority, refresh immediately.
+	var hotWg sync.WaitGroup
 	for _, pages := range groupKeys(hotKeys) {
+		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
+		hotWg.Add(1)
+		rw.markDirtyWithWG(ctx, representativeGVR, dirtyPairs, pages, fn, &hotWg)
+	}
+	hotWg.Wait()
+
+	// Phase 4b: WARM — medium priority, after HOT completes.
+	var warmWg sync.WaitGroup
+	for _, pages := range groupKeys(warmKeys) {
+		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
+		warmWg.Add(1)
+		rw.markDirtyWithWG(ctx, representativeGVR, dirtyPairs, pages, fn, &warmWg)
+	}
+	warmWg.Wait()
+
+	// Phase 4c: COLD — lowest priority, after WARM completes.
+	for _, pages := range groupKeys(coldKeys) {
 		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
 		rw.markDirtySequentialBatch(ctx, representativeGVR, dirtyPairs, pages, fn)
 	}
-
-	// WARM: background refresh with lower priority (after HOT keys).
-	// Stale-while-refresh: L1 keys stay in cache, users always hit.
-	// The goroutine overwrites stale data with fresh data.
-	for _, pages := range groupKeys(warmKeys) {
-		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
-		rw.markWarmRefresh(ctx, representativeGVR, dirtyPairs, pages, fn)
-	}
 }
 
-// markWarmRefresh refreshes WARM keys (per-resource detail page widgets) in
-// the background, just like HOT keys, but using the same markDirtySequentialBatch
-// mechanism. Stale-while-refresh: L1 keys are NOT deleted — users always hit
-// cache (even if stale). The goroutine overwrites with fresh data.
-func (rw *ResourceWatcher) markWarmRefresh(ctx context.Context, triggerGVR schema.GroupVersionResource, dirtyPairs map[gvrNS]bool, pages []pageKey, fn L1RefreshFunc) {
-	rw.markDirtySequentialBatch(ctx, triggerGVR, dirtyPairs, pages, fn)
+// markDirtyWithWG is like markDirtySequentialBatch but accepts a *sync.WaitGroup
+// so the caller can wait for completion. Used by the HOT/WARM tiers in
+// triggerL1RefreshBatch to enforce priority ordering (HOT before WARM before COLD).
+//
+// If loaded is true (goroutine already running for this identity), wg.Done() is
+// called immediately — the existing goroutine will handle the pending work,
+// and the WaitGroup must not block waiting for a goroutine that was already running.
+func (rw *ResourceWatcher) markDirtyWithWG(ctx context.Context, triggerGVR schema.GroupVersionResource, dirtyPairs map[gvrNS]bool, pages []pageKey, fn L1RefreshFunc, wg *sync.WaitGroup) {
+	if len(pages) == 0 {
+		wg.Done()
+		return
+	}
+	// Use the base key (first page's key stripped of pagination) as identity.
+	// All pagination variants coalesce into one goroutine.
+	identity := pages[0].key
+	if info, ok := ParseResolvedKey(identity); ok {
+		identity = ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
+	}
+
+	val, loaded := rw.dirtyKeys.LoadOrStore(identity, &dirtyState{})
+	state := val.(*dirtyState)
+	// Record ALL GVR+ns pairs that triggered this dirty mark BEFORE setting pending,
+	// so the goroutine's drain always sees every entry.
+	for pair := range dirtyPairs {
+		state.addEntry(pair.gvrKey, pair.ns)
+	}
+	state.pending.Store(true)
+
+	if loaded {
+		// Goroutine already running for this identity — it will pick up the
+		// pending work. Release the WaitGroup immediately so the caller
+		// does not block on an already-running goroutine.
+		wg.Done()
+		return
+	}
+
+	go func() {
+		defer wg.Done()
+		defer rw.dirtyKeys.Delete(identity)
+		defer func() {
+			if r := recover(); r != nil {
+				buf := make([]byte, 4096)
+				n := runtime.Stack(buf, false)
+				slog.Error("resource-watcher: panic in L1 refresh",
+					slog.Any("error", r),
+					slog.String("stack", string(buf[:n])))
+			}
+		}()
+
+		for state.pending.Swap(false) {
+			// Drain accumulated dirty entries and build a targeted DirtySet
+			// so only the affected GVR+ns pairs bypass the API result cache.
+			entries := state.drainEntries()
+			dirtySet := NewDirtySet(entries)
+
+			// Resolve each page sequentially: p1 → p2 → ... → pN.
+			var allCascade []string
+			for _, pg := range pages {
+				refreshCtx, cancel := context.WithTimeout(WithDirtySet(ctx, dirtySet), 60*time.Second)
+				cascade := fn(refreshCtx, triggerGVR, []string{pg.key})
+				cancel()
+				allCascade = append(allCascade, cascade...)
+			}
+
+			// Cascade: group dependent keys the same way and resolve
+			// sequentially within each group. Cascades get no bypass
+			// (gvrKey="" ns="") because they are transitive dependencies
+			// that don't directly correspond to the triggering event.
+			if len(allCascade) > 0 {
+				cascadeGroups := make(map[string][]pageKey)
+				for _, ck := range allCascade {
+					info, ok := ParseResolvedKey(ck)
+					if !ok {
+						cascadeGroups[ck] = append(cascadeGroups[ck], pageKey{key: ck, page: 0})
+						continue
+					}
+					baseKey := ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
+					cascadeGroups[baseKey] = append(cascadeGroups[baseKey], pageKey{key: ck, page: info.Page})
+				}
+				for _, cPages := range cascadeGroups {
+					sort.Slice(cPages, func(i, j int) bool { return cPages[i].page < cPages[j].page })
+					rw.markDirtySequential(ctx, triggerGVR, "", "", cPages, fn)
+				}
+			}
+		}
+	}()
 }
 
 // markDirtySequentialBatch is like markDirtySequential but registers ALL
