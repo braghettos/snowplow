@@ -28,7 +28,7 @@ import (
 // This eliminates the K8s API call on every request (~150-200ms), falling back
 // to the live lookup on cache miss. The UserSecretWatcher invalidates the cache
 // entry when the Secret changes.
-func CachedUserConfig(signingKey, authnNS string, rc *rest.Config, c *cache.RedisCache) func(http.Handler) http.Handler {
+func CachedUserConfig(signingKey, authnNS string, rc *rest.Config, c *cache.RedisCache, rbacWatcher *cache.RBACWatcher) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(wri http.ResponseWriter, req *http.Request) {
 			ctx := profile.Start(req.Context(), req.URL.Path)
@@ -81,6 +81,14 @@ func CachedUserConfig(signingKey, authnNS string, rc *rest.Config, c *cache.Redi
 				xcontext.WithUserInfo(userInfo),
 				xcontext.WithUserConfig(ep),
 			)
+
+			// Compute binding identity for RBAC-based L1 cache sharing.
+			// Users with identical RBAC bindings share the same L1 entries.
+			if rbacWatcher != nil {
+				if bid := rbacWatcher.ComputeBindingIdentity(userInfo.Username, userInfo.Groups); bid != "" {
+					ctx = cache.WithBindingIdentity(ctx, bid)
+				}
+			}
 
 			next.ServeHTTP(wri, req.WithContext(ctx))
 		})

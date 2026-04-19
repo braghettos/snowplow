@@ -230,7 +230,13 @@ func main() {
 	mux.Handle("GET /metrics/cache", chain.Then(handlers.CacheMetrics()))
 	mux.Handle("GET /metrics/runtime", handlers.RuntimeMetricsHandler(redisCache))
 	mux.Handle("GET /api-info/names", chain.Then(handlers.Plurals()))
-	userCfg := handlers.CachedUserConfig(*signKey, *authnNS, sarc, redisCache)
+	// Create RBACWatcher early so the middleware can compute binding identities.
+	// Start() is called later in startBackgroundServices.
+	var globalRBACWatcher *cache.RBACWatcher
+	if redisCache != nil {
+		globalRBACWatcher = cache.NewRBACWatcher(redisCache, sarc)
+	}
+	userCfg := handlers.CachedUserConfig(*signKey, *authnNS, sarc, redisCache, globalRBACWatcher)
 
 	mux.Handle("GET /list", chain.Append(userCfg, withCache).Then(handlers.List()))
 
@@ -283,7 +289,7 @@ func main() {
 	// Previously this ran before ListenAndServe, causing startup probe failures
 	// when informer sync + L2/RBAC warmup exceeded the probe timeout.
 	if redisCache != nil {
-		go startBackgroundServices(ctx, log, redisCache, *authnNS, *warmupConfigPath, *signKey)
+		go startBackgroundServices(ctx, log, redisCache, *authnNS, *warmupConfigPath, *signKey, globalRBACWatcher)
 	}
 	<-ctx.Done()
 
@@ -323,7 +329,7 @@ func recoveryMiddleware(next http.Handler) http.Handler {
 // Warmup and informer sync use a separate background context so that a SIGTERM
 // received during startup (e.g. from a failing liveness probe) does not abort
 // the warmup — the server will start with a fully warm cache regardless.
-func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.RedisCache, authnNS, warmupConfigPath, signKey string) {
+func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.RedisCache, authnNS, warmupConfigPath, signKey string, rbacWatcher *cache.RBACWatcher) {
 	rc, err := rest.InClusterConfig()
 	if err != nil {
 		log.Warn("not running in-cluster; background cache services disabled", slog.Any("err", err))
@@ -357,9 +363,10 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 
 	resourceWatcher.Start(ctx)
 
-	rbacWatcher := cache.NewRBACWatcher(c, rc)
-	if err := rbacWatcher.Start(ctx); err != nil {
-		log.Warn("failed to start RBAC watcher", slog.Any("err", err))
+	if rbacWatcher != nil {
+		if err := rbacWatcher.Start(ctx); err != nil {
+			log.Warn("failed to start RBAC watcher", slog.Any("err", err))
+		}
 	}
 
 	if authnNS != "" {

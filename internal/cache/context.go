@@ -106,3 +106,20 @@ func DirtySetFromContext(ctx context.Context) *DirtySet {
 	ds, _ := ctx.Value(dirtySetKey{}).(*DirtySet)
 	return ds
 }
+
+type bindingIdentityKey struct{}
+
+// WithBindingIdentity returns a context carrying the user's binding identity
+// (hash of their RBAC bindings). Used as the L1 cache key component instead
+// of the username, enabling shared cache entries across users with identical
+// RBAC permissions.
+func WithBindingIdentity(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, bindingIdentityKey{}, id)
+}
+
+// BindingIdentityFromContext extracts the binding identity from ctx.
+// Returns "" if not set (fallback to username-based keys).
+func BindingIdentityFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(bindingIdentityKey{}).(string)
+	return id
+}
