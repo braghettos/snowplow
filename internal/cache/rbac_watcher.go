@@ -2,13 +2,18 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	rbaclisters "k8s.io/client-go/listers/rbac/v1"
 	"k8s.io/client-go/rest"
 	k8scache "k8s.io/client-go/tools/cache"
 )
@@ -24,8 +29,13 @@ type RBACWatcher struct {
 	rc    *rest.Config
 
 	mu      sync.Mutex
-	pending bool     // true when a debounced invalidation is scheduled
+	pending bool // true when a debounced invalidation is scheduled
 	timer   *time.Timer
+
+	// Listers for binding identity computation. Set after Start().
+	rbLister  rbaclisters.RoleBindingLister
+	crbLister rbaclisters.ClusterRoleBindingLister
+	synced    bool
 }
 
 func NewRBACWatcher(c *RedisCache, rc *rest.Config) *RBACWatcher {
@@ -58,7 +68,13 @@ func (rw *RBACWatcher) Start(ctx context.Context) error {
 	_, _ = factory.Rbac().V1().ClusterRoleBindings().Informer().AddEventHandler(k8scache.ResourceEventHandlerFuncs{
 		UpdateFunc: func(_, n any) { bindingHandler(n) }, DeleteFunc: bindingHandler,
 	})
+	// Store listers for binding identity computation.
+	rw.rbLister = factory.Rbac().V1().RoleBindings().Lister()
+	rw.crbLister = factory.Rbac().V1().ClusterRoleBindings().Lister()
+
 	factory.Start(ctx.Done())
+	factory.WaitForCacheSync(ctx.Done())
+	rw.synced = true
 	slog.Info("rbac-watcher: started informers")
 	return nil
 }
@@ -183,6 +199,75 @@ func (rw *RBACWatcher) purgeUserCacheData(ctx context.Context, username string) 
 		total += len(keys)
 	}
 	return total
+}
+
+// ComputeBindingIdentity returns a short hash identifying the effective RBAC
+// permissions for a user. Users with the same set of RoleBindings and
+// ClusterRoleBindings produce the same identity, enabling shared L1 cache
+// entries across users with identical permissions.
+//
+// The identity is the first 12 hex chars of SHA-256(sorted binding names).
+// Returns "" if the informers have not synced yet.
+func (rw *RBACWatcher) ComputeBindingIdentity(username string, groups []string) string {
+	if !rw.synced {
+		return ""
+	}
+
+	subjects := make(map[string]bool, 1+len(groups))
+	subjects["User:"+username] = true
+	for _, g := range groups {
+		subjects["Group:"+g] = true
+	}
+
+	var bindingNames []string
+
+	// ClusterRoleBindings (cluster-scoped).
+	if crbs, err := rw.crbLister.List(labels.Everything()); err == nil {
+		for _, crb := range crbs {
+			if matchesSubjects(crb.Subjects, subjects) {
+				bindingNames = append(bindingNames, "crb:"+crb.Name)
+			}
+		}
+	}
+
+	// RoleBindings (namespace-scoped).
+	if rbs, err := rw.rbLister.List(labels.Everything()); err == nil {
+		for _, rb := range rbs {
+			if matchesSubjects(rb.Subjects, subjects) {
+				bindingNames = append(bindingNames, "rb:"+rb.Namespace+"/"+rb.Name)
+			}
+		}
+	}
+
+	if len(bindingNames) == 0 {
+		return "no-bindings"
+	}
+
+	sort.Strings(bindingNames)
+	h := sha256.New()
+	for _, name := range bindingNames {
+		h.Write([]byte(name))
+		h.Write([]byte{0})
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))[:12]
+}
+
+// matchesSubjects returns true if any subject in the binding matches the
+// user's identity (username or group membership).
+func matchesSubjects(bindingSubjects []rbacv1.Subject, userSubjects map[string]bool) bool {
+	for _, s := range bindingSubjects {
+		switch s.Kind {
+		case rbacv1.UserKind:
+			if userSubjects["User:"+s.Name] {
+				return true
+			}
+		case rbacv1.GroupKind:
+			if userSubjects["Group:"+s.Name] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func extractSubjects(obj any) ([]rbacv1.Subject, bool) {
