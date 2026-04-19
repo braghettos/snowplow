@@ -83,6 +83,14 @@ const (
 	preWarmMaxDepth         = 5
 	widgetGroup             = "widgets.templates.krateo.io"
 	clientConfigSecretSuffix = "-clientconfig"
+
+	// prewarmPerPage is the page size used during prewarm widget resolution.
+	// Matches the frontend default so prewarm resolves only the first visible
+	// page of paginated widgets (e.g., the compositions DataGrid shows 5 panels
+	// initially). Without this bound, the prewarm resolves ALL 50K compositions
+	// and recurses into every panel's children.
+	prewarmPerPage = 5
+	prewarmPage    = 1
 )
 
 // ---------------------------------------------------------------------------
@@ -131,7 +139,8 @@ func preWarmChildWidgets(parentCtx context.Context, c *cache.RedisCache, resolve
 	accessToken, _ := xcontext.AccessToken(parentCtx)
 
 	identity := cache.CacheIdentity(parentCtx, user.Username)
-	refs := extractChildWidgetRefs(parentCtx, c, items, identity)
+	actionRefIDs := extractActionRefIDs(resolved.Object)
+	refs := extractChildWidgetRefs(parentCtx, c, items, identity, actionRefIDs)
 	if len(refs) == 0 {
 		return
 	}
@@ -179,7 +188,12 @@ func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.E
 		if err != nil || !found || len(childItems) == 0 {
 			continue
 		}
-		nextRefs = append(nextRefs, extractChildWidgetRefs(ctx, c, childItems, cache.CacheIdentity(ctx, user.Username))...)
+		// Collect ref IDs that are action-linked (navigate, openDrawer,
+		// openModal, etc.). These are deferred — the frontend only
+		// resolves them on user interaction — so the prewarm must skip
+		// them to avoid recursing into 50K+ composition children.
+		actionRefIDs := extractActionRefIDs(res.Object)
+		nextRefs = append(nextRefs, extractChildWidgetRefs(ctx, c, childItems, cache.CacheIdentity(ctx, user.Username), actionRefIDs)...)
 	}
 
 	recursivePreWarm(ctx, user, ep, accessToken, c, dynClient, nextRefs, authnNS, visited, depth+1)
@@ -568,11 +582,20 @@ func warmL1RestActionsForUser(ctx context.Context, c *cache.RedisCache, dynClien
 	return warmed
 }
 
-func extractChildWidgetRefs(ctx context.Context, c *cache.RedisCache, items []interface{}, identity string) []l1Ref {
+// extractChildWidgetRefs filters resourcesRefs items to only those that should
+// be pre-warmed. Items whose ID appears in skipIDs (action-linked refs like
+// navigate/openDrawer/openModal) are excluded — they are deferred and only
+// resolved on user interaction.
+func extractChildWidgetRefs(ctx context.Context, c *cache.RedisCache, items []interface{}, identity string, skipIDs map[string]bool) []l1Ref {
 	var refs []l1Ref
 	for _, item := range items {
 		m, ok := item.(map[string]interface{})
 		if !ok {
+			continue
+		}
+		// Skip action-linked refs: their ID matches a resourceRefId in the
+		// widget's actions map. The frontend resolves these lazily on click.
+		if id, _ := m["id"].(string); id != "" && skipIDs[id] {
 			continue
 		}
 		path, _ := m["path"].(string)
@@ -593,6 +616,42 @@ func extractChildWidgetRefs(ctx context.Context, c *cache.RedisCache, items []in
 		refs = append(refs, l1Ref{gvr: gvr, ns: ns, name: name})
 	}
 	return refs
+}
+
+// extractActionRefIDs collects all resourceRefId values from the resolved
+// widget's status.widgetData.actions map. Action types include navigate,
+// openDrawer, openModal, and rest — each is an array of items with a
+// resourceRefId field. These refs are deferred (resolved only on user
+// interaction) and must be excluded from prewarm recursion.
+func extractActionRefIDs(obj map[string]interface{}) map[string]bool {
+	ids := make(map[string]bool)
+	// The resolved widget stores widgetData under status.widgetData.
+	widgetData, found, err := unstructured.NestedMap(obj, "status", "widgetData")
+	if err != nil || !found {
+		return ids
+	}
+	actions, found, err := unstructured.NestedMap(widgetData, "actions")
+	if err != nil || !found {
+		return ids
+	}
+	// Walk every action type (navigate, openDrawer, openModal, rest, etc.).
+	// Each is an array of objects with a resourceRefId field.
+	for _, actionList := range actions {
+		items, ok := actionList.([]interface{})
+		if !ok {
+			continue
+		}
+		for _, item := range items {
+			m, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if refID, ok := m["resourceRefId"].(string); ok && refID != "" {
+				ids[refID] = true
+			}
+		}
+	}
+	return ids
 }
 
 // resolveL1RefsForUser resolves a batch of L1 refs (widgets or RESTActions) for
@@ -655,11 +714,17 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			tracker := cache.NewDependencyTracker()
 			tctx := cache.WithDependencyTracker(rctx, tracker)
 
+			// Use bounded pagination during prewarm: resolve only page 1
+			// with a small page size (matching the frontend default). This
+			// prevents the prewarm from resolving ALL 50K compositions and
+			// recursing into every panel's children. Widgets without
+			// pagination are unaffected (PerPage/Page are ignored when the
+			// widget has no apiRef or the apiRef has no .slice usage).
 			res, resolveErr := widgets.Resolve(tctx, widgets.ResolveOptions{
 				In:      cached,
 				AuthnNS: authnNS,
-				PerPage: -1,
-				Page:    -1,
+				PerPage: prewarmPerPage,
+				Page:    prewarmPage,
 			})
 			if resolveErr != nil {
 				return
