@@ -277,11 +277,12 @@ func FilterWidgetGVRs(cfg *cache.WarmupConfig) []schema.GroupVersionResource {
 
 
 // WarmL1FromEntryPoints discovers the widget tree starting from the frontend
-// entry points (INIT, ROUTES_LOADER) and resolves them for each active user.
-// RBAC decisions are populated organically during resolution -- no explicit
-// pre-warming of the GVR x NS x verbs cartesian product.
+// entry points (INIT, ROUTES_LOADER) and resolves them per unique binding
+// identity group. Users with identical RBAC bindings share L1 entries, so
+// only one representative user per group is resolved. RBAC decisions are
+// populated organically during resolution.
 func WarmL1FromEntryPoints(ctx context.Context, c *cache.RedisCache, rc *rest.Config,
-	authnNS, signKey string, entryPoints []cache.EntryPoint) {
+	authnNS, signKey string, entryPoints []cache.EntryPoint, rbacWatcher *cache.RBACWatcher) {
 	log := slog.Default()
 	if len(entryPoints) == 0 || authnNS == "" {
 		log.Info("L1 entry-point warmup: skipped (no entry points or authn namespace)")
@@ -305,8 +306,36 @@ func WarmL1FromEntryPoints(ctx context.Context, c *cache.RedisCache, rc *rest.Co
 	}
 	prewarmDynClient = dynClient
 
+	// Group users by binding identity. Only one representative user per
+	// group needs to be resolved — the L1 keys use the binding identity,
+	// so the resolved output is shared across all users in the group.
+	type bindingGroup struct {
+		identity string
+		user     discoveredUser
+		members  int
+	}
+	groups := make(map[string]*bindingGroup)
+	for _, u := range users {
+		bid := ""
+		if rbacWatcher != nil {
+			bid = rbacWatcher.ComputeBindingIdentity(u.userInfo.Username, u.userInfo.Groups)
+		}
+		if bid == "" {
+			bid = u.userInfo.Username // fallback: treat as unique
+		}
+		// Register the mapping for L1 refresh credential lookup.
+		cache.RegisterBindingUser(bid, u.userInfo.Username)
+
+		if g, ok := groups[bid]; ok {
+			g.members++
+		} else {
+			groups[bid] = &bindingGroup{identity: bid, user: u, members: 1}
+		}
+	}
+
 	log.Info("L1 entry-point warmup: starting",
 		slog.Int("users", len(users)),
+		slog.Int("bindingGroups", len(groups)),
 		slog.Int("entryPoints", len(entryPoints)),
 	)
 
@@ -316,21 +345,31 @@ func WarmL1FromEntryPoints(ctx context.Context, c *cache.RedisCache, rc *rest.Co
 		epRefs = append(epRefs, l1Ref{gvr: ep.GVR, ns: ep.Namespace, name: ep.Name})
 	}
 
+	// Warm one representative user per binding group.
 	var totalWarmed int64
-	for _, u := range users {
+	for _, g := range groups {
+		u := g.user
 		token := mintJWT(u.userInfo, signKey)
+
+		// Inject binding identity into context so all downstream key
+		// building uses the shared identity, not the username.
+		warmCtx := cache.WithBindingIdentity(ctx, g.identity)
+
 		visited := make(map[string]bool)
-		recursivePreWarm(ctx, u.userInfo, u.endpoint, token, c, dynClient, epRefs, authnNS, visited, 1)
+		recursivePreWarm(warmCtx, u.userInfo, u.endpoint, token, c, dynClient, epRefs, authnNS, visited, 1)
 		warmed := int64(len(visited))
 		totalWarmed += warmed
-		log.Info("L1 entry-point warmup: user done",
-			slog.String("user", u.userInfo.Username),
+		log.Info("L1 entry-point warmup: group done",
+			slog.String("identity", g.identity),
+			slog.String("representative", u.userInfo.Username),
+			slog.Int("members", g.members),
 			slog.Int64("warmed", warmed),
 		)
 	}
 
 	log.Info("L1 entry-point warmup: completed",
 		slog.Int("users", len(users)),
+		slog.Int("bindingGroups", len(groups)),
 		slog.Int64("totalWarmed", totalWarmed),
 	)
 

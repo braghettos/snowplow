@@ -453,7 +453,7 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 				log.Info("L1 warmup: using frontend entry points",
 					slog.Int("entryPoints", len(eps)),
 					slog.String("configPath", frontendConfigPath))
-				dispatchers.WarmL1FromEntryPoints(l1Ctx, c, rc, authnNS, signKey, eps)
+				dispatchers.WarmL1FromEntryPoints(l1Ctx, c, rc, authnNS, signKey, eps, rbacWatcher)
 				return
 			}
 		} else {
