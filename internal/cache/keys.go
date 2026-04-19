@@ -18,6 +18,16 @@ const (
 	notFoundSentinel = `{"__snowplow_not_found__":true}`
 )
 
+// CacheIdentity returns the binding identity from context if available,
+// falling back to the username. This is the cache key component that
+// enables sharing L1 entries across users with identical RBAC bindings.
+func CacheIdentity(ctx context.Context, username string) string {
+	if bid := BindingIdentityFromContext(ctx); bid != "" {
+		return bid
+	}
+	return username
+}
+
 // MarkL1Ready writes a Unix-epoch timestamp to the L1 ready sentinel key.
 // External consumers (e.g. e2e tests) can poll this key to deterministically
 // know when the most recent L1 warmup or refresh cycle completed.

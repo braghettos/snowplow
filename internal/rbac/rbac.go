@@ -42,14 +42,17 @@ func UserCan(ctx context.Context, opts UserCanOptions) (ok bool) {
 		return false
 	}
 
-	// Attempt cache lookup using per-user RBAC HASH.
+	// Attempt cache lookup using per-identity RBAC HASH.
+	// Uses binding identity when available so users with identical RBAC
+	// bindings share the same RBAC cache entries.
 	c := cache.FromContext(ctx)
 	username := resolveUsername(ctx)
-	if c != nil && username != "" {
-		if allowed, cached := c.IsRBACAllowed(ctx, username, opts.Verb, opts.GroupResource, opts.Namespace); cached {
+	identity := cache.CacheIdentity(ctx, username)
+	if c != nil && identity != "" {
+		if allowed, cached := c.IsRBACAllowed(ctx, identity, opts.Verb, opts.GroupResource, opts.Namespace); cached {
 			cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RBACHits, "rbac_hits")
 			log.Debug("RBAC cache hit (hash)",
-				slog.String("username", username),
+				slog.String("identity", identity),
 				slog.String("verb", opts.Verb))
 			return allowed
 		}
@@ -89,8 +92,8 @@ func UserCan(ctx context.Context, opts UserCanOptions) (ok bool) {
 
 	log.Debug("SelfSubjectAccessReviews result", slog.Any("response", resp))
 
-	if c != nil && username != "" {
-		_ = c.SetRBACResult(ctx, username, opts.Verb, opts.GroupResource, opts.Namespace, resp.Status.Allowed, rbacCacheTTL)
+	if c != nil && identity != "" {
+		_ = c.SetRBACResult(ctx, identity, opts.Verb, opts.GroupResource, opts.Namespace, resp.Status.Allowed, rbacCacheTTL)
 	}
 
 	return resp.Status.Allowed

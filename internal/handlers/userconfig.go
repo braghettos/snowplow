@@ -87,6 +87,9 @@ func CachedUserConfig(signingKey, authnNS string, rc *rest.Config, c *cache.Redi
 			if rbacWatcher != nil {
 				if bid := rbacWatcher.ComputeBindingIdentity(userInfo.Username, userInfo.Groups); bid != "" {
 					ctx = cache.WithBindingIdentity(ctx, bid)
+					// Register the mapping so L1 refresh can find credentials
+					// for keys that use the binding identity instead of username.
+					cache.RegisterBindingUser(bid, userInfo.Username)
 				}
 			}
 

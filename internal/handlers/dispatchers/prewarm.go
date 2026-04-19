@@ -130,7 +130,8 @@ func preWarmChildWidgets(parentCtx context.Context, c *cache.RedisCache, resolve
 	}
 	accessToken, _ := xcontext.AccessToken(parentCtx)
 
-	refs := extractChildWidgetRefs(parentCtx, c, items, user.Username)
+	identity := cache.CacheIdentity(parentCtx, user.Username)
+	refs := extractChildWidgetRefs(parentCtx, c, items, identity)
 	if len(refs) == 0 {
 		return
 	}
@@ -178,7 +179,7 @@ func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.E
 		if err != nil || !found || len(childItems) == 0 {
 			continue
 		}
-		nextRefs = append(nextRefs, extractChildWidgetRefs(ctx, c, childItems, user.Username)...)
+		nextRefs = append(nextRefs, extractChildWidgetRefs(ctx, c, childItems, cache.CacheIdentity(ctx, user.Username))...)
 	}
 
 	recursivePreWarm(ctx, user, ep, accessToken, c, dynClient, nextRefs, authnNS, visited, depth+1)
@@ -409,6 +410,12 @@ func extractGroupsFromClientCert(certPEM string) []string {
 func warmL1ForUser(ctx context.Context, c *cache.RedisCache, dynClient k8sdynamic.Interface, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, gvrs []schema.GroupVersionResource, authnNS string) int64 {
 	log := slog.Default()
 
+	// Use binding identity for cache keys during prewarm. The prewarm context
+	// does not go through HTTP middleware, so binding identity is not in ctx.
+	// Use username as the identity (prewarm runs before binding identity is
+	// available from the RBAC watcher's initial sync).
+	identity := cache.CacheIdentity(ctx, user.Username)
+
 	var allRefs []l1Ref
 	for _, gvr := range gvrs {
 		var list unstructured.UnstructuredList
@@ -420,7 +427,7 @@ func warmL1ForUser(ctx context.Context, c *cache.RedisCache, dynClient k8sdynami
 			continue
 		}
 		for _, obj := range list.Items {
-			rKey := cache.ResolvedKey(user.Username, gvr, obj.GetNamespace(), obj.GetName(), -1, -1)
+			rKey := cache.ResolvedKey(identity, gvr, obj.GetNamespace(), obj.GetName(), -1, -1)
 			if c.Exists(ctx, rKey) {
 				continue
 			}
@@ -469,9 +476,12 @@ func warmL1RestActionsForUser(ctx context.Context, c *cache.RedisCache, dynClien
 	)
 	rctx = cache.WithCache(rctx, c)
 
+	// Use binding identity for cache keys during prewarm.
+	identity := cache.CacheIdentity(rctx, user.Username)
+
 	var warmed int64
 	for _, ra := range ras {
-		rKey := cache.ResolvedKey(user.Username, raGVR, ra.Namespace, ra.Name, -1, -1)
+		rKey := cache.ResolvedKey(identity, raGVR, ra.Namespace, ra.Name, -1, -1)
 		if c.Exists(rctx, rKey) {
 			continue
 		}
@@ -519,7 +529,7 @@ func warmL1RestActionsForUser(ctx context.Context, c *cache.RedisCache, dynClien
 	return warmed
 }
 
-func extractChildWidgetRefs(ctx context.Context, c *cache.RedisCache, items []interface{}, username string) []l1Ref {
+func extractChildWidgetRefs(ctx context.Context, c *cache.RedisCache, items []interface{}, identity string) []l1Ref {
 	var refs []l1Ref
 	for _, item := range items {
 		m, ok := item.(map[string]interface{})
@@ -537,7 +547,7 @@ func extractChildWidgetRefs(ctx context.Context, c *cache.RedisCache, items []in
 		if gvr.Group != widgetGroup {
 			continue
 		}
-		key := cache.ResolvedKey(username, gvr, ns, name, -1, -1)
+		key := cache.ResolvedKey(identity, gvr, ns, name, -1, -1)
 		if c.Exists(ctx, key) {
 			continue
 		}
@@ -559,6 +569,9 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 	)
 	ctx = cache.WithCache(ctx, c)
 
+	// Use binding identity for cache keys when available.
+	identity := cache.CacheIdentity(ctx, user.Username)
+
 	var (
 		wg      sync.WaitGroup
 		sem     = make(chan struct{}, runtime.GOMAXPROCS(0))
@@ -575,7 +588,7 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 
 			// Skip if L1 key already exists — pre-warmer only populates cold slots.
 			// Event-driven dirty+ticker handles updates to existing keys.
-			rKey := cache.ResolvedKey(user.Username, r.gvr, r.ns, r.name, -1, -1)
+			rKey := cache.ResolvedKey(identity, r.gvr, r.ns, r.name, -1, -1)
 			if c != nil && c.Exists(ctx, rKey) {
 				return
 			}

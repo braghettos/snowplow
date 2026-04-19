@@ -62,6 +62,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		return map[string]any{}
 	}
 
+	// Use binding identity for cache keys when available (shared L1 entries).
+	identity := cache.CacheIdentity(ctx, user.Username)
+
 	// Extract Redis cache from context (nil-safe: all cache ops are no-ops on nil).
 	c := cache.FromContext(ctx)
 
@@ -210,7 +213,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					dirtySet := cache.DirtySetFromContext(ctx)
 					gvrKey := cache.GVRToKey(pathGVR)
 					if c != nil && (dirtySet == nil || !dirtySet.ShouldBypassAPIResult(gvrKey, pathNS)) {
-						apiCacheKey := cache.APIResultKey(user.Username, pathGVR, pathNS, pathName)
+						apiCacheKey := cache.APIResultKey(identity, pathGVR, pathNS, pathName)
 						if raw, hit, _ := c.GetRaw(ctx, apiCacheKey); hit {
 							rbacVerb := "list"
 							if pathName != "" {
@@ -306,7 +309,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								if herr == nil {
 									// Write to L1 API cache for subsequent pages.
 									if c != nil {
-										apiCacheKey := cache.APIResultKey(user.Username, pathGVR, pathNS, pathName)
+										apiCacheKey := cache.APIResultKey(identity, pathGVR, pathNS, pathName)
 										if raw, merr := json.Marshal(directData); merr == nil {
 											_ = c.SetAPIResultRaw(ctx, apiCacheKey, raw)
 											// Register API result key in dep index so it's
@@ -325,7 +328,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							} else {
 								if herr := jsonHandlerDirect(ctx, handlerOpts, directData); herr == nil {
 									if c != nil {
-										apiCacheKey := cache.APIResultKey(user.Username, pathGVR, pathNS, pathName)
+										apiCacheKey := cache.APIResultKey(identity, pathGVR, pathNS, pathName)
 										if raw, merr := json.Marshal(directData); merr == nil {
 											_ = c.SetAPIResultRaw(ctx, apiCacheKey, raw)
 											gvrKey := cache.GVRToKey(pathGVR)
@@ -356,7 +359,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			// ── /call path L1 lookup ────────────────────────────────────────
 			if c != nil && verb == http.MethodGet {
 				if callGVR, callNS, callName := cache.ParseCallPath(call.Path); callGVR.Resource != "" && callName != "" {
-					l1Key := cache.ResolvedKey(user.Username, callGVR, callNS, callName, 0, 0)
+					l1Key := cache.ResolvedKey(identity, callGVR, callNS, callName, 0, 0)
 					if l1Raw, l1Hit, _ := c.GetRaw(ctx, l1Key); l1Hit {
 						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 						handler := jsonHandler(ctx, jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter})

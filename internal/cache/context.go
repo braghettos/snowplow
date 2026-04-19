@@ -2,10 +2,36 @@ package cache
 
 import (
 	"context"
+	"sync"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
+
+// bindingToUser maps binding identity hashes to a representative username.
+// Populated during HTTP requests (CachedUserConfig middleware) and prewarm.
+// Used by L1 refresh to look up user credentials for a binding identity key.
+var bindingToUser sync.Map // map[string]string
+
+// RegisterBindingUser records that the given username has the given binding
+// identity. During L1 refresh, the binding identity from a parsed key can be
+// mapped back to a real username for credential lookup.
+func RegisterBindingUser(bindingIdentity, username string) {
+	if bindingIdentity == "" || username == "" {
+		return
+	}
+	bindingToUser.Store(bindingIdentity, username)
+}
+
+// UsernameForBinding returns the representative username for a binding
+// identity. Returns ("", false) if no mapping exists.
+func UsernameForBinding(bindingIdentity string) (string, bool) {
+	v, ok := bindingToUser.Load(bindingIdentity)
+	if !ok {
+		return "", false
+	}
+	return v.(string), true
+}
 
 type contextKey struct{}
 

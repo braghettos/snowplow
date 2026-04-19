@@ -57,7 +57,8 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		if gerr == nil && nerr == nil {
 			user, uerr := xcontext.UserInfo(req.Context())
 			if uerr == nil {
-				resolvedKey = cache.ResolvedKey(user.Username, gvr, nsn.Namespace, nsn.Name, page, perPage)
+				identity := cache.CacheIdentity(req.Context(), user.Username)
+				resolvedKey = cache.ResolvedKey(identity, gvr, nsn.Namespace, nsn.Name, page, perPage)
 				lookupCtx, lookupSpan := restactionTracer.Start(req.Context(), "cache.lookup",
 					trace.WithAttributes(
 						attribute.String("cache.layer", "l1"),
@@ -77,7 +78,7 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 					}
 					cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
 					cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
-					cache.TouchKey(cache.ResolvedKeyBase(user.Username, gvr, nsn.Namespace, nsn.Name))
+					cache.TouchKey(cache.ResolvedKeyBase(identity, gvr, nsn.Namespace, nsn.Name))
 					log.Info("RESTAction resolved from cache",
 						slog.String("key", resolvedKey),
 						slog.String("user", user.Username),

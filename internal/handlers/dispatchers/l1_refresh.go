@@ -48,10 +48,17 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 		userCtxCache = make(map[string]*userContext)
 	)
 
-	getUserContext := func(ctx context.Context, username string) (*userContext, error) {
+	getUserContext := func(ctx context.Context, identity string) (*userContext, error) {
+		// The identity may be a binding identity hash (from Phase C) or
+		// a plain username. Resolve to real username for credential lookup.
+		username := identity
+		if realUser, ok := cache.UsernameForBinding(identity); ok {
+			username = realUser
+		}
+
 		now := time.Now().Unix()
 
-		// Fast path: read from cache.
+		// Fast path: read from cache (keyed by real username).
 		userCtxMu.RLock()
 		uc, ok := userCtxCache[username]
 		userCtxMu.RUnlock()
@@ -92,29 +99,30 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 		log := slog.Default()
 		refreshStart := time.Now()
 
-		type userKeys struct {
+		type identityKeys struct {
 			info cache.ResolvedKeyInfo
 			raw  string
 		}
-		byUser := map[string][]userKeys{}
+		byIdentity := map[string][]identityKeys{}
 		for _, key := range l1Keys {
 			info, ok := cache.ParseResolvedKey(key)
 			if !ok {
 				continue
 			}
-			byUser[info.Username] = append(byUser[info.Username], userKeys{info: info, raw: key})
+			byIdentity[info.Username] = append(byIdentity[info.Username], identityKeys{info: info, raw: key})
 		}
 
 		// Resolve each key directly. No sub-goroutines, no semaphores.
 		// User credentials are cached — no K8s API call per goroutine.
+		// The identity may be a binding identity hash or a plain username.
 		var totalRefreshed int64
 		var allCascade []string
 
-		for username, keys := range byUser {
-			uc, err := getUserContext(ctx, username)
+		for identity, keys := range byIdentity {
+			uc, err := getUserContext(ctx, identity)
 			if err != nil {
 				log.Warn("L1 refresh: cannot load user context",
-					slog.String("user", username), slog.Any("err", err))
+					slog.String("identity", identity), slog.Any("err", err))
 				continue
 			}
 
@@ -136,7 +144,7 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 			observability.L1RefreshDuration.Record(ctx, refreshDuration.Seconds())
 		}
 		if observability.L1RefreshUsers != nil {
-			observability.L1RefreshUsers.Add(ctx, int64(len(byUser)))
+			observability.L1RefreshUsers.Add(ctx, int64(len(byIdentity)))
 		}
 
 		if ctx.Err() != nil {
@@ -175,6 +183,13 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 		xcontext.WithAccessToken(accessToken),
 	)
 	rctx = cache.WithCache(rctx, c)
+
+	// If the key's identity differs from the real username, it's a binding
+	// identity hash. Set it in context so CacheIdentity returns the hash
+	// during inner resolution, keeping keys consistent.
+	if info.Username != user.Username {
+		rctx = cache.WithBindingIdentity(rctx, info.Username)
+	}
 
 	got := objects.Get(rctx, templatesv1.ObjectReference{
 		Reference: templatesv1.Reference{

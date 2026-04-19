@@ -53,7 +53,8 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	if c != nil {
 		user, uerr := xcontext.UserInfo(ctx)
 		if uerr == nil && user.Username != "" {
-			l1Key = cache.ResolvedKey(user.Username, restActionGVR,
+			identity := cache.CacheIdentity(ctx, user.Username)
+			l1Key = cache.ResolvedKey(identity, restActionGVR,
 				opts.ApiRef.Namespace, opts.ApiRef.Name, opts.Page, opts.PerPage)
 			// L1 fast path: when a widget depends on a RESTAction that
 			// has already been resolved for this user, reading the

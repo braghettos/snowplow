@@ -177,27 +177,49 @@ func (rw *RBACWatcher) invalidateFromBinding(ctx context.Context, obj any) {
 }
 
 // purgeUserCacheData deletes RBAC and L1 (resolved) cache entries for a
-// single user. RBAC uses a single HASH per user (O(1) DEL). L1 resolved
-// entries still use the per-user index SET for O(1) lookup, with SCAN fallback.
+// single user. Handles both username-keyed and binding-identity-keyed entries:
+//   - Purges RBAC hash and L1 resolved index for the username directly
+//   - If the RBAC watcher can compute a binding identity for the user,
+//     also purges the binding-identity-keyed RBAC hash and L1 resolved index
+//
 // Returns the total number of keys deleted.
 func (rw *RBACWatcher) purgeUserCacheData(ctx context.Context, username string) int {
 	total := 0
 
-	// RBAC: one DEL removes the entire per-user hash.
+	// Purge username-keyed entries (backward compat / migration).
 	_ = rw.cache.DeleteUserRBAC(ctx, username)
-	total++ // count the hash key itself
+	total++
 
-	// L1 resolved: index-based invalidation with SCAN fallback.
 	idxKey := UserResolvedIndexKey(username)
 	keys, _ := rw.cache.SMembers(ctx, idxKey)
 	if len(keys) == 0 {
-		// Fallback to SCAN for keys created before index tracking.
 		keys, _ = rw.cache.ScanKeys(ctx, "snowplow:resolved:"+username+":*")
 	}
 	if len(keys) > 0 {
 		_ = rw.cache.Delete(ctx, append(keys, idxKey)...)
 		total += len(keys)
 	}
+
+	// Also purge binding-identity-keyed entries. After a binding change,
+	// the informer has the NEW state, so ComputeBindingIdentity returns
+	// the new identity. We purge it because the RBAC decisions cached
+	// under the new identity may have been stale (computed before the
+	// binding change propagated). We also check the sync.Map for the
+	// old identity that was registered during HTTP requests.
+	if bid := rw.ComputeBindingIdentity(username, nil); bid != "" && bid != username {
+		_ = rw.cache.DeleteUserRBAC(ctx, bid)
+		total++
+		bidIdx := UserResolvedIndexKey(bid)
+		bidKeys, _ := rw.cache.SMembers(ctx, bidIdx)
+		if len(bidKeys) == 0 {
+			bidKeys, _ = rw.cache.ScanKeys(ctx, "snowplow:resolved:"+bid+":*")
+		}
+		if len(bidKeys) > 0 {
+			_ = rw.cache.Delete(ctx, append(bidKeys, bidIdx)...)
+			total += len(bidKeys)
+		}
+	}
+
 	return total
 }
 
