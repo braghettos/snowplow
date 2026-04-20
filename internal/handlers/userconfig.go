@@ -85,7 +85,7 @@ func CachedUserConfig(signingKey, authnNS string, rc *rest.Config, c *cache.Redi
 			// Compute binding identity for RBAC-based L1 cache sharing.
 			// Users with identical RBAC bindings share the same L1 entries.
 			if rbacWatcher != nil {
-				if bid := rbacWatcher.ComputeBindingIdentity(userInfo.Username, userInfo.Groups); bid != "" {
+				if bid := rbacWatcher.CachedBindingIdentity(userInfo.Username, userInfo.Groups); bid != "" {
 					ctx = cache.WithBindingIdentity(ctx, bid)
 					// Register the mapping so L1 refresh can find credentials
 					// for keys that use the binding identity instead of username.

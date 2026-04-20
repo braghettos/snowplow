@@ -135,6 +135,13 @@ type ResourceWatcher struct {
 	// runs per L1 key. Events marking the same key dirty while a resolve
 	// is running cause a re-run with the latest informer state.
 	dirtyKeys sync.Map // map[string]*dirtyState
+
+	// Priority channels for non-blocking L1 refresh dispatch.
+	// triggerL1RefreshBatch sends items to these channels instead of
+	// blocking the l1Worker with WaitGroup barriers.
+	hotCh  chan refreshItem
+	warmCh chan refreshItem
+	coldCh chan refreshItem
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -165,9 +172,12 @@ func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error
 				opts.Limit = 500
 			},
 		),
-		watched:                make(map[string]bool),
+		watched:     make(map[string]bool),
 		eventCh:     make(chan l1Event, 1000000),
 		dynamicGVRs: make(map[string]schema.GroupVersionResource),
+		hotCh:       make(chan refreshItem, 10000),
+		warmCh:      make(chan refreshItem, 10000),
+		coldCh:      make(chan refreshItem, 10000),
 	}, nil
 }
 
@@ -193,6 +203,7 @@ func (rw *ResourceWatcher) Start(ctx context.Context) {
 		}
 	}()
 	go rw.l1Worker(rw.appCtx) // appCtx carries InformerReader for background refreshes
+	go rw.priorityConsumer(rw.appCtx)
 	// Periodically prune stale keyAccess entries to prevent unbounded map growth.
 	go func() {
 		ticker := time.NewTicker(10 * time.Minute)
@@ -206,6 +217,43 @@ func (rw *ResourceWatcher) Start(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// priorityConsumer drains the HOT, WARM, and COLD refresh channels using
+// nested selects that enforce strict priority: HOT items are always preferred
+// over WARM, and WARM over COLD. This replaces the previous WaitGroup-based
+// blocking in triggerL1RefreshBatch, freeing the l1Worker to process the next
+// batch of informer events without waiting for refresh completion.
+func (rw *ResourceWatcher) priorityConsumer(ctx context.Context) {
+	for {
+		// Inner select: prefer HOT, then WARM, then COLD.
+		select {
+		case <-ctx.Done():
+			return
+		case item := <-rw.hotCh:
+			rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn)
+		default:
+			select {
+			case <-ctx.Done():
+				return
+			case item := <-rw.hotCh:
+				rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn)
+			case item := <-rw.warmCh:
+				rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn)
+			default:
+				select {
+				case <-ctx.Done():
+					return
+				case item := <-rw.hotCh:
+					rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn)
+				case item := <-rw.warmCh:
+					rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn)
+				case item := <-rw.coldCh:
+					rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn)
+				}
+			}
+		}
+	}
 }
 
 // registerFromRedis reads the watched-gvrs set from Redis and registers
@@ -332,6 +380,15 @@ func (ds *dirtyState) drainEntries() []DirtyEntry {
 type pageKey struct {
 	key  string
 	page int
+}
+
+// refreshItem carries all data needed by the priority consumer to invoke
+// markDirtySequentialBatch for a single key group.
+type refreshItem struct {
+	triggerGVR schema.GroupVersionResource
+	dirtyPairs map[gvrNS]bool
+	pages      []pageKey
+	fn         L1RefreshFunc
 }
 
 // gvrNS identifies a GVR+namespace pair for dirty tracking across batched events.
@@ -546,16 +603,17 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 		return
 	}
 
-	// ── Phase 4: Group paginated keys and trigger dirty resolves ─────────
+	// ── Phase 4: Group paginated keys and dispatch to priority channels ──
 	// Group paginated keys by base key (user:gvr:ns:name without page suffix).
 	// Paginated variants of the same resource resolve the same underlying data
 	// — only the page parameter changes the output. Resolving them sequentially
 	// (p1 → p2 → ... → pN) avoids N concurrent goroutines each doing a full
 	// O(N) resolve of the same 49K items.
 	//
-	// HOT:  refreshed first via WaitGroup-guarded goroutines
-	// WARM: refreshed after HOT completes via WaitGroup-guarded goroutines
-	// COLD: refreshed after WARM completes, sequentially (lowest priority)
+	// Items are dispatched to priority channels (HOT > WARM > COLD). The
+	// priorityConsumer goroutine drains them in strict priority order. This
+	// is non-blocking for the l1Worker — it can immediately process the next
+	// batch of informer events.
 	groupKeys := func(keys map[string]bool) map[string][]pageKey {
 		groups := make(map[string][]pageKey)
 		for l1Key := range keys {
@@ -570,117 +628,37 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 		return groups
 	}
 
-	// Phase 4a: HOT — highest priority, refresh immediately.
-	var hotWg sync.WaitGroup
+	// Dispatch to priority channels. Non-blocking sends: if a channel is full
+	// the item is dropped with a warning (the informer store is already updated;
+	// the next event will re-trigger).
+	dispatch := func(ch chan refreshItem, tier string, pages []pageKey) {
+		item := refreshItem{
+			triggerGVR: representativeGVR,
+			dirtyPairs: dirtyPairs,
+			pages:      pages,
+			fn:         fn,
+		}
+		select {
+		case ch <- item:
+		default:
+			slog.Warn("triggerL1RefreshBatch: priority channel full, dropping item",
+				slog.String("tier", tier),
+				slog.Int("pages", len(pages)))
+		}
+	}
+
 	for _, pages := range groupKeys(hotKeys) {
 		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
-		hotWg.Add(1)
-		rw.markDirtyWithWG(ctx, representativeGVR, dirtyPairs, pages, fn, &hotWg)
+		dispatch(rw.hotCh, "hot", pages)
 	}
-	hotWg.Wait()
-
-	// Phase 4b: WARM — medium priority, after HOT completes.
-	var warmWg sync.WaitGroup
 	for _, pages := range groupKeys(warmKeys) {
 		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
-		warmWg.Add(1)
-		rw.markDirtyWithWG(ctx, representativeGVR, dirtyPairs, pages, fn, &warmWg)
+		dispatch(rw.warmCh, "warm", pages)
 	}
-	warmWg.Wait()
-
-	// Phase 4c: COLD — lowest priority, after WARM completes.
 	for _, pages := range groupKeys(coldKeys) {
 		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
-		rw.markDirtySequentialBatch(ctx, representativeGVR, dirtyPairs, pages, fn)
+		dispatch(rw.coldCh, "cold", pages)
 	}
-}
-
-// markDirtyWithWG is like markDirtySequentialBatch but accepts a *sync.WaitGroup
-// so the caller can wait for completion. Used by the HOT/WARM tiers in
-// triggerL1RefreshBatch to enforce priority ordering (HOT before WARM before COLD).
-//
-// If loaded is true (goroutine already running for this identity), wg.Done() is
-// called immediately — the existing goroutine will handle the pending work,
-// and the WaitGroup must not block waiting for a goroutine that was already running.
-func (rw *ResourceWatcher) markDirtyWithWG(ctx context.Context, triggerGVR schema.GroupVersionResource, dirtyPairs map[gvrNS]bool, pages []pageKey, fn L1RefreshFunc, wg *sync.WaitGroup) {
-	if len(pages) == 0 {
-		wg.Done()
-		return
-	}
-	// Use the base key (first page's key stripped of pagination) as identity.
-	// All pagination variants coalesce into one goroutine.
-	identity := pages[0].key
-	if info, ok := ParseResolvedKey(identity); ok {
-		identity = ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
-	}
-
-	val, loaded := rw.dirtyKeys.LoadOrStore(identity, &dirtyState{})
-	state := val.(*dirtyState)
-	// Record ALL GVR+ns pairs that triggered this dirty mark BEFORE setting pending,
-	// so the goroutine's drain always sees every entry.
-	for pair := range dirtyPairs {
-		state.addEntry(pair.gvrKey, pair.ns)
-	}
-	state.pending.Store(true)
-
-	if loaded {
-		// Goroutine already running for this identity — it will pick up the
-		// pending work. Release the WaitGroup immediately so the caller
-		// does not block on an already-running goroutine.
-		wg.Done()
-		return
-	}
-
-	go func() {
-		defer wg.Done()
-		defer rw.dirtyKeys.Delete(identity)
-		defer func() {
-			if r := recover(); r != nil {
-				buf := make([]byte, 4096)
-				n := runtime.Stack(buf, false)
-				slog.Error("resource-watcher: panic in L1 refresh",
-					slog.Any("error", r),
-					slog.String("stack", string(buf[:n])))
-			}
-		}()
-
-		for state.pending.Swap(false) {
-			// Drain accumulated dirty entries and build a targeted DirtySet
-			// so only the affected GVR+ns pairs bypass the API result cache.
-			entries := state.drainEntries()
-			dirtySet := NewDirtySet(entries)
-
-			// Resolve each page sequentially: p1 → p2 → ... → pN.
-			var allCascade []string
-			for _, pg := range pages {
-				refreshCtx, cancel := context.WithTimeout(WithDirtySet(ctx, dirtySet), 60*time.Second)
-				cascade := fn(refreshCtx, triggerGVR, []string{pg.key})
-				cancel()
-				allCascade = append(allCascade, cascade...)
-			}
-
-			// Cascade: group dependent keys the same way and resolve
-			// sequentially within each group. Cascades get no bypass
-			// (gvrKey="" ns="") because they are transitive dependencies
-			// that don't directly correspond to the triggering event.
-			if len(allCascade) > 0 {
-				cascadeGroups := make(map[string][]pageKey)
-				for _, ck := range allCascade {
-					info, ok := ParseResolvedKey(ck)
-					if !ok {
-						cascadeGroups[ck] = append(cascadeGroups[ck], pageKey{key: ck, page: 0})
-						continue
-					}
-					baseKey := ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
-					cascadeGroups[baseKey] = append(cascadeGroups[baseKey], pageKey{key: ck, page: info.Page})
-				}
-				for _, cPages := range cascadeGroups {
-					sort.Slice(cPages, func(i, j int) bool { return cPages[i].page < cPages[j].page })
-					rw.markDirtySequential(ctx, triggerGVR, "", "", cPages, fn)
-				}
-			}
-		}
-	}()
 }
 
 // markDirtySequentialBatch is like markDirtySequential but registers ALL

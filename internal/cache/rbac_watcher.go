@@ -36,6 +36,11 @@ type RBACWatcher struct {
 	rbLister  rbaclisters.RoleBindingLister
 	crbLister rbaclisters.ClusterRoleBindingLister
 	synced    bool
+
+	// identityCache maps username → binding identity hash (from ComputeBindingIdentity).
+	// Avoids re-listing all bindings on every HTTP request. Cleared on broad
+	// RBAC changes; individual entries deleted on per-user binding invalidation.
+	identityCache sync.Map
 }
 
 func NewRBACWatcher(c *RedisCache, rc *rest.Config) *RBACWatcher {
@@ -126,6 +131,13 @@ func (rw *RBACWatcher) scheduleInvalidateFromBinding(ctx context.Context, obj an
 
 // invalidate uses the active-users set for targeted RBAC invalidation.
 func (rw *RBACWatcher) invalidate(ctx context.Context) {
+	// Clear all cached identities on broad RBAC change so the next
+	// request re-computes the binding identity from the updated listers.
+	rw.identityCache.Range(func(key, _ any) bool {
+		rw.identityCache.Delete(key)
+		return true
+	})
+
 	usernames, err := rw.cache.SMembers(ctx, ActiveUsersKey)
 	if err != nil || len(usernames) == 0 {
 		rw.invalidateAllRBAC(ctx)
@@ -186,6 +198,14 @@ func (rw *RBACWatcher) invalidateFromBinding(ctx context.Context, obj any) {
 func (rw *RBACWatcher) purgeUserCacheData(ctx context.Context, username string) int {
 	total := 0
 
+	// Load old identity from cache BEFORE clearing it, so we can purge
+	// stale entries keyed under the previous binding identity.
+	var oldBid string
+	if v, ok := rw.identityCache.Load(username); ok {
+		oldBid = v.(string)
+	}
+	rw.identityCache.Delete(username)
+
 	// Purge username-keyed entries (backward compat / migration).
 	_ = rw.cache.DeleteUserRBAC(ctx, username)
 	total++
@@ -200,19 +220,34 @@ func (rw *RBACWatcher) purgeUserCacheData(ctx context.Context, username string) 
 		total += len(keys)
 	}
 
-	// Also purge binding-identity-keyed entries. After a binding change,
+	// Purge old binding identity entries (cached before the RBAC change).
+	// The old identity may differ from the new one after a binding update.
+	if oldBid != "" && oldBid != username {
+		_ = rw.cache.DeleteUserRBAC(ctx, oldBid)
+		total++
+		oldIdx := UserResolvedIndexKey(oldBid)
+		oldKeys, _ := rw.cache.SMembers(ctx, oldIdx)
+		if len(oldKeys) == 0 {
+			oldKeys, _ = rw.cache.ScanKeys(ctx, "snowplow:resolved:"+oldBid+":*")
+		}
+		if len(oldKeys) > 0 {
+			_ = rw.cache.Delete(ctx, append(oldKeys, oldIdx)...)
+			total += len(oldKeys)
+		}
+	}
+
+	// Also purge NEW binding-identity-keyed entries. After a binding change,
 	// the informer has the NEW state, so ComputeBindingIdentity returns
 	// the new identity. We purge it because the RBAC decisions cached
 	// under the new identity may have been stale (computed before the
-	// binding change propagated). We also check the sync.Map for the
-	// old identity that was registered during HTTP requests.
-	if bid := rw.ComputeBindingIdentity(username, nil); bid != "" && bid != username {
-		_ = rw.cache.DeleteUserRBAC(ctx, bid)
+	// binding change propagated).
+	if newBid := rw.ComputeBindingIdentity(username, nil); newBid != "" && newBid != username && newBid != oldBid {
+		_ = rw.cache.DeleteUserRBAC(ctx, newBid)
 		total++
-		bidIdx := UserResolvedIndexKey(bid)
+		bidIdx := UserResolvedIndexKey(newBid)
 		bidKeys, _ := rw.cache.SMembers(ctx, bidIdx)
 		if len(bidKeys) == 0 {
-			bidKeys, _ = rw.cache.ScanKeys(ctx, "snowplow:resolved:"+bid+":*")
+			bidKeys, _ = rw.cache.ScanKeys(ctx, "snowplow:resolved:"+newBid+":*")
 		}
 		if len(bidKeys) > 0 {
 			_ = rw.cache.Delete(ctx, append(bidKeys, bidIdx)...)
@@ -221,6 +256,21 @@ func (rw *RBACWatcher) purgeUserCacheData(ctx context.Context, username string) 
 	}
 
 	return total
+}
+
+// CachedBindingIdentity returns a cached binding identity for the user. On
+// cache hit it skips the full lister scan. On miss it delegates to
+// ComputeBindingIdentity and stores the result. Empty identities (informer
+// not synced) are not cached.
+func (rw *RBACWatcher) CachedBindingIdentity(username string, groups []string) string {
+	if v, ok := rw.identityCache.Load(username); ok {
+		return v.(string)
+	}
+	bid := rw.ComputeBindingIdentity(username, groups)
+	if bid != "" {
+		rw.identityCache.Store(username, bid)
+	}
+	return bid
 }
 
 // ComputeBindingIdentity returns a short hash identifying the effective RBAC

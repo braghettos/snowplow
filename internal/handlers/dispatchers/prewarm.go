@@ -332,7 +332,7 @@ func WarmL1FromEntryPoints(ctx context.Context, c *cache.RedisCache, rc *rest.Co
 	for _, u := range users {
 		bid := ""
 		if rbacWatcher != nil {
-			bid = rbacWatcher.ComputeBindingIdentity(u.userInfo.Username, u.userInfo.Groups)
+			bid = rbacWatcher.CachedBindingIdentity(u.userInfo.Username, u.userInfo.Groups)
 		}
 		if bid == "" {
 			bid = u.userInfo.Username // fallback: treat as unique
