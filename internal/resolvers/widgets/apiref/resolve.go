@@ -80,6 +80,17 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 					slog.Warn("apiref: L1 hit but NO tracker in context",
 						slog.String("l1Key", l1Key))
 				}
+				// Touch the RESTAction key so its temperature reflects
+				// user access through widget apiref, not just direct HTTP
+				// calls. Without this, RESTActions only accessed via widget
+				// apiref (e.g. compositions-list for the piechart) decay
+				// from HOT to WARM after 5 min because the widget L1 HIT
+				// path only touches the WIDGET key, not the RESTAction key.
+				// Gate on foreground requests only (no DirtySet in context).
+				if cache.DirtySetFromContext(ctx) == nil {
+					cache.TouchKey(cache.ResolvedKeyBase(identity, restActionGVR,
+						opts.ApiRef.Namespace, opts.ApiRef.Name))
+				}
 				return status, nil
 			}
 		}
