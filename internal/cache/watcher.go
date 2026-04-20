@@ -483,38 +483,36 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 	// To avoid 50K individual SMembers calls at scale, GET dep lookups use a
 	// Redis pipeline: one round-trip for all GET deps (~1-2s for 50K commands).
 	allKeys := make(map[string]bool)
-	collect := func(idxKey string) {
-		if keys, err := rw.cache.SMembers(ctx, idxKey); err == nil {
-			for _, k := range keys {
-				allKeys[k] = true
-			}
-		}
-	}
 
-	for _, dep := range listDeps {
-		collect(dep.redisKey)
-	}
-	for _, dep := range clusterDeps {
-		collect(dep.redisKey)
-	}
-
-	// Pipeline all GET dep SMembers into one Redis round-trip.
-	if len(getDeps) > 0 {
+	// Pipeline ALL dep SMembers (list + cluster + get) into one Redis
+	// round-trip. Before this change list and cluster deps used sequential
+	// SMembers calls — one round-trip each. At scale (50K compositions)
+	// this added measurable latency to every L1 refresh batch.
+	totalDeps := len(listDeps) + len(clusterDeps) + len(getDeps)
+	if totalDeps > 0 {
 		pipe := rw.cache.Pipeline(ctx)
 		if pipe != nil {
 			type pipeCmd struct {
 				cmd *redis.StringSliceCmd
 			}
-			pipeCmds := make([]pipeCmd, 0, len(getDeps))
+			pipeCmds := make([]pipeCmd, 0, totalDeps)
+			for _, dep := range listDeps {
+				cmd := pipe.SMembers(ctx, dep.redisKey)
+				pipeCmds = append(pipeCmds, pipeCmd{cmd: cmd})
+			}
+			for _, dep := range clusterDeps {
+				cmd := pipe.SMembers(ctx, dep.redisKey)
+				pipeCmds = append(pipeCmds, pipeCmd{cmd: cmd})
+			}
 			for _, dep := range getDeps {
 				cmd := pipe.SMembers(ctx, dep.redisKey)
 				pipeCmds = append(pipeCmds, pipeCmd{cmd: cmd})
 			}
 			_, execErr := pipe.Exec(ctx)
 			if execErr != nil && execErr != redis.Nil {
-				slog.Warn("triggerL1RefreshBatch: GET dep pipeline failed",
+				slog.Warn("triggerL1RefreshBatch: dep pipeline failed",
 					slog.Any("err", execErr),
-					slog.Int("getDeps", len(getDeps)))
+					slog.Int("totalDeps", totalDeps))
 			}
 			for _, pc := range pipeCmds {
 				members, err := pc.cmd.Result()

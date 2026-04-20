@@ -173,9 +173,13 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 
 	if in.Cache != nil && in.ResolvedKey != "" {
 		_ = in.Cache.SetResolvedRaw(tctx, in.ResolvedKey, raw)
-		// Touch the key so it starts HOT for refresh priority.
-		if rki, ok := cache.ParseResolvedKey(in.ResolvedKey); ok {
-			cache.TouchKey(cache.ResolvedKeyBase(rki.Username, rki.GVR, rki.NS, rki.Name))
+		// Only touch on HTTP requests and prewarm, NOT background refresh.
+		// Background refresh is system activity — temperature must reflect
+		// user access only. DirtySet in context signals background refresh.
+		if cache.DirtySetFromContext(tctx) == nil {
+			if rki, ok := cache.ParseResolvedKey(in.ResolvedKey); ok {
+				cache.TouchKey(cache.ResolvedKeyBase(rki.Username, rki.GVR, rki.NS, rki.Name))
+			}
 		}
 		cache.RegisterL1Dependencies(tctx, in.Cache, tracker, in.ResolvedKey)
 	}
