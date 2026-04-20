@@ -647,14 +647,23 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 
 	for _, pages := range groupKeys(hotKeys) {
 		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
+		if len(pages) > 0 {
+			slog.Info("dispatch", slog.String("tier", "hot"), slog.String("key", pages[0].key))
+		}
 		dispatch(rw.hotCh, "hot", pages)
 	}
 	for _, pages := range groupKeys(warmKeys) {
 		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
+		if len(pages) > 0 {
+			slog.Info("dispatch", slog.String("tier", "warm"), slog.String("key", pages[0].key))
+		}
 		dispatch(rw.warmCh, "warm", pages)
 	}
 	for _, pages := range groupKeys(coldKeys) {
 		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
+		if len(pages) > 0 {
+			slog.Info("dispatch", slog.String("tier", "cold"), slog.String("key", pages[0].key))
+		}
 		dispatch(rw.coldCh, "cold", pages)
 	}
 }
@@ -713,6 +722,11 @@ func (rw *ResourceWatcher) markDirtySequentialBatch(ctx context.Context, trigger
 				cancel()
 				allCascade = append(allCascade, cascade...)
 			}
+
+			slog.Info("refresh done",
+				slog.String("key", identity),
+				slog.Int("cascade", len(allCascade)),
+				slog.String("trigger", triggerGVR.String()))
 
 			// Cascade: group dependent keys the same way and resolve
 			// sequentially within each group. Cascades get no bypass

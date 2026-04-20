@@ -218,8 +218,15 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 	case info.GVR.Group == templatesGroup && info.GVR.Resource == restactionResource:
 		_, err := ResolveRESTActionBackground(rctx, c, got.Unstructured.Object, rawKey, authnNS, info.PerPage, info.Page)
 		if err != nil {
+			slog.Info("refreshSingleL1: RESTAction resolve failed",
+				slog.String("key", rawKey), slog.Any("err", err))
 			return false, nil
 		}
+
+		slog.Info("refreshSingleL1: RESTAction resolved",
+			slog.String("key", rawKey),
+			slog.String("name", info.Name),
+			slog.String("ns", info.NS))
 
 		// Cascading refresh: find L1 keys that depend on this RESTAction
 		// as a resource (e.g. piechart depends on compositions-list).
@@ -227,6 +234,11 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 			cache.GVRToKey(info.GVR), info.NS, info.Name,
 		)
 		cascade, _ := c.SMembers(rctx, depKey)
+		if len(cascade) > 0 {
+			slog.Info("refreshSingleL1: cascade",
+				slog.String("from", info.Name),
+				slog.Int("targets", len(cascade)))
+		}
 		return true, cascade
 
 	default:
