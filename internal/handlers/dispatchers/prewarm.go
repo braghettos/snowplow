@@ -368,6 +368,10 @@ func WarmL1FromEntryPoints(ctx context.Context, c *cache.RedisCache, rc *rest.Co
 		// Inject binding identity into context so all downstream key
 		// building uses the shared identity, not the username.
 		warmCtx := cache.WithBindingIdentity(ctx, g.identity)
+		// Inject RBACWatcher for local RBAC evaluation during prewarm.
+		if rbacWatcher != nil {
+			warmCtx = cache.WithRBACWatcher(warmCtx, rbacWatcher)
+		}
 
 		visited := make(map[string]bool)
 		recursivePreWarm(warmCtx, u.userInfo, u.endpoint, token, c, dynClient, epRefs, authnNS, visited, 1)

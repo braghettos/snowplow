@@ -40,7 +40,9 @@ type userContext struct {
 // MakeL1Refresher returns a cache.L1RefreshFunc that re-resolves L1 keys in
 // the background instead of deleting them. Old values keep being served while
 // the refresh runs (stale-while-revalidate).
-func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey string) cache.L1RefreshFunc {
+// rbacWatcher may be nil; when non-nil it is injected into the refresh context
+// so UserCan uses in-memory RBAC evaluation instead of SSAR API calls.
+func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey string, rbacWatcher *cache.RBACWatcher) cache.L1RefreshFunc {
 	// User context cache: loaded once per user, shared across all goroutines.
 	// Avoids 50K K8s Secret GETs when 50K events arrive for the same users.
 	var (
@@ -88,6 +90,13 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 	}
 
 	return func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string) []string {
+		// Inject RBACWatcher for local RBAC evaluation during background refresh.
+		// Without this, UserCan falls back to SSAR (K8s API), which saturates
+		// the rate limiter with 345K calls at 50K scale.
+		if rbacWatcher != nil {
+			ctx = cache.WithRBACWatcher(ctx, rbacWatcher)
+		}
+
 		ctx, span := l1RefreshTracer.Start(ctx, "l1.refresh",
 			trace.WithAttributes(
 				attribute.String("trigger", triggerGVR.String()),
@@ -184,6 +193,12 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 		xcontext.WithLogger(slog.Default()),
 	)
 	rctx = cache.WithCache(rctx, c)
+
+	// Propagate RBACWatcher from parent context for local RBAC evaluation.
+	// The closure in MakeL1Refresher injects it before calling us.
+	if rw := cache.RBACWatcherFromContext(ctx); rw != nil {
+		rctx = cache.WithRBACWatcher(rctx, rw)
+	}
 
 	// If the key's identity differs from the real username, it's a binding
 	// identity hash. Set it in context so CacheIdentity returns the hash

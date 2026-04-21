@@ -350,7 +350,7 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 
 	c.SetGVRNotifier(resourceWatcher.AddGVR)
 	globalInformerReader = resourceWatcher // InformerReader interface — reads from informer store
-	resourceWatcher.SetL1Refresher(dispatchers.MakeL1Refresher(c, rc, authnNS, signKey))
+	resourceWatcher.SetL1Refresher(dispatchers.MakeL1Refresher(c, rc, authnNS, signKey, rbacWatcher))
 
 	// Load warmup config early to get autoDiscoverGroups for CRD informer filtering.
 	warmupCfg, err := cache.LoadWarmupConfig(warmupConfigPath)

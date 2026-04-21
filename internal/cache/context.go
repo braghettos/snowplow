@@ -133,6 +133,22 @@ func DirtySetFromContext(ctx context.Context) *DirtySet {
 	return ds
 }
 
+type rbacWatcherKey struct{}
+
+// WithRBACWatcher returns a context carrying the RBACWatcher for local
+// RBAC evaluation. When present, UserCan uses in-memory rule matching
+// instead of SelfSubjectAccessReview API calls.
+func WithRBACWatcher(ctx context.Context, rw *RBACWatcher) context.Context {
+	return context.WithValue(ctx, rbacWatcherKey{}, rw)
+}
+
+// RBACWatcherFromContext extracts the RBACWatcher from ctx.
+// Returns nil if not set (callers fall back to SSAR).
+func RBACWatcherFromContext(ctx context.Context) *RBACWatcher {
+	rw, _ := ctx.Value(rbacWatcherKey{}).(*RBACWatcher)
+	return rw
+}
+
 type bindingIdentityKey struct{}
 
 // WithBindingIdentity returns a context carrying the user's binding identity

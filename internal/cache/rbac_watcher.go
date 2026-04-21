@@ -11,6 +11,7 @@ import (
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	rbaclisters "k8s.io/client-go/listers/rbac/v1"
@@ -32,10 +33,13 @@ type RBACWatcher struct {
 	pending bool // true when a debounced invalidation is scheduled
 	timer   *time.Timer
 
-	// Listers for binding identity computation. Set after Start().
-	rbLister  rbaclisters.RoleBindingLister
-	crbLister rbaclisters.ClusterRoleBindingLister
-	synced    bool
+	// Listers for binding identity computation and local RBAC evaluation.
+	// Set after Start().
+	rbLister   rbaclisters.RoleBindingLister
+	crbLister  rbaclisters.ClusterRoleBindingLister
+	roleLister rbaclisters.RoleLister
+	crLister   rbaclisters.ClusterRoleLister
+	synced     bool
 
 	// identityCache maps username → binding identity hash (from ComputeBindingIdentity).
 	// Avoids re-listing all bindings on every HTTP request. Cleared on broad
@@ -73,9 +77,11 @@ func (rw *RBACWatcher) Start(ctx context.Context) error {
 	_, _ = factory.Rbac().V1().ClusterRoleBindings().Informer().AddEventHandler(k8scache.ResourceEventHandlerFuncs{
 		UpdateFunc: func(_, n any) { bindingHandler(n) }, DeleteFunc: bindingHandler,
 	})
-	// Store listers for binding identity computation.
+	// Store listers for binding identity computation and local RBAC evaluation.
 	rw.rbLister = factory.Rbac().V1().RoleBindings().Lister()
 	rw.crbLister = factory.Rbac().V1().ClusterRoleBindings().Lister()
+	rw.roleLister = factory.Rbac().V1().Roles().Lister()
+	rw.crLister = factory.Rbac().V1().ClusterRoles().Lister()
 
 	factory.Start(ctx.Done())
 	factory.WaitForCacheSync(ctx.Done())
@@ -352,4 +358,102 @@ func extractSubjects(obj any) ([]rbacv1.Subject, bool) {
 		return extractSubjects(b.Obj)
 	}
 	return nil, false
+}
+
+// EvaluateRBAC performs in-memory RBAC rule evaluation using the informer
+// cache, avoiding any K8s API call. It follows the K8s RBAC authorizer
+// logic: ClusterRoleBindings are checked first, then namespace-scoped
+// RoleBindings. Returns true on the first matching allow rule (short-circuit).
+//
+// Falls back to false (deny) if informers have not synced yet. This is safe
+// because the caller keeps the SSAR path as a fallback when EvaluateRBAC
+// is not available (RBACWatcher not in context).
+func (rw *RBACWatcher) EvaluateRBAC(username string, groups []string, verb string, gr schema.GroupResource, namespace string) bool {
+	if !rw.synced {
+		return false
+	}
+
+	// Build subject identity set for matching.
+	subjects := make(map[string]bool, 1+len(groups))
+	subjects["User:"+username] = true
+	for _, g := range groups {
+		subjects["Group:"+g] = true
+	}
+
+	// Phase 1: Check ClusterRoleBindings (K8s evaluates CRBs before RBs).
+	if crbs, err := rw.crbLister.List(labels.Everything()); err == nil {
+		for _, crb := range crbs {
+			if !matchesSubjects(crb.Subjects, subjects) {
+				continue
+			}
+			// Resolve the referenced ClusterRole.
+			if crb.RoleRef.Kind != "ClusterRole" {
+				continue
+			}
+			cr, err := rw.crLister.Get(crb.RoleRef.Name)
+			if err != nil {
+				continue
+			}
+			for _, rule := range cr.Rules {
+				if ruleAllows(rule, verb, gr.Group, gr.Resource) {
+					return true
+				}
+			}
+		}
+	}
+
+	// Phase 2: Check RoleBindings in the target namespace (skip for cluster-wide).
+	if namespace == "" {
+		return false
+	}
+	if rbs, err := rw.rbLister.RoleBindings(namespace).List(labels.Everything()); err == nil {
+		for _, rb := range rbs {
+			if !matchesSubjects(rb.Subjects, subjects) {
+				continue
+			}
+			switch rb.RoleRef.Kind {
+			case "Role":
+				role, err := rw.roleLister.Roles(namespace).Get(rb.RoleRef.Name)
+				if err != nil {
+					continue
+				}
+				for _, rule := range role.Rules {
+					if ruleAllows(rule, verb, gr.Group, gr.Resource) {
+						return true
+					}
+				}
+			case "ClusterRole":
+				cr, err := rw.crLister.Get(rb.RoleRef.Name)
+				if err != nil {
+					continue
+				}
+				for _, rule := range cr.Rules {
+					if ruleAllows(rule, verb, gr.Group, gr.Resource) {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// ruleAllows returns true if the policy rule grants the given verb on the
+// given API group and resource. All three must match (conjunctive). The
+// wildcard "*" matches any value.
+func ruleAllows(rule rbacv1.PolicyRule, verb, group, resource string) bool {
+	return containsOrStar(rule.Verbs, verb) &&
+		containsOrStar(rule.APIGroups, group) &&
+		containsOrStar(rule.Resources, resource)
+}
+
+// containsOrStar returns true if the list contains item or the wildcard "*".
+func containsOrStar(list []string, item string) bool {
+	for _, s := range list {
+		if s == "*" || s == item {
+			return true
+		}
+	}
+	return false
 }

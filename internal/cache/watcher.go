@@ -142,6 +142,12 @@ type ResourceWatcher struct {
 	hotCh  chan refreshItem
 	warmCh chan refreshItem
 	coldCh chan refreshItem
+
+	// warmColdSem bounds concurrent WARM/COLD refresh goroutines to
+	// GOMAXPROCS. HOT refreshes are unbounded (latency-critical).
+	// Without this, a burst of 50K informer events spawns one goroutine
+	// per unique L1 key group, exhausting memory.
+	warmColdSem chan struct{}
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -178,6 +184,7 @@ func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error
 		hotCh:       make(chan refreshItem, 10000),
 		warmCh:      make(chan refreshItem, 10000),
 		coldCh:      make(chan refreshItem, 10000),
+		warmColdSem: make(chan struct{}, runtime.GOMAXPROCS(0)),
 	}, nil
 }
 
@@ -231,25 +238,25 @@ func (rw *ResourceWatcher) priorityConsumer(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case item := <-rw.hotCh:
-			rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn)
+			rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn, item.sem)
 		default:
 			select {
 			case <-ctx.Done():
 				return
 			case item := <-rw.hotCh:
-				rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn)
+				rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn, item.sem)
 			case item := <-rw.warmCh:
-				rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn)
+				rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn, item.sem)
 			default:
 				select {
 				case <-ctx.Done():
 					return
 				case item := <-rw.hotCh:
-					rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn)
+					rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn, item.sem)
 				case item := <-rw.warmCh:
-					rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn)
+					rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn, item.sem)
 				case item := <-rw.coldCh:
-					rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn)
+					rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn, item.sem)
 				}
 			}
 		}
@@ -389,6 +396,7 @@ type refreshItem struct {
 	dirtyPairs map[gvrNS]bool
 	pages      []pageKey
 	fn         L1RefreshFunc
+	sem        chan struct{} // nil for HOT (unbounded), non-nil for WARM/COLD
 }
 
 // gvrNS identifies a GVR+namespace pair for dirty tracking across batched events.
@@ -629,12 +637,13 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 	// Dispatch to priority channels. Non-blocking sends: if a channel is full
 	// the item is dropped with a warning (the informer store is already updated;
 	// the next event will re-trigger).
-	dispatch := func(ch chan refreshItem, tier string, pages []pageKey) {
+	dispatch := func(ch chan refreshItem, tier string, pages []pageKey, sem chan struct{}) {
 		item := refreshItem{
 			triggerGVR: representativeGVR,
 			dirtyPairs: dirtyPairs,
 			pages:      pages,
 			fn:         fn,
+			sem:        sem,
 		}
 		select {
 		case ch <- item:
@@ -650,21 +659,21 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 		if len(pages) > 0 {
 			slog.Info("dispatch", slog.String("tier", "hot"), slog.String("key", pages[0].key))
 		}
-		dispatch(rw.hotCh, "hot", pages)
+		dispatch(rw.hotCh, "hot", pages, nil) // HOT: unbounded
 	}
 	for _, pages := range groupKeys(warmKeys) {
 		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
 		if len(pages) > 0 {
 			slog.Info("dispatch", slog.String("tier", "warm"), slog.String("key", pages[0].key))
 		}
-		dispatch(rw.warmCh, "warm", pages)
+		dispatch(rw.warmCh, "warm", pages, rw.warmColdSem) // WARM: bounded
 	}
 	for _, pages := range groupKeys(coldKeys) {
 		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
 		if len(pages) > 0 {
 			slog.Info("dispatch", slog.String("tier", "cold"), slog.String("key", pages[0].key))
 		}
-		dispatch(rw.coldCh, "cold", pages)
+		dispatch(rw.coldCh, "cold", pages, rw.warmColdSem) // COLD: bounded
 	}
 }
 
@@ -672,7 +681,12 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 // GVR+ns pairs from the batch as dirty entries, not just a single pair.
 // This ensures the DirtySet built during refresh correctly bypasses the
 // API result cache for every dependency that changed in the batch.
-func (rw *ResourceWatcher) markDirtySequentialBatch(ctx context.Context, triggerGVR schema.GroupVersionResource, dirtyPairs map[gvrNS]bool, pages []pageKey, fn L1RefreshFunc) {
+//
+// sem is an optional concurrency semaphore: when non-nil the goroutine
+// acquires a slot before resolving and releases it on exit. Used for
+// WARM/COLD tiers to bound concurrent goroutines to GOMAXPROCS. HOT
+// items pass nil (unbounded, latency-critical).
+func (rw *ResourceWatcher) markDirtySequentialBatch(ctx context.Context, triggerGVR schema.GroupVersionResource, dirtyPairs map[gvrNS]bool, pages []pageKey, fn L1RefreshFunc, sem chan struct{}) {
 	if len(pages) == 0 {
 		return
 	}
@@ -697,6 +711,12 @@ func (rw *ResourceWatcher) markDirtySequentialBatch(ctx context.Context, trigger
 	}
 
 	go func() {
+		// Acquire semaphore slot if bounded (WARM/COLD). HOT passes nil.
+		if sem != nil {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+		}
+
 		defer rw.dirtyKeys.Delete(identity)
 		defer func() {
 			if r := recover(); r != nil {

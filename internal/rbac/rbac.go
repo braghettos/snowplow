@@ -36,6 +36,18 @@ type UserCanOptions struct {
 func UserCan(ctx context.Context, opts UserCanOptions) (ok bool) {
 	log := xcontext.Logger(ctx)
 
+	// Try local RBAC evaluation from informer cache (zero K8s API calls).
+	// Short-circuits the entire SSAR + Redis cache path when the RBACWatcher
+	// is available (HTTP requests and background L1 refresh contexts).
+	if rw := cache.RBACWatcherFromContext(ctx); rw != nil {
+		username := resolveUsername(ctx)
+		var groups []string
+		if ui, err := xcontext.UserInfo(ctx); err == nil {
+			groups = ui.Groups
+		}
+		return rw.EvaluateRBAC(username, groups, opts.Verb, opts.GroupResource, opts.Namespace)
+	}
+
 	ep, err := xcontext.UserConfig(ctx)
 	if err != nil {
 		log.Error("unable to get user endpoint", slog.Any("err", err))

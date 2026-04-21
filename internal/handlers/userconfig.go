@@ -83,6 +83,13 @@ func CachedUserConfig(signingKey, authnNS string, rc *rest.Config, c *cache.Redi
 				xcontext.WithLogger(slog.Default()),
 			)
 
+			// Inject RBACWatcher for local RBAC evaluation (zero K8s API calls).
+			// Without this, every UserCan call falls back to SSAR which
+			// saturates the K8s API rate limiter at scale.
+			if rbacWatcher != nil {
+				ctx = cache.WithRBACWatcher(ctx, rbacWatcher)
+			}
+
 			// Compute binding identity for RBAC-based L1 cache sharing.
 			// Users with identical RBAC bindings share the same L1 entries.
 			if rbacWatcher != nil {
