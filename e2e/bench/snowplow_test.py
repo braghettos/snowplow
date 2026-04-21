@@ -40,6 +40,7 @@ import json
 import os
 import statistics
 import subprocess
+import threading
 import sys
 import time
 import urllib.error
@@ -2254,6 +2255,28 @@ def _verify_composition_count_api(token):
         return -1
 
 
+def _poll_piechart_progression(token, stop_event, interval=5):
+    """Poll piechart API during S6 deploy+stabilize to log value progression.
+
+    Runs in a background thread. Logs each sample with elapsed time, piechart
+    value (from cache), and cluster truth (kubectl count).
+    """
+    start = time.time()
+    sample = 0
+    prev_api = None
+    while not stop_event.is_set():
+        sample += 1
+        api_count = _verify_composition_count_api(token) if token else -1
+        cluster_count = count_compositions()
+        elapsed_s = int(time.time() - start)
+        # Only log when value changes or every 30s to avoid noise
+        if api_count != prev_api or sample == 1 or elapsed_s % 30 < interval:
+            api_str = f"{api_count}" if api_count >= 0 else "?"
+            log(f"    S6 PIECHART t={elapsed_s:>4d}s  piechart={api_str}  cluster={cluster_count}")
+            prev_api = api_count
+        stop_event.wait(interval)
+
+
 def _verify_composition_count_ui(page):
     """Verify composition count by fetching the piechart widget from the browser.
 
@@ -2598,9 +2621,19 @@ def run_phase_browser_scaling(tokens):
             s6_timeout = 1200 if SCALE <= 5000 else 3600
             s6_quiesce = 60 if SCALE <= 5000 else 120
             ts = _snapshot_l1()
+            # Start background piechart polling to capture value progression
+            pie_stop = threading.Event()
+            pie_thread = threading.Thread(
+                target=_poll_piechart_progression,
+                args=(admin_token, pie_stop),
+                daemon=True,
+            )
+            pie_thread.start()
             deploy_compositions_parallel(1, s5_ns_end, s6_comps_per_ns)
             wait_for_compositions(SCALE, timeout=s6_timeout)
             _stabilize(ts, quiesce=True, quiesce_secs=s6_quiesce)
+            pie_stop.set()
+            pie_thread.join(timeout=10)
             r = _browser_measure_stage(page, 6, f"{SCALE} compositions", cache_mode, token=admin_token)
             if r:
                 all_results.append(r)
@@ -2766,7 +2799,7 @@ def run_phase_browser_scaling(tokens):
             speedup = off_warm / on_warm if on_warm > 0 and off_warm > 0 else 0
             color = GREEN if speedup > 1.1 else (RED if speedup < 0.9 else YELLOW)
 
-            print(f"  S{s:<5d} {info['desc']:<22s} {ns:>4d} {comp:>5d} "
+            print(f"  S{str(s):<5s} {info['desc']:<22s} {ns:>4d} {comp:>5d} "
                   f"│ {on_warm:>7d}ms {on_wf:>7d}ms {on_calls:>4d} "
                   f"│ {off_warm:>8d}ms {off_wf:>7d}ms {off_calls:>5d} "
                   f"│ {color}{speedup:>6.1f}x{RESET}{anomaly} {conv_str:>7s}")

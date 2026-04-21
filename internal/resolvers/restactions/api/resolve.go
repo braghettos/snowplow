@@ -21,6 +21,8 @@ import (
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
@@ -256,11 +258,21 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						var directHit bool
 
 						if pathName == "" {
+							_, listSpan := apiHandlerTracer.Start(ctx, "restaction.api.informer_list",
+								trace.WithAttributes(
+									attribute.String("gvr", pathGVR.String()),
+									attribute.String("ns", pathNS),
+								))
 							if items, ok := ir.ListObjects(pathGVR, pathNS); ok && len(items) > 0 {
+								listSpan.SetAttributes(attribute.Int("items", len(items)))
+								listSpan.End()
+								_, normSpan := apiHandlerTracer.Start(ctx, "restaction.api.normalize",
+									trace.WithAttributes(attribute.Int("items", len(items))))
 								itemsList := make([]any, len(items))
 								for i, item := range items {
 									itemsList[i] = normalizeForJQ(item.Object)
 								}
+								normSpan.End()
 								directData = map[string]any{
 									"apiVersion": "v1",
 									"kind":       "List",
@@ -269,6 +281,8 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								}
 								directHit = true
 							} else if ok {
+								listSpan.SetAttributes(attribute.Int("items", 0))
+								listSpan.End()
 								directData = map[string]any{
 									"apiVersion": "v1",
 									"kind":       "List",
@@ -276,6 +290,8 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 									"items":      []any{},
 								}
 								directHit = true
+							} else {
+								listSpan.End()
 							}
 						} else {
 							if obj, ok := ir.GetObject(pathGVR, pathNS, pathName); ok {
