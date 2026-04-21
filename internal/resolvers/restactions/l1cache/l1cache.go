@@ -151,7 +151,7 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 		return nil, err
 	}
 
-	log.Info("RESTAction resolved",
+	slog.Debug("RESTAction resolved",
 		slog.String("name", cr.Name),
 		slog.String("namespace", cr.Namespace))
 
@@ -193,6 +193,23 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 		return &Result{Raw: raw}, nil
 	}
 	status, _ := wrapper["status"].(map[string]any)
+
+	// Diagnostic for S7: log item count for list-type RESTActions (e.g.
+	// compositions-list). The JQ filter produces {"list": [...items...]},
+	// so status["list"] is the array. This lets us see whether a delete
+	// event was reflected in the resolved output.
+	if status != nil {
+		if listRaw, ok := status["list"]; ok {
+			if listSlice, ok := listRaw.([]any); ok {
+				slog.Info("resolveAndCacheInner: resolved",
+					slog.String("name", cr.Name),
+					slog.String("ns", cr.Namespace),
+					slog.Int("items", len(listSlice)),
+					slog.Int("rawBytes", len(raw)))
+			}
+		}
+	}
+
 	return &Result{Raw: raw, Status: status}, nil
 }
 

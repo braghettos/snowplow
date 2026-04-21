@@ -84,7 +84,7 @@ func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRe
 		return all, err
 	}
 
-	log.Info("resolving resource ref",
+	log.Debug("resolving resource ref",
 		slog.String("id", in.ID),
 		slog.String("group", gvr.Group),
 		slog.String("name", in.Name),
@@ -104,7 +104,7 @@ func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRe
 			Namespace:     in.Namespace,
 		})
 		if !el.Allowed {
-			log.Warn("resource ref action not allowed",
+			log.Debug("resource ref action not allowed",
 				slog.String("id", in.ID),
 				slog.String("verb", verb),
 				slog.String("group", gvr.Group),
@@ -127,7 +127,7 @@ func resolveOne(ctx context.Context, rc *rest.Config, in *templatesv1.ResourceRe
 
 		all = append(all, el)
 
-		log.Info("resource ref successfully resolved",
+		log.Debug("resource ref successfully resolved",
 			slog.String("id", in.ID),
 			slog.String("group", gvr.Group),
 			slog.String("name", in.Name),

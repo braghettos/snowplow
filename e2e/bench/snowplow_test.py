@@ -2668,30 +2668,23 @@ def run_phase_browser_scaling(tokens):
 
             # S7 — Delete 1 composition
             ts = _snapshot_l1()
-            # Capture pod logs BEFORE delete for baseline
-            try:
-                result = subprocess.run(
-                    ["kubectl", "logs", "-n", "krateo-system", "-l", "app.kubernetes.io/name=snowplow",
-                     "-c", "snowplow", "--tail=100"],
-                    capture_output=True, text=True, timeout=10)
-                log(f"  S7 pre-delete: {len((result.stdout or '').splitlines())} log lines")
-            except Exception:
-                pass
+            # Tail pod logs to file during entire S7 (survives log rotation)
+            s7_log_file = "/tmp/snowplow_s7_logs.txt"
+            s7_tail = subprocess.Popen(
+                ["kubectl", "logs", "-f", "-n", "krateo-system",
+                 "-l", "app.kubernetes.io/name=snowplow", "-c", "snowplow"],
+                stdout=open(s7_log_file, "w"), stderr=subprocess.DEVNULL)
+            log(f"  S7 log tail started (pid={s7_tail.pid})")
             delete_one_composition("bench-ns-01", "bench-app-01-01")
             wait_for_composition_gone("bench-ns-01", "bench-app-01-01")
             _stabilize(ts)
             r = _browser_measure_stage(page, 7, "Deleted 1 comp", cache_mode, token=admin_token)
-            # Capture pod logs IMMEDIATELY after S7 verify for diagnosis
+            # Stop log tail
+            s7_tail.terminate()
+            s7_tail.wait(timeout=5)
             try:
-                s7_log_file = "/tmp/snowplow_s7_logs.txt"
-                result = subprocess.run(
-                    ["kubectl", "logs", "-n", "krateo-system", "-l", "app.kubernetes.io/name=snowplow",
-                     "-c", "snowplow", "--since=600s"],
-                    capture_output=True, text=True, timeout=30)
-                if result.stdout:
-                    with open(s7_log_file, "w") as f:
-                        f.write(result.stdout)
-                    log(f"  S7 logs saved to {s7_log_file} ({len(result.stdout)} bytes, {len(result.stdout.splitlines())} lines)")
+                lines = sum(1 for _ in open(s7_log_file))
+                log(f"  S7 logs saved to {s7_log_file} ({lines} lines)")
             except Exception as e:
                 log(f"  S7 log capture failed: {e}")
             if r:

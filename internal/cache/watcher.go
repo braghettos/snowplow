@@ -1050,11 +1050,18 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 		return
 	}
 
-	slog.Debug("resource-watcher: event",
-		slog.String("type", eventType),
-		slog.String("gvr", gvr.String()),
-		slog.String("ns", ns),
-		slog.String("name", name))
+	if eventType == "delete" {
+		slog.Info("resource-watcher: delete event",
+			slog.String("gvr", gvr.String()),
+			slog.String("ns", ns),
+			slog.String("name", name))
+	} else {
+		slog.Debug("resource-watcher: event",
+			slog.String("type", eventType),
+			slog.String("gvr", gvr.String()),
+			slog.String("ns", ns),
+			slog.String("name", name))
+	}
 
 	// No Redis writes for raw K8s data. The informer store IS the data source.
 	// L1 refresh reads directly from the informer via InformerReader.

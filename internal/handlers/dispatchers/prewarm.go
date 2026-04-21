@@ -526,6 +526,7 @@ func warmL1RestActionsForUser(ctx context.Context, c *cache.RedisCache, dynClien
 		xcontext.WithUserConfig(ep),
 		xcontext.WithUserInfo(user),
 		xcontext.WithAccessToken(accessToken),
+		xcontext.WithLogger(slog.Default()),
 	)
 	rctx = cache.WithCache(rctx, c)
 
@@ -664,6 +665,7 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 		xcontext.WithUserConfig(ep),
 		xcontext.WithUserInfo(user),
 		xcontext.WithAccessToken(accessToken),
+		xcontext.WithLogger(slog.Default()),
 	)
 	ctx = cache.WithCache(ctx, c)
 
@@ -699,6 +701,7 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 				xcontext.WithUserConfig(ep),
 				xcontext.WithUserInfo(user),
 				xcontext.WithAccessToken(accessToken),
+				xcontext.WithLogger(slog.Default()),
 			)
 			rctx = cache.WithCache(rctx, c)
 

@@ -80,6 +80,7 @@ func CachedUserConfig(signingKey, authnNS string, rc *rest.Config, c *cache.Redi
 				xcontext.WithAccessToken(parts[1]),
 				xcontext.WithUserInfo(userInfo),
 				xcontext.WithUserConfig(ep),
+				xcontext.WithLogger(slog.Default()),
 			)
 
 			// Compute binding identity for RBAC-based L1 cache sharing.

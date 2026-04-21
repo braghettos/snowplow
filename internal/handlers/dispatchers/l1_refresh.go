@@ -181,6 +181,7 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 		xcontext.WithUserConfig(ep),
 		xcontext.WithUserInfo(user),
 		xcontext.WithAccessToken(accessToken),
+		xcontext.WithLogger(slog.Default()),
 	)
 	rctx = cache.WithCache(rctx, c)
 
@@ -211,6 +212,10 @@ func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.User
 			return false, nil
 		}
 		_ = result
+		slog.Info("refreshSingleL1: widget resolved",
+			slog.String("key", rawKey),
+			slog.String("name", info.Name),
+			slog.String("ns", info.NS))
 		// Do NOT TouchKey here: background refresh is system activity, not
 		// user access. Temperature must reflect user visits only.
 		return true, nil

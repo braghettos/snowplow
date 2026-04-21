@@ -54,7 +54,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	}
 
 	log := xcontext.Logger(ctx)
-	log.Info("pagination options", slog.Int("page", opts.Page), slog.Int("perPage", opts.PerPage))
+	log.Debug("pagination options", slog.Int("page", opts.Page), slog.Int("perPage", opts.PerPage))
 
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
@@ -418,7 +418,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				return call.ContinueOnError
 			}
 
-			log.Info("api successfully resolved",
+			log.Debug("api successfully resolved",
 				slog.String("name", id),
 				slog.String("host", call.Endpoint.ServerURL), slog.String("path", call.Path),
 			)
