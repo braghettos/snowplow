@@ -82,15 +82,14 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 				}
 				// Touch the RESTAction key so its temperature reflects
 				// user access through widget apiref, not just direct HTTP
-				// calls. Without this, RESTActions only accessed via widget
-				// apiref (e.g. compositions-list for the piechart) decay
-				// from HOT to WARM after 5 min because the widget L1 HIT
-				// path only touches the WIDGET key, not the RESTAction key.
-				// Gate on foreground requests only (no DirtySet in context).
-				if cache.DirtySetFromContext(ctx) == nil {
-					cache.TouchKey(cache.ResolvedKeyBase(identity, restActionGVR,
-						opts.ApiRef.Namespace, opts.ApiRef.Name))
-				}
+				// Touch the RESTAction key so it inherits the widget's
+				// temperature. compositions-list is only resolved by
+				// background refresh (never by HTTP directly). Without
+				// this touch, it decays to WARM and gets lower priority.
+				// If the widget is being refreshed, its transitive deps
+				// are transitively user-accessed.
+				cache.TouchKey(cache.ResolvedKeyBase(identity, restActionGVR,
+					opts.ApiRef.Namespace, opts.ApiRef.Name))
 				return status, nil
 			}
 		}

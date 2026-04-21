@@ -447,25 +447,20 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 			l1Ctx = cache.WithInformerReader(l1Ctx, globalInformerReader)
 		}
 
-		if feCfg, feErr := cache.LoadFrontendConfig(frontendConfigPath); feErr == nil {
-			eps := feCfg.EntryPoints()
-			if len(eps) > 0 {
-				log.Info("L1 warmup: using frontend entry points",
-					slog.Int("entryPoints", len(eps)),
-					slog.String("configPath", frontendConfigPath))
-				dispatchers.WarmL1FromEntryPoints(l1Ctx, c, rc, authnNS, signKey, eps, rbacWatcher)
-				return
-			}
-		} else {
-			log.Info("L1 warmup: frontend config not available, falling back to GVR-based warmup",
+		feCfg, feErr := cache.LoadFrontendConfig(frontendConfigPath)
+		if feErr != nil {
+			log.Warn("L1 warmup: frontend config not available — skipping L1 prewarm",
 				slog.String("path", frontendConfigPath), slog.Any("err", feErr))
+			return
 		}
-
-		// Fallback: GVR-based warmup when frontend config is not available.
-		if warmupCfg != nil && authnNS != "" {
-			widgetGVRs := dispatchers.FilterWidgetGVRs(warmupCfg)
-			restActions := warmupCfg.Warmup.L1RestActions
-			dispatchers.WarmL1ForAllUsers(l1Ctx, c, rc, authnNS, signKey, widgetGVRs, restActions)
+		eps := feCfg.EntryPoints()
+		if len(eps) == 0 {
+			log.Warn("L1 warmup: no entry points in frontend config — skipping L1 prewarm")
+			return
 		}
+		log.Info("L1 warmup: using frontend entry points",
+			slog.Int("entryPoints", len(eps)),
+			slog.String("configPath", frontendConfigPath))
+		dispatchers.WarmL1FromEntryPoints(l1Ctx, c, rc, authnNS, signKey, eps, rbacWatcher)
 	}()
 }
