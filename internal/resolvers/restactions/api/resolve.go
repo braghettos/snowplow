@@ -322,50 +322,54 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								herr := jsonHandlerDirect(ctx, handlerOpts, directData)
 								mu.Unlock()
 								if herr == nil {
-									// Write to L1 API cache for subsequent pages.
+									// Populate API result cache asynchronously — the L1
+									// resolved cache (written by l1cache.go) is the
+									// user-facing cache and is written synchronously.
+									// This avoids blocking convergence with 62 sequential
+									// marshal+compress+write operations (~2.5s each).
 									if c != nil {
-										_, cacheWriteSpan := apiHandlerTracer.Start(ctx, "restaction.api.cache_write",
-											trace.WithAttributes(
-												attribute.String("ns", pathNS),
-												attribute.String("name", pathName),
-											))
-										apiCacheKey := cache.APIResultKey(identity, pathGVR, pathNS, pathName)
-										if raw, merr := json.Marshal(directData); merr == nil {
-											cacheWriteSpan.SetAttributes(attribute.Int("bytes", len(raw)))
-											_ = c.SetAPIResultRaw(ctx, apiCacheKey, raw)
-											gvrKey := cache.GVRToKey(pathGVR)
-											depKey := cache.L1ResourceDepKey(gvrKey, pathNS, pathName)
-											_ = c.SAddWithTTL(ctx, depKey, apiCacheKey, cache.ReverseIndexTTL)
-											if pathName == "" {
-												clusterDep := cache.L1ResourceDepKey(gvrKey, "", "")
-												_ = c.SAddWithTTL(ctx, clusterDep, apiCacheKey, cache.ReverseIndexTTL)
+										data := directData
+										pNS := pathNS
+										pName := pathName
+										pGVR := pathGVR
+										go func() {
+											bgCtx := context.Background()
+											apiCacheKey := cache.APIResultKey(identity, pGVR, pNS, pName)
+											if raw, merr := json.Marshal(data); merr == nil {
+												_ = c.SetAPIResultRaw(bgCtx, apiCacheKey, raw)
+												gvrKey := cache.GVRToKey(pGVR)
+												depKey := cache.L1ResourceDepKey(gvrKey, pNS, pName)
+												_ = c.SAddWithTTL(bgCtx, depKey, apiCacheKey, cache.ReverseIndexTTL)
+												if pName == "" {
+													clusterDep := cache.L1ResourceDepKey(gvrKey, "", "")
+													_ = c.SAddWithTTL(bgCtx, clusterDep, apiCacheKey, cache.ReverseIndexTTL)
+												}
 											}
-										}
-										cacheWriteSpan.End()
+										}()
 									}
 									return true
 								}
 							} else {
 								if herr := jsonHandlerDirect(ctx, handlerOpts, directData); herr == nil {
 									if c != nil {
-										_, cacheWriteSpan := apiHandlerTracer.Start(ctx, "restaction.api.cache_write",
-											trace.WithAttributes(
-												attribute.String("ns", pathNS),
-												attribute.String("name", pathName),
-											))
-										apiCacheKey := cache.APIResultKey(identity, pathGVR, pathNS, pathName)
-										if raw, merr := json.Marshal(directData); merr == nil {
-											cacheWriteSpan.SetAttributes(attribute.Int("bytes", len(raw)))
-											_ = c.SetAPIResultRaw(ctx, apiCacheKey, raw)
-											gvrKey := cache.GVRToKey(pathGVR)
-											depKey := cache.L1ResourceDepKey(gvrKey, pathNS, pathName)
-											_ = c.SAddWithTTL(ctx, depKey, apiCacheKey, cache.ReverseIndexTTL)
-											if pathName == "" {
-												clusterDep := cache.L1ResourceDepKey(gvrKey, "", "")
-												_ = c.SAddWithTTL(ctx, clusterDep, apiCacheKey, cache.ReverseIndexTTL)
+										data := directData
+										pNS := pathNS
+										pName := pathName
+										pGVR := pathGVR
+										go func() {
+											bgCtx := context.Background()
+											apiCacheKey := cache.APIResultKey(identity, pGVR, pNS, pName)
+											if raw, merr := json.Marshal(data); merr == nil {
+												_ = c.SetAPIResultRaw(bgCtx, apiCacheKey, raw)
+												gvrKey := cache.GVRToKey(pGVR)
+												depKey := cache.L1ResourceDepKey(gvrKey, pNS, pName)
+												_ = c.SAddWithTTL(bgCtx, depKey, apiCacheKey, cache.ReverseIndexTTL)
+												if pName == "" {
+													clusterDep := cache.L1ResourceDepKey(gvrKey, "", "")
+													_ = c.SAddWithTTL(bgCtx, clusterDep, apiCacheKey, cache.ReverseIndexTTL)
+												}
 											}
-										}
-										cacheWriteSpan.End()
+										}()
 									}
 									return true
 								}
