@@ -889,13 +889,23 @@ func (rw *ResourceWatcher) GetObject(gvr schema.GroupVersionResource, ns, name s
 // store, optionally scoped to a namespace (ns="" means cluster-wide).
 // Returns (nil, false) if the GVR has no registered informer.
 func (rw *ResourceWatcher) ListObjects(gvr schema.GroupVersionResource, ns string) ([]*unstructured.Unstructured, bool) {
-	store := rw.factory.ForResource(gvr).Informer().GetStore()
-	items := store.List()
+	informer := rw.factory.ForResource(gvr).Informer()
+
+	var items []any
+	if ns != "" {
+		// Use the namespace index that DynamicSharedInformerFactory already
+		// registers (cache.NamespaceIndex). Returns only items in the target
+		// namespace — O(items_in_ns) instead of O(total_items).
+		var err error
+		items, err = informer.GetIndexer().ByIndex(k8scache.NamespaceIndex, ns)
+		if err != nil {
+			items = informer.GetStore().List()
+		}
+	} else {
+		items = informer.GetStore().List()
+	}
+
 	if len(items) == 0 {
-		// Distinguish "informer exists but empty" from "no informer".
-		// If the factory has no informer for this GVR, List() returns nil.
-		// Return empty slice (true) for registered-but-empty, nil (false)
-		// for unregistered. Check watched map.
 		rw.mu.Lock()
 		_, registered := rw.watched[GVRToKey(gvr)]
 		rw.mu.Unlock()
@@ -904,13 +914,11 @@ func (rw *ResourceWatcher) ListObjects(gvr schema.GroupVersionResource, ns strin
 		}
 		return []*unstructured.Unstructured{}, true
 	}
+
 	result := make([]*unstructured.Unstructured, 0, len(items))
 	for _, item := range items {
 		uns, ok := item.(*unstructured.Unstructured)
 		if !ok {
-			continue
-		}
-		if ns != "" && uns.GetNamespace() != ns {
 			continue
 		}
 		result = append(result, uns)
