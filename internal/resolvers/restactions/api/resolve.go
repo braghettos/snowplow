@@ -266,13 +266,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							if items, ok := ir.ListObjects(pathGVR, pathNS); ok && len(items) > 0 {
 								listSpan.SetAttributes(attribute.Int("items", len(items)))
 								listSpan.End()
-								_, normSpan := apiHandlerTracer.Start(ctx, "restaction.api.normalize",
-									trace.WithAttributes(attribute.Int("items", len(items))))
+								// Objects are pre-normalized in-place at informer transform
+								// time (int64→float64, zero alloc). No deep-copy needed.
 								itemsList := make([]any, len(items))
 								for i, item := range items {
-									itemsList[i] = normalizeForJQ(item.Object)
+									itemsList[i] = item.Object
 								}
-								normSpan.End()
 								directData = map[string]any{
 									"apiVersion": "v1",
 									"kind":       "List",
@@ -295,7 +294,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							}
 						} else {
 							if obj, ok := ir.GetObject(pathGVR, pathNS, pathName); ok {
-								directData = normalizeForJQ(obj.Object)
+								directData = obj.Object // pre-normalized at informer transform
 								directHit = true
 							}
 						}
@@ -325,11 +324,15 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								if herr == nil {
 									// Write to L1 API cache for subsequent pages.
 									if c != nil {
+										_, cacheWriteSpan := apiHandlerTracer.Start(ctx, "restaction.api.cache_write",
+											trace.WithAttributes(
+												attribute.String("ns", pathNS),
+												attribute.String("name", pathName),
+											))
 										apiCacheKey := cache.APIResultKey(identity, pathGVR, pathNS, pathName)
 										if raw, merr := json.Marshal(directData); merr == nil {
+											cacheWriteSpan.SetAttributes(attribute.Int("bytes", len(raw)))
 											_ = c.SetAPIResultRaw(ctx, apiCacheKey, raw)
-											// Register API result key in dep index so it's
-											// invalidated when this GVR+ns changes.
 											gvrKey := cache.GVRToKey(pathGVR)
 											depKey := cache.L1ResourceDepKey(gvrKey, pathNS, pathName)
 											_ = c.SAddWithTTL(ctx, depKey, apiCacheKey, cache.ReverseIndexTTL)
@@ -338,14 +341,21 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 												_ = c.SAddWithTTL(ctx, clusterDep, apiCacheKey, cache.ReverseIndexTTL)
 											}
 										}
+										cacheWriteSpan.End()
 									}
 									return true
 								}
 							} else {
 								if herr := jsonHandlerDirect(ctx, handlerOpts, directData); herr == nil {
 									if c != nil {
+										_, cacheWriteSpan := apiHandlerTracer.Start(ctx, "restaction.api.cache_write",
+											trace.WithAttributes(
+												attribute.String("ns", pathNS),
+												attribute.String("name", pathName),
+											))
 										apiCacheKey := cache.APIResultKey(identity, pathGVR, pathNS, pathName)
 										if raw, merr := json.Marshal(directData); merr == nil {
+											cacheWriteSpan.SetAttributes(attribute.Int("bytes", len(raw)))
 											_ = c.SetAPIResultRaw(ctx, apiCacheKey, raw)
 											gvrKey := cache.GVRToKey(pathGVR)
 											depKey := cache.L1ResourceDepKey(gvrKey, pathNS, pathName)
@@ -355,6 +365,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 												_ = c.SAddWithTTL(ctx, clusterDep, apiCacheKey, cache.ReverseIndexTTL)
 											}
 										}
+										cacheWriteSpan.End()
 									}
 									return true
 								}
