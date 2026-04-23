@@ -226,35 +226,26 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								GroupResource: schema.GroupResource{Group: pathGVR.Group, Resource: pathGVR.Resource},
 								Namespace:     pathNS,
 							}) {
-								// Custom ResponseHandler (external APIs): use original io path.
-								if call.ResponseHandler != nil {
-									if herr := call.ResponseHandler(io.NopCloser(bytes.NewReader(raw))); herr == nil {
-										return true
-									}
-								} else {
-									// Unmarshal once, use zero-copy direct handler.
-									// Eliminates 2× io.ReadAll copies (1.1GB in pprof at 71K).
-									_, unmarshalSpan := apiHandlerTracer.Start(ctx, "restaction.api.cache_unmarshal",
-										trace.WithAttributes(
-											attribute.String("key", id),
-											attribute.Int("bytes", len(raw)),
-										))
-									var cached any
-									uerr := json.Unmarshal(raw, &cached)
-									unmarshalSpan.End()
-									if uerr == nil {
-										opts := jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter}
-										if mu != nil {
-											mu.Lock()
-											herr := jsonHandlerDirect(ctx, opts, cached)
-											mu.Unlock()
-											if herr == nil {
-												return true
+								handler := call.ResponseHandler
+								if handler == nil {
+									handler = jsonHandler(ctx, jsonHandlerOptions{
+										key: id, out: dict, filter: apiCall.Filter,
+									})
+									if mu != nil {
+										origHandler := handler
+										handler = func(r io.ReadCloser) error {
+											data, rerr := io.ReadAll(r)
+											if rerr != nil {
+												return rerr
 											}
-										} else if herr := jsonHandlerDirect(ctx, opts, cached); herr == nil {
-											return true
+											mu.Lock()
+											defer mu.Unlock()
+											return origHandler(io.NopCloser(bytes.NewReader(data)))
 										}
 									}
+								}
+								if herr := handler(io.NopCloser(bytes.NewReader(raw))); herr == nil {
+									return true // L1 API cache hit
 								}
 							}
 						}
