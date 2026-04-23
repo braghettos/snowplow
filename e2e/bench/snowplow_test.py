@@ -1419,20 +1419,17 @@ def clean_environment():
                         "--ignore-not-found", "--wait=false")
                 log(f"Deleted {len(bench_items)} {res} in krateo-system")
 
-    # Step 8: Deploy image + restart pod (flushes Redis sidecar)
+    # Step 8: Deploy image + scale back up (was scaled to 0 in Step 5b)
     tag = os.environ.get("EXPECTED_IMAGE_TAG")
     if tag:
         log(f"Deploying snowplow image tag {tag} ...")
         kubectl("set", "image", "deployment/snowplow",
                 f"snowplow=ghcr.io/braghettos/snowplow:{tag}", "-n", "krateo-system")
+    kubectl("scale", "deployment/snowplow", "--replicas=1", "-n", "krateo-system")
     log("Restarting snowplow pod to flush Redis cache ...")
-    rc, _, err = kubectl("rollout", "restart", "deployment/snowplow", "-n", "krateo-system")
-    if rc == 0:
-        kubectl("rollout", "status", "deployment/snowplow", "-n", "krateo-system",
-                "--timeout=300s")
-        log("  Snowplow pod restarted — Redis flushed")
-    else:
-        log(f"  WARNING: failed to restart snowplow: {err[:100]}")
+    kubectl("rollout", "status", "deployment/snowplow", "-n", "krateo-system",
+            "--timeout=600s")
+    log("  Snowplow pod restarted — Redis flushed")
 
     # Scale CD parser back up (was stopped to prevent re-creation during cleanup)
     kubectl("scale", "deployment/finops-composition-definition-parser", "--replicas=1", "-n", NS)
