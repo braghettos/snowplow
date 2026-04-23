@@ -177,11 +177,20 @@ func main() {
 	}
 
 	// Initialize OpenTelemetry SDK (no-op when OTEL_ENABLED != "true").
-	otelShutdown, otelErr := observability.Init(ctx, build)
+	// Use an independent context so exporter failures (e.g., collector
+	// refusing data due to memory pressure) do not cascade into a
+	// server shutdown. The OTel context is cancelled on server stop.
+	otelCtx, otelCancel := context.WithCancel(context.Background())
+	otelShutdown, otelErr := observability.Init(otelCtx, build)
 	if otelErr != nil {
 		log.Warn("otel init failed", slog.Any("err", otelErr))
 	}
-	defer otelShutdown(ctx)
+	defer func() {
+		otelCancel()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		otelShutdown(shutdownCtx)
+	}()
 
 	// When OTel is enabled, wrap the slog handler to:
 	// 1. Inject trace_id/span_id into stderr log output
