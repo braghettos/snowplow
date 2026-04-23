@@ -221,6 +221,8 @@ func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config
 	}
 	if len(users) == 0 {
 		log.Info("L1 warmup: no users found")
+		preWarmComplete.Store(true)
+		cache.MarkL1Ready(ctx, c)
 		return
 	}
 
@@ -310,6 +312,8 @@ func WarmL1FromEntryPoints(ctx context.Context, c *cache.RedisCache, rc *rest.Co
 	}
 	if len(users) == 0 {
 		log.Info("L1 entry-point warmup: no users found")
+		preWarmComplete.Store(true)
+		cache.MarkL1Ready(ctx, c)
 		return
 	}
 
