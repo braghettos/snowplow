@@ -232,11 +232,16 @@ def login(username, password):
 def login_all():
     tokens = {}
     for username, password in USERS.items():
-        try:
-            tokens[username] = login(username, password)
-            log(f"{username}: JWT acquired")
-        except Exception as e:
-            log(f"{username}: login FAILED — {e}")
+        for attempt in range(5):
+            try:
+                tokens[username] = login(username, password)
+                log(f"{username}: JWT acquired")
+                break
+            except Exception as e:
+                if attempt < 4:
+                    time.sleep(3)
+                else:
+                    log(f"{username}: login FAILED — {e}")
     return tokens
 
 
