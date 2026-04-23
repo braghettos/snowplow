@@ -32,10 +32,17 @@ func jsonHandler(ctx context.Context, opts jsonHandlerOptions) func(io.ReadClose
 			return err
 		}
 
+		_, unmarshalSpan := apiHandlerTracer.Start(ctx, "restaction.api.cache_unmarshal",
+			trace.WithAttributes(
+				attribute.String("key", opts.key),
+				attribute.Int("bytes", len(dat)),
+			))
 		var tmp any
 		if err := json.Unmarshal(dat, &tmp); err != nil {
+			unmarshalSpan.End()
 			return err
 		}
+		unmarshalSpan.End()
 
 		pig := map[string]any{
 			opts.key: tmp,
