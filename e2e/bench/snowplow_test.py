@@ -1051,18 +1051,17 @@ def ensure_composition_controller(ns):
 
 
 def delete_argo_apps_in_ns(ns):
-    """Delete all Argo applications in a namespace, patching finalizers first."""
+    """Delete all Argo applications in a namespace using batch operations."""
     rc, out, _ = kubectl("get", "applications.argoproj.io", "-n", ns,
                          "--no-headers", "-o", "custom-columns=NAME:.metadata.name",
                          "--ignore-not-found")
     if rc != 0 or not out.strip():
         return
     apps = [a.strip() for a in out.strip().split("\n") if a.strip()]
-    for app_name in apps:
-        kubectl("patch", "applications.argoproj.io", app_name, "-n", ns,
-                "--type=merge", f"-p={FINALIZER_PATCH}")
-        kubectl("delete", "applications.argoproj.io", app_name, "-n", ns,
-                "--ignore-not-found", "--wait=false")
+    kubectl("patch", "applications.argoproj.io", "--all", "-n", ns,
+            "--type=merge", f"-p={FINALIZER_PATCH}")
+    kubectl("delete", "applications.argoproj.io", "--all", "-n", ns,
+            "--ignore-not-found", "--wait=false")
     log(f"Deleted {len(apps)} Argo app(s) in {ns}")
 
 
@@ -1170,51 +1169,31 @@ def delete_one_bench_namespace(ns_name):
     5. Delete the namespace
     6. If namespace is stuck in Terminating, force-finalize via /finalize API
     """
-    # Step 1+2: Delete compositions in this namespace
+    # Step 1+2: Batch patch + batch delete compositions
     rc, out, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "-n", ns_name,
                          "--no-headers", "-o", "custom-columns=NAME:.metadata.name")
     if rc == 0 and out.strip():
         comps = [c.strip() for c in out.strip().split("\n") if c.strip()]
-        for comp_name in comps:
-            kubectl("patch", f"{COMP_RES}.{COMP_GVR}", comp_name, "-n", ns_name,
-                    "--type=merge", f"-p={FINALIZER_PATCH}")
-            kubectl("delete", f"{COMP_RES}.{COMP_GVR}", comp_name, "-n", ns_name,
-                    "--ignore-not-found", "--wait=false")
+        kubectl("patch", f"{COMP_RES}.{COMP_GVR}", "--all", "-n", ns_name,
+                "--type=merge", f"-p={FINALIZER_PATCH}")
+        kubectl("delete", f"{COMP_RES}.{COMP_GVR}", "--all", "-n", ns_name,
+                "--ignore-not-found", "--wait=false")
         log(f"Deleted {len(comps)} compositions in {ns_name}")
-        # Wait for compositions to be gone
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            remaining = count_compositions_in_ns(ns_name)
-            if remaining == 0:
-                break
-            time.sleep(2)
-        # If still stuck, re-patch finalizers
+        # Brief wait, then re-patch stragglers
+        time.sleep(5)
         remaining = count_compositions_in_ns(ns_name)
         if remaining > 0:
             log(f"Force-patching {remaining} stuck compositions in {ns_name}")
-            rc2, out2, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "-n", ns_name,
-                                   "--no-headers",
-                                   "-o", "custom-columns=NAME:.metadata.name")
-            if rc2 == 0 and out2.strip():
-                for c in out2.strip().split("\n"):
-                    c = c.strip()
-                    if c:
-                        kubectl("patch", f"{COMP_RES}.{COMP_GVR}", c, "-n", ns_name,
-                                "--type=merge", f"-p={FINALIZER_PATCH}")
+            kubectl("patch", f"{COMP_RES}.{COMP_GVR}", "--all", "-n", ns_name,
+                    "--type=merge", f"-p={FINALIZER_PATCH}")
 
-    # Step 3: Delete Argo applications
+    # Step 3: Delete Argo applications (batch)
     delete_argo_apps_in_ns(ns_name)
 
-    # Step 4: Patch finalizers on other blocking resources
+    # Step 4: Batch patch finalizers on other blocking resources
     for resource in FINALIZER_RESOURCES:
-        rc, objs, _ = kubectl("get", resource, "-n", ns_name, "-o", "name",
-                              "--ignore-not-found")
-        if rc == 0 and objs.strip():
-            for obj in objs.strip().split("\n"):
-                obj_name = obj.split("/")[-1] if "/" in obj else obj
-                if obj_name.strip():
-                    kubectl("patch", resource, obj_name.strip(), "-n", ns_name,
-                            "--type=merge", f"-p={FINALIZER_PATCH}")
+        kubectl("patch", resource, "--all", "-n", ns_name,
+                "--type=merge", f"-p={FINALIZER_PATCH}")
 
     # Step 5: Delete the namespace
     kubectl("delete", "ns", ns_name, "--ignore-not-found", "--wait=false",
@@ -1395,6 +1374,35 @@ def clean_environment():
                     break
                 time.sleep(10)
             log(f"Deleted {len(items)} Argo applications")
+
+    # Step 5b: Scale snowplow to 0 BEFORE deleting composition resources.
+    # Mass deletion of 56K+ widgets floods the informer with DELETE events,
+    # causing OOM at 16Gi. Since Step 8 restarts snowplow anyway, scaling
+    # to 0 now avoids the informer storm entirely.
+    kubectl("scale", "deployment/snowplow", "--replicas=0", "-n", NS)
+    log("Snowplow scaled to 0 for safe resource cleanup")
+
+    # Step 5c: Delete resources created by compositions (panels, repos, etc.)
+    # Dynamically discover all widget CRDs to catch all types.
+    rc_api, out_api, _ = kubectl("api-resources",
+                                  "--api-group=widgets.templates.krateo.io",
+                                  "-o", "name", "--no-headers")
+    widget_resources = [r.strip() for r in (out_api or "").strip().split("\n") if r.strip()]
+    COMPOSITION_RESOURCES = widget_resources + [
+        "repoes.github.ogen.krateo.io",
+        "repoes.git.krateo.io",
+    ]
+    rc, out, _ = kubectl("get", "ns", "--no-headers", "-o", "custom-columns=NAME:.metadata.name")
+    bench_ns = sorted(l.strip() for l in (out or "").strip().split("\n")
+                       if l.strip().startswith("bench-"))
+    if bench_ns:
+        def delete_comp_resources_in_ns(ns):
+            for res in COMPOSITION_RESOURCES:
+                kubectl("delete", res, "--all", "-n", ns,
+                        "--ignore-not-found", "--wait=false")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
+            list(ex.map(delete_comp_resources_in_ns, bench_ns))
+        log(f"Deleted composition resources in {len(bench_ns)} bench namespaces")
 
     # Step 6: Delete bench namespaces (normal delete, wait for termination)
     delete_bench_namespaces()
@@ -2648,13 +2656,16 @@ def run_phase_browser_scaling(tokens):
                 except Exception as e:
                     log(f"    REDIS memory check failed: {e}")
 
-            # Pod restart check at peak scale
+            # Pod restart check at peak scale — assert zero restarts
             try:
                 rc, out, _ = kubectl("get", "pods", "-n", "krateo-system",
                                      "-l", "app.kubernetes.io/name=snowplow",
                                      "-o", "jsonpath={.items[0].status.containerStatuses[0].restartCount}")
                 if rc == 0:
-                    log(f"    POD restarts at {SCALE} scale: {out.strip()}")
+                    restarts = int(out.strip() or "0")
+                    log(f"    POD restarts at {SCALE} scale: {restarts}")
+                    record(f"P6 S6 pod restarts == 0", restarts == 0,
+                           note=f"restarts={restarts}")
             except Exception:
                 pass
 
@@ -2722,6 +2733,15 @@ def run_phase_browser_scaling(tokens):
                 log(f"  S7 log capture failed: {e}")
             if r:
                 all_results.append(r)
+
+            # Multi-user convergence: cyberjoker should also see the deletion
+            cj_token = tokens_fresh.get("cyberjoker") if tokens_fresh else None
+            if cj_token:
+                cj_count = _verify_composition_count_api(cj_token)
+                cluster_count = count_compositions()
+                record(f"P6 S7 multi-user convergence (cyberjoker)",
+                       cj_count >= 0 and cj_count == cluster_count,
+                       note=f"cyberjoker={cj_count} cluster={cluster_count}")
 
             # S8 — Delete 1 namespace (~comps_per_ns compositions)
             # s8_ns was computed before S7 for the controller health check
@@ -2805,6 +2825,44 @@ def run_phase_browser_scaling(tokens):
                   f"│ {color}{speedup:>6.1f}x{RESET}{anomaly} {conv_str:>7s}")
 
         print(f"  {'':>6s} {'warm=last nav, p50=median all navs, Conv=cache convergence time, * = incomplete load':>100s}")
+
+    # ── Performance regression assertions ──
+    for entry in all_results:
+        sn = str(entry["stage"])
+        cache = entry["cache"]
+        if cache != "ON":
+            continue
+        for page_name in [p[0] for p in BROWSER_SCALING_PAGES]:
+            pg = entry["pages"].get(page_name, {})
+            warm_wf = pg.get("waterfall_warm_last", 0)
+            if warm_wf > 0 and page_name == "Dashboard":
+                record(f"P6 S{sn} Dashboard warm < 3000ms",
+                       warm_wf < 3000, note=f"{warm_wf}ms")
+            navs = pg.get("navigations", [])
+            for nav in navs:
+                conv_ms = nav.get("convergence_ms", -2)
+                if conv_ms == -2:
+                    continue
+                threshold = 300000 if sn in ("6", "6b", "7", "8") else 60000
+                record(f"P6 S{sn} convergence < {threshold // 1000}s",
+                       0 <= conv_ms <= threshold,
+                       note=f"{'TIMEOUT' if conv_ms < 0 else f'{conv_ms}ms'}")
+                if "content_match" in nav:
+                    record(f"P6 S{sn} content match",
+                           nav["content_match"] is True,
+                           note=f"missing={nav.get('content_missing', 0)} extra={nav.get('content_extra', 0)}")
+
+    # Final pod restart check (after S8)
+    try:
+        rc, out, _ = kubectl("get", "pods", "-n", "krateo-system",
+                             "-l", "app.kubernetes.io/name=snowplow",
+                             "-o", "jsonpath={.items[0].status.containerStatuses[0].restartCount}")
+        if rc == 0:
+            restarts = int(out.strip() or "0")
+            record(f"P6 final pod restarts == 0", restarts == 0,
+                   note=f"restarts={restarts}")
+    except Exception:
+        pass
 
     out_file = "/tmp/browser_scaling_results.json"
     with open(out_file, "w") as f:
