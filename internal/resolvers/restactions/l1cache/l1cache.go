@@ -33,7 +33,6 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 )
@@ -165,11 +164,10 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 		return nil, merr
 	}
 
-	_, stripSpan := tracer.Start(ctx, "http.strip_bulky",
-		trace.WithAttributes(attribute.Int("input.bytes", len(raw))))
-	raw = cache.StripBulkyAnnotations(raw)
-	stripSpan.SetAttributes(attribute.Int("output.bytes", len(raw)))
-	stripSpan.End()
+	// StripBulkyAnnotations removed: metadata cleanup is now handled by
+	// the informer transform (watcher.go:985) for K8s objects and by JQ
+	// filters in each RESTAction for the resolved output. Snowplow should
+	// not post-process business-level field selection.
 
 	if in.Cache != nil && in.ResolvedKey != "" {
 		_ = in.Cache.SetResolvedRaw(tctx, in.ResolvedKey, raw)
