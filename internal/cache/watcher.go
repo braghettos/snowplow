@@ -131,6 +131,12 @@ type ResourceWatcher struct {
 	dynamicGVRs   map[string]schema.GroupVersionResource
 	dynamicGVRsMu sync.Mutex
 
+	// synced is set to true after WaitForSync completes. Before that,
+	// handleEvent skips L1 refresh events — resolving during initial sync
+	// produces incomplete results and causes OOM at 71K+ objects because
+	// the informer store + L1 resolve pipeline compete for memory.
+	synced atomic.Bool
+
 	// dirtyKeys tracks per-L1-key refresh state. At most one goroutine
 	// runs per L1 key. Events marking the same key dirty while a resolve
 	// is running cause a re-run with the latest informer state.
@@ -857,12 +863,14 @@ func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR s
 
 // WaitForSync blocks until all started informers have completed their initial sync.
 func (rw *ResourceWatcher) WaitForSync(ctx context.Context) bool {
-	synced := rw.factory.WaitForCacheSync(ctx.Done())
-	for _, ok := range synced {
+	result := rw.factory.WaitForCacheSync(ctx.Done())
+	for _, ok := range result {
 		if !ok {
 			return false
 		}
 	}
+	rw.synced.Store(true)
+	slog.Info("informer caches synced")
 	return true
 }
 
@@ -1102,10 +1110,15 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	}
 
 	// ── Enqueue L1 refresh event ─────────────────────────────────────────────
+	// Skip L1 refresh during initial informer sync. Resolving before all
+	// informers have completed their LIST produces incomplete results and
+	// causes OOM (informer store + resolve pipeline competing for memory).
+	// After WaitForSync, the warmup + reconcile cycle handles the initial state.
+	if !rw.synced.Load() {
+		return
+	}
+
 	// The informer store is already updated (the event means it changed).
-	// Enqueue the event for the l1Worker to trigger an L1 refresh.
-	// Non-blocking: if the channel is full, drop the event — the next
-	// process sequentially. The worker will read the latest informer state.
 	// Non-blocking: if the channel is full, drop the event (the informer
 	// is already updated; the next event for this GVR will trigger a refresh).
 	select {
