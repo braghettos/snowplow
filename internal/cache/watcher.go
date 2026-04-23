@@ -983,11 +983,6 @@ func (rw *ResourceWatcher) registerInformer(gvr schema.GroupVersionResource) boo
 	if err := informer.SetTransform(func(obj any) (any, error) {
 		if uns, ok := obj.(*unstructured.Unstructured); ok {
 			StripAnnotationsFromUnstructured(uns)
-			// Normalize int64→float64 in-place (zero allocation).
-			// The transform owns this object before it enters the store,
-			// so in-place mutation is safe and avoids the OOM caused by
-			// deep-copy normalization at 50K objects.
-			NormalizeInPlace(uns.Object)
 		}
 		return obj, nil
 	}); err != nil {
