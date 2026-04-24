@@ -28,12 +28,12 @@ COPY main.go main.go
 ARG COMMIT_HASH
 
 # Build
-RUN CGO_ENABLED=0 GO111MODULE=on go build -a -a -ldflags "-X main.Build=${COMMIT_HASH}" -o /bin/server ./main.go && \
-    strip /bin/server
+RUN CGO_ENABLED=1 GO111MODULE=on go build -race -a -ldflags "-X main.Build=${COMMIT_HASH}" -o /bin/server ./main.go
 
 # Deployment environment
 # ----------------------
-FROM gcr.io/distroless/static:nonroot
+FROM debian:trixie-slim
+USER 65534:65534
 
 #COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/

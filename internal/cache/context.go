@@ -85,8 +85,16 @@ type DirtyEntry struct {
 // DirtySet holds the set of GVR+namespace pairs that should bypass
 // the API result cache. Built once per dirty L1 refresh cycle.
 type DirtySet struct {
-	pairs   map[string]bool // gvrKey + "\x00" + ns → true (namespace-scoped match)
-	gvrKeys map[string]bool // gvrKey → true (cluster-wide match)
+	bypassAll bool            // bypass API result cache for ALL pairs (background refresh)
+	pairs     map[string]bool // gvrKey + "\x00" + ns → true (namespace-scoped match)
+	gvrKeys   map[string]bool // gvrKey → true (cluster-wide match)
+}
+
+// NewBypassAllDirtySet returns a DirtySet that bypasses the API result
+// cache for ALL pairs. Used during background L1 refresh where the
+// informer is always fresh and faster than Redis GET + json.Unmarshal.
+func NewBypassAllDirtySet() *DirtySet {
+	return &DirtySet{bypassAll: true}
 }
 
 // NewDirtySet builds an immutable DirtySet from the given entries.
@@ -109,6 +117,9 @@ func NewDirtySet(entries []DirtyEntry) *DirtySet {
 func (ds *DirtySet) ShouldBypassAPIResult(gvrKey, pathNS string) bool {
 	if ds == nil {
 		return false
+	}
+	if ds.bypassAll {
+		return true
 	}
 	if pathNS == "" {
 		// Cluster-wide list: bypass if any entry touches this GVR.
