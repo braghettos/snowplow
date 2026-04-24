@@ -737,8 +737,8 @@ func (rw *ResourceWatcher) markDirtySequentialBatch(ctx context.Context, trigger
 		for state.pending.Swap(false) {
 			// Drain accumulated dirty entries and build a targeted DirtySet
 			// so only the affected GVR+ns pairs bypass the API result cache.
-			entries := state.drainEntries()
-			dirtySet := NewDirtySet(entries)
+			_ = state.drainEntries()
+			dirtySet := NewBypassAllDirtySet()
 
 			// Resolve each page sequentially: p1 → p2 → ... → pN.
 			var allCascade []string
@@ -822,8 +822,8 @@ func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR s
 		for state.pending.Swap(false) {
 			// Drain accumulated dirty entries and build a targeted DirtySet
 			// so only the affected GVR+ns pairs bypass the API result cache.
-			entries := state.drainEntries()
-			dirtySet := NewDirtySet(entries)
+			_ = state.drainEntries()
+			dirtySet := NewBypassAllDirtySet()
 
 			// Resolve each page sequentially: p1 → p2 → ... → pN.
 			// The underlying data is the same — only the page parameter
