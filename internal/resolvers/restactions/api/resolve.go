@@ -266,8 +266,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							if items, ok := ir.ListObjects(pathGVR, pathNS); ok && len(items) > 0 {
 								listSpan.SetAttributes(attribute.Int("items", len(items)))
 								listSpan.End()
-								// Objects are pre-normalized in-place at informer transform
-								// time (int64→float64, zero alloc). No deep-copy needed.
+								// Informer objects are shared pointers (client-go contract:
+								// read-only). Safe copy is made below via marshal+unmarshal
+								// before passing to JQ which may mutate maps in-place.
 								itemsList := make([]any, len(items))
 								for i, item := range items {
 									itemsList[i] = item.Object
@@ -294,7 +295,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							}
 						} else {
 							if obj, ok := ir.GetObject(pathGVR, pathNS, pathName); ok {
-								directData = obj.Object // pre-normalized at informer transform
+								directData = obj.Object
 								directHit = true
 							}
 						}
@@ -314,58 +315,55 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						}
 
 						if directHit {
+							// Marshal the informer data to bytes immediately.
+							// This captures the shared informer maps as owned []byte
+							// and serves as the API result cache entry. The bytes are
+							// then unmarshaled into an independent copy that JQ can
+							// safely mutate (gojq's deleteEmpty writes to maps in-place).
+							// Cost: ~2ms marshal + ~2ms unmarshal per namespace vs
+							// 6.9s total from the Redis GET + decompress path.
+							raw, merr := json.Marshal(directData)
+							if merr != nil {
+								return false
+							}
+							var safeData any
+							if uerr := json.Unmarshal(raw, &safeData); uerr != nil {
+								return false
+							}
+
 							handlerOpts := jsonHandlerOptions{
 								key: id, out: dict, filter: apiCall.Filter,
 							}
 							if mu != nil {
 								mu.Lock()
-								herr := jsonHandlerDirect(ctx, handlerOpts, directData)
+								herr := jsonHandlerDirect(ctx, handlerOpts, safeData)
 								mu.Unlock()
 								if herr == nil {
-									// Write to L1 API cache for subsequent pages.
 									if c != nil {
-										_, cacheWriteSpan := apiHandlerTracer.Start(ctx, "restaction.api.cache_write",
-											trace.WithAttributes(
-												attribute.String("ns", pathNS),
-												attribute.String("name", pathName),
-											))
 										apiCacheKey := cache.APIResultKey(identity, pathGVR, pathNS, pathName)
-										if raw, merr := json.Marshal(directData); merr == nil {
-											cacheWriteSpan.SetAttributes(attribute.Int("bytes", len(raw)))
-											_ = c.SetAPIResultRaw(ctx, apiCacheKey, raw)
-											gvrKey := cache.GVRToKey(pathGVR)
-											depKey := cache.L1ResourceDepKey(gvrKey, pathNS, pathName)
-											_ = c.SAddWithTTL(ctx, depKey, apiCacheKey, cache.ReverseIndexTTL)
-											if pathName == "" {
-												clusterDep := cache.L1ResourceDepKey(gvrKey, "", "")
-												_ = c.SAddWithTTL(ctx, clusterDep, apiCacheKey, cache.ReverseIndexTTL)
-											}
+										_ = c.SetAPIResultRaw(ctx, apiCacheKey, raw)
+										gvrKey := cache.GVRToKey(pathGVR)
+										depKey := cache.L1ResourceDepKey(gvrKey, pathNS, pathName)
+										_ = c.SAddWithTTL(ctx, depKey, apiCacheKey, cache.ReverseIndexTTL)
+										if pathName == "" {
+											clusterDep := cache.L1ResourceDepKey(gvrKey, "", "")
+											_ = c.SAddWithTTL(ctx, clusterDep, apiCacheKey, cache.ReverseIndexTTL)
 										}
-										cacheWriteSpan.End()
 									}
 									return true
 								}
 							} else {
-								if herr := jsonHandlerDirect(ctx, handlerOpts, directData); herr == nil {
+								if herr := jsonHandlerDirect(ctx, handlerOpts, safeData); herr == nil {
 									if c != nil {
-										_, cacheWriteSpan := apiHandlerTracer.Start(ctx, "restaction.api.cache_write",
-											trace.WithAttributes(
-												attribute.String("ns", pathNS),
-												attribute.String("name", pathName),
-											))
 										apiCacheKey := cache.APIResultKey(identity, pathGVR, pathNS, pathName)
-										if raw, merr := json.Marshal(directData); merr == nil {
-											cacheWriteSpan.SetAttributes(attribute.Int("bytes", len(raw)))
-											_ = c.SetAPIResultRaw(ctx, apiCacheKey, raw)
-											gvrKey := cache.GVRToKey(pathGVR)
-											depKey := cache.L1ResourceDepKey(gvrKey, pathNS, pathName)
-											_ = c.SAddWithTTL(ctx, depKey, apiCacheKey, cache.ReverseIndexTTL)
-											if pathName == "" {
-												clusterDep := cache.L1ResourceDepKey(gvrKey, "", "")
-												_ = c.SAddWithTTL(ctx, clusterDep, apiCacheKey, cache.ReverseIndexTTL)
-											}
+										_ = c.SetAPIResultRaw(ctx, apiCacheKey, raw)
+										gvrKey := cache.GVRToKey(pathGVR)
+										depKey := cache.L1ResourceDepKey(gvrKey, pathNS, pathName)
+										_ = c.SAddWithTTL(ctx, depKey, apiCacheKey, cache.ReverseIndexTTL)
+										if pathName == "" {
+											clusterDep := cache.L1ResourceDepKey(gvrKey, "", "")
+											_ = c.SAddWithTTL(ctx, clusterDep, apiCacheKey, cache.ReverseIndexTTL)
 										}
-										cacheWriteSpan.End()
 									}
 									return true
 								}
