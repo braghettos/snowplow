@@ -637,6 +637,21 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 			baseKey := ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
 			groups[baseKey] = append(groups[baseKey], pageKey{key: l1Key, page: info.Page})
 		}
+		// Ensure the unpaginated variant (page=0) is refreshed alongside
+		// paginated keys. HTTP requests without pagination read the base
+		// key; without this, it stays stale while paginated keys converge.
+		for baseKey, pages := range groups {
+			hasPage0 := false
+			for _, p := range pages {
+				if p.page == 0 {
+					hasPage0 = true
+					break
+				}
+			}
+			if !hasPage0 {
+				groups[baseKey] = append([]pageKey{{key: baseKey, page: 0}}, pages...)
+			}
+		}
 		return groups
 	}
 

@@ -199,28 +199,39 @@ func RegisterL1Dependencies(ctx context.Context, c *RedisCache, tracker *Depende
 		return
 	}
 
+	// Also register the unpaginated base key so that events trigger
+	// refresh of both paginated and unpaginated variants. HTTP requests
+	// without pagination read the base key; without this registration,
+	// it stays stale while paginated keys converge.
+	info, isPaginated := ParseResolvedKey(l1Key)
+	var baseKey string
+	if isPaginated && (info.Page > 0 || info.PerPage > 0) {
+		baseKey = ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
+	}
+
 	// Per-resource deps (ns + name specific).
 	for _, ref := range refs {
 		key := L1ResourceDepKey(ref.GVRKey, ref.NS, ref.Name)
 		if !seen[key] {
 			seen[key] = true
 			pipe.SAdd(ctx, key, l1Key)
+			if baseKey != "" {
+				pipe.SAdd(ctx, key, baseKey)
+			}
 			pipe.Expire(ctx, key, ReverseIndexTTL)
 		}
 	}
 
 	// Cluster-wide deps: only for GVRs that were LISTed (name="").
-	// A RESTAction that lists ALL compositions across namespaces gets a
-	// cluster-wide dep so ANY composition change triggers a refresh.
-	// A per-composition RESTAction (GET with specific name) does NOT get
-	// a cluster-wide dep — it only depends on that one resource.
 	for _, ref := range refs {
 		if ref.Name == "" {
-			// LIST access → cluster-wide dep
 			key := L1ResourceDepKey(ref.GVRKey, "", "")
 			if !seen[key] {
 				seen[key] = true
 				pipe.SAdd(ctx, key, l1Key)
+				if baseKey != "" {
+					pipe.SAdd(ctx, key, baseKey)
+				}
 				pipe.Expire(ctx, key, ReverseIndexTTL)
 			}
 		}

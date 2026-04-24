@@ -1295,7 +1295,10 @@ def clean_environment():
     section("Cleaning environment")
 
     # Step 1+2: Delete compositions (patch finalizers, then delete)
-    # If CRD doesn't exist, skip (no compositions to delete)
+    # Step 1+2: Delete compositions WITH controllers running.
+    # The composition-dynamic-controller handles child cleanup (panels,
+    # repos, Argo apps) via finalizers. Deleting with controllers running
+    # avoids orphaned resources.
     rc, _, _ = kubectl("get", "crd", f"{COMP_RES}.{COMP_GVR}", "--no-headers")
     if rc == 0:
         # Recreate any missing bench namespaces so kubectl can reach orphans
@@ -1304,38 +1307,56 @@ def clean_environment():
         if rc2 == 0 and out2.strip():
             for ns in sorted(set(out2.strip().split("\n"))):
                 if ns.startswith("bench-"):
-                    kubectl("create", "ns", ns, "--dry-run=client", "-o", "yaml",
-                            input_data=None)
                     kubectl("create", "ns", ns)
 
-        # Patch finalizers in parallel
-        rc3, out3, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "--all-namespaces",
-                               "--no-headers", "-o",
-                               "custom-columns=NS:.metadata.namespace")
-        if rc3 == 0 and out3.strip():
-            namespaces = sorted(set(l.strip() for l in out3.strip().split("\n") if l.strip()))
-            def patch_ns(ns):
-                kubectl("patch", f"{COMP_RES}.{COMP_GVR}", "--all", "-n", ns,
-                        "--type=json", '-p=[{"op":"remove","path":"/metadata/finalizers"}]')
-            with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
-                list(ex.map(patch_ns, namespaces))
-            log(f"Patched finalizers in {len(namespaces)} namespaces")
-
-        # Delete compositions
+        # Delete compositions (controllers process finalizers and clean children)
         delete_all_compositions()
+
+        # Wait for compositions to drain (controllers cleaning up)
+        deadline = time.time() + 600
+        while time.time() < deadline:
+            rc3, out3, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "--all-namespaces",
+                                   "--no-headers")
+            remaining = len([l for l in (out3 or "").strip().split("\n") if l.strip()]) if rc3 == 0 and out3.strip() else 0
+            if remaining == 0:
+                break
+            if remaining < 100:
+                log(f"  {remaining} compositions remaining ...")
+            time.sleep(15)
+        else:
+            # Timeout: force-patch remaining finalizers
+            remaining = count_compositions()
+            if remaining > 0:
+                log(f"Patching finalizers off {remaining} stuck compositions ...")
+                rc4, out4, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "--all-namespaces",
+                                       "--no-headers", "-o", "custom-columns=NS:.metadata.namespace")
+                if rc4 == 0 and out4.strip():
+                    namespaces = sorted(set(l.strip() for l in out4.strip().split("\n") if l.strip()))
+                    def patch_ns(ns):
+                        kubectl("patch", f"{COMP_RES}.{COMP_GVR}", "--all", "-n", ns,
+                                "--type=merge", f"-p={FINALIZER_PATCH}")
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
+                        list(ex.map(patch_ns, namespaces))
+                    log(f"Finalizers patched on {remaining} compositions")
+                wait_deadline = time.time() + 60
+                while time.time() < wait_deadline:
+                    if count_compositions() == 0:
+                        break
+                    time.sleep(5)
+                log("All compositions deleted (after finalizer patch)")
     else:
         log("No composition CRD — skipping composition deletion")
 
     # Step 3+4: Delete CompositionDefinition → core provider cleans CRD
     delete_all_compositiondefinitions()
 
-    # Step 5: Scale Argo + CD parser to 0 (prevents re-creation during cleanup),
-    # delete all apps (patch finalizers), then clean
+    # Step 5: NOW scale controllers to 0 (compositions already deleted,
+    # children already cleaned by the controller)
     for deploy in ("argocd-server", "argocd-applicationset-controller", "argocd-repo-server",
                     "finops-composition-definition-parser"):
         kubectl("scale", f"deployment/{deploy}", "--replicas=0", "-n", NS)
     kubectl("scale", "statefulset/argocd-application-controller", "--replicas=0", "-n", NS)
-    # Also stop composition-dynamic-controller if running
+    # Stop composition-dynamic-controllers
     rc, out, _ = kubectl("get", "pods", "--all-namespaces", "--no-headers",
                          "-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
     if rc == 0:
