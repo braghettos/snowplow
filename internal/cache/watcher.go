@@ -735,10 +735,12 @@ func (rw *ResourceWatcher) markDirtySequentialBatch(ctx context.Context, trigger
 		}()
 
 		for state.pending.Swap(false) {
-			// Drain accumulated dirty entries and build a targeted DirtySet
-			// so only the affected GVR+ns pairs bypass the API result cache.
-			entries := state.drainEntries()
-			dirtySet := NewDirtySet(entries)
+			// Drain accumulated dirty entries. Use bypass-all DirtySet so
+			// the resolve reads directly from the informer (L3, in-memory)
+			// instead of the API result cache (Redis GET + json.Unmarshal).
+			// At 64 namespaces, informer reads take 0.04s vs 6.9s from cache.
+			_ = state.drainEntries()
+			dirtySet := NewBypassAllDirtySet()
 
 			// Resolve each page sequentially: p1 → p2 → ... → pN.
 			var allCascade []string
@@ -820,10 +822,12 @@ func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR s
 		}()
 
 		for state.pending.Swap(false) {
-			// Drain accumulated dirty entries and build a targeted DirtySet
-			// so only the affected GVR+ns pairs bypass the API result cache.
-			entries := state.drainEntries()
-			dirtySet := NewDirtySet(entries)
+			// Drain accumulated dirty entries. Use bypass-all DirtySet so
+			// the resolve reads directly from the informer (L3, in-memory)
+			// instead of the API result cache (Redis GET + json.Unmarshal).
+			// At 64 namespaces, informer reads take 0.04s vs 6.9s from cache.
+			_ = state.drainEntries()
+			dirtySet := NewBypassAllDirtySet()
 
 			// Resolve each page sequentially: p1 → p2 → ... → pN.
 			// The underlying data is the same — only the page parameter
