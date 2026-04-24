@@ -3,6 +3,7 @@ package dispatchers
 import (
 	"context"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"log/slog"
@@ -454,10 +455,19 @@ func discoverUsers(ctx context.Context, rc *rest.Config, authnNS string) ([]disc
 }
 
 
-// extractGroupsFromClientCert parses the PEM-encoded client certificate and
-// returns the Subject.Organization values, which Kubernetes uses as groups.
+// extractGroupsFromClientCert parses the client certificate and returns the
+// Subject.Organization values, which Kubernetes uses as groups.
+// The cert may be raw PEM or base64-encoded PEM (K8s clientconfig secrets
+// store base64(PEM) in their data fields).
 func extractGroupsFromClientCert(certPEM string) []string {
+	// Try raw PEM first.
 	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		// The clientconfig secret stores base64(PEM). Decode and retry.
+		if decoded, err := base64.StdEncoding.DecodeString(certPEM); err == nil {
+			block, _ = pem.Decode(decoded)
+		}
+	}
 	if block == nil {
 		return nil
 	}

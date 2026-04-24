@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -268,13 +269,20 @@ func (rw *RBACWatcher) purgeUserCacheData(ctx context.Context, username string) 
 // cache hit it skips the full lister scan. On miss it delegates to
 // ComputeBindingIdentity and stores the result. Empty identities (informer
 // not synced) are not cached.
+//
+// The cache key includes groups because the same username can appear with
+// different group sets (prewarm extracts groups from X.509 cert, HTTP gets
+// them from JWT). Without groups in the key, the first caller poisons the
+// cache for all subsequent callers.
 func (rw *RBACWatcher) CachedBindingIdentity(username string, groups []string) string {
-	if v, ok := rw.identityCache.Load(username); ok {
+	sort.Strings(groups)
+	cacheKey := username + "\x00" + strings.Join(groups, ",")
+	if v, ok := rw.identityCache.Load(cacheKey); ok {
 		return v.(string)
 	}
 	bid := rw.ComputeBindingIdentity(username, groups)
 	if bid != "" {
-		rw.identityCache.Store(username, bid)
+		rw.identityCache.Store(cacheKey, bid)
 	}
 	return bid
 }
