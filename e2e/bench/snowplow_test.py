@@ -1350,85 +1350,28 @@ def clean_environment():
     # Step 3+4: Delete CompositionDefinition → core provider cleans CRD
     delete_all_compositiondefinitions()
 
-    # Step 5: NOW scale controllers to 0 (compositions already deleted,
-    # children already cleaned by the controller)
-    for deploy in ("argocd-server", "argocd-applicationset-controller", "argocd-repo-server",
-                    "finops-composition-definition-parser"):
-        kubectl("scale", f"deployment/{deploy}", "--replicas=0", "-n", NS)
-    kubectl("scale", "statefulset/argocd-application-controller", "--replicas=0", "-n", NS)
-    # Stop composition-dynamic-controllers
-    rc, out, _ = kubectl("get", "pods", "--all-namespaces", "--no-headers",
-                         "-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
-    if rc == 0:
-        for line in (out or "").strip().split("\n"):
-            parts = line.split(None, 1)
-            if len(parts) == 2 and "composition" in parts[1] and "controller" in parts[1]:
-                kubectl("scale", f"deployment/{COMP_CONTROLLER_DEPLOY}",
-                        "--replicas=0", "-n", parts[0])
-                kubectl("delete", "deployment", COMP_CONTROLLER_DEPLOY,
-                        "-n", parts[0], "--ignore-not-found", "--wait=false")
-
-    rc, out, _ = kubectl("get", "applications.argoproj.io", "--all-namespaces",
-                         "--no-headers", "-o",
-                         "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
-    if rc == 0 and out.strip():
-        items = [(p[0], p[1]) for line in out.strip().split("\n")
-                 if (p := line.split(None, 1)) and len(p) >= 2]
-        if items:
-            # Batch patch in krateo-system (most apps are there)
-            kubectl("patch", "applications.argoproj.io", "--all", "-n", NS,
+    # Step 5: Wait for controllers to finish cleaning children.
+    # All controllers stay running — they handle Argo apps, panels, repos
+    # naturally via finalizers. No scaling to 0.
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        rc, out, _ = kubectl("get", "applications.argoproj.io", "--all-namespaces",
+                             "--no-headers")
+        argo_remaining = len([l for l in (out or "").strip().split("\n") if l.strip()]) if rc == 0 and out.strip() else 0
+        if argo_remaining == 0:
+            break
+        if int(time.time()) % 30 < 10:
+            log(f"  Waiting for controllers to clean {argo_remaining} Argo apps ...")
+        time.sleep(10)
+    if argo_remaining > 0:
+        log(f"  Force-patching {argo_remaining} stuck Argo apps ...")
+        for ns_name in sorted(set(l.split()[0] for l in (out or "").strip().split("\n") if l.strip())):
+            kubectl("patch", "applications.argoproj.io", "--all", "-n", ns_name,
                     "--type=merge", '-p={"metadata":{"finalizers":null}}')
-            kubectl("delete", "applications.argoproj.io", "--all", "-n", NS,
-                    "--ignore-not-found", "--wait=false", "--force", "--grace-period=0")
-            # Patch remaining in other namespaces
-            other_items = [i for i in items if i[0] != NS]
-            def patch_app(item):
-                kubectl("patch", "applications.argoproj.io", item[1], "-n", item[0],
-                        "--type=json", '-p=[{"op":"remove","path":"/metadata/finalizers"}]')
-                kubectl("delete", "applications.argoproj.io", item[1], "-n", item[0],
-                        "--ignore-not-found", "--wait=false", "--force", "--grace-period=0")
-            if other_items:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
-                    list(ex.map(patch_app, other_items))
-            # Wait for apps to drain
-            deadline = time.time() + 120
-            while time.time() < deadline:
-                rc2, out2, _ = kubectl("get", "applications.argoproj.io", "--all-namespaces",
-                                       "--no-headers")
-                remaining = len([l for l in (out2 or "").strip().split("\n") if l.strip()])
-                if remaining == 0:
-                    break
-                time.sleep(10)
-            log(f"Deleted {len(items)} Argo applications")
-
-    # Step 5b: Scale snowplow to 0 BEFORE deleting composition resources.
-    # Mass deletion of 56K+ widgets floods the informer with DELETE events,
-    # causing OOM at 16Gi. Since Step 8 restarts snowplow anyway, scaling
-    # to 0 now avoids the informer storm entirely.
-    kubectl("scale", "deployment/snowplow", "--replicas=0", "-n", NS)
-    log("Snowplow scaled to 0 for safe resource cleanup")
-
-    # Step 5c: Delete resources created by compositions (panels, repos, etc.)
-    # Dynamically discover all widget CRDs to catch all types.
-    rc_api, out_api, _ = kubectl("api-resources",
-                                  "--api-group=widgets.templates.krateo.io",
-                                  "-o", "name", "--no-headers")
-    widget_resources = [r.strip() for r in (out_api or "").strip().split("\n") if r.strip()]
-    COMPOSITION_RESOURCES = widget_resources + [
-        "repoes.github.ogen.krateo.io",
-        "repoes.git.krateo.io",
-    ]
-    rc, out, _ = kubectl("get", "ns", "--no-headers", "-o", "custom-columns=NAME:.metadata.name")
-    bench_ns = sorted(l.strip() for l in (out or "").strip().split("\n")
-                       if l.strip().startswith("bench-"))
-    if bench_ns:
-        def delete_comp_resources_in_ns(ns):
-            for res in COMPOSITION_RESOURCES:
-                kubectl("delete", res, "--all", "-n", ns,
-                        "--ignore-not-found", "--wait=false")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
-            list(ex.map(delete_comp_resources_in_ns, bench_ns))
-        log(f"Deleted composition resources in {len(bench_ns)} bench namespaces")
+            kubectl("delete", "applications.argoproj.io", "--all", "-n", ns_name,
+                    "--ignore-not-found", "--wait=false")
+        time.sleep(10)
+    log(f"Argo applications cleaned")
 
     # Step 6: Delete bench namespaces (normal delete, wait for termination)
     delete_bench_namespaces()
@@ -1445,20 +1388,18 @@ def clean_environment():
                         "--ignore-not-found", "--wait=false")
                 log(f"Deleted {len(bench_items)} {res} in krateo-system")
 
-    # Step 8: Deploy image + scale back up (was scaled to 0 in Step 5b)
+    # Step 8: Deploy image + restart pod (flushes Redis sidecar).
+    # No scaling — all controllers stay running throughout.
     tag = os.environ.get("EXPECTED_IMAGE_TAG")
     if tag:
         log(f"Deploying snowplow image tag {tag} ...")
         kubectl("set", "image", "deployment/snowplow",
                 f"snowplow=ghcr.io/braghettos/snowplow:{tag}", "-n", "krateo-system")
-    kubectl("scale", "deployment/snowplow", "--replicas=1", "-n", "krateo-system")
     log("Restarting snowplow pod to flush Redis cache ...")
+    kubectl("rollout", "restart", "deployment/snowplow", "-n", "krateo-system")
     kubectl("rollout", "status", "deployment/snowplow", "-n", "krateo-system",
             "--timeout=600s")
     log("  Snowplow pod restarted — Redis flushed")
-
-    # Scale CD parser back up (was stopped to prevent re-creation during cleanup)
-    kubectl("scale", "deployment/finops-composition-definition-parser", "--replicas=1", "-n", NS)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
