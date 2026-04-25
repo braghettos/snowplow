@@ -2385,13 +2385,18 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, token=None, 
                 deadline = verify_start + verify_timeout
                 api_count = -1
                 ui_count = -1
+                # Get cluster count once — kubectl at 50K takes 22s per call.
+                # Refresh only every 60s to avoid dominating the poll cycle.
                 fresh_comp_count = count_compositions()
+                last_cluster_check = time.time()
                 matched = False
 
                 poll_num = 0
                 while time.time() < deadline:
                     poll_num += 1
-                    fresh_comp_count = count_compositions()
+                    if time.time() - last_cluster_check > 60:
+                        fresh_comp_count = count_compositions()
+                        last_cluster_check = time.time()
                     api_count = _verify_composition_count_api(token) if token else -1
                     ui_count = _verify_composition_count_ui(page)
                     elapsed_ms = int((time.time() - verify_start) * 1000)
