@@ -1169,6 +1169,9 @@ def delete_one_bench_namespace(ns_name):
 
     No force-patching — controllers handle all finalizers naturally.
     """
+    # Ensure the composition controller is running in this namespace
+    ensure_composition_controller(ns_name)
+
     # Step 1: Delete compositions (controllers process finalizers, clean children)
     rc, out, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "-n", ns_name,
                          "--no-headers", "-o", "custom-columns=NAME:.metadata.name")
@@ -1179,10 +1182,14 @@ def delete_one_bench_namespace(ns_name):
         log(f"Triggered deletion of {len(comps)} compositions in {ns_name}")
 
         # Wait for controllers to finish cleaning all compositions + children
+        prev_remaining = -1
         while True:
             remaining = count_compositions_in_ns(ns_name)
             if remaining == 0:
                 break
+            if remaining != prev_remaining:
+                log(f"  {remaining} compositions remaining in {ns_name} ...")
+                prev_remaining = remaining
             time.sleep(5)
         log(f"All compositions deleted in {ns_name}")
 
