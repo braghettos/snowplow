@@ -1312,38 +1312,20 @@ def clean_environment():
         # Delete compositions (controllers process finalizers and clean children)
         delete_all_compositions()
 
-        # Wait for compositions to drain (controllers cleaning up)
-        deadline = time.time() + 600
-        while time.time() < deadline:
+        # Wait for compositions to drain — no force-patching.
+        # Controllers handle all child cleanup (Argo apps, panels, repos).
+        prev_remaining = -1
+        while True:
             rc3, out3, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "--all-namespaces",
                                    "--no-headers")
             remaining = len([l for l in (out3 or "").strip().split("\n") if l.strip()]) if rc3 == 0 and out3.strip() else 0
             if remaining == 0:
+                log("All compositions deleted by controllers")
                 break
-            if remaining < 100:
-                log(f"  {remaining} compositions remaining ...")
+            if remaining != prev_remaining:
+                log(f"  {remaining} compositions remaining (controllers cleaning up) ...")
+                prev_remaining = remaining
             time.sleep(15)
-        else:
-            # Timeout: force-patch remaining finalizers
-            remaining = count_compositions()
-            if remaining > 0:
-                log(f"Patching finalizers off {remaining} stuck compositions ...")
-                rc4, out4, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "--all-namespaces",
-                                       "--no-headers", "-o", "custom-columns=NS:.metadata.namespace")
-                if rc4 == 0 and out4.strip():
-                    namespaces = sorted(set(l.strip() for l in out4.strip().split("\n") if l.strip()))
-                    def patch_ns(ns):
-                        kubectl("patch", f"{COMP_RES}.{COMP_GVR}", "--all", "-n", ns,
-                                "--type=merge", f"-p={FINALIZER_PATCH}")
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
-                        list(ex.map(patch_ns, namespaces))
-                    log(f"Finalizers patched on {remaining} compositions")
-                wait_deadline = time.time() + 60
-                while time.time() < wait_deadline:
-                    if count_compositions() == 0:
-                        break
-                    time.sleep(5)
-                log("All compositions deleted (after finalizer patch)")
     else:
         log("No composition CRD — skipping composition deletion")
 
