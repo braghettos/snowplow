@@ -251,9 +251,18 @@ func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objec
 		if len(refs) > 0 {
 			pipe := c.Pipeline(ctx)
 			if pipe != nil {
+				// Also register the unpaginated base key so cascade
+				// refreshes both paginated and unpaginated variants.
+				var baseKey string
+				if rki, ok := cache.ParseResolvedKey(resolvedKey); ok && (rki.Page > 0 || rki.PerPage > 0) {
+					baseKey = cache.ResolvedKeyBase(rki.Username, rki.GVR, rki.NS, rki.Name)
+				}
 				for _, ref := range refs {
 					key := cache.L1ResourceDepKey(ref.GVRKey, ref.NS, ref.Name)
 					pipe.SAdd(ctx, key, resolvedKey)
+					if baseKey != "" {
+						pipe.SAdd(ctx, key, baseKey)
+					}
 					pipe.Expire(ctx, key, cache.ReverseIndexTTL)
 				}
 				_, _ = pipe.Exec(ctx)

@@ -784,6 +784,19 @@ func (rw *ResourceWatcher) markDirtySequentialBatch(ctx context.Context, trigger
 					baseKey := ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
 					cascadeGroups[baseKey] = append(cascadeGroups[baseKey], pageKey{key: ck, page: info.Page})
 				}
+				// Ensure unpaginated base key is refreshed alongside paginated.
+				for bk, cps := range cascadeGroups {
+					hasPage0 := false
+					for _, p := range cps {
+						if p.page == 0 {
+							hasPage0 = true
+							break
+						}
+					}
+					if !hasPage0 {
+						cascadeGroups[bk] = append([]pageKey{{key: bk, page: 0}}, cps...)
+					}
+				}
 				for _, cPages := range cascadeGroups {
 					sort.Slice(cPages, func(i, j int) bool { return cPages[i].page < cPages[j].page })
 					rw.markDirtySequential(ctx, triggerGVR, "", "", cPages, fn)
@@ -866,6 +879,19 @@ func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR s
 					}
 					baseKey := ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
 					cascadeGroups[baseKey] = append(cascadeGroups[baseKey], pageKey{key: ck, page: info.Page})
+				}
+				// Ensure unpaginated base key is refreshed alongside paginated.
+				for bk, cps := range cascadeGroups {
+					hasPage0 := false
+					for _, p := range cps {
+						if p.page == 0 {
+							hasPage0 = true
+							break
+						}
+					}
+					if !hasPage0 {
+						cascadeGroups[bk] = append([]pageKey{{key: bk, page: 0}}, cps...)
+					}
 				}
 				for _, cPages := range cascadeGroups {
 					sort.Slice(cPages, func(i, j int) bool { return cPages[i].page < cPages[j].page })
