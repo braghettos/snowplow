@@ -1164,45 +1164,30 @@ def wait_for_l1_key_gone(pattern, timeout=60):
 
 
 def delete_one_bench_namespace(ns_name):
-    """Delete a single bench namespace with all its compositions and Argo apps.
+    """Delete a single bench namespace by deleting compositions first
+    (controllers clean children), then deleting the namespace.
 
-    Steps:
-    1. Patch finalizers on all compositions in the namespace
-    2. Delete all compositions
-    3. Delete all Argo applications (patch finalizers first)
-    4. Patch finalizers on all other blocking resources
-    5. Delete the namespace
-    6. If namespace is stuck in Terminating, force-finalize via /finalize API
+    No force-patching — controllers handle all finalizers naturally.
     """
-    # Step 1+2: Batch patch + batch delete compositions
+    # Step 1: Delete compositions (controllers process finalizers, clean children)
     rc, out, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "-n", ns_name,
                          "--no-headers", "-o", "custom-columns=NAME:.metadata.name")
     if rc == 0 and out.strip():
         comps = [c.strip() for c in out.strip().split("\n") if c.strip()]
-        kubectl("patch", f"{COMP_RES}.{COMP_GVR}", "--all", "-n", ns_name,
-                "--type=merge", f"-p={FINALIZER_PATCH}")
         kubectl("delete", f"{COMP_RES}.{COMP_GVR}", "--all", "-n", ns_name,
                 "--ignore-not-found", "--wait=false")
-        log(f"Deleted {len(comps)} compositions in {ns_name}")
-        # Brief wait, then re-patch stragglers
-        time.sleep(5)
-        remaining = count_compositions_in_ns(ns_name)
-        if remaining > 0:
-            log(f"Force-patching {remaining} stuck compositions in {ns_name}")
-            kubectl("patch", f"{COMP_RES}.{COMP_GVR}", "--all", "-n", ns_name,
-                    "--type=merge", f"-p={FINALIZER_PATCH}")
+        log(f"Triggered deletion of {len(comps)} compositions in {ns_name}")
 
-    # Step 3: Delete Argo applications (batch)
-    delete_argo_apps_in_ns(ns_name)
+        # Wait for controllers to finish cleaning all compositions + children
+        while True:
+            remaining = count_compositions_in_ns(ns_name)
+            if remaining == 0:
+                break
+            time.sleep(5)
+        log(f"All compositions deleted in {ns_name}")
 
-    # Step 4: Batch patch finalizers on other blocking resources
-    for resource in FINALIZER_RESOURCES:
-        kubectl("patch", resource, "--all", "-n", ns_name,
-                "--type=merge", f"-p={FINALIZER_PATCH}")
-
-    # Step 5: Delete the namespace
-    kubectl("delete", "ns", ns_name, "--ignore-not-found", "--wait=false",
-            "--force", "--grace-period=0")
+    # Step 2: Delete the namespace (children already cleaned by controllers)
+    kubectl("delete", "ns", ns_name, "--ignore-not-found", "--wait=false")
     log(f"Triggered deletion of namespace {ns_name}")
 
 
