@@ -368,9 +368,11 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 // GVR+namespace pairs triggered the dirty mark so the refresh can
 // do targeted API result cache bypass instead of blanket bypass.
 type dirtyState struct {
-	pending atomic.Bool
-	mu      sync.Mutex
-	entries []DirtyEntry
+	pending  atomic.Bool
+	mu       sync.Mutex
+	entries  []DirtyEntry
+	cancelMu sync.Mutex
+	cancelFn context.CancelFunc // cancels the in-flight resolve iteration
 }
 
 // addEntry appends a dirty entry under lock. Called before pending.Store(true).
@@ -728,6 +730,14 @@ func (rw *ResourceWatcher) markDirtySequentialBatch(ctx context.Context, trigger
 	state.pending.Store(true)
 
 	if loaded {
+		// Cancel the in-flight stale resolve so the goroutine re-loops
+		// with fresh data sooner. The resolve aborts at the next
+		// ctx.Err() check (~300ms worst case, one page completion).
+		state.cancelMu.Lock()
+		if state.cancelFn != nil {
+			state.cancelFn()
+		}
+		state.cancelMu.Unlock()
 		return
 	}
 
@@ -750,19 +760,34 @@ func (rw *ResourceWatcher) markDirtySequentialBatch(ctx context.Context, trigger
 		}()
 
 		for state.pending.Swap(false) {
-			// Drain accumulated dirty entries and build a targeted DirtySet
-			// so only the affected GVR+ns pairs bypass the API result cache.
 			_ = state.drainEntries()
 			dirtySet := NewBypassAllDirtySet()
 
+			// Create a cancellable context for this iteration.
+			// A new event can cancel it to abort the stale resolve.
+			iterCtx, iterCancel := context.WithCancel(ctx)
+			state.cancelMu.Lock()
+			state.cancelFn = iterCancel
+			state.cancelMu.Unlock()
+
 			// Resolve each page sequentially: p1 → p2 → ... → pN.
+			// Uses iterCtx so a new event can cancel the stale resolve.
 			var allCascade []string
 			for _, pg := range pages {
-				refreshCtx, cancel := context.WithTimeout(WithDirtySet(ctx, dirtySet), 60*time.Second)
+				refreshCtx, cancel := context.WithTimeout(WithDirtySet(iterCtx, dirtySet), 60*time.Second)
 				cascade := fn(refreshCtx, triggerGVR, []string{pg.key})
 				cancel()
+				if iterCtx.Err() != nil {
+					break // cancelled by a new event — re-loop with fresh data
+				}
 				allCascade = append(allCascade, cascade...)
 			}
+
+			// Clear cancel before checking pending.
+			state.cancelMu.Lock()
+			state.cancelFn = nil
+			state.cancelMu.Unlock()
+			iterCancel()
 
 			slog.Info("refresh done",
 				slog.String("key", identity),

@@ -1445,6 +1445,34 @@ def clean_environment():
                         "--ignore-not-found", "--wait=false")
                 log(f"Deleted {len(bench_items)} {res} in krateo-system")
 
+    # Step 7b: Final cleanup verification — ensure zero orphaned resources.
+    # Force-patch finalizers on any remaining Argo apps (orphaned by
+    # force-patched compositions whose controllers couldn't clean up).
+    for attempt in range(3):
+        rc, out, _ = kubectl("get", "applications.argoproj.io", "--all-namespaces",
+                             "--no-headers")
+        remaining = len([l for l in (out or "").strip().split("\n") if l.strip()]) if rc == 0 and out.strip() else 0
+        if remaining == 0:
+            break
+        log(f"  {remaining} orphaned Argo apps — force-patching finalizers (attempt {attempt+1})")
+        # Patch all namespaces
+        rc2, out2, _ = kubectl("get", "applications.argoproj.io", "--all-namespaces",
+                               "--no-headers", "-o", "custom-columns=NS:.metadata.namespace")
+        if rc2 == 0 and out2.strip():
+            for ns in sorted(set(l.strip() for l in out2.strip().split("\n") if l.strip())):
+                kubectl("patch", "applications.argoproj.io", "--all", "-n", ns,
+                        "--type=merge", '-p={"metadata":{"finalizers":null}}')
+                kubectl("delete", "applications.argoproj.io", "--all", "-n", ns,
+                        "--ignore-not-found", "--wait=false", "--force", "--grace-period=0")
+        time.sleep(10)
+    else:
+        remaining = 0
+        rc, out, _ = kubectl("get", "applications.argoproj.io", "--all-namespaces", "--no-headers")
+        if rc == 0 and out.strip():
+            remaining = len([l for l in out.strip().split("\n") if l.strip()])
+        if remaining > 0:
+            log(f"WARNING: {remaining} Argo apps still remain after cleanup")
+
     # Step 8: Deploy image + scale back up (was scaled to 0 in Step 5b)
     tag = os.environ.get("EXPECTED_IMAGE_TAG")
     if tag:
