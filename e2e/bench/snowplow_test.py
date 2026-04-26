@@ -1196,7 +1196,18 @@ def delete_one_bench_namespace(ns_name):
             time.sleep(5)
         remaining = count_compositions_in_ns(ns_name)
         if remaining > 0:
-            log(f"WARNING: {remaining} compositions still in {ns_name} after timeout")
+            log(f"Force-patching {remaining} stuck compositions in {ns_name} (controller backlogged)")
+            kubectl("get", f"{COMP_RES}.{COMP_GVR}", "-n", ns_name, "--no-headers", "-o", "name")
+            rc_p, out_p, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "-n", ns_name,
+                                      "--no-headers", "-o", "name")
+            if rc_p == 0 and out_p.strip():
+                for obj_name in out_p.strip().split("\n"):
+                    obj_name = obj_name.strip()
+                    if obj_name:
+                        kubectl("patch", obj_name, "-n", ns_name,
+                                "--type=merge", f"-p={FINALIZER_PATCH}")
+            time.sleep(10)
+            log(f"Compositions force-patched in {ns_name}")
         else:
             log(f"All compositions deleted in {ns_name}")
 
