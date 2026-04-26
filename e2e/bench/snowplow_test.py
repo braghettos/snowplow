@@ -1405,18 +1405,17 @@ def run_phase_functional(tokens):
     enable_cache()
     wait_for_l1_warmup(timeout=300)
 
-    # T1 — L3 warmup verification
-    section("T1 — L3 Warmup Verification")
+    # T1 — Cache warmup verification
+    section("T1 — Cache Warmup Verification")
     token = tokens["admin"]
-    for label, key in [
-        ("restactions", "snowplow:list:templates.krateo.io/v1/restactions:"),
-        ("widgets pages", "snowplow:list:widgets.templates.krateo.io/v1beta1/pages:"),
-        ("navmenus", "snowplow:list:widgets.templates.krateo.io/v1beta1/navmenus:"),
-        ("compositiondefs", "snowplow:list:core.krateo.io/v1alpha1/compositiondefinitions:"),
-        ("CRDs", "snowplow:list:apiextensions.k8s.io/v1/customresourcedefinitions:"),
+    # Verify L1 resolved keys and watched GVRs exist after warmup
+    for label, pattern in [
+        ("L1 resolved keys", "snowplow:resolved:*"),
+        ("watched GVRs", "snowplow:watched-gvrs"),
     ]:
-        exists = redis_cmd("EXISTS", key)
-        record(f"Warmup L3 key exists: {label}", exists == "1", note=f"key={key}")
+        count = redis_cmd("EVAL", "return #redis.call('keys', ARGV[1])", "0", pattern) if "*" in pattern else redis_cmd("SCARD", pattern)
+        ok = int(count or "0") > 0
+        record(f"Warmup: {label} populated", ok, note=f"pattern={pattern} count={count}")
     dbsize = redis_cmd("DBSIZE")
     record("Redis has substantial key count", int(dbsize or "0") > 50, note=f"dbsize={dbsize}")
 
@@ -1449,25 +1448,22 @@ def run_phase_functional(tokens):
                        m1.get("get_hits", 0) - m0.get("get_hits", 0))
             record(f"{username}: {label} cache hit", code == 200 and ms < 2000, ms, code, f"hits+{total_d}")
 
-    # T4 — L3 direct read
-    section("T4 — L3 Direct Read")
+    # T4 — Object cache verification
+    section("T4 — Object Cache Verification")
     http_get(WIDGET_ENDPOINTS[0][1], token)
     time.sleep(2)
-    m = cache_metrics(token)
-    l3p = m.get("l3_promotions", 0)
-    l3_key = "snowplow:get:widgets.templates.krateo.io/v1beta1/pages:krateo-system:dashboard-page"
-    l3_exists = False
+    obj_key = "snowplow:get:widgets.templates.krateo.io/v1beta1/pages:krateo-system:dashboard-page"
+    obj_exists = False
     for attempt in range(3):
-        if redis_cmd("EXISTS", l3_key) == "1":
-            l3_exists = True
+        if redis_cmd("EXISTS", obj_key) == "1":
+            obj_exists = True
             break
-        log(f"L3 key not found yet (attempt {attempt+1}/3), waiting 3s ...")
+        log(f"Object cache key not found yet (attempt {attempt+1}/3), waiting 3s ...")
         time.sleep(3)
-    record("L3 object key exists for dashboard-page", l3_exists, note=f"key={l3_key}")
-    record("L3 promotions counter is non-negative", l3p >= 0, note=f"l3_promotions={l3p} (0 is OK if warmup pre-populated L3)")
+    record("Object cache key exists for dashboard-page", obj_exists, note=f"key={obj_key}")
 
-    # T5 — /call paths skip L3 promotion
-    section("T5 — /call Paths Skip L3 Promotion")
+    # T5 — /call returns resolved output
+    section("T5 — /call Returns Resolved Output")
     p5 = "/call?apiVersion=templates.krateo.io%2Fv1&resource=restactions&name=compositions-get-ns-and-crd&namespace=krateo-system"
     ms, code, body = http_get_json(p5, token)
     record("/call returns resolved output (not raw K8s)", code == 200 and isinstance(body, dict), ms, code,
@@ -1509,8 +1505,8 @@ def run_phase_functional(tokens):
     # T9 — Redis key structure (must run before T10 which invalidates L1 via CRUD)
     section("T9 — Redis Key Structure")
     for prefix, label, threshold in [
-        ("snowplow:get:*", "L3 GET keys", 10),
-        ("snowplow:list:*", "L3 LIST keys", 5),
+        ("snowplow:get:*", "Object cache keys", 10),
+        ("snowplow:list-idx:*", "List index SETs", 1),
         ("snowplow:resolved:*", "L1 resolved keys", 1),
     ]:
         keys = redis_cmd("KEYS", prefix)
@@ -1595,8 +1591,8 @@ subjects:
         rbac_d = m1.get("rbac_hits", 0) - m0.get("rbac_hits", 0)
         record(f"{username}: RBAC cache hit", code == 200 and rbac_d >= 0, ms, code, f"rbac_hits+{rbac_d}")
 
-    # T12 — Shared L3 layer
-    section("T12 — Shared L3 Layer Verification")
+    # T12 — Multi-user cache verification
+    section("T12 — Multi-User Cache Verification")
     ra_path = RESTACTION_ENDPOINTS[0][1]
     http_get(ra_path, tokens["admin"])
     ms1, c1, _ = http_get(ra_path, tokens["admin"])
