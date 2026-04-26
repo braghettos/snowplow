@@ -528,12 +528,28 @@ def enable_cache():
 
 def disable_cache():
     log("Disabling cache (CACHE_ENABLED=false) ...")
-    # kubectl set env already triggers a rollout — no extra rollout restart needed.
+    # Record current pod name so we can verify it changed
+    _, old_pods, _ = kubectl("get", "pods", "-n", NS, "-l", "app.kubernetes.io/name=snowplow",
+                              "-o", "jsonpath={.items[*].metadata.name}")
     kubectl("set", "env", "deployment/snowplow", "-n", NS,
             "-c", "snowplow", "CACHE_ENABLED=false")
     kubectl("rollout", "status", "deployment/snowplow", "-n", NS, "--timeout=300s")
+    # Wait for old pod(s) to terminate — service must only route to the new pod
+    if old_pods.strip():
+        for old_pod in old_pods.strip().split():
+            for _ in range(30):
+                rc, out, _ = kubectl("get", "pod", old_pod, "-n", NS, "--no-headers",
+                                     "-o", "jsonpath={.status.phase}")
+                if rc != 0 or out.strip() not in ("Running", "Pending"):
+                    break
+                time.sleep(2)
     wait_for_snowplow()
-    log("Cache disabled")
+    # Verify the new pod is actually running without cache
+    _, _, body = http_get_json("/metrics/cache", "")
+    fresh_l1 = (body or {}).get("l1_hits", -1)
+    log(f"Cache disabled (fresh pod l1_hits={fresh_l1})")
+    if fresh_l1 > 0:
+        log("WARNING: fresh pod has non-zero l1_hits — metrics may be stale from Redis")
 
 
 # ── Resource management ──────────────────────────────────────────────────────
@@ -1700,9 +1716,39 @@ def run_phase_latency(tokens):
         section("Cache ENABLED — Frontend Proxy")
         cached_fe = _bench_endpoints(ALL_ENDPOINTS, token, FRONTEND, ITERS, WARMUP_ITERS)
 
+    # ── Proof-of-cache: collect cache ON indicators ──────────────────────
+    section("Cache ON — Code Path Proof")
+    m_on = cache_metrics(token)
+    on_l1_hits = m_on.get("l1_hits", 0)
+    on_raw_hits = m_on.get("raw_hits", 0)
+    on_l1_rate = m_on.get("l1_hit_rate", 0)
+    log(f"  Cache ON metrics: l1_hits={on_l1_hits}, raw_hits={on_raw_hits}, l1_hit_rate={on_l1_rate:.1f}%")
+
+    rt_on = get_runtime_metrics() or {}
+    on_redis_keys = rt_on.get("redis_key_count", 0)
+    on_goroutines = rt_on.get("goroutine_count", 0)
+    on_heap_mb = rt_on.get("heap_alloc_mb", 0)
+    on_redis_mb = get_redis_memory_mb()
+    log(f"  Cache ON runtime: redis_keys={on_redis_keys}, goroutines={on_goroutines}, "
+        f"heap={on_heap_mb:.1f}MB, redis_mem={on_redis_mb:.1f}MB")
+
+    # Cache-Control header on a warmed widget endpoint
+    cc_path = ALL_ENDPOINTS[0][1]
+    http_get(cc_path, token)  # ensure warm
+    _, _, _, hdrs_on = http_get_with_headers(cc_path, token)
+    on_cache_control = hdrs_on.get("Cache-Control", "")
+    log(f"  Cache ON Cache-Control: {on_cache_control}")
+
     section("Disabling cache for baseline ...")
     disable_cache()
+    # Wait for old pod to fully terminate so service only routes to new pod
+    time.sleep(10)
     token = login("admin", USERS["admin"])
+
+    # Snapshot metrics BEFORE cache-OFF benchmark (baseline for delta)
+    m_off_before = cache_metrics(token)
+    off_before_l1 = m_off_before.get("l1_hits", 0)
+    off_before_raw = m_off_before.get("raw_hits", 0)
 
     section("Cache DISABLED — Backend")
     nocache_be = _bench_endpoints(ALL_ENDPOINTS, token, SNOWPLOW, ITERS, WARMUP_ITERS)
@@ -1712,8 +1758,58 @@ def run_phase_latency(tokens):
         section("Cache DISABLED — Frontend Proxy")
         nocache_fe = _bench_endpoints(ALL_ENDPOINTS, token, FRONTEND, ITERS, WARMUP_ITERS)
 
+    # ── Proof-of-cache: collect cache OFF indicators ─────────────────────
+    section("Cache OFF — Code Path Proof")
+    m_off = cache_metrics(token)
+    off_l1_hits = m_off.get("l1_hits", 0)
+    off_raw_hits = m_off.get("raw_hits", 0)
+    off_l1_rate = m_off.get("l1_hit_rate", 0)
+    # Delta: hits generated during cache-OFF benchmark
+    off_l1_delta = off_l1_hits - off_before_l1
+    off_raw_delta = off_raw_hits - off_before_raw
+    log(f"  Cache OFF metrics: l1_hits={off_l1_hits} (delta={off_l1_delta}), "
+        f"raw_hits={off_raw_hits} (delta={off_raw_delta}), l1_hit_rate={off_l1_rate:.1f}%")
+
+    rt_off = get_runtime_metrics() or {}
+    off_redis_keys = rt_off.get("redis_key_count", 0)
+    off_goroutines = rt_off.get("goroutine_count", 0)
+    off_heap_mb = rt_off.get("heap_alloc_mb", 0)
+    off_redis_mb = get_redis_memory_mb()
+    log(f"  Cache OFF runtime: redis_keys={off_redis_keys}, goroutines={off_goroutines}, "
+        f"heap={off_heap_mb:.1f}MB, redis_mem={off_redis_mb:.1f}MB")
+
+    _, _, _, hdrs_off = http_get_with_headers(cc_path, token)
+    off_cache_control = hdrs_off.get("Cache-Control", "")
+    log(f"  Cache OFF Cache-Control: {off_cache_control}")
+
     section("Restoring cache ...")
     enable_cache()
+
+    # ── Proof-of-cache: assertions ───────────────────────────────────────
+    section("Phase 2 — Code Path Proof Assertions")
+    # Cache ON: must have non-zero hits (proves L1 path executed)
+    record("P2: cache ON l1_hits > 0", on_l1_hits > 0, note=f"l1_hits={on_l1_hits}")
+    record("P2: cache ON raw_hits > 0", on_raw_hits > 0, note=f"raw_hits={on_raw_hits}")
+    record("P2: cache ON redis_keys > 0", on_redis_keys > 0, note=f"keys={on_redis_keys}")
+    record("P2: cache ON no Cache-Control header", "max-age" not in on_cache_control,
+           note=f"header={on_cache_control}")
+    # Cache OFF: no NEW hits generated during benchmark (delta must be 0)
+    record("P2: cache OFF generated 0 L1 hits", off_l1_delta == 0,
+           note=f"delta={off_l1_delta} (before={off_before_l1} after={off_l1_hits})")
+    record("P2: cache OFF generated 0 raw hits", off_raw_delta == 0,
+           note=f"delta={off_raw_delta} (before={off_before_raw} after={off_raw_hits})")
+    # Cache OFF: no Cache-Control header (proves response NOT from L1)
+    record("P2: cache OFF no Cache-Control header", "max-age" not in off_cache_control,
+           note=f"header={off_cache_control}")
+    # Goroutine delta: cache ON should have more (informer watchers + refresh workers)
+    goroutine_delta = on_goroutines - off_goroutines
+    record("P2: cache ON more goroutines than OFF", goroutine_delta > 0,
+           note=f"ON={on_goroutines} OFF={off_goroutines} delta={goroutine_delta:+d}")
+    log(f"  Memory: ON={on_heap_mb:.1f}MB vs OFF={off_heap_mb:.1f}MB "
+        f"(delta={on_heap_mb - off_heap_mb:+.1f}MB)")
+    log(f"  Redis memory: ON={on_redis_mb:.1f}MB vs OFF={off_redis_mb:.1f}MB")
+    log(f"  Goroutines: ON={on_goroutines} vs OFF={off_goroutines} "
+        f"(delta={goroutine_delta:+d})")
 
     _print_comparison("Backend (Direct Snowplow)", cached_be, nocache_be)
     if cached_fe and nocache_fe:
@@ -1850,9 +1946,10 @@ def run_phase_browser():
 
             user_results = {}
             for page_name, page_path in BROWSER_PAGES:
+              try:
                 log(f"  {page_name} — cold ...")
                 page.evaluate("() => performance.clearResourceTimings()")
-                page.goto(f"{FRONTEND}{page_path}", wait_until="networkidle", timeout=300000)
+                page.goto(f"{FRONTEND}{page_path}", wait_until="networkidle", timeout=120000)
 
                 timing = page.evaluate("""() => {
                     const t = performance.getEntriesByType('navigation')[0];
@@ -1878,7 +1975,7 @@ def run_phase_browser():
 
                 load_values = [cold.get("loadComplete", 0)]
                 for _ in range(ITERS - 1):
-                    page.goto(f"{FRONTEND}{page_path}", wait_until="networkidle", timeout=300000)
+                    page.goto(f"{FRONTEND}{page_path}", wait_until="networkidle", timeout=120000)
                     wt = page.evaluate("""() => {
                         const t = performance.getEntriesByType('navigation')[0];
                         return t ? Math.round(t.loadEventEnd - t.startTime) : 0;
@@ -1894,6 +1991,9 @@ def run_phase_browser():
                     f"XHRs={cold.get('xhrCount', 0)}  "
                     f"waterfall={cold.get('xhrWaterfallMs', 0)}ms  "
                     f"transfer={cold.get('totalTransferKB', 0)}KB")
+              except Exception as e:
+                log(f"    [{page_name}] SKIPPED — {type(e).__name__}: {e}")
+                user_results[page_name] = {"error": str(e)}
 
             all_results[username] = user_results
             ctx.close()

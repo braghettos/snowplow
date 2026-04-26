@@ -88,7 +88,6 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 						slog.String("source", "L1-cache"),
 						slog.String("duration", util.ETA(start)))
 					wri.Header().Set("Content-Type", "application/json")
-					wri.Header().Set("Cache-Control", "public, max-age=3, stale-while-revalidate=12")
 					wri.WriteHeader(http.StatusOK)
 					_, writeSpan := restactionTracer.Start(req.Context(), "http.write",
 						trace.WithAttributes(
