@@ -1169,8 +1169,9 @@ def delete_one_bench_namespace(ns_name):
 
     No force-patching — controllers handle all finalizers naturally.
     """
-    # Ensure the composition controller is running in this namespace
-    ensure_composition_controller(ns_name)
+    # The composition controller runs in the CompositionDefinition namespace
+    # (bench-ns-01), NOT in each bench namespace. Ensure it's healthy.
+    ensure_composition_controller("bench-ns-01")
 
     # Step 1: Delete compositions (controllers process finalizers, clean children)
     rc, out, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "-n", ns_name,
@@ -1181,9 +1182,11 @@ def delete_one_bench_namespace(ns_name):
                 "--ignore-not-found", "--wait=false")
         log(f"Triggered deletion of {len(comps)} compositions in {ns_name}")
 
-        # Wait for controllers to finish cleaning all compositions + children
+        # Wait for controllers to finish cleaning all compositions + children.
+        # Timeout after 10 min — the controller may be backlogged at 50K scale.
         prev_remaining = -1
-        while True:
+        deadline = time.time() + 600
+        while time.time() < deadline:
             remaining = count_compositions_in_ns(ns_name)
             if remaining == 0:
                 break
@@ -1191,7 +1194,11 @@ def delete_one_bench_namespace(ns_name):
                 log(f"  {remaining} compositions remaining in {ns_name} ...")
                 prev_remaining = remaining
             time.sleep(5)
-        log(f"All compositions deleted in {ns_name}")
+        remaining = count_compositions_in_ns(ns_name)
+        if remaining > 0:
+            log(f"WARNING: {remaining} compositions still in {ns_name} after timeout")
+        else:
+            log(f"All compositions deleted in {ns_name}")
 
     # Step 2: Delete the namespace (children already cleaned by controllers)
     kubectl("delete", "ns", ns_name, "--ignore-not-found", "--wait=false")
