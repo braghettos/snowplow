@@ -93,8 +93,11 @@ func (w *Warmer) SetWarmupConfig(cfg *WarmupConfig) {
 		if entry.TTL != "" {
 			if ttl, err := time.ParseDuration(entry.TTL); err == nil {
 				w.gvrTTLs[gvr] = ttl
-				if rc, ok := w.cache.(*RedisCache); ok {
-					rc.RegisterGVRTTL(gvr, ttl)
+				switch cc := w.cache.(type) {
+				case *RedisCache:
+					cc.RegisterGVRTTL(gvr, ttl)
+				case *MemCache:
+					cc.RegisterGVRTTL(gvr, ttl)
 				}
 			} else {
 				slog.Warn("warmup: invalid TTL for GVR; using default",

@@ -78,8 +78,7 @@ func main() {
 		"path to cache warmup YAML config")
 	resourceTTL := flag.Duration("resource-ttl", env.Duration("RESOURCE_TTL", cache.DefaultResourceTTL),
 		"default TTL for cached Kubernetes resources")
-	l1DiskPath := flag.String("l1-disk-path", env.String("L1_DISK_PATH", ""),
-		"directory for disk-backed L1 resolved cache (empty = use Redis)")
+	// l1DiskPath removed — MemCache stores L1 in-process.
 
 	flag.Usage = func() {
 		fmt.Fprintln(flag.CommandLine.Output(), "Flags:")
@@ -121,12 +120,15 @@ func main() {
 		log.Debug("environment variables", slog.Any("env", os.Environ()))
 	}
 
-	// Build a Redis cache (sidecar at localhost:6379).
-	var redisCache *cache.RedisCache
+	// Build an in-process cache (replaces Redis sidecar).
+	var appCache cache.Cache
 	if cache.Disabled() {
 		log.Info("caching disabled via CACHE_ENABLED=false")
 	} else {
-		redisCache = cache.New(*resourceTTL)
+		mc := cache.NewMem(*resourceTTL)
+		mc.StartEviction(context.Background())
+		appCache = mc
+		log.Info("in-process cache enabled")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), []os.Signal{
@@ -150,31 +152,7 @@ func main() {
 		sarc.NextProtos = []string{"http/1.1"} // disable HTTP2 to avoid h2 frame crashes
 	}
 
-	if redisCache != nil {
-		if err := redisCache.Ping(ctx); err != nil {
-			log.Warn("redis not available; caching disabled", slog.Any("err", err))
-			redisCache = nil
-		} else {
-			log.Info("redis connected")
-			cache.GlobalMetrics.SetRedis(redisCache)
-			cache.GlobalMetrics.StartMetricsFlusher(ctx, 10*time.Second)
-		}
-	}
-
-	// Configure disk-backed L1 store when --l1-disk-path is set.
-	if redisCache != nil && *l1DiskPath != "" {
-		ds, err := cache.NewDiskStore(*l1DiskPath, cache.ResolvedCacheTTL)
-		if err != nil {
-			log.Error("failed to create disk store; L1 will use Redis",
-				slog.String("path", *l1DiskPath), slog.Any("err", err))
-		} else {
-			redisCache.SetDiskStore(ds)
-			ds.StartCleanup(ctx, 60*time.Second)
-			log.Info("disk-backed L1 store enabled",
-				slog.String("path", *l1DiskPath),
-				slog.Duration("ttl", cache.ResolvedCacheTTL))
-		}
-	}
+	// No Redis ping or disk store needed — MemCache is always available.
 
 	// Initialize OpenTelemetry SDK (no-op when OTEL_ENABLED != "true").
 	// Use an independent context so exporter failures (e.g., collector
@@ -208,8 +186,8 @@ func main() {
 	withCache := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx := r.Context()
-			if redisCache != nil {
-				ctx = cache.WithCache(ctx, redisCache)
+			if appCache != nil {
+				ctx = cache.WithCache(ctx, appCache)
 			}
 			if globalInformerReader != nil {
 				ctx = cache.WithInformerReader(ctx, globalInformerReader)
@@ -237,15 +215,15 @@ func main() {
 	mux.Handle("GET /health", handlers.HealthCheck(serviceName, build, kubeutil.ServiceAccountNamespace))
 	mux.Handle("GET /ready", handlers.ReadinessCheck())
 	mux.Handle("GET /metrics/cache", chain.Then(handlers.CacheMetrics()))
-	mux.Handle("GET /metrics/runtime", handlers.RuntimeMetricsHandler(redisCache))
+	mux.Handle("GET /metrics/runtime", handlers.RuntimeMetricsHandler(appCache))
 	mux.Handle("GET /api-info/names", chain.Then(handlers.Plurals()))
 	// Create RBACWatcher early so the middleware can compute binding identities.
 	// Start() is called later in startBackgroundServices.
 	var globalRBACWatcher *cache.RBACWatcher
-	if redisCache != nil {
-		globalRBACWatcher = cache.NewRBACWatcher(redisCache, sarc)
+	if appCache != nil {
+		globalRBACWatcher = cache.NewRBACWatcher(appCache, sarc)
 	}
-	userCfg := handlers.CachedUserConfig(*signKey, *authnNS, sarc, redisCache, globalRBACWatcher)
+	userCfg := handlers.CachedUserConfig(*signKey, *authnNS, sarc, appCache, globalRBACWatcher)
 
 	mux.Handle("GET /list", chain.Append(userCfg, withCache).Then(handlers.List()))
 
@@ -297,8 +275,8 @@ func main() {
 	// Run cache warmup in background so /health responds immediately.
 	// Previously this ran before ListenAndServe, causing startup probe failures
 	// when informer sync + L2/RBAC warmup exceeded the probe timeout.
-	if redisCache != nil {
-		go startBackgroundServices(ctx, log, redisCache, *authnNS, *warmupConfigPath, *signKey, globalRBACWatcher)
+	if appCache != nil {
+		go startBackgroundServices(ctx, log, appCache, *authnNS, *warmupConfigPath, *signKey, globalRBACWatcher)
 	}
 	<-ctx.Done()
 
@@ -357,8 +335,11 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cach
 		return
 	}
 
-	if concreteCache, ok := c.(*cache.RedisCache); ok {
-		concreteCache.SetGVRNotifier(resourceWatcher.AddGVR)
+	switch cc := c.(type) {
+	case *cache.MemCache:
+		cc.SetGVRNotifier(resourceWatcher.AddGVR)
+	case *cache.RedisCache:
+		cc.SetGVRNotifier(resourceWatcher.AddGVR)
 	}
 	globalInformerReader = resourceWatcher // InformerReader interface — reads from informer store
 	resourceWatcher.SetL1Refresher(dispatchers.MakeL1Refresher(c, rc, authnNS, signKey, rbacWatcher))
