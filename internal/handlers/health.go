@@ -7,6 +7,7 @@ import (
 	"github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/kubeutil"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
 	"k8s.io/client-go/rest"
 )
@@ -49,7 +50,7 @@ func HealthCheck(serviceName, build string, nsgetter func() (string, error)) htt
 // with a cold cache.
 func ReadinessCheck() http.HandlerFunc {
 	return func(wri http.ResponseWriter, req *http.Request) {
-		if !dispatchers.IsPreWarmComplete() {
+		if !cache.Disabled() && !dispatchers.IsPreWarmComplete() {
 			http.Error(wri, `{"status":"warming up"}`, http.StatusServiceUnavailable)
 			return
 		}
