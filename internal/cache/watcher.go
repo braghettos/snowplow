@@ -150,10 +150,15 @@ type ResourceWatcher struct {
 	coldCh chan refreshItem
 
 	// warmColdSem bounds concurrent WARM/COLD refresh goroutines to
-	// GOMAXPROCS. HOT refreshes are unbounded (latency-critical).
-	// Without this, a burst of 50K informer events spawns one goroutine
-	// per unique L1 key group, exhausting memory.
+	// GOMAXPROCS. Without this, a burst of 50K informer events spawns
+	// one goroutine per unique L1 key group, exhausting memory.
 	warmColdSem chan struct{}
+
+	// hotSem bounds concurrent HOT refresh goroutines to GOMAXPROCS/2.
+	// This reserves CPU for HTTP request handlers so L1 cache hits
+	// complete in <10ms instead of competing with hundreds of refresh
+	// goroutines for CPU time.
+	hotSem chan struct{}
 }
 
 func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -191,6 +196,7 @@ func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error
 		warmCh:      make(chan refreshItem, 10000),
 		coldCh:      make(chan refreshItem, 10000),
 		warmColdSem: make(chan struct{}, runtime.GOMAXPROCS(0)),
+		hotSem:      make(chan struct{}, max(1, runtime.GOMAXPROCS(0)/2)),
 	}, nil
 }
 
@@ -680,7 +686,7 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 		if len(pages) > 0 {
 			slog.Info("dispatch", slog.String("tier", "hot"), slog.String("key", pages[0].key))
 		}
-		dispatch(rw.hotCh, "hot", pages, nil) // HOT: unbounded
+		dispatch(rw.hotCh, "hot", pages, rw.hotSem)
 	}
 	for _, pages := range groupKeys(warmKeys) {
 		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
