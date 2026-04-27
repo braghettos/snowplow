@@ -119,7 +119,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 // resolveViaL1Cache fetches the RESTAction CR and hands it off to
 // l1cache.ResolveAndCache, which runs inside the shared foreground
 // singleflight.Group and writes the L1 entry.
-func resolveViaL1Cache(ctx context.Context, c *cache.RedisCache, opts ResolveOptions, l1Key string) (map[string]any, error) {
+func resolveViaL1Cache(ctx context.Context, c cache.Cache, opts ResolveOptions, l1Key string) (map[string]any, error) {
 	res := objects.Get(ctx, opts.ApiRef)
 	if res.Err != nil {
 		return map[string]any{}, fmt.Errorf("%s", res.Err.Message)
@@ -173,7 +173,7 @@ func resolveInline(ctx context.Context, opts ResolveOptions) (map[string]any, er
 
 // lookupL1 reads a RESTAction L1 entry and extracts its status map.
 // Returns (status, true) on hit, (nil, false) on miss or decode failure.
-func lookupL1(ctx context.Context, c *cache.RedisCache, l1Key string) (map[string]any, bool) {
+func lookupL1(ctx context.Context, c cache.Cache, l1Key string) (map[string]any, bool) {
 	raw, hit, err := c.GetRaw(ctx, l1Key)
 	if err != nil || !hit || len(raw) == 0 {
 		return nil, false

@@ -36,13 +36,13 @@ func UsernameForBinding(bindingIdentity string) (string, bool) {
 type contextKey struct{}
 
 // WithCache returns a context carrying c.
-func WithCache(ctx context.Context, c *RedisCache) context.Context {
+func WithCache(ctx context.Context, c Cache) context.Context {
 	return context.WithValue(ctx, contextKey{}, c)
 }
 
-// FromContext extracts the RedisCache from ctx, returning nil if none was set.
-func FromContext(ctx context.Context) *RedisCache {
-	c, _ := ctx.Value(contextKey{}).(*RedisCache)
+// FromContext extracts the Cache from ctx, returning nil if none was set.
+func FromContext(ctx context.Context) Cache {
+	c, _ := ctx.Value(contextKey{}).(Cache)
 	return c
 }
 

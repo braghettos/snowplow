@@ -51,9 +51,9 @@ var tracer = otel.Tracer("snowplow/resolvers/restactions/l1cache")
 // ResolvedKey signals a non-cacheable path (skip L1 write AND skip
 // singleflight).
 type Input struct {
-	// Cache is the Redis L1 cache. May be nil (cache disabled); in
+	// Cache is the L1 cache. May be nil (cache disabled); in
 	// that case L1 writes are skipped.
-	Cache *cache.RedisCache
+	Cache cache.Cache
 
 	// Obj is the unstructured RESTAction CR as fetched from L2 Redis
 	// or the informer store. Marshaled shape: map[string]any.

@@ -338,7 +338,7 @@ func recoveryMiddleware(next http.Handler) http.Handler {
 // Warmup and informer sync use a separate background context so that a SIGTERM
 // received during startup (e.g. from a failing liveness probe) does not abort
 // the warmup — the server will start with a fully warm cache regardless.
-func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.RedisCache, authnNS, warmupConfigPath, signKey string, rbacWatcher *cache.RBACWatcher) {
+func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cache, authnNS, warmupConfigPath, signKey string, rbacWatcher *cache.RBACWatcher) {
 	rc, err := rest.InClusterConfig()
 	if err != nil {
 		log.Warn("not running in-cluster; background cache services disabled", slog.Any("err", err))
@@ -357,7 +357,9 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c *cache.Red
 		return
 	}
 
-	c.SetGVRNotifier(resourceWatcher.AddGVR)
+	if concreteCache, ok := c.(*cache.RedisCache); ok {
+		concreteCache.SetGVRNotifier(resourceWatcher.AddGVR)
+	}
 	globalInformerReader = resourceWatcher // InformerReader interface — reads from informer store
 	resourceWatcher.SetL1Refresher(dispatchers.MakeL1Refresher(c, rc, authnNS, signKey, rbacWatcher))
 

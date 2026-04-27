@@ -57,7 +57,7 @@ func newUnthrottledDynClient(rc *rest.Config) (k8sdynamic.Interface, error) {
 //
 // Returns (nil, false) if neither L2 nor the k8s GET yields a CR (eg the
 // resource does not exist, RBAC denies, or the fallback client was nil).
-func prewarmFetchCR(ctx context.Context, c *cache.RedisCache, dynClient k8sdynamic.Interface, gvr schema.GroupVersionResource, ns, name string) (*unstructured.Unstructured, bool) {
+func prewarmFetchCR(ctx context.Context, c cache.Cache, dynClient k8sdynamic.Interface, gvr schema.GroupVersionResource, ns, name string) (*unstructured.Unstructured, bool) {
 	if c != nil {
 		var cached unstructured.Unstructured
 		l2Key := cache.GetKey(gvr, ns, name)
@@ -117,7 +117,7 @@ func IsPreWarmComplete() bool {
 // during parent widget resolution and stores them in L1 cache. It walks the
 // entire widget tree (up to preWarmMaxDepth levels) so that all descendants
 // are cached before the frontend requests them.
-func preWarmChildWidgets(parentCtx context.Context, c *cache.RedisCache, resolved *unstructured.Unstructured, authnNS string) {
+func preWarmChildWidgets(parentCtx context.Context, c cache.Cache, resolved *unstructured.Unstructured, authnNS string) {
 	// After initial warmup completes, pre-warming is disabled.
 	// Runtime L1 updates are handled by the event-driven dirty+ticker system.
 	if preWarmComplete.Load() {
@@ -160,7 +160,7 @@ func preWarmChildWidgets(parentCtx context.Context, c *cache.RedisCache, resolve
 
 // recursivePreWarm resolves refs into L1 cache, then extracts their children
 // and recurses until maxDepth or no more children are found.
-func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, c *cache.RedisCache, dynClient k8sdynamic.Interface, refs []l1Ref, authnNS string, visited map[string]bool, depth int) {
+func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, c cache.Cache, dynClient k8sdynamic.Interface, refs []l1Ref, authnNS string, visited map[string]bool, depth int) {
 	if depth > preWarmMaxDepth || len(refs) == 0 {
 		return
 	}
@@ -208,7 +208,7 @@ func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.E
 // resolves every instance of every widget GVR for each user, populating the
 // per-user L1 cache. It also warms explicitly-configured RESTActions so that
 // navigation and dashboard requests have zero cold-start latency.
-func WarmL1ForAllUsers(ctx context.Context, c *cache.RedisCache, rc *rest.Config, authnNS, signKey string, widgetGVRs []schema.GroupVersionResource, restActions []cache.WarmupRestAction) {
+func WarmL1ForAllUsers(ctx context.Context, c cache.Cache, rc *rest.Config, authnNS, signKey string, widgetGVRs []schema.GroupVersionResource, restActions []cache.WarmupRestAction) {
 	log := slog.Default()
 	if len(widgetGVRs) == 0 && len(restActions) == 0 || authnNS == "" {
 		log.Info("L1 warmup: skipped (no GVRs/restactions or authn namespace)")
@@ -298,7 +298,7 @@ func FilterWidgetGVRs(cfg *cache.WarmupConfig) []schema.GroupVersionResource {
 // identity group. Users with identical RBAC bindings share L1 entries, so
 // only one representative user per group is resolved. RBAC decisions are
 // populated organically during resolution.
-func WarmL1FromEntryPoints(ctx context.Context, c *cache.RedisCache, rc *rest.Config,
+func WarmL1FromEntryPoints(ctx context.Context, c cache.Cache, rc *rest.Config,
 	authnNS, signKey string, entryPoints []cache.EntryPoint, rbacWatcher *cache.RBACWatcher) {
 	log := slog.Default()
 	if len(entryPoints) == 0 || authnNS == "" {
@@ -404,7 +404,7 @@ func WarmL1FromEntryPoints(ctx context.Context, c *cache.RedisCache, rc *rest.Co
 // MakeRBACPreWarmer returns a no-op UserReadyFunc. RBAC decisions are now
 // populated organically during widget/RESTAction resolution rather than
 // pre-warmed via the GVR x NS x verb cartesian product.
-func MakeRBACPreWarmer(c *cache.RedisCache, rc *rest.Config, authnNS, signKey string) cache.UserReadyFunc {
+func MakeRBACPreWarmer(c cache.Cache, rc *rest.Config, authnNS, signKey string) cache.UserReadyFunc {
 	return func(ctx context.Context, username string) {
 		// RBAC warms organically during resolution -- no explicit pre-warm.
 	}
@@ -478,7 +478,7 @@ func extractGroupsFromClientCert(certPEM string) []string {
 	return cert.Subject.Organization
 }
 
-func warmL1ForUser(ctx context.Context, c *cache.RedisCache, dynClient k8sdynamic.Interface, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, gvrs []schema.GroupVersionResource, authnNS string) int64 {
+func warmL1ForUser(ctx context.Context, c cache.Cache, dynClient k8sdynamic.Interface, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, gvrs []schema.GroupVersionResource, authnNS string) int64 {
 	log := slog.Default()
 
 	// Use binding identity for cache keys during prewarm. The prewarm context
@@ -534,7 +534,7 @@ type l1Ref struct {
 
 // warmL1RestActionsForUser resolves the explicitly-configured RESTActions for
 // a single user and stores them in L1 cache. Returns the number warmed.
-func warmL1RestActionsForUser(ctx context.Context, c *cache.RedisCache, dynClient k8sdynamic.Interface, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, ras []cache.WarmupRestAction, authnNS string) int64 {
+func warmL1RestActionsForUser(ctx context.Context, c cache.Cache, dynClient k8sdynamic.Interface, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, ras []cache.WarmupRestAction, authnNS string) int64 {
 	log := slog.Default()
 	raGVR := schema.GroupVersionResource{
 		Group: "templates.krateo.io", Version: "v1", Resource: "restactions",
@@ -605,7 +605,7 @@ func warmL1RestActionsForUser(ctx context.Context, c *cache.RedisCache, dynClien
 // be pre-warmed. Items whose ID appears in skipIDs (action-linked refs like
 // navigate/openDrawer/openModal) are excluded — they are deferred and only
 // resolved on user interaction.
-func extractChildWidgetRefs(ctx context.Context, c *cache.RedisCache, items []interface{}, identity string, skipIDs map[string]bool) []l1Ref {
+func extractChildWidgetRefs(ctx context.Context, c cache.Cache, items []interface{}, identity string, skipIDs map[string]bool) []l1Ref {
 	var refs []l1Ref
 	for _, item := range items {
 		m, ok := item.(map[string]interface{})
@@ -678,7 +678,7 @@ func extractActionRefIDs(obj map[string]interface{}) map[string]bool {
 // warmed. The caller provides the context (with its own deadline).
 // resolveL1RefsCollect resolves refs into L1 and returns the resolved objects
 // so callers can inspect children for recursive pre-warming.
-func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, c *cache.RedisCache, dynClient k8sdynamic.Interface, refs []l1Ref, authnNS string) []*unstructured.Unstructured {
+func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, c cache.Cache, dynClient k8sdynamic.Interface, refs []l1Ref, authnNS string) []*unstructured.Unstructured {
 	ctx = xcontext.BuildContext(ctx,
 		xcontext.WithUserConfig(ep),
 		xcontext.WithUserInfo(user),
@@ -763,7 +763,7 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			// Register cascade deps: widget → RESTAction (from tracker refs).
 			// Same logic as widgets.go:244-255.
 			if refs := tracker.ResourceRefs(); len(refs) > 0 {
-				pipe := c.Pipeline(rctx)
+				pipe := cache.PipelineFrom(rctx, c)
 				if pipe != nil {
 					for _, ref := range refs {
 						key := cache.L1ResourceDepKey(ref.GVRKey, ref.NS, ref.Name)

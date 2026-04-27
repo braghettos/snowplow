@@ -53,7 +53,7 @@ func LoadWarmupConfig(path string) (*WarmupConfig, error) {
 }
 
 type Warmer struct {
-	cache              *RedisCache
+	cache              Cache
 	rc                 *rest.Config
 	gvrs               []schema.GroupVersionResource
 	gvrTTLs            map[schema.GroupVersionResource]time.Duration
@@ -76,7 +76,7 @@ func matchesGroupPatterns(group string, patterns []string) bool {
 	return false
 }
 
-func NewWarmer(c *RedisCache, rc *rest.Config) *Warmer {
+func NewWarmer(c Cache, rc *rest.Config) *Warmer {
 	return &Warmer{cache: c, rc: rc, gvrTTLs: make(map[schema.GroupVersionResource]time.Duration)}
 }
 
@@ -93,7 +93,9 @@ func (w *Warmer) SetWarmupConfig(cfg *WarmupConfig) {
 		if entry.TTL != "" {
 			if ttl, err := time.ParseDuration(entry.TTL); err == nil {
 				w.gvrTTLs[gvr] = ttl
-				w.cache.RegisterGVRTTL(gvr, ttl)
+				if rc, ok := w.cache.(*RedisCache); ok {
+					rc.RegisterGVRTTL(gvr, ttl)
+				}
 			} else {
 				slog.Warn("warmup: invalid TTL for GVR; using default",
 					slog.String("gvr", gvr.String()), slog.String("ttl", entry.TTL))

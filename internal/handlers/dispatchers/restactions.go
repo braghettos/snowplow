@@ -198,7 +198,7 @@ func (errEmptyResolve) Error() string {
 // l1_refresh.go already imports this package and calls this function;
 // moving the call site to l1cache directly would churn l1_refresh
 // without any correctness or performance benefit.
-func ResolveRESTActionBackground(ctx context.Context, c *cache.RedisCache, obj map[string]interface{}, resolvedKey, authnNS string, perPage, page int) ([]byte, error) {
+func ResolveRESTActionBackground(ctx context.Context, c cache.Cache, obj map[string]interface{}, resolvedKey, authnNS string, perPage, page int) ([]byte, error) {
 	result, err := l1cache.ResolveAndCache(ctx, l1cache.Input{
 		Cache:       c,
 		Obj:         obj,

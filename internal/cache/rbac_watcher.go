@@ -27,7 +27,7 @@ import (
 const rbacDebounceWindow = 2 * time.Second
 
 type RBACWatcher struct {
-	cache *RedisCache
+	cache Cache
 	rc    *rest.Config
 
 	mu      sync.Mutex
@@ -48,7 +48,7 @@ type RBACWatcher struct {
 	identityCache sync.Map
 }
 
-func NewRBACWatcher(c *RedisCache, rc *rest.Config) *RBACWatcher {
+func NewRBACWatcher(c Cache, rc *rest.Config) *RBACWatcher {
 	return &RBACWatcher{cache: c, rc: rc}
 }
 

@@ -28,7 +28,7 @@ import (
 // This eliminates the K8s API call on every request (~150-200ms), falling back
 // to the live lookup on cache miss. The UserSecretWatcher invalidates the cache
 // entry when the Secret changes.
-func CachedUserConfig(signingKey, authnNS string, rc *rest.Config, c *cache.RedisCache, rbacWatcher *cache.RBACWatcher) func(http.Handler) http.Handler {
+func CachedUserConfig(signingKey, authnNS string, rc *rest.Config, c cache.Cache, rbacWatcher *cache.RBACWatcher) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(wri http.ResponseWriter, req *http.Request) {
 			ctx := profile.Start(req.Context(), req.URL.Path)
@@ -106,7 +106,7 @@ func CachedUserConfig(signingKey, authnNS string, rc *rest.Config, c *cache.Redi
 	}
 }
 
-func cachedEndpointLookup(ctx context.Context, c *cache.RedisCache, rc *rest.Config, username, authnNS string) (endpoints.Endpoint, error) {
+func cachedEndpointLookup(ctx context.Context, c cache.Cache, rc *rest.Config, username, authnNS string) (endpoints.Endpoint, error) {
 	cacheKey := cache.UserConfigKey(username)
 
 	if c != nil {

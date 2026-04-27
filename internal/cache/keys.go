@@ -33,7 +33,7 @@ func CacheIdentity(ctx context.Context, username string) string {
 // know when the most recent L1 warmup or refresh cycle completed.
 // The key expires after 5 minutes so a stale timestamp from a crashed pod
 // does not mislead readiness probes (Bug 13).
-func MarkL1Ready(ctx context.Context, c *RedisCache) {
+func MarkL1Ready(ctx context.Context, c Cache) {
 	if c == nil {
 		return
 	}
@@ -41,7 +41,7 @@ func MarkL1Ready(ctx context.Context, c *RedisCache) {
 }
 
 // L1ReadyTimestamp returns the Unix epoch stored in the L1 ready key, or 0.
-func L1ReadyTimestamp(ctx context.Context, c *RedisCache) int64 {
+func L1ReadyTimestamp(ctx context.Context, c Cache) int64 {
 	if c == nil {
 		return 0
 	}
@@ -183,7 +183,7 @@ func L1ResourceDepKey(gvrKey, ns, name string) string {
 // The cluster-wide dep ensures that when ANY resource of a GVR changes in
 // ANY namespace, the L1 key is found by triggerL1RefreshBatch. This is critical
 // for RESTActions like compositions-list that iterate all namespaces.
-func RegisterL1Dependencies(ctx context.Context, c *RedisCache, tracker *DependencyTracker, l1Key string) {
+func RegisterL1Dependencies(ctx context.Context, c Cache, tracker *DependencyTracker, l1Key string) {
 	if c == nil || tracker == nil {
 		return
 	}
@@ -194,7 +194,7 @@ func RegisterL1Dependencies(ctx context.Context, c *RedisCache, tracker *Depende
 	}
 
 	seen := make(map[string]bool)
-	pipe := c.Pipeline(ctx)
+	pipe := PipelineFrom(ctx, c)
 	if pipe == nil {
 		return
 	}

@@ -166,7 +166,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 //
 // Returns a *ResolveWidgetResult so singleflight callers can access both the
 // raw JSON (for HTTP response) and the resolved unstructured (for child pre-warming).
-func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objects.Result, resolvedKey, authnNS string, perPage, page int, extras map[string]any) (*ResolveWidgetResult, error) {
+func resolveWidgetFromObject(ctx context.Context, c cache.Cache, got objects.Result, resolvedKey, authnNS string, perPage, page int, extras map[string]any) (*ResolveWidgetResult, error) {
 	ctx, span := widgetTracer.Start(ctx, "widget.resolve",
 		trace.WithAttributes(
 			attribute.String("widget.kind", widgets.GetKind(got.Unstructured.Object)),
@@ -248,7 +248,7 @@ func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objec
 		// dep index so refreshSingleL1's cascade finds it.
 		refs := tracker.ResourceRefs()
 		if len(refs) > 0 {
-			pipe := c.Pipeline(ctx)
+			pipe := cache.PipelineFrom(ctx, c)
 			if pipe != nil {
 				// Also register the unpaginated base key so cascade
 				// refreshes both paginated and unpaginated variants.
@@ -277,7 +277,7 @@ func resolveWidgetFromObject(ctx context.Context, c *cache.RedisCache, got objec
 
 // ResolveWidget resolves a widget and writes L1. Used by prewarm and
 // background L1 refresh.
-func ResolveWidget(ctx context.Context, c *cache.RedisCache, got objects.Result, resolvedKey, authnNS string, perPage, page int) (*ResolveWidgetResult, error) {
+func ResolveWidget(ctx context.Context, c cache.Cache, got objects.Result, resolvedKey, authnNS string, perPage, page int) (*ResolveWidgetResult, error) {
 	return resolveWidgetFromObject(ctx, c, got, resolvedKey, authnNS, perPage, page, nil)
 }
 

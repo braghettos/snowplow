@@ -42,7 +42,7 @@ type userContext struct {
 // the refresh runs (stale-while-revalidate).
 // rbacWatcher may be nil; when non-nil it is injected into the refresh context
 // so UserCan uses in-memory RBAC evaluation instead of SSAR API calls.
-func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey string, rbacWatcher *cache.RBACWatcher) cache.L1RefreshFunc {
+func MakeL1Refresher(c cache.Cache, rc *rest.Config, authnNS, signKey string, rbacWatcher *cache.RBACWatcher) cache.L1RefreshFunc {
 	// User context cache: loaded once per user, shared across all goroutines.
 	// Avoids 50K K8s Secret GETs when 50K events arrive for the same users.
 	var (
@@ -185,7 +185,7 @@ func MakeL1Refresher(c *cache.RedisCache, rc *rest.Config, authnNS, signKey stri
 // Returns (ok, cascadeKeys): ok indicates success, cascadeKeys contains L1 keys
 // that depend on the refreshed resource and should be enqueued for refresh too
 // (cascading invalidation for RESTAction → widget dependency chains).
-func refreshSingleL1(ctx context.Context, c *cache.RedisCache, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, info cache.ResolvedKeyInfo, rawKey, authnNS string) (bool, []string) {
+func refreshSingleL1(ctx context.Context, c cache.Cache, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, info cache.ResolvedKeyInfo, rawKey, authnNS string) (bool, []string) {
 	rctx := xcontext.BuildContext(ctx,
 		xcontext.WithUserConfig(ep),
 		xcontext.WithUserInfo(user),

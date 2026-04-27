@@ -116,7 +116,7 @@ type l1Event struct {
 
 // ResourceWatcher maintains dynamic informers for every GVR in the watched set.
 type ResourceWatcher struct {
-	cache     *RedisCache
+	cache     Cache
 	dynClient k8sdynamic.Interface
 	factory   dynamicinformer.DynamicSharedInformerFactory
 	mu        sync.Mutex
@@ -161,7 +161,7 @@ type ResourceWatcher struct {
 	hotSem chan struct{}
 }
 
-func NewResourceWatcher(c *RedisCache, rc *rest.Config) (*ResourceWatcher, error) {
+func NewResourceWatcher(c Cache, rc *rest.Config) (*ResourceWatcher, error) {
 	// Create a dedicated rest.Config for informers with its own rate limiter.
 	// This prevents L1 refresh API calls (RBAC, objects.Get) from starving
 	// informer WATCH streams. Without this, the shared rate limiter at QPS=100
@@ -510,7 +510,7 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 	// this added measurable latency to every L1 refresh batch.
 	totalDeps := len(listDeps) + len(clusterDeps) + len(getDeps)
 	if totalDeps > 0 {
-		pipe := rw.cache.Pipeline(ctx)
+		pipe := PipelineFrom(ctx, rw.cache)
 		if pipe != nil {
 			type pipeCmd struct {
 				cmd *redis.StringSliceCmd

@@ -22,7 +22,7 @@ type UserReadyFunc func(ctx context.Context, username string)
 // UserSecretWatcher watches *-clientconfig Secrets in AUTHN_NAMESPACE.
 // Tracks active users and purges per-user RBAC cache on re-auth or deletion.
 type UserSecretWatcher struct {
-	cache   *RedisCache
+	cache   Cache
 	rc      *rest.Config
 	authnNS string
 
@@ -35,7 +35,7 @@ type UserSecretWatcher struct {
 	warmingUsers sync.Map // username -> struct{}
 }
 
-func NewUserSecretWatcher(c *RedisCache, rc *rest.Config, authnNS string) *UserSecretWatcher {
+func NewUserSecretWatcher(c Cache, rc *rest.Config, authnNS string) *UserSecretWatcher {
 	return &UserSecretWatcher{cache: c, rc: rc, authnNS: authnNS}
 }
 

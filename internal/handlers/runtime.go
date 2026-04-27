@@ -22,7 +22,7 @@ type RuntimeMetrics struct {
 // RuntimeMetricsHandler returns an http.Handler that serves /metrics/runtime.
 // It collects Go runtime stats, active user count from Redis, disk L1 file
 // count, and total Redis key count. All operations are lightweight.
-func RuntimeMetricsHandler(c *cache.RedisCache) http.Handler {
+func RuntimeMetricsHandler(c cache.Cache) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
@@ -37,14 +37,24 @@ func RuntimeMetricsHandler(c *cache.RedisCache) http.Handler {
 			}
 		}
 
+		var diskFiles int64
+		if rc, ok := c.(*cache.RedisCache); ok {
+			diskFiles = rc.DiskFileCount()
+		}
+
+		var redisKeyCount int64
+		if c != nil {
+			redisKeyCount = c.DBSize(ctx)
+		}
+
 		m := RuntimeMetrics{
 			HeapAllocMB:    float64(ms.HeapAlloc) / (1024 * 1024),
 			HeapSysMB:      float64(ms.HeapSys) / (1024 * 1024),
 			GoroutineCount: runtime.NumGoroutine(),
 			NumGC:          ms.NumGC,
 			ActiveUsers:    activeUsers,
-			L1DiskFiles:    c.DiskFileCount(),
-			RedisKeyCount:  c.DBSize(ctx),
+			L1DiskFiles:    diskFiles,
+			RedisKeyCount:  redisKeyCount,
 		}
 
 		w.Header().Set("Content-Type", "application/json")
