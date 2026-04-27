@@ -2,20 +2,36 @@ package cache
 
 import (
 	"context"
+	"os"
+	"strings"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-// Cache is the interface satisfied by *RedisCache and (later) by test doubles.
+// Disabled returns true when the CACHE_ENABLED env var is "false" or "0".
+func Disabled() bool {
+	v := strings.ToLower(os.Getenv("CACHE_ENABLED"))
+	return v == "false" || v == "0"
+}
+
+// gvrNotifyFunc is the callback signature used to notify the ResourceWatcher
+// when a new GVR is registered (so it can start an informer).
+type gvrNotifyFunc = func(context.Context, schema.GroupVersionResource)
+
+const (
+	DefaultResourceTTL = time.Hour
+	ResolvedCacheTTL   = time.Hour
+	APIResultCacheTTL  = 60 * time.Second
+	ReverseIndexTTL    = 2 * time.Hour
+	notFoundTTL        = 30 * time.Second
+)
+
+// Cache is the interface satisfied by *MemCache (and test doubles).
 // It contains every method that callers outside the cache package need.
 //
 // Methods intentionally NOT on the interface:
-//   - Pipeline (returns redis.Pipeliner — Redis-specific; use PipelineFrom)
-//   - Ping / Close (lifecycle, only used by main.go on the concrete type)
-//   - SetDiskStore, SetGVRNotifier, RegisterGVRTTL (configuration, concrete-only)
-//   - DiskFileCount (implementation detail; callers use type assertion)
+//   - SetGVRNotifier, RegisterGVRTTL (configuration, concrete-only)
 type Cache interface {
 	// ── Core read/write ──────────────────────────────────────────────────
 	Get(ctx context.Context, key string, dest any) (bool, error)
@@ -73,15 +89,5 @@ type Cache interface {
 	DBSize(ctx context.Context) int64
 }
 
-// compile-time check: *RedisCache satisfies Cache.
-var _ Cache = (*RedisCache)(nil)
-
-// PipelineFrom returns the Redis pipeliner if the cache is a *RedisCache, nil otherwise.
-// Callers that need pipeline access (RegisterL1Dependencies, widget dep registration)
-// already guard against a nil return.
-func PipelineFrom(ctx context.Context, c Cache) redis.Pipeliner {
-	if rc, ok := c.(*RedisCache); ok {
-		return rc.Pipeline(ctx)
-	}
-	return nil
-}
+// compile-time check: *MemCache satisfies Cache.
+var _ Cache = (*MemCache)(nil)

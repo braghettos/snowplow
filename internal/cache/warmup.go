@@ -93,10 +93,7 @@ func (w *Warmer) SetWarmupConfig(cfg *WarmupConfig) {
 		if entry.TTL != "" {
 			if ttl, err := time.ParseDuration(entry.TTL); err == nil {
 				w.gvrTTLs[gvr] = ttl
-				switch cc := w.cache.(type) {
-				case *RedisCache:
-					cc.RegisterGVRTTL(gvr, ttl)
-				case *MemCache:
+				if cc, ok := w.cache.(*MemCache); ok {
 					cc.RegisterGVRTTL(gvr, ttl)
 				}
 			} else {

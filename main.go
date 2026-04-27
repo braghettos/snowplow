@@ -335,10 +335,7 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cach
 		return
 	}
 
-	switch cc := c.(type) {
-	case *cache.MemCache:
-		cc.SetGVRNotifier(resourceWatcher.AddGVR)
-	case *cache.RedisCache:
+	if cc, ok := c.(*cache.MemCache); ok {
 		cc.SetGVRNotifier(resourceWatcher.AddGVR)
 	}
 	globalInformerReader = resourceWatcher // InformerReader interface — reads from informer store

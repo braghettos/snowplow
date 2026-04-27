@@ -194,10 +194,6 @@ func RegisterL1Dependencies(ctx context.Context, c Cache, tracker *DependencyTra
 	}
 
 	seen := make(map[string]bool)
-	pipe := PipelineFrom(ctx, c)
-	if pipe == nil {
-		return
-	}
 
 	// Also register the unpaginated base key so that events trigger
 	// refresh of both paginated and unpaginated variants. HTTP requests
@@ -214,11 +210,10 @@ func RegisterL1Dependencies(ctx context.Context, c Cache, tracker *DependencyTra
 		key := L1ResourceDepKey(ref.GVRKey, ref.NS, ref.Name)
 		if !seen[key] {
 			seen[key] = true
-			pipe.SAdd(ctx, key, l1Key)
+			_ = c.SAddWithTTL(ctx, key, l1Key, ReverseIndexTTL)
 			if baseKey != "" {
-				pipe.SAdd(ctx, key, baseKey)
+				_ = c.SAddWithTTL(ctx, key, baseKey, ReverseIndexTTL)
 			}
-			pipe.Expire(ctx, key, ReverseIndexTTL)
 		}
 	}
 
@@ -228,16 +223,13 @@ func RegisterL1Dependencies(ctx context.Context, c Cache, tracker *DependencyTra
 			key := L1ResourceDepKey(ref.GVRKey, "", "")
 			if !seen[key] {
 				seen[key] = true
-				pipe.SAdd(ctx, key, l1Key)
+				_ = c.SAddWithTTL(ctx, key, l1Key, ReverseIndexTTL)
 				if baseKey != "" {
-					pipe.SAdd(ctx, key, baseKey)
+					_ = c.SAddWithTTL(ctx, key, baseKey, ReverseIndexTTL)
 				}
-				pipe.Expire(ctx, key, ReverseIndexTTL)
 			}
 		}
 	}
-
-	_, _ = pipe.Exec(ctx)
 }
 
 

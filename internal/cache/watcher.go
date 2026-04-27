@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -504,45 +503,33 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 	// Redis pipeline: one round-trip for all GET deps (~1-2s for 50K commands).
 	allKeys := make(map[string]bool)
 
-	// Pipeline ALL dep SMembers (list + cluster + get) into one Redis
-	// round-trip. Before this change list and cluster deps used sequential
-	// SMembers calls — one round-trip each. At scale (50K compositions)
-	// this added measurable latency to every L1 refresh batch.
-	totalDeps := len(listDeps) + len(clusterDeps) + len(getDeps)
-	if totalDeps > 0 {
-		pipe := PipelineFrom(ctx, rw.cache)
-		if pipe != nil {
-			type pipeCmd struct {
-				cmd *redis.StringSliceCmd
-			}
-			pipeCmds := make([]pipeCmd, 0, totalDeps)
-			for _, dep := range listDeps {
-				cmd := pipe.SMembers(ctx, dep.redisKey)
-				pipeCmds = append(pipeCmds, pipeCmd{cmd: cmd})
-			}
-			for _, dep := range clusterDeps {
-				cmd := pipe.SMembers(ctx, dep.redisKey)
-				pipeCmds = append(pipeCmds, pipeCmd{cmd: cmd})
-			}
-			for _, dep := range getDeps {
-				cmd := pipe.SMembers(ctx, dep.redisKey)
-				pipeCmds = append(pipeCmds, pipeCmd{cmd: cmd})
-			}
-			_, execErr := pipe.Exec(ctx)
-			if execErr != nil && execErr != redis.Nil {
-				slog.Warn("triggerL1RefreshBatch: dep pipeline failed",
-					slog.Any("err", execErr),
-					slog.Int("totalDeps", totalDeps))
-			}
-			for _, pc := range pipeCmds {
-				members, err := pc.cmd.Result()
-				if err != nil {
-					continue
-				}
-				for _, k := range members {
-					allKeys[k] = true
-				}
-			}
+	// Look up all dep sets (list + cluster + get) via direct SMembers calls.
+	// In-process MemCache makes each call O(1) — no pipelining needed.
+	for _, dep := range listDeps {
+		members, err := rw.cache.SMembers(ctx, dep.redisKey)
+		if err != nil {
+			continue
+		}
+		for _, k := range members {
+			allKeys[k] = true
+		}
+	}
+	for _, dep := range clusterDeps {
+		members, err := rw.cache.SMembers(ctx, dep.redisKey)
+		if err != nil {
+			continue
+		}
+		for _, k := range members {
+			allKeys[k] = true
+		}
+	}
+	for _, dep := range getDeps {
+		members, err := rw.cache.SMembers(ctx, dep.redisKey)
+		if err != nil {
+			continue
+		}
+		for _, k := range members {
+			allKeys[k] = true
 		}
 	}
 

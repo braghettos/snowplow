@@ -49,7 +49,7 @@ type MemCache struct {
 	// the same format as RBACField (verb:group/resource:namespace).
 	rbac sync.Map // string -> *memEntry (data = "true" or "false")
 
-	// GVR TTLs and notifier (same semantics as RedisCache).
+	// GVR TTLs and notifier.
 	gvrTTLs     sync.Map
 	onNewGVR    atomic.Value // stores gvrNotifyFunc
 	resourceTTL time.Duration
@@ -283,7 +283,7 @@ func (c *MemCache) SetRawForGVR(_ context.Context, gvr schema.GroupVersionResour
 
 // SetResolvedRaw stores a fully-resolved widget/restaction output with
 // ResolvedCacheTTL. Also tracks the key in a per-user resolved index set
-// for O(1) invalidation (matching RedisCache.SetResolvedRaw behavior).
+// for O(1) invalidation.
 func (c *MemCache) SetResolvedRaw(_ context.Context, key string, val []byte) error {
 	if c == nil {
 		return nil
@@ -538,7 +538,7 @@ func (c *MemCache) AssembleListFromIndex(ctx context.Context, gvr schema.GroupVe
 		return nil, false, err
 	}
 
-	// Build GET keys from member names (same logic as RedisCache).
+	// Build GET keys from member names.
 	getKeys := make([]string, len(members))
 	for i, member := range members {
 		if namespace == "" {
@@ -558,7 +558,7 @@ func (c *MemCache) AssembleListFromIndex(ctx context.Context, gvr schema.GroupVe
 		return nil, false, nil
 	}
 
-	// Assemble into an UnstructuredList JSON (same format as RedisCache).
+	// Assemble into an UnstructuredList JSON.
 	var buf bytes.Buffer
 	buf.WriteString(`{"apiVersion":"`)
 	g := gvr.Group
