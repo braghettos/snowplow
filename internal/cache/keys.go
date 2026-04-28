@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"strconv"
 	"strings"
@@ -218,17 +219,25 @@ func RegisterL1Dependencies(ctx context.Context, c Cache, tracker *DependencyTra
 	}
 
 	// Cluster-wide deps: only for GVRs that were LISTed (name="").
+	clusterRegistered := 0
 	for _, ref := range refs {
 		if ref.Name == "" {
 			key := L1ResourceDepKey(ref.GVRKey, "", "")
 			if !seen[key] {
 				seen[key] = true
 				_ = c.SAddWithTTL(ctx, key, l1Key, ReverseIndexTTL)
+				clusterRegistered++
 				if baseKey != "" {
 					_ = c.SAddWithTTL(ctx, key, baseKey, ReverseIndexTTL)
 				}
 			}
 		}
+	}
+	if clusterRegistered > 0 {
+		slog.Info("RegisterL1Dependencies: cluster-wide deps registered",
+			slog.String("l1Key", l1Key),
+			slog.Int("clusterDeps", clusterRegistered),
+			slog.Int("perResourceDeps", len(seen)-clusterRegistered))
 	}
 }
 

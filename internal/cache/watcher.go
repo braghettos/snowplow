@@ -517,20 +517,39 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 	for _, dep := range clusterDeps {
 		members, err := rw.cache.SMembers(ctx, dep.redisKey)
 		if err != nil {
+			slog.Warn("triggerL1RefreshBatch: SMembers error", slog.String("key", dep.redisKey), slog.Any("err", err))
 			continue
+		}
+		if len(members) == 0 {
+			slog.Info("triggerL1RefreshBatch: cluster dep has 0 members",
+				slog.String("depKey", dep.redisKey))
 		}
 		for _, k := range members {
 			allKeys[k] = true
 		}
 	}
-	for _, dep := range getDeps {
-		members, err := rw.cache.SMembers(ctx, dep.redisKey)
-		if err != nil {
-			continue
+	// GET deps are only looked up when the batch is small enough that
+	// individual resource tracking matters.  When the batch has cluster-wide
+	// LIST deps (which already cover all resources in the GVR), individual
+	// GET dep lookups are redundant — the LIST dep already triggers refresh
+	// for the aggregating RESTActions, and per-resource widgets are
+	// refreshed via cascade.  This prevents 500K SMembers calls when 50K
+	// compositions are deployed simultaneously.
+	if len(getDeps) <= 100 {
+		for _, dep := range getDeps {
+			members, err := rw.cache.SMembers(ctx, dep.redisKey)
+			if err != nil {
+				continue
+			}
+			for _, k := range members {
+				allKeys[k] = true
+			}
 		}
-		for _, k := range members {
-			allKeys[k] = true
-		}
+	} else {
+		slog.Info("triggerL1RefreshBatch: skipping GET deps (covered by LIST/cluster deps)",
+			slog.Int("getDeps", len(getDeps)),
+			slog.Int("listDeps", len(listDeps)),
+			slog.Int("clusterDeps", len(clusterDeps)))
 	}
 
 	if len(allKeys) == 0 {
@@ -748,8 +767,8 @@ func (rw *ResourceWatcher) markDirtySequentialBatch(ctx context.Context, trigger
 		// One goroutine per identity; new events set pending=true
 		// instead of spawning competing goroutines.
 		for state.pending.Swap(false) {
-			_ = state.drainEntries()
-			dirtySet := NewBypassAllDirtySet()
+			entries := state.drainEntries()
+			dirtySet := NewDirtySet(entries)
 
 			var allCascade []string
 			for _, pg := range pages {
@@ -838,8 +857,8 @@ func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR s
 		}()
 
 		for state.pending.Swap(false) {
-			_ = state.drainEntries()
-			dirtySet := NewBypassAllDirtySet()
+			entries := state.drainEntries()
+			dirtySet := NewDirtySet(entries)
 
 			var allCascade []string
 			for _, pg := range pages {
