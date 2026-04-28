@@ -6,7 +6,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"runtime"
 	"strings"
 	"sync"
@@ -160,6 +163,14 @@ func preWarmChildWidgets(parentCtx context.Context, c cache.Cache, resolved *uns
 
 // recursivePreWarm resolves refs into L1 cache, then extracts their children
 // and recurses until maxDepth or no more children are found.
+// recursivePreWarm warms the widget tree by making HTTP /call requests to
+// snowplow's own endpoint.  This ensures:
+// 1. Same L1 keys as the browser (page=0, perPage=0)
+// 2. Same dep registration (full handler chain including RegisterL1Dependencies)
+// 3. Same identity resolution (userconfig middleware)
+//
+// The tree is walked the same way the frontend renders: fetch a widget's
+// /call response, parse resourcesRefs.items for child paths, recurse.
 func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, c cache.Cache, dynClient k8sdynamic.Interface, refs []l1Ref, authnNS string, visited map[string]bool, depth int) {
 	if depth > preWarmMaxDepth || len(refs) == 0 {
 		return
@@ -181,23 +192,73 @@ func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.E
 		return
 	}
 
-	resolved := resolveL1RefsCollect(ctx, user, ep, accessToken, c, dynClient, unvisited, authnNS)
-
+	// Resolve each ref via HTTP /call — same as the browser.
 	var nextRefs []l1Ref
-	for _, res := range resolved {
-		childItems, found, err := unstructured.NestedSlice(res.Object, "status", "resourcesRefs", "items")
-		if err != nil || !found || len(childItems) == 0 {
-			continue
-		}
-		// Collect ref IDs that are action-linked (navigate, openDrawer,
-		// openModal, etc.). These are deferred — the frontend only
-		// resolves them on user interaction — so the prewarm must skip
-		// them to avoid recursing into 50K+ composition children.
-		actionRefIDs := extractActionRefIDs(res.Object)
-		nextRefs = append(nextRefs, extractChildWidgetRefs(ctx, c, childItems, cache.CacheIdentity(ctx, user.Username), actionRefIDs)...)
+	var mu sync.Mutex
+	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
+	var wg sync.WaitGroup
+
+	for _, ref := range unvisited {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(r l1Ref) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			body, err := prewarmHTTPCall(ctx, r, accessToken)
+			if err != nil || body == nil {
+				return
+			}
+
+			// Parse resourcesRefs.items for child widget paths.
+			items, found, _ := unstructured.NestedSlice(body, "status", "resourcesRefs", "items")
+			if !found || len(items) == 0 {
+				return
+			}
+			actionRefIDs := extractActionRefIDs(body)
+			identity := cache.CacheIdentity(ctx, user.Username)
+			children := extractChildWidgetRefs(ctx, c, items, identity, actionRefIDs)
+			mu.Lock()
+			nextRefs = append(nextRefs, children...)
+			mu.Unlock()
+		}(ref)
 	}
+	wg.Wait()
 
 	recursivePreWarm(ctx, user, ep, accessToken, c, dynClient, nextRefs, authnNS, visited, depth+1)
+}
+
+// prewarmHTTPCall makes an HTTP GET /call to snowplow's own endpoint.
+// The request goes through the full handler chain (Dispatcher → Widget/RESTAction
+// handler → L1 lookup → resolve → dep registration).
+func prewarmHTTPCall(ctx context.Context, ref l1Ref, accessToken string) (map[string]interface{}, error) {
+	callPath := fmt.Sprintf("/call?apiVersion=%s/%s&resource=%s&name=%s&namespace=%s",
+		url.QueryEscape(ref.gvr.Group), url.QueryEscape(ref.gvr.Version),
+		url.QueryEscape(ref.gvr.Resource),
+		url.QueryEscape(ref.name), url.QueryEscape(ref.ns))
+
+	reqURL := "http://localhost:8081" + callPath
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("prewarm /call returned %d for %s/%s", resp.StatusCode, ref.ns, ref.name)
+	}
+
+	var body map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+	return body, nil
 }
 
 // ---------------------------------------------------------------------------
