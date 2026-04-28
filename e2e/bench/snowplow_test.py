@@ -1606,19 +1606,33 @@ subjects:
             record("ADD: GET new resource returns 200", code == 200, ms, code)
             kubectl("label", f"{COMP_RES}.{COMP_GVR}/{TEST_NAME_NEW}", "-n", TEST_NS,
                     "cache-test=updated", "--overwrite")
-            time.sleep(5)
-            ms, code, body = http_get_json(call_url(TEST_NS, TEST_NAME_NEW), token)
-            if code == 404:
-                # Controller may have deleted the resource during reconciliation
-                record("UPDATE: resource deleted by controller (expected for ephemeral CRs)", True, ms, code,
-                       note="controller reconciled and removed resource")
-            else:
-                label_ok = isinstance(body, dict) and body.get("metadata", {}).get("labels", {}).get("cache-test") == "updated"
-                record("UPDATE: label reflected in response", code == 200 and label_ok, ms, code)
+            # Poll until label is reflected (stale-while-refresh: background
+            # refresh must overwrite L1 with the updated resource).
+            label_ok = False
+            for attempt in range(15):  # up to 30s
+                time.sleep(2)
+                ms, code, body = http_get_json(call_url(TEST_NS, TEST_NAME_NEW), token)
+                if code == 404:
+                    record("UPDATE: resource deleted by controller (expected for ephemeral CRs)", True, ms, code,
+                           note="controller reconciled and removed resource")
+                    label_ok = None  # skip the label check
+                    break
+                if isinstance(body, dict) and body.get("metadata", {}).get("labels", {}).get("cache-test") == "updated":
+                    label_ok = True
+                    break
+            if label_ok is not None:
+                record("UPDATE: label reflected in response", label_ok, ms, code)
+
             kubectl("delete", "-n", TEST_NS, f"{COMP_RES}.{COMP_GVR}", TEST_NAME_NEW)
-            time.sleep(10)
-            ms, code, _ = http_get(call_url(TEST_NS, TEST_NAME_NEW), token)
-            record("DELETE: resource removed from cache", code in (404, 500), ms, code)
+            # Poll until DELETE is reflected (L1 keys invalidated via dep index).
+            deleted = False
+            for attempt in range(15):  # up to 30s
+                time.sleep(2)
+                ms, code, _ = http_get(call_url(TEST_NS, TEST_NAME_NEW), token)
+                if code in (404, 500):
+                    deleted = True
+                    break
+            record("DELETE: resource removed from cache", deleted, ms, code)
 
     # T11 — RBAC cache
     section("T11 — RBAC Cache")

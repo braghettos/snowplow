@@ -83,12 +83,16 @@ def wait_for_l1_warmup(timeout=300):
     log("Waiting for L1 warmup ...")
     deadline = time.time() + timeout
     while time.time() < deadline:
-        resolved = redis_cmd("KEYS", "snowplow:resolved:*")
-        if resolved and resolved.strip():
-            count = len([k for k in resolved.strip().split("\n") if k.strip()])
-            if count > 0:
-                log(f"L1 warmup detected ({count} resolved keys)")
-                return True
+        try:
+            req = urllib.request.Request(SNOWPLOW + "/metrics/runtime")
+            with urllib.request.urlopen(req, timeout=5) as r:
+                rt = json.loads(r.read())
+                keys = rt.get("cache_key_count", rt.get("redis_key_count", 0))
+                if keys > 0:
+                    log(f"L1 warmup detected ({keys} cache keys)")
+                    return True
+        except Exception:
+            pass
         time.sleep(5)
     log("WARNING: L1 warmup timeout")
     return False
@@ -148,32 +152,42 @@ def browser_login(page, username, password):
     return False
 
 
-def measure_page_load(page, page_path, page_name, iters=5):
-    """Navigate to a page and measure total time until all XHR requests complete.
+def measure_page_load(page, page_path, page_name, iters=5, target_calls=0, timeout_s=300):
+    """Navigate to a page and measure total time until all widget /call
+    requests complete.
 
-    Returns dict with load times, XHR count, and waterfall duration.
+    The widget tree is discovered progressively: each level's response
+    reveals the next level's children.  With cache ON responses arrive
+    in ~5ms so all levels are discovered quickly.  With cache OFF each
+    level takes ~1-2s, creating long gaps between child discovery.
+
+    To compare apples-to-apples:
+      1. First run with cache ON to learn the full widget count
+         (target_calls=0 uses a 10s stability window)
+      2. Then run with cache OFF using target_calls=<ON count>
+         so we wait for the SAME number of widgets.
+
+    Returns dict with load times, /call count, and waterfall duration.
     """
+    stability_window = 10  # seconds with no new /call before declaring done
     results = []
     for i in range(iters):
         page.evaluate("() => performance.clearResourceTimings()")
         t0 = time.perf_counter()
         try:
-            # Load the page — don't wait for networkidle (SPA hydration gap)
-            page.goto(f"{FRONTEND}{page_path}", wait_until="load", timeout=120000)
+            page.goto(f"{FRONTEND}{page_path}", wait_until="load", timeout=30000)
             if i == 0:
                 page.wait_for_timeout(1000)
                 log(f"    URL after nav: {page.url}")
-            # Wait for SPA to hydrate and all /call requests to finish.
-            # 1. Wait at least 5s for React to mount and start fetching
-            # 2. Then poll until no new /call requests for 2 seconds
+            # Wait for React to hydrate
             page.wait_for_timeout(5000)
             prev_count = page.evaluate("""() => {
                 return performance.getEntriesByType('resource')
                     .filter(x => x.name.includes('/call')).length;
             }""")
             stable_since = time.perf_counter()
-            while time.perf_counter() - t0 < 120:
-                page.wait_for_timeout(500)
+            while time.perf_counter() - t0 < timeout_s:
+                page.wait_for_timeout(1000)
                 cur_count = page.evaluate("""() => {
                     return performance.getEntriesByType('resource')
                         .filter(x => x.name.includes('/call')).length;
@@ -181,8 +195,15 @@ def measure_page_load(page, page_path, page_name, iters=5):
                 if cur_count > prev_count:
                     prev_count = cur_count
                     stable_since = time.perf_counter()
-                elif time.perf_counter() - stable_since > 2:
-                    break  # No new /call for 2s — page is loaded
+                # If we have a target, stop as soon as we reach it
+                if target_calls > 0 and cur_count >= target_calls:
+                    break
+                # Otherwise, use the stability window
+                if target_calls == 0 and time.perf_counter() - stable_since > stability_window:
+                    break
+                # With a target, use a longer stability fallback (30s)
+                if target_calls > 0 and time.perf_counter() - stable_since > 30:
+                    break
         except Exception:
             pass
         wall_ms = int((time.perf_counter() - t0) * 1000)
@@ -191,16 +212,15 @@ def measure_page_load(page, page_path, page_name, iters=5):
             const e = performance.getEntriesByType('resource');
             const xhrs = e.filter(x => x.initiatorType === 'xmlhttprequest' || x.initiatorType === 'fetch');
             const calls = xhrs.filter(x => x.name.includes('/call'));
-            // Debug: sample of all fetch URLs to diagnose /call detection
-            const sampleUrls = xhrs.slice(0, 5).map(x => x.name);
+            // Time from first /call start to last /call responseEnd
+            // = total page loading time as experienced by the user
+            const firstStart = calls.length > 0 ? Math.min(...calls.map(x => x.startTime)) : 0;
+            const lastEnd = calls.length > 0 ? Math.max(...calls.map(x => x.responseEnd)) : 0;
             return {
                 totalRequests: e.length,
                 xhrCount: xhrs.length,
                 callCount: calls.length,
-                sampleUrls: sampleUrls,
-                waterfallMs: calls.length > 0 ?
-                    Math.round(Math.max(...calls.map(x => x.responseEnd)) - Math.min(...calls.map(x => x.startTime))) : 0,
-                totalCallTimeMs: Math.round(calls.reduce((s, x) => s + (x.responseEnd - x.startTime), 0)),
+                pageLoadMs: Math.round(lastEnd - firstStart),
                 avgCallMs: calls.length > 0 ?
                     Math.round(calls.reduce((s, x) => s + (x.responseEnd - x.startTime), 0) / calls.length) : 0,
             };
@@ -209,24 +229,18 @@ def measure_page_load(page, page_path, page_name, iters=5):
         result = {
             "wall_ms": wall_ms,
             "call_count": network.get("callCount", 0),
-            "waterfall_ms": network.get("waterfallMs", 0),
-            "total_call_ms": network.get("totalCallTimeMs", 0),
+            "page_load_ms": network.get("pageLoadMs", 0),
             "avg_call_ms": network.get("avgCallMs", 0),
         }
         results.append(result)
-        log(f"  [{i+1}/{iters}] {page_name}: wall={wall_ms}ms  /call={result['call_count']}  "
-            f"xhr={network.get('xhrCount',0)}  waterfall={result['waterfall_ms']}ms  avg_call={result['avg_call_ms']}ms")
-        if i == 0 and result['call_count'] == 0:
-            log(f"    DEBUG: total_resources={network.get('totalRequests',0)}  "
-                f"xhr_count={network.get('xhrCount',0)}  sample_urls={network.get('sampleUrls', [])}")
+        log(f"  [{i+1}/{iters}] {page_name}: page_load={result['page_load_ms']}ms  "
+            f"/call={result['call_count']}  avg_call={result['avg_call_ms']}ms")
 
-    walls = [r["wall_ms"] for r in results]
-    waterfalls = [r["waterfall_ms"] for r in results]
+    page_loads = [r["page_load_ms"] for r in results]
     calls = [r["call_count"] for r in results]
     avg_calls = [r["avg_call_ms"] for r in results]
     return {
-        "wall_p50": sorted(walls)[len(walls)//2],
-        "waterfall_p50": sorted(waterfalls)[len(waterfalls)//2],
+        "page_load_p50": sorted(page_loads)[len(page_loads)//2],
         "call_count": sorted(calls)[len(calls)//2],
         "avg_call_p50": sorted(avg_calls)[len(avg_calls)//2],
         "all": results,
@@ -273,9 +287,14 @@ def main():
 
     enable_cache()
     wait_for_l1_warmup()
-    resolved = redis_cmd("KEYS", "snowplow:resolved:*")
-    resolved_count = len([k for k in (resolved or "").strip().split("\n") if k.strip()])
-    log(f"L1 resolved keys: {resolved_count}")
+    try:
+        req = urllib.request.Request(SNOWPLOW + "/metrics/runtime")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            rt = json.loads(r.read())
+            cache_keys = rt.get("cache_key_count", rt.get("redis_key_count", 0))
+            log(f"L1 cache keys: {cache_keys}")
+    except Exception:
+        log("L1 cache key count unavailable")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -290,16 +309,22 @@ def main():
 
         log("Measuring Dashboard (cache ON, warm L1) ...")
         on_dashboard = measure_page_load(page, "/dashboard", "Dashboard", iters=ITERS)
+        on_dash_calls = on_dashboard["call_count"]
+        log(f"  Dashboard widget tree: {on_dash_calls} /call requests")
 
         log("Measuring Compositions page (cache ON, warm L1) ...")
         on_compositions = measure_page_load(page, "/compositions", "Compositions", iters=ITERS)
+        on_comp_calls = on_compositions["call_count"]
+        log(f"  Compositions widget tree: {on_comp_calls} /call requests")
 
         ctx.close()
         browser.close()
 
     # ── Step 2: Cache OFF ────────────────────────────────────────────────
+    # Use the cache ON widget counts as targets so the test waits for the
+    # FULL tree to load (same number of widgets) before declaring done.
     print(f"\n{BOLD}{'─'*80}{RESET}")
-    print(f"{BOLD}  CACHE OFF — Direct K8s API{RESET}")
+    print(f"{BOLD}  CACHE OFF — Direct K8s API  (target: {on_dash_calls} dashboard, {on_comp_calls} compositions){RESET}")
     print(f"{BOLD}{'─'*80}{RESET}")
 
     disable_cache()
@@ -312,11 +337,13 @@ def main():
         log("Logging in ...")
         browser_login(page, "admin", USERS["admin"])
 
-        log("Measuring Dashboard (cache OFF) ...")
-        off_dashboard = measure_page_load(page, "/dashboard", "Dashboard", iters=ITERS)
+        log(f"Measuring Dashboard (cache OFF, target={on_dash_calls} calls) ...")
+        off_dashboard = measure_page_load(page, "/dashboard", "Dashboard",
+                                           iters=ITERS, target_calls=on_dash_calls)
 
-        log("Measuring Compositions page (cache OFF) ...")
-        off_compositions = measure_page_load(page, "/compositions", "Compositions", iters=ITERS)
+        log(f"Measuring Compositions (cache OFF, target={on_comp_calls} calls) ...")
+        off_compositions = measure_page_load(page, "/compositions", "Compositions",
+                                              iters=ITERS, target_calls=on_comp_calls)
 
         ctx.close()
         browser.close()
@@ -337,8 +364,7 @@ def main():
         ("Compositions", on_compositions, off_compositions),
     ]:
         for metric, key in [
-            ("Wall time", "wall_p50"),
-            ("Waterfall", "waterfall_p50"),
+            ("Page load", "page_load_p50"),
             ("/call count", "call_count"),
             ("Avg /call time", "avg_call_p50"),
         ]:
@@ -354,10 +380,10 @@ def main():
         print(f"  {'':20s}")
 
     # Overall speedup
-    on_total = on_dashboard["wall_p50"] + on_compositions["wall_p50"]
-    off_total = off_dashboard["wall_p50"] + off_compositions["wall_p50"]
+    on_total = on_dashboard["page_load_p50"] + on_compositions["page_load_p50"]
+    off_total = off_dashboard["page_load_p50"] + off_compositions["page_load_p50"]
     total_spd = off_total / on_total if on_total > 0 else 0
-    print(f"  {'TOTAL':<20s}  {'Wall time':<20s}  {on_total:>8d}ms  {off_total:>8d}ms  "
+    print(f"  {'TOTAL':<20s}  {'Page load':<20s}  {on_total:>8d}ms  {off_total:>8d}ms  "
           f"{GREEN if total_spd > 1.5 else RED}{total_spd:>8.1f}x{RESET}")
 
     print(f"\n{BOLD}{'═'*80}{RESET}")
