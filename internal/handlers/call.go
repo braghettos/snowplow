@@ -179,6 +179,25 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		listIdxKey := cache.ListIndexKey(opts.gvr, opts.nsn.Namespace)
 		_ = c.Delete(req.Context(), getKey, listKey, cache.ListKey(opts.gvr, ""), listIdxKey, cache.ListIndexKey(opts.gvr, ""))
 
+		// On DELETE only: invalidate L1 resolved keys that depend on the
+		// deleted resource. The resource no longer exists so serving stale
+		// L1 would show a ghost. For UPDATE/PATCH, stale-while-revalidate
+		// is correct — the background refresh will update L1 with new data.
+		if opts.verb == http.MethodDelete {
+			gvrKey := cache.GVRToKey(opts.gvr)
+			for _, depKey := range []string{
+				cache.L1ResourceDepKey(gvrKey, opts.nsn.Namespace, opts.nsn.Name),
+				cache.L1ResourceDepKey(gvrKey, opts.nsn.Namespace, ""),
+				cache.L1ResourceDepKey(gvrKey, "", ""),
+			} {
+				if members, err := c.SMembers(req.Context(), depKey); err == nil {
+					for _, m := range members {
+						_ = c.Delete(req.Context(), m)
+					}
+				}
+			}
+		}
+
 		slog.Debug("cache invalidated after mutation",
 			slog.String("verb", opts.verb), slog.String("gvr", cache.GVRToKey(opts.gvr)))
 	}

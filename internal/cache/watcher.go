@@ -195,7 +195,7 @@ func NewResourceWatcher(c Cache, rc *rest.Config) (*ResourceWatcher, error) {
 		warmCh:      make(chan refreshItem, 10000),
 		coldCh:      make(chan refreshItem, 10000),
 		warmColdSem: make(chan struct{}, runtime.GOMAXPROCS(0)),
-		hotSem:      make(chan struct{}, max(1, runtime.GOMAXPROCS(0)/2)),
+		hotSem:      make(chan struct{}, runtime.GOMAXPROCS(0)),
 	}, nil
 }
 
@@ -725,7 +725,6 @@ func (rw *ResourceWatcher) markDirtySequentialBatch(ctx context.Context, trigger
 	}
 
 	go func() {
-		// Acquire semaphore slot if bounded (WARM/COLD). HOT passes nil.
 		if sem != nil {
 			sem <- struct{}{}
 			defer func() { <-sem }()
@@ -742,11 +741,16 @@ func (rw *ResourceWatcher) markDirtySequentialBatch(ctx context.Context, trigger
 			}
 		}()
 
+		// Loop-until-clean: resolve, then check if new events arrived
+		// during resolution. If yes, resolve again with the latest
+		// informer snapshot. No debounce — the loop exits as soon as
+		// no new events arrived during the last resolve.
+		// One goroutine per identity; new events set pending=true
+		// instead of spawning competing goroutines.
 		for state.pending.Swap(false) {
 			_ = state.drainEntries()
 			dirtySet := NewBypassAllDirtySet()
 
-			// Resolve each page sequentially: p1 → p2 → ... → pN.
 			var allCascade []string
 			for _, pg := range pages {
 				refreshCtx, cancel := context.WithTimeout(WithDirtySet(ctx, dirtySet), 60*time.Second)
@@ -760,10 +764,6 @@ func (rw *ResourceWatcher) markDirtySequentialBatch(ctx context.Context, trigger
 				slog.Int("cascade", len(allCascade)),
 				slog.String("trigger", triggerGVR.String()))
 
-			// Cascade: group dependent keys the same way and resolve
-			// sequentially within each group. Cascades get no bypass
-			// (gvrKey="" ns="") because they are transitive dependencies
-			// that don't directly correspond to the triggering event.
 			if len(allCascade) > 0 {
 				cascadeGroups := make(map[string][]pageKey)
 				for _, ck := range allCascade {
@@ -775,7 +775,6 @@ func (rw *ResourceWatcher) markDirtySequentialBatch(ctx context.Context, trigger
 					baseKey := ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
 					cascadeGroups[baseKey] = append(cascadeGroups[baseKey], pageKey{key: ck, page: info.Page})
 				}
-				// Ensure unpaginated base key is refreshed alongside paginated.
 				for bk, cps := range cascadeGroups {
 					hasPage0 := false
 					for _, p := range cps {
@@ -839,15 +838,9 @@ func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR s
 		}()
 
 		for state.pending.Swap(false) {
-			// Drain accumulated dirty entries and build a targeted DirtySet
-			// so only the affected GVR+ns pairs bypass the API result cache.
 			_ = state.drainEntries()
 			dirtySet := NewBypassAllDirtySet()
 
-			// Resolve each page sequentially: p1 → p2 → ... → pN.
-			// The underlying data is the same — only the page parameter
-			// changes the JQ output. Sequential avoids N concurrent
-			// goroutines each doing O(items) work.
 			var allCascade []string
 			for _, pg := range pages {
 				refreshCtx, cancel := context.WithTimeout(WithDirtySet(ctx, dirtySet), 60*time.Second)
@@ -856,10 +849,6 @@ func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR s
 				allCascade = append(allCascade, cascade...)
 			}
 
-			// Cascade: group dependent keys the same way and resolve
-			// sequentially within each group. Cascades get no bypass
-			// (gvrKey="" ns="") because they are transitive dependencies
-			// that don't directly correspond to the triggering event.
 			if len(allCascade) > 0 {
 				cascadeGroups := make(map[string][]pageKey)
 				for _, ck := range allCascade {
@@ -871,7 +860,6 @@ func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR s
 					baseKey := ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
 					cascadeGroups[baseKey] = append(cascadeGroups[baseKey], pageKey{key: ck, page: info.Page})
 				}
-				// Ensure unpaginated base key is refreshed alongside paginated.
 				for bk, cps := range cascadeGroups {
 					hasPage0 := false
 					for _, p := range cps {
