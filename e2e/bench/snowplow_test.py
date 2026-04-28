@@ -5,12 +5,12 @@ Snowplow Cache — Unified Test Suite
 Consolidates all cache tests into a single script with selectable phases.
 
 Phases:
-  1  functional   14 test cases: warmup, L1/L3, RBAC, negative cache, informer CRUD, etc.
+  1  functional   16 test cases: warmup, L1/L3, RBAC, negative cache, informer CRUD, cache OFF correctness
   2  latency      Backend + frontend proxy latency benchmark (cache ON vs OFF)
-  3  scaling      8-stage incremental scaling matrix (cache ON vs OFF)
-  4  browser      Playwright browser metrics (DOM, render, XHR waterfall)
+  3  scaling      8-stage incremental scaling matrix (cache ON vs OFF) — skipped at SCALE>=10000
+  4  browser      Playwright browser metrics (cache ON vs OFF, DOM, render, XHR waterfall)
   5  comparison   Browser navigation: cache OFF vs cache ON (cold) vs cache ON (warmed)
-  7  user-scaling Multi-user scaling: warmup + first-login burst at 10/50/100/500/1000 users (opt-in)
+  7  user-scaling Multi-user scaling: warmup + first-login burst + cache OFF baseline
 
 Usage:
   python3 snowplow_test.py                     # all phases
@@ -1449,11 +1449,11 @@ def clean_environment():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# PHASE 1 — FUNCTIONAL VALIDATION (14 test cases)
+# PHASE 1 — FUNCTIONAL VALIDATION (16 test cases: T1-T15 cache ON, T16 cache OFF)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def run_phase_functional(tokens):
-    phase_banner(1, "FUNCTIONAL VALIDATION (cache ENABLED)")
+    phase_banner(1, "FUNCTIONAL VALIDATION (cache ON + OFF correctness)")
 
     # Ensure cache is enabled and warmed before functional tests
     enable_cache()
@@ -1608,8 +1608,10 @@ subjects:
                     "cache-test=updated", "--overwrite")
             # Poll until label is reflected (stale-while-refresh: background
             # refresh must overwrite L1 with the updated resource).
+            # At 50K scale, background refresh takes longer.
+            t10_polls = 30 if SCALE <= 5000 else 60  # up to 60s or 120s
             label_ok = False
-            for attempt in range(15):  # up to 30s
+            for attempt in range(t10_polls):
                 time.sleep(2)
                 ms, code, body = http_get_json(call_url(TEST_NS, TEST_NAME_NEW), token)
                 if code == 404:
@@ -1624,9 +1626,9 @@ subjects:
                 record("UPDATE: label reflected in response", label_ok, ms, code)
 
             kubectl("delete", "-n", TEST_NS, f"{COMP_RES}.{COMP_GVR}", TEST_NAME_NEW)
-            # Poll until DELETE is reflected (L1 keys invalidated via dep index).
+            # Poll until DELETE is reflected (background refresh overwrites L1).
             deleted = False
-            for attempt in range(15):  # up to 30s
+            for attempt in range(t10_polls):
                 time.sleep(2)
                 ms, code, _ = http_get(call_url(TEST_NS, TEST_NAME_NEW), token)
                 if code in (404, 500):
@@ -1699,6 +1701,42 @@ subjects:
         # Also verify backend is independently reachable
         be_ms, be_code, _ = http_get(WIDGET_ENDPOINTS[0][1], token, base_url=SNOWPLOW)
         record("Backend API independently reachable", be_code == 200, be_ms, be_code)
+
+    # ── Cache OFF correctness check ──
+    # Verify snowplow serves correct data without cache (direct K8s API path).
+    section("T16 — Cache OFF Correctness")
+    disable_cache()
+    tokens_off = login_all()
+    token_off = tokens_off.get("admin", "")
+
+    # T16a — All endpoints return HTTP 200 with cache disabled
+    all_ok = True
+    for label, path in ALL_ENDPOINTS:
+        ms, code, _ = http_get(path, token_off)
+        ok = code == 200
+        if not ok:
+            all_ok = False
+        record(f"OFF: {label} returns 200", ok, ms, code)
+
+    # T16b — Metrics show 0 cache hits (proves cache code path is off)
+    m_off = cache_metrics(token_off)
+    off_hits = m_off.get("l1_hits", 0) + m_off.get("raw_hits", 0)
+    record("OFF: /metrics/cache shows 0 hits", off_hits == 0,
+           note=f"l1+raw={off_hits}")
+
+    # T16c — Compositions-list returns correct count
+    p16 = "/call?apiVersion=templates.krateo.io%2Fv1&resource=restactions&name=compositions-list&namespace=krateo-system"
+    ms_off, code_off, body_off = http_get_json(p16, token_off)
+    lst_off = body_off.get("status", {}).get("list", []) if isinstance(body_off, dict) else None
+    count_off = len(lst_off) if lst_off is not None else "N/A"
+    cluster_count = count_compositions()
+    count_match = (lst_off is not None and len(lst_off) == cluster_count)
+    record(f"OFF: compositions-list count matches cluster ({count_off} vs {cluster_count})",
+           code_off == 200 and count_match, ms_off, code_off)
+
+    # Restore cache for subsequent phases
+    enable_cache()
+    log("Cache restored after OFF correctness check")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2067,8 +2105,103 @@ def run_phase_scaling(tokens):
 # PHASE 4 — BROWSER METRICS (Playwright)
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _browser_collect_metrics(browser, cache_label):
+    """Collect browser metrics for all users. Returns {user: {page: metrics}}.
+
+    Expects the caller to have already toggled the cache and waited for
+    warmup (if applicable). Creates a fresh browser context per user.
+    """
+    results = {}
+    for username, password in USERS.items():
+        section(f"Browser ({cache_label}): {username}")
+        ctx = browser.new_context(viewport={"width": 1280, "height": 900},
+                                  ignore_https_errors=True)
+        page = ctx.new_page()
+
+        page.goto(f"{FRONTEND}/login", wait_until="networkidle", timeout=300000)
+        page.click('#basic_username', timeout=10000)
+        page.keyboard.type(username, delay=30)
+        page.click('#basic_password', timeout=10000)
+        page.keyboard.type(password, delay=30)
+        page.click('button[type="submit"]')
+        page.wait_for_load_state("networkidle", timeout=30000)
+        page.wait_for_timeout(5000)
+
+        user_results = {}
+        for page_name, page_path in BROWSER_PAGES:
+          try:
+            log(f"  {page_name} — cold ...")
+            page.evaluate("() => performance.clearResourceTimings()")
+            page.goto(f"{FRONTEND}{page_path}", wait_until="networkidle", timeout=120000)
+
+            timing = page.evaluate("""() => {
+                const t = performance.getEntriesByType('navigation')[0];
+                if (!t) return {};
+                return {
+                    ttfb: Math.round(t.responseStart - t.requestStart),
+                    domContentLoaded: Math.round(t.domContentLoadedEventEnd - t.startTime),
+                    loadComplete: Math.round(t.loadEventEnd - t.startTime),
+                };
+            }""")
+            network = page.evaluate("""() => {
+                const e = performance.getEntriesByType('resource');
+                const xhrs = e.filter(x => x.initiatorType === 'xmlhttprequest' || x.initiatorType === 'fetch');
+                return {
+                    requestCount: e.length,
+                    xhrCount: xhrs.length,
+                    totalTransferKB: Math.round(e.reduce((s, x) => s + (x.transferSize || 0), 0) / 1024),
+                    xhrWaterfallMs: xhrs.length > 0 ?
+                        Math.round(Math.max(...xhrs.map(x => x.responseEnd)) - Math.min(...xhrs.map(x => x.startTime))) : 0,
+                };
+            }""")
+            cold = {**(timing or {}), **(network or {})}
+
+            load_values = [cold.get("loadComplete", 0)]
+            for _ in range(ITERS - 1):
+                page.goto(f"{FRONTEND}{page_path}", wait_until="networkidle", timeout=120000)
+                wt = page.evaluate("""() => {
+                    const t = performance.getEntriesByType('navigation')[0];
+                    return t ? Math.round(t.loadEventEnd - t.startTime) : 0;
+                }""")
+                load_values.append(wt)
+
+            cold["loadComplete_p50"] = pct(load_values, 50)
+            cold["loadComplete_p90"] = pct(load_values, 90)
+            user_results[page_name] = cold
+            log(f"    TTFB={cold.get('ttfb', 0)}ms  "
+                f"loadComplete={cold.get('loadComplete', 0)}ms  "
+                f"p50={cold['loadComplete_p50']}ms  "
+                f"XHRs={cold.get('xhrCount', 0)}  "
+                f"waterfall={cold.get('xhrWaterfallMs', 0)}ms  "
+                f"transfer={cold.get('totalTransferKB', 0)}KB")
+          except Exception as e:
+            log(f"    [{page_name}] SKIPPED — {type(e).__name__}: {e}")
+            user_results[page_name] = {"error": str(e)}
+
+        results[username] = user_results
+        ctx.close()
+    return results
+
+
+def _print_browser_table(label, results):
+    """Print a browser metrics summary table."""
+    print(f"\n  {BOLD}{label}{RESET}")
+    print(f"  {'User':<12s} {'Page':<15s} {'TTFB':>6s} {'Load':>6s} {'p50':>6s} {'p90':>6s} {'XHRs':>5s} {'Waterfall':>10s} {'Transfer':>10s}")
+    print(f"  {SEP}")
+    for username, pages in results.items():
+        for pname, d in pages.items():
+            if "error" in d:
+                print(f"  {username:<12s} {pname:<15s}  ERROR: {d['error'][:60]}")
+                continue
+            print(f"  {username:<12s} {pname:<15s} "
+                  f"{d.get('ttfb', 0):>5d}ms {d.get('loadComplete', 0):>5d}ms "
+                  f"{d.get('loadComplete_p50', 0):>5d}ms {d.get('loadComplete_p90', 0):>5d}ms "
+                  f"{d.get('xhrCount', 0):>5d} {d.get('xhrWaterfallMs', 0):>8d}ms "
+                  f"{d.get('totalTransferKB', 0):>8d}KB")
+
+
 def run_phase_browser():
-    phase_banner(4, "BROWSER METRICS (Playwright)")
+    phase_banner(4, "BROWSER METRICS (Playwright, cache ON vs OFF)")
 
     if not FRONTEND:
         log("FRONTEND_URL not set — skipping browser phase")
@@ -2081,93 +2214,54 @@ def run_phase_browser():
         log("Install: pip install playwright && python -m playwright install chromium")
         return
 
-    all_results = {}
+    # ── Cache ON measurement ──
+    enable_cache()
+    wait_for_l1_warmup(timeout=300)
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        for username, password in USERS.items():
-            section(f"Browser: {username}")
-            ctx = browser.new_context(viewport={"width": 1280, "height": 900},
-                                      ignore_https_errors=True)
-            page = ctx.new_page()
+        on_results = _browser_collect_metrics(browser, "cache ON")
 
-            page.goto(f"{FRONTEND}/login", wait_until="networkidle", timeout=300000)
-            page.click('#basic_username', timeout=10000)
-            page.keyboard.type(username, delay=30)
-            page.click('#basic_password', timeout=10000)
-            page.keyboard.type(password, delay=30)
-            page.click('button[type="submit"]')
-            page.wait_for_load_state("networkidle", timeout=30000)
-            page.wait_for_timeout(5000)
-
-            user_results = {}
-            for page_name, page_path in BROWSER_PAGES:
-              try:
-                log(f"  {page_name} — cold ...")
-                page.evaluate("() => performance.clearResourceTimings()")
-                page.goto(f"{FRONTEND}{page_path}", wait_until="networkidle", timeout=120000)
-
-                timing = page.evaluate("""() => {
-                    const t = performance.getEntriesByType('navigation')[0];
-                    if (!t) return {};
-                    return {
-                        ttfb: Math.round(t.responseStart - t.requestStart),
-                        domContentLoaded: Math.round(t.domContentLoadedEventEnd - t.startTime),
-                        loadComplete: Math.round(t.loadEventEnd - t.startTime),
-                    };
-                }""")
-                network = page.evaluate("""() => {
-                    const e = performance.getEntriesByType('resource');
-                    const xhrs = e.filter(x => x.initiatorType === 'xmlhttprequest' || x.initiatorType === 'fetch');
-                    return {
-                        requestCount: e.length,
-                        xhrCount: xhrs.length,
-                        totalTransferKB: Math.round(e.reduce((s, x) => s + (x.transferSize || 0), 0) / 1024),
-                        xhrWaterfallMs: xhrs.length > 0 ?
-                            Math.round(Math.max(...xhrs.map(x => x.responseEnd)) - Math.min(...xhrs.map(x => x.startTime))) : 0,
-                    };
-                }""")
-                cold = {**(timing or {}), **(network or {})}
-
-                load_values = [cold.get("loadComplete", 0)]
-                for _ in range(ITERS - 1):
-                    page.goto(f"{FRONTEND}{page_path}", wait_until="networkidle", timeout=120000)
-                    wt = page.evaluate("""() => {
-                        const t = performance.getEntriesByType('navigation')[0];
-                        return t ? Math.round(t.loadEventEnd - t.startTime) : 0;
-                    }""")
-                    load_values.append(wt)
-
-                cold["loadComplete_p50"] = pct(load_values, 50)
-                cold["loadComplete_p90"] = pct(load_values, 90)
-                user_results[page_name] = cold
-                log(f"    TTFB={cold.get('ttfb', 0)}ms  "
-                    f"loadComplete={cold.get('loadComplete', 0)}ms  "
-                    f"p50={cold['loadComplete_p50']}ms  "
-                    f"XHRs={cold.get('xhrCount', 0)}  "
-                    f"waterfall={cold.get('xhrWaterfallMs', 0)}ms  "
-                    f"transfer={cold.get('totalTransferKB', 0)}KB")
-              except Exception as e:
-                log(f"    [{page_name}] SKIPPED — {type(e).__name__}: {e}")
-                user_results[page_name] = {"error": str(e)}
-
-            all_results[username] = user_results
-            ctx.close()
+        # ── Cache OFF measurement ──
+        disable_cache()
+        off_results = _browser_collect_metrics(browser, "cache OFF")
         browser.close()
 
+    # Restore cache
+    enable_cache()
+
+    # ── Summary tables ──
     section("Browser Summary")
-    print(f"  {'User':<12s} {'Page':<15s} {'TTFB':>6s} {'Load':>6s} {'p50':>6s} {'p90':>6s} {'XHRs':>5s} {'Waterfall':>10s} {'Transfer':>10s}")
-    print(f"  {SEP}")
-    for username, pages in all_results.items():
-        for pname, d in pages.items():
-            print(f"  {username:<12s} {pname:<15s} "
-                  f"{d.get('ttfb', 0):>5d}ms {d.get('loadComplete', 0):>5d}ms "
-                  f"{d.get('loadComplete_p50', 0):>5d}ms {d.get('loadComplete_p90', 0):>5d}ms "
-                  f"{d.get('xhrCount', 0):>5d} {d.get('xhrWaterfallMs', 0):>8d}ms "
-                  f"{d.get('totalTransferKB', 0):>8d}KB")
+    _print_browser_table("Cache ON", on_results)
+    _print_browser_table("Cache OFF", off_results)
+
+    # ── ON vs OFF comparison table ──
+    section("Browser ON vs OFF Comparison")
+    print(f"  {'User':<12s} {'Page':<15s} {'ON p50':>8s} {'OFF p50':>9s} {'Speedup':>8s}")
+    print(f"  {'─' * 60}")
+    on_totals, off_totals, count = 0, 0, 0
+    for username in on_results:
+        for pname in on_results[username]:
+            on_d = on_results[username].get(pname, {})
+            off_d = off_results.get(username, {}).get(pname, {})
+            on_p50 = on_d.get("loadComplete_p50", 0)
+            off_p50 = off_d.get("loadComplete_p50", 0)
+            if on_p50 > 0 and off_p50 > 0:
+                spd = off_p50 / on_p50
+                color = GREEN if spd > 1.1 else (RED if spd < 0.9 else YELLOW)
+                print(f"  {username:<12s} {pname:<15s} {on_p50:>6d}ms {off_p50:>7d}ms {color}{spd:>6.1f}x{RESET}")
+                on_totals += on_p50
+                off_totals += off_p50
+                count += 1
+    if count > 0:
+        avg_spd = (off_totals / count) / (on_totals / count) if on_totals > 0 else 0
+        record(f"P4: browser cache ON faster than OFF ({avg_spd:.1f}x)",
+               avg_spd > 1.0,
+               note=f"ON_avg={on_totals // count}ms OFF_avg={off_totals // count}ms")
 
     out_file = "/tmp/browser_results.json"
     with open(out_file, "w") as f:
-        json.dump(all_results, f, indent=2)
+        json.dump({"cache_on": on_results, "cache_off": off_results}, f, indent=2)
     log(f"Results saved to {out_file}")
 
 
@@ -2750,7 +2844,7 @@ def run_phase_browser_scaling(tokens):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
 
-        for cache_mode in ("ON",):  # Run ON only for scale test
+        for cache_mode in ("ON", "OFF"):
             section(f"BROWSER MATRIX: cache={cache_mode}")
             clean_environment()
             if cache_mode == "ON":
@@ -2851,7 +2945,11 @@ def run_phase_browser_scaling(tokens):
             pie_thread.start()
             deploy_compositions_parallel(1, s5_ns_end, s6_comps_per_ns)
             wait_for_compositions(SCALE, timeout=s6_timeout)
-            _stabilize(ts, quiesce=True, quiesce_secs=s6_quiesce)
+            # Let the informer fully sync all ADD events before measuring
+            # convergence. At 50K, the informer paginated LIST takes ~30-60s.
+            log(f"Waiting {s6_quiesce}s for informer sync after deployment ...")
+            time.sleep(s6_quiesce)
+            _stabilize(ts, quiesce=True, quiesce_secs=15)
             pie_stop.set()
             pie_thread.join(timeout=10)
             r = _browser_measure_stage(page, 6, f"{SCALE} compositions", cache_mode, token=admin_token)
@@ -3507,6 +3605,55 @@ def run_phase_user_scaling(tokens):
         log("  Full warmup: TIMEOUT")
         record(f"P7: cold-start N={max(USER_COUNTS)}", False, note="timeout")
 
+    # ── Step 8b: Cache OFF baseline ──
+    # Measure per-user Dashboard latency without cache for comparison.
+    # Synthetic users are still registered — we only toggle the cache.
+    section("Step 8b: Cache OFF baseline (multi-user latency)")
+    off_results = {}
+    # Snapshot ON latency per user count using admin (already measured above)
+    on_admin_latency = 0
+    if cumulative_results:
+        last_on = cumulative_results[-1]
+        on_admin_latency = last_on.get("admin_during_ms", last_on.get("admin_baseline_ms", 0))
+
+    disable_cache()
+    tokens_off = login_all()
+    token_off_admin = tokens_off.get("admin", "")
+
+    # Measure Dashboard latency with cache OFF for admin
+    off_latencies_admin = []
+    dash_path = WIDGET_ENDPOINTS[0][1]  # page/dashboard
+    for _ in range(5):
+        ms, code, _ = http_get(dash_path, token_off_admin)
+        if code == 200:
+            off_latencies_admin.append(ms)
+    off_admin_p50 = pct(off_latencies_admin, 50) if off_latencies_admin else 0
+
+    # Measure compositions-list latency (heaviest endpoint at scale)
+    comp_path = RESTACTION_ENDPOINTS[2][1]  # restaction/comp-list
+    off_latencies_comp = []
+    for _ in range(3):
+        ms, code, _ = http_get(comp_path, token_off_admin)
+        if code == 200:
+            off_latencies_comp.append(ms)
+    off_comp_p50 = pct(off_latencies_comp, 50) if off_latencies_comp else 0
+
+    off_results = {
+        "admin_dashboard_p50": off_admin_p50,
+        "admin_complist_p50": off_comp_p50,
+    }
+
+    # Compare ON vs OFF
+    on_vs_off_dash = off_admin_p50 / on_admin_latency if on_admin_latency > 0 else 0
+    log(f"  Dashboard ON={on_admin_latency:.0f}ms  OFF={off_admin_p50}ms  speedup={on_vs_off_dash:.1f}x")
+    log(f"  Comp-list OFF={off_comp_p50}ms")
+    record(f"P7: cache OFF dashboard baseline measured", off_admin_p50 > 0,
+           ms=off_admin_p50,
+           note=f"ON={on_admin_latency:.0f}ms OFF={off_admin_p50}ms speedup={on_vs_off_dash:.1f}x")
+
+    # Restore cache
+    enable_cache()
+
     # ── Step 9: Cleanup ──
     section("Step 9: Cleanup synthetic users")
     delete_synthetic_users()
@@ -3545,9 +3692,17 @@ def run_phase_user_scaling(tokens):
               f"{entry.get('redis_mb', 0):>10.0f} │ "
               f"{admin_base_str:>15s} {admin_during_str:>13s}")
 
+    # Print cache OFF baseline row
+    if off_results.get("admin_dashboard_p50", 0) > 0:
+        print(f"  {'─' * 120}")
+        print(f"  {'cache-OFF':<14s} {'—':>6s} {'—':>6s} │ "
+              f"{'—':>10s} {'—':>10s} {'—':>11s} {'—':>10s} │ "
+              f"{'—':>15s} "
+              f"{off_results['admin_dashboard_p50']:>11d}ms")
+
     # Save detailed results
     out_file = "/tmp/phase7_user_scaling_results.json"
-    all_data = {"baseline": baseline, "results": cumulative_results}
+    all_data = {"baseline": baseline, "results": cumulative_results, "cache_off": off_results}
     with open(out_file, "w") as f:
         json.dump(all_data, f, indent=2, default=str)
     log(f"Detailed results saved to {out_file}")
@@ -3605,17 +3760,21 @@ def main():
     if 1 in phases:
         wait_for_l1_warmup()
         run_phase_functional(tokens)
+        tokens = login_all()  # re-login: Phase 1 toggles cache OFF/ON
 
     if 2 in phases:
         run_phase_latency(tokens)
         tokens = login_all()
 
-    if 3 in phases:
+    if 3 in phases and SCALE < 10000:
         run_phase_scaling(tokens)
         tokens = login_all()
+    elif 3 in phases:
+        log(f"Phase 3 skipped at SCALE={SCALE} (redundant with Phase 6)")
 
     if 4 in phases:
         run_phase_browser()
+        tokens = login_all()  # re-login: Phase 4 toggles cache OFF/ON
 
     if 5 in phases:
         run_phase_browser_comparison()
