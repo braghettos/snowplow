@@ -225,7 +225,11 @@ func RegisterL1Dependencies(ctx context.Context, c Cache, tracker *DependencyTra
 			key := L1ResourceDepKey(ref.GVRKey, "", "")
 			if !seen[key] {
 				seen[key] = true
-				_ = c.SAddWithTTL(ctx, key, l1Key, ReverseIndexTTL)
+				err := c.SAddWithTTL(ctx, key, l1Key, ReverseIndexTTL)
+				slog.Info("RegisterL1Dependencies: SAddWithTTL cluster",
+					slog.String("depKey", key),
+					slog.String("l1Key", l1Key),
+					slog.Any("err", err))
 				clusterRegistered++
 				if baseKey != "" {
 					_ = c.SAddWithTTL(ctx, key, baseKey, ReverseIndexTTL)
