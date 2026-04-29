@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/snowplow/apis"
@@ -177,6 +178,58 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 		if cache.DirtySetFromContext(tctx) == nil {
 			if rki, ok := cache.ParseResolvedKey(in.ResolvedKey); ok {
 				cache.TouchKey(cache.ResolvedKeyBase(rki.Username, rki.GVR, rki.NS, rki.Name))
+			}
+		}
+		// Diagnostic: dump tracker contents before registering deps.
+		// This tells us exactly which GVR+NS+Name refs were captured
+		// during the entire resolution (including /call and iterator paths).
+		refs := tracker.ResourceRefs()
+		gvrKeys := tracker.GVRKeys()
+		hasCompositionGVR := false
+		listRefCount := 0
+		for _, ref := range refs {
+			if ref.Name == "" {
+				listRefCount++
+			}
+			if strings.Contains(ref.GVRKey, "composition.krateo.io") {
+				hasCompositionGVR = true
+			}
+		}
+		slog.Info("tracker contents before RegisterL1Dependencies",
+			slog.String("resolvedKey", in.ResolvedKey),
+			slog.Int("totalRefs", len(refs)),
+			slog.Int("listRefs_nameEmpty", listRefCount),
+			slog.Int("gvrKeys", len(gvrKeys)),
+			slog.Bool("hasCompositionGVR", hasCompositionGVR),
+		)
+		if len(refs) <= 20 {
+			for i, ref := range refs {
+				slog.Info("tracker ref",
+					slog.Int("idx", i),
+					slog.String("gvrKey", ref.GVRKey),
+					slog.String("ns", ref.NS),
+					slog.String("name", ref.Name),
+				)
+			}
+		} else {
+			// For large ref lists (50K compositions), sample first 5 and last 5
+			for i := 0; i < 5 && i < len(refs); i++ {
+				slog.Info("tracker ref (head)",
+					slog.Int("idx", i),
+					slog.String("gvrKey", refs[i].GVRKey),
+					slog.String("ns", refs[i].NS),
+					slog.String("name", refs[i].Name),
+				)
+			}
+			for i := len(refs) - 5; i < len(refs); i++ {
+				if i >= 5 {
+					slog.Info("tracker ref (tail)",
+						slog.Int("idx", i),
+						slog.String("gvrKey", refs[i].GVRKey),
+						slog.String("ns", refs[i].NS),
+						slog.String("name", refs[i].Name),
+					)
+				}
 			}
 		}
 		cache.RegisterL1Dependencies(tctx, in.Cache, tracker, in.ResolvedKey)

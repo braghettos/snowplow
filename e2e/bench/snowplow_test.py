@@ -1604,20 +1604,19 @@ subjects:
             time.sleep(10)
             ms, code, _ = http_get(call_url(TEST_NS, TEST_NAME_NEW), token)
             record("ADD: GET new resource returns 200", code == 200, ms, code)
+            # Label via kubectl — the informer UPDATE event updates the
+            # raw object cache (snowplow:get:*) automatically.
             kubectl("label", f"{COMP_RES}.{COMP_GVR}/{TEST_NAME_NEW}", "-n", TEST_NS,
                     "cache-test=updated", "--overwrite")
-            # Poll until label is reflected (stale-while-refresh: background
-            # refresh must overwrite L1 with the updated resource).
-            # At 50K scale, background refresh takes longer.
-            t10_polls = 30 if SCALE <= 5000 else 60  # up to 60s or 120s
+            # Poll until label is reflected.
             label_ok = False
-            for attempt in range(t10_polls):
+            for attempt in range(15):  # up to 30s
                 time.sleep(2)
                 ms, code, body = http_get_json(call_url(TEST_NS, TEST_NAME_NEW), token)
                 if code == 404:
                     record("UPDATE: resource deleted by controller (expected for ephemeral CRs)", True, ms, code,
                            note="controller reconciled and removed resource")
-                    label_ok = None  # skip the label check
+                    label_ok = None
                     break
                 if isinstance(body, dict) and body.get("metadata", {}).get("labels", {}).get("cache-test") == "updated":
                     label_ok = True
@@ -1625,10 +1624,12 @@ subjects:
             if label_ok is not None:
                 record("UPDATE: label reflected in response", label_ok, ms, code)
 
+            # Delete via kubectl — the informer DELETE event removes the
+            # raw object cache key automatically.
             kubectl("delete", "-n", TEST_NS, f"{COMP_RES}.{COMP_GVR}", TEST_NAME_NEW)
-            # Poll until DELETE is reflected (background refresh overwrites L1).
+            # Poll until resource returns 404.
             deleted = False
-            for attempt in range(t10_polls):
+            for attempt in range(15):  # up to 30s
                 time.sleep(2)
                 ms, code, _ = http_get(call_url(TEST_NS, TEST_NAME_NEW), token)
                 if code in (404, 500):

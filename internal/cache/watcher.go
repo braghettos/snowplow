@@ -1138,8 +1138,17 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 			slog.String("name", name))
 	}
 
-	// No Redis writes for raw K8s data. The informer store IS the data source.
-	// L1 refresh reads directly from the informer via InformerReader.
+	// Update the raw object cache (snowplow:get:*) so the callHandler
+	// serves fresh data immediately. Same stale-while-refresh pattern as
+	// L1 resolved keys: overwrite on ADD/UPDATE, delete on DELETE.
+	if rw.cache != nil {
+		getKey := GetKey(gvr, ns, name)
+		if eventType == "delete" {
+			_ = rw.cache.Delete(ctx, getKey)
+		} else {
+			_ = rw.cache.SetForGVR(ctx, gvr, getKey, uns.Object)
+		}
+	}
 
 	gvrKey := GVRToKey(gvr)
 
