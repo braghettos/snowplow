@@ -161,10 +161,13 @@ func preWarmChildWidgets(parentCtx context.Context, c cache.Cache, resolved *uns
 // recursivePreWarm resolves refs into L1 cache, then extracts their children
 // and recurses until maxDepth or no more children are found.
 func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, c cache.Cache, dynClient k8sdynamic.Interface, refs []l1Ref, authnNS string, visited map[string]bool, depth int) {
-	if depth > preWarmMaxDepth || len(refs) == 0 {
+	if len(refs) == 0 {
 		return
 	}
 	if ctx.Err() != nil {
+		slog.Warn("prewarm: context cancelled",
+			slog.Int("depth", depth),
+			slog.Int("pendingRefs", len(refs)))
 		return
 	}
 
@@ -181,7 +184,21 @@ func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.E
 		return
 	}
 
+	// Log each depth level so we can trace how far the tree walk gets.
+	for _, r := range unvisited {
+		slog.Info("prewarm: resolving",
+			slog.Int("depth", depth),
+			slog.String("resource", r.gvr.Resource),
+			slog.String("ns", r.ns),
+			slog.String("name", r.name))
+	}
+
 	resolved := resolveL1RefsCollect(ctx, user, ep, accessToken, c, dynClient, unvisited, authnNS)
+
+	slog.Info("prewarm: depth done",
+		slog.Int("depth", depth),
+		slog.Int("resolved", len(resolved)),
+		slog.Int("totalVisited", len(visited)))
 
 	var nextRefs []l1Ref
 	for _, res := range resolved {
@@ -189,12 +206,14 @@ func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.E
 		if err != nil || !found || len(childItems) == 0 {
 			continue
 		}
-		// Collect ref IDs that are action-linked (navigate, openDrawer,
-		// openModal, etc.). These are deferred — the frontend only
-		// resolves them on user interaction — so the prewarm must skip
-		// them to avoid recursing into 50K+ composition children.
 		actionRefIDs := extractActionRefIDs(res.Object)
 		nextRefs = append(nextRefs, extractChildWidgetRefs(ctx, c, childItems, cache.CacheIdentity(ctx, user.Username), actionRefIDs)...)
+	}
+
+	if len(nextRefs) > 0 {
+		slog.Info("prewarm: next level",
+			slog.Int("depth", depth+1),
+			slog.Int("childRefs", len(nextRefs)))
 	}
 
 	recursivePreWarm(ctx, user, ep, accessToken, c, dynClient, nextRefs, authnNS, visited, depth+1)
@@ -401,6 +420,7 @@ func WarmL1FromEntryPoints(ctx context.Context, c cache.Cache, rc *rest.Config,
 	log.Info("L1 entry-point warmup: pre-warm disabled, switching to event-driven updates")
 }
 
+
 // MakeRBACPreWarmer returns a no-op UserReadyFunc. RBAC decisions are now
 // populated organically during widget/RESTAction resolution rather than
 // pre-warmed via the GVR x NS x verb cartesian product.
@@ -558,11 +578,6 @@ func warmL1RestActionsForUser(ctx context.Context, c cache.Cache, dynClient k8sd
 			continue
 		}
 
-		// Fetch the RESTAction CR via L2-first with unthrottled k8s
-		// fallback. See prewarmFetchCR for rationale — avoids the
-		// default 5 QPS / 10 burst rate limiter on the per-user rest
-		// config that would otherwise fail every fallback with
-		// "client rate limiter Wait returned an error".
 		cached, ok := prewarmFetchCR(rctx, c, dynClient, raGVR, ra.Namespace, ra.Name)
 		if !ok {
 			log.Warn("L1 warmup: failed to fetch RESTAction",
@@ -571,10 +586,6 @@ func warmL1RestActionsForUser(ctx context.Context, c cache.Cache, dynClient k8sd
 			continue
 		}
 
-		// Delegate convert → resolve → marshal → strip → L1 write to the
-		// shared l1cache helper. Keeps prewarm, HTTP dispatcher, and
-		// widget apiref paths on one code path — no drift risk on key
-		// schema, dependency registration, or marshal step.
 		if _, err := l1cache.ResolveAndCache(rctx, l1cache.Input{
 			Cache:       c,
 			Obj:         cached.Object,
@@ -588,7 +599,6 @@ func warmL1RestActionsForUser(ctx context.Context, c cache.Cache, dynClient k8sd
 			continue
 		}
 
-		// Touch the key so prewarm-resolved RESTActions start HOT.
 		if rki, ok := cache.ParseResolvedKey(rKey); ok {
 			cache.TouchKey(cache.ResolvedKeyBase(rki.Username, rki.GVR, rki.NS, rki.Name))
 		}
@@ -704,8 +714,8 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			// Skip if L1 key already exists — pre-warmer only populates cold slots.
-			// Event-driven dirty+ticker handles updates to existing keys.
+			// Skip if L1 key already exists — avoid redundant resolution.
+			// Deps from the first resolve persist in MemCache for all groups.
 			rKey := cache.ResolvedKey(identity, r.gvr, r.ns, r.name, -1, -1)
 			if c != nil && c.Exists(ctx, rKey) {
 				return
