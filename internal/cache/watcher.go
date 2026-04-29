@@ -22,6 +22,7 @@ import (
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/rest"
 	k8scache "k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 )
 
 var watcherTracer = otel.Tracer("snowplow/watcher")
@@ -136,28 +137,22 @@ type ResourceWatcher struct {
 	// the informer store + L1 resolve pipeline compete for memory.
 	synced atomic.Bool
 
-	// dirtyKeys tracks per-L1-key refresh state. At most one goroutine
-	// runs per L1 key. Events marking the same key dirty while a resolve
-	// is running cause a re-run with the latest informer state.
-	dirtyKeys sync.Map // map[string]*dirtyState
+	// Three priority workqueues: HOT > WARM > COLD. Workers always
+	// drain hotQ before warmQ, and warmQ before coldQ. Each queue
+	// has its own rate limiter for independent backoff tracking.
+	hotQ  workqueue.TypedRateLimitingInterface[string]
+	warmQ workqueue.TypedRateLimitingInterface[string]
+	coldQ workqueue.TypedRateLimitingInterface[string]
 
-	// Priority channels for non-blocking L1 refresh dispatch.
-	// triggerL1RefreshBatch sends items to these channels instead of
-	// blocking the l1Worker with WaitGroup barriers.
-	hotCh  chan refreshItem
-	warmCh chan refreshItem
-	coldCh chan refreshItem
+	// refreshMeta stores per-identity metadata needed by processItem:
+	// the trigger GVR, page keys, and the refresh function. Updated
+	// atomically by enqueueRefresh before adding to the queue.
+	refreshMeta sync.Map // map[string]*refreshMetaEntry
 
-	// warmColdSem bounds concurrent WARM/COLD refresh goroutines to
-	// GOMAXPROCS. Without this, a burst of 50K informer events spawns
-	// one goroutine per unique L1 key group, exhausting memory.
-	warmColdSem chan struct{}
-
-	// hotSem bounds concurrent HOT refresh goroutines to GOMAXPROCS/2.
-	// This reserves CPU for HTTP request handlers so L1 cache hits
-	// complete in <10ms instead of competing with hundreds of refresh
-	// goroutines for CPU time.
-	hotSem chan struct{}
+	// dirtyEntries accumulates per-identity dirty GVR+ns pairs. Each
+	// enqueueRefresh call appends entries; processItem drains them to
+	// build a DirtySet for targeted API result cache bypass.
+	dirtyEntries sync.Map // map[string]*dirtyEntryBucket
 }
 
 func NewResourceWatcher(c Cache, rc *rest.Config) (*ResourceWatcher, error) {
@@ -191,11 +186,18 @@ func NewResourceWatcher(c Cache, rc *rest.Config) (*ResourceWatcher, error) {
 		watched:     make(map[string]bool),
 		eventCh:     make(chan l1Event, 1000000),
 		dynamicGVRs: make(map[string]schema.GroupVersionResource),
-		hotCh:       make(chan refreshItem, 10000),
-		warmCh:      make(chan refreshItem, 10000),
-		coldCh:      make(chan refreshItem, 10000),
-		warmColdSem: make(chan struct{}, runtime.GOMAXPROCS(0)),
-		hotSem:      make(chan struct{}, runtime.GOMAXPROCS(0)),
+		hotQ: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.NewTypedItemExponentialFailureRateLimiter[string](1*time.Second, 30*time.Second),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "snowplow-hot"},
+		),
+		warmQ: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.NewTypedItemExponentialFailureRateLimiter[string](1*time.Second, 30*time.Second),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "snowplow-warm"},
+		),
+		coldQ: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.NewTypedItemExponentialFailureRateLimiter[string](1*time.Second, 30*time.Second),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "snowplow-cold"},
+		),
 	}, nil
 }
 
@@ -221,7 +223,7 @@ func (rw *ResourceWatcher) Start(ctx context.Context) {
 		}
 	}()
 	go rw.l1Worker(rw.appCtx) // appCtx carries InformerReader for background refreshes
-	go rw.priorityConsumer(rw.appCtx)
+	go rw.runWorkers(rw.appCtx)
 	// Periodically prune stale keyAccess entries to prevent unbounded map growth.
 	go func() {
 		ticker := time.NewTicker(10 * time.Minute)
@@ -237,41 +239,246 @@ func (rw *ResourceWatcher) Start(ctx context.Context) {
 	}()
 }
 
-// priorityConsumer drains the HOT, WARM, and COLD refresh channels using
-// nested selects that enforce strict priority: HOT items are always preferred
-// over WARM, and WARM over COLD. This replaces the previous WaitGroup-based
-// blocking in triggerL1RefreshBatch, freeing the l1Worker to process the next
-// batch of informer events without waiting for refresh completion.
-func (rw *ResourceWatcher) priorityConsumer(ctx context.Context) {
+// runWorkers launches GOMAXPROCS worker goroutines that drain the three
+// priority queues (HOT > WARM > COLD). On context cancellation all
+// queues are shut down and workers exit.
+func (rw *ResourceWatcher) runWorkers(ctx context.Context) {
+	numWorkers := runtime.GOMAXPROCS(0)
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		go func() {
+			defer wg.Done()
+			for rw.processNext(ctx) {
+			}
+		}()
+	}
+	<-ctx.Done()
+	rw.hotQ.ShutDown()
+	rw.warmQ.ShutDown()
+	rw.coldQ.ShutDown()
+	wg.Wait()
+}
+
+// processNext polls the three queues in strict priority order:
+// HOT first, then WARM, then COLD. If all are empty, sleeps 10ms
+// before retrying. Returns false when all queues are shut down.
+func (rw *ResourceWatcher) processNext(ctx context.Context) bool {
 	for {
-		// Inner select: prefer HOT, then WARM, then COLD.
 		select {
 		case <-ctx.Done():
-			return
-		case item := <-rw.hotCh:
-			rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn, item.sem)
+			return false
 		default:
-			select {
-			case <-ctx.Done():
-				return
-			case item := <-rw.hotCh:
-				rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn, item.sem)
-			case item := <-rw.warmCh:
-				rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn, item.sem)
-			default:
-				select {
-				case <-ctx.Done():
-					return
-				case item := <-rw.hotCh:
-					rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn, item.sem)
-				case item := <-rw.warmCh:
-					rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn, item.sem)
-				case item := <-rw.coldCh:
-					rw.markDirtySequentialBatch(ctx, item.triggerGVR, item.dirtyPairs, item.pages, item.fn, item.sem)
-				}
+		}
+
+		// HOT: always preferred
+		if rw.hotQ.Len() > 0 {
+			identity, shutdown := rw.hotQ.Get()
+			if shutdown {
+				return false
 			}
+			rw.processItem(ctx, identity)
+			rw.hotQ.Done(identity)
+			return true
+		}
+		// WARM: second priority
+		if rw.warmQ.Len() > 0 {
+			identity, shutdown := rw.warmQ.Get()
+			if shutdown {
+				return false
+			}
+			rw.processItem(ctx, identity)
+			rw.warmQ.Done(identity)
+			return true
+		}
+		// COLD: lowest priority
+		if rw.coldQ.Len() > 0 {
+			identity, shutdown := rw.coldQ.Get()
+			if shutdown {
+				return false
+			}
+			rw.processItem(ctx, identity)
+			rw.coldQ.Done(identity)
+			return true
+		}
+
+		// All empty: wait briefly then re-check priorities.
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(10 * time.Millisecond):
 		}
 	}
+}
+
+// processItem resolves all pages for a single identity (resolved key base).
+// It drains accumulated dirty entries, builds a DirtySet, and calls the
+// L1RefreshFunc for each page. On success the rate limiter is reset; cascade
+// targets are enqueued via enqueueCascade.
+func (rw *ResourceWatcher) processItem(ctx context.Context, identity string) {
+	defer func() {
+		if r := recover(); r != nil {
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			slog.Error("resource-watcher: panic in L1 refresh",
+				slog.Any("error", r),
+				slog.String("identity", identity),
+				slog.String("stack", string(buf[:n])))
+		}
+	}()
+
+	// Load metadata for this identity. If missing, another goroutine
+	// may have cleaned up — skip.
+	metaVal, ok := rw.refreshMeta.Load(identity)
+	if !ok {
+		return
+	}
+	meta := metaVal.(*refreshMetaEntry)
+
+	// Snapshot metadata under lock to avoid races with concurrent
+	// enqueueRefresh calls updating the same identity.
+	meta.mu.Lock()
+	triggerGVR := meta.triggerGVR
+	pages := make([]pageKey, len(meta.pages))
+	copy(pages, meta.pages)
+	fn := meta.fn
+	meta.mu.Unlock()
+
+	// Drain dirty entries accumulated since the last processItem call.
+	var dirtySet *DirtySet
+	if bucketVal, ok := rw.dirtyEntries.Load(identity); ok {
+		bucket := bucketVal.(*dirtyEntryBucket)
+		entries := bucket.drain()
+		dirtySet = NewDirtySet(entries)
+	} else {
+		dirtySet = NewDirtySet(nil)
+	}
+
+	var allCascade []string
+	for _, pg := range pages {
+		refreshCtx, cancel := context.WithTimeout(WithDirtySet(ctx, dirtySet), 60*time.Second)
+		cascade := fn(refreshCtx, triggerGVR, []string{pg.key})
+		cancel()
+		allCascade = append(allCascade, cascade...)
+	}
+
+	// Success: reset the rate limiter backoff for this identity.
+	// Forget on all three queues — no-op on queues that don't track it.
+	rw.hotQ.Forget(identity)
+	rw.warmQ.Forget(identity)
+	rw.coldQ.Forget(identity)
+
+	slog.Info("refresh done",
+		slog.String("key", identity),
+		slog.Int("cascade", len(allCascade)),
+		slog.String("trigger", triggerGVR.String()))
+
+	if len(allCascade) > 0 {
+		rw.enqueueCascade(ctx, triggerGVR, pages, allCascade, fn)
+	}
+}
+
+// enqueueCascade groups cascade keys by identity (resolved key base) and
+// enqueues each group for refresh. The parent's GVR info is propagated
+// so cascade resolves build a non-empty DirtySet that bypasses stale
+// API result cache entries.
+func (rw *ResourceWatcher) enqueueCascade(_ context.Context, triggerGVR schema.GroupVersionResource, parentPages []pageKey, cascadeKeys []string, fn L1RefreshFunc) {
+	// Extract parent GVR info for DirtySet propagation.
+	parentGVRKey := ""
+	parentNS := ""
+	if len(parentPages) > 0 {
+		if pInfo, ok := ParseResolvedKey(parentPages[0].key); ok {
+			parentGVRKey = GVRToKey(pInfo.GVR)
+			parentNS = pInfo.NS
+		}
+	}
+
+	// Build dirty pairs from the parent's GVR info.
+	var dirtyPairs []DirtyEntry
+	if parentGVRKey != "" {
+		dirtyPairs = []DirtyEntry{{GVRKey: parentGVRKey, NS: parentNS}}
+	}
+
+	// Group cascade keys by identity.
+	cascadeGroups := make(map[string][]pageKey)
+	for _, ck := range cascadeKeys {
+		info, ok := ParseResolvedKey(ck)
+		if !ok {
+			cascadeGroups[ck] = append(cascadeGroups[ck], pageKey{key: ck, page: 0})
+			continue
+		}
+		baseKey := ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
+		cascadeGroups[baseKey] = append(cascadeGroups[baseKey], pageKey{key: ck, page: info.Page})
+	}
+	// Ensure page 0 exists for each group.
+	for bk, cps := range cascadeGroups {
+		hasPage0 := false
+		for _, p := range cps {
+			if p.page == 0 {
+				hasPage0 = true
+				break
+			}
+		}
+		if !hasPage0 {
+			cascadeGroups[bk] = append([]pageKey{{key: bk, page: 0}}, cps...)
+		}
+	}
+	for _, cPages := range cascadeGroups {
+		sort.Slice(cPages, func(i, j int) bool { return cPages[i].page < cPages[j].page })
+		rw.enqueueRefresh(cPages, triggerGVR, dirtyPairs, fn)
+	}
+}
+
+// enqueueRefresh is the unified enqueue function. It stores/updates metadata
+// and dirty entries, then adds the identity to one of three priority queues
+// (HOT/WARM/COLD) based on access-recency temperature. Workers poll the
+// queues in strict priority order so HOT items always preempt COLD ones.
+func (rw *ResourceWatcher) enqueueRefresh(pages []pageKey, triggerGVR schema.GroupVersionResource, dirtyPairs []DirtyEntry, fn L1RefreshFunc) {
+	if len(pages) == 0 {
+		return
+	}
+	// Compute identity from the first page key.
+	identity := pages[0].key
+	if info, ok := ParseResolvedKey(identity); ok {
+		identity = ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
+	}
+
+	// Store/update metadata. If another goroutine already stored an entry,
+	// update it under lock to reflect the latest trigger GVR and pages.
+	metaVal, loaded := rw.refreshMeta.LoadOrStore(identity, &refreshMetaEntry{
+		triggerGVR: triggerGVR,
+		pages:      pages,
+		fn:         fn,
+	})
+	if loaded {
+		meta := metaVal.(*refreshMetaEntry)
+		meta.mu.Lock()
+		meta.triggerGVR = triggerGVR
+		meta.pages = pages
+		meta.fn = fn
+		meta.mu.Unlock()
+	}
+
+	// Accumulate dirty entries.
+	if len(dirtyPairs) > 0 {
+		bucketVal, _ := rw.dirtyEntries.LoadOrStore(identity, &dirtyEntryBucket{})
+		bucket := bucketVal.(*dirtyEntryBucket)
+		for _, dp := range dirtyPairs {
+			bucket.add(dp.GVRKey, dp.NS)
+		}
+	}
+
+	// Classify by temperature and enqueue to the appropriate priority queue.
+	tier := keyTemperature(identity)
+	switch tier {
+	case "hot":
+		rw.hotQ.Add(identity)
+	case "warm":
+		rw.warmQ.Add(identity)
+	default: // cold
+		rw.coldQ.Add(identity)
+	}
+	slog.Info("dispatch", slog.String("tier", tier), slog.String("key", identity))
 }
 
 // registerFromRedis reads the watched-gvrs set from Redis and registers
@@ -369,28 +576,35 @@ func (rw *ResourceWatcher) l1Worker(ctx context.Context) {
 	}
 }
 
-// dirtyState tracks whether an L1 key needs (re-)resolve and which
-// GVR+namespace pairs triggered the dirty mark so the refresh can
-// do targeted API result cache bypass instead of blanket bypass.
-type dirtyState struct {
-	pending atomic.Bool
+// refreshMetaEntry stores per-identity metadata needed by processItem.
+// Updated by enqueueRefresh under lock; read by processItem under lock.
+type refreshMetaEntry struct {
+	mu         sync.Mutex
+	triggerGVR schema.GroupVersionResource
+	pages      []pageKey
+	fn         L1RefreshFunc
+}
+
+// dirtyEntryBucket accumulates dirty GVR+ns pairs for a single identity.
+// Thread-safe: add() appends under lock, drain() returns and resets.
+type dirtyEntryBucket struct {
 	mu      sync.Mutex
 	entries []DirtyEntry
 }
 
-// addEntry appends a dirty entry under lock. Called before pending.Store(true).
-func (ds *dirtyState) addEntry(gvrKey, ns string) {
-	ds.mu.Lock()
-	ds.entries = append(ds.entries, DirtyEntry{GVRKey: gvrKey, NS: ns})
-	ds.mu.Unlock()
+// add appends a dirty entry under lock.
+func (b *dirtyEntryBucket) add(gvrKey, ns string) {
+	b.mu.Lock()
+	b.entries = append(b.entries, DirtyEntry{GVRKey: gvrKey, NS: ns})
+	b.mu.Unlock()
 }
 
-// drainEntries returns and resets the accumulated dirty entries under lock.
-func (ds *dirtyState) drainEntries() []DirtyEntry {
-	ds.mu.Lock()
-	out := ds.entries
-	ds.entries = nil
-	ds.mu.Unlock()
+// drain returns and resets the accumulated dirty entries under lock.
+func (b *dirtyEntryBucket) drain() []DirtyEntry {
+	b.mu.Lock()
+	out := b.entries
+	b.entries = nil
+	b.mu.Unlock()
 	return out
 }
 
@@ -398,16 +612,6 @@ func (ds *dirtyState) drainEntries() []DirtyEntry {
 type pageKey struct {
 	key  string
 	page int
-}
-
-// refreshItem carries all data needed by the priority consumer to invoke
-// markDirtySequentialBatch for a single key group.
-type refreshItem struct {
-	triggerGVR schema.GroupVersionResource
-	dirtyPairs map[gvrNS]bool
-	pages      []pageKey
-	fn         L1RefreshFunc
-	sem        chan struct{} // nil for HOT (unbounded), non-nil for WARM/COLD
 }
 
 // gvrNS identifies a GVR+namespace pair for dirty tracking across batched events.
@@ -622,17 +826,17 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 		return
 	}
 
-	// ── Phase 4: Group paginated keys and dispatch to priority channels ──
+	// ── Phase 4: Group paginated keys and dispatch to workqueue ─────────
 	// Group paginated keys by base key (user:gvr:ns:name without page suffix).
 	// Paginated variants of the same resource resolve the same underlying data
 	// — only the page parameter changes the output. Resolving them sequentially
 	// (p1 → p2 → ... → pN) avoids N concurrent goroutines each doing a full
 	// O(N) resolve of the same 49K items.
 	//
-	// Items are dispatched to priority channels (HOT > WARM > COLD). The
-	// priorityConsumer goroutine drains them in strict priority order. This
-	// is non-blocking for the l1Worker — it can immediately process the next
-	// batch of informer events.
+	// Items are routed to one of three priority workqueues by temperature
+	// (HOT/WARM/COLD). Workers poll HOT > WARM > COLD in strict priority
+	// order. The workqueues handle deduplication, rate-limited backoff on
+	// failure, and bounded concurrency via GOMAXPROCS workers.
 	groupKeys := func(keys map[string]bool) map[string][]pageKey {
 		groups := make(map[string][]pageKey)
 		for l1Key := range keys {
@@ -662,257 +866,24 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 		return groups
 	}
 
-	// Dispatch to priority channels. Non-blocking sends: if a channel is full
-	// the item is dropped with a warning (the informer store is already updated;
-	// the next event will re-trigger).
-	dispatch := func(ch chan refreshItem, tier string, pages []pageKey, sem chan struct{}) {
-		item := refreshItem{
-			triggerGVR: representativeGVR,
-			dirtyPairs: dirtyPairs,
-			pages:      pages,
-			fn:         fn,
-			sem:        sem,
-		}
-		select {
-		case ch <- item:
-		default:
-			slog.Warn("triggerL1RefreshBatch: priority channel full, dropping item",
-				slog.String("tier", tier),
-				slog.Int("pages", len(pages)))
-		}
+	// Convert dirtyPairs to []DirtyEntry for enqueueRefresh.
+	dirtyList := make([]DirtyEntry, 0, len(dirtyPairs))
+	for pair := range dirtyPairs {
+		dirtyList = append(dirtyList, DirtyEntry{GVRKey: pair.gvrKey, NS: pair.ns})
 	}
 
 	for _, pages := range groupKeys(hotKeys) {
 		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
-		if len(pages) > 0 {
-			slog.Info("dispatch", slog.String("tier", "hot"), slog.String("key", pages[0].key))
-		}
-		dispatch(rw.hotCh, "hot", pages, rw.hotSem)
+		rw.enqueueRefresh(pages, representativeGVR, dirtyList, fn)
 	}
 	for _, pages := range groupKeys(warmKeys) {
 		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
-		if len(pages) > 0 {
-			slog.Info("dispatch", slog.String("tier", "warm"), slog.String("key", pages[0].key))
-		}
-		dispatch(rw.warmCh, "warm", pages, rw.warmColdSem) // WARM: bounded
+		rw.enqueueRefresh(pages, representativeGVR, dirtyList, fn)
 	}
 	for _, pages := range groupKeys(coldKeys) {
 		sort.Slice(pages, func(i, j int) bool { return pages[i].page < pages[j].page })
-		if len(pages) > 0 {
-			slog.Info("dispatch", slog.String("tier", "cold"), slog.String("key", pages[0].key))
-		}
-		dispatch(rw.coldCh, "cold", pages, rw.warmColdSem) // COLD: bounded
+		rw.enqueueRefresh(pages, representativeGVR, dirtyList, fn)
 	}
-}
-
-// markDirtySequentialBatch is like markDirtySequential but registers ALL
-// GVR+ns pairs from the batch as dirty entries, not just a single pair.
-// This ensures the DirtySet built during refresh correctly bypasses the
-// API result cache for every dependency that changed in the batch.
-//
-// sem is an optional concurrency semaphore: when non-nil the goroutine
-// acquires a slot before resolving and releases it on exit. Used for
-// WARM/COLD tiers to bound concurrent goroutines to GOMAXPROCS. HOT
-// items pass nil (unbounded, latency-critical).
-func (rw *ResourceWatcher) markDirtySequentialBatch(ctx context.Context, triggerGVR schema.GroupVersionResource, dirtyPairs map[gvrNS]bool, pages []pageKey, fn L1RefreshFunc, sem chan struct{}) {
-	if len(pages) == 0 {
-		return
-	}
-	// Use the base key (first page's key stripped of pagination) as identity.
-	// All pagination variants coalesce into one goroutine.
-	identity := pages[0].key
-	if info, ok := ParseResolvedKey(identity); ok {
-		identity = ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
-	}
-
-	val, loaded := rw.dirtyKeys.LoadOrStore(identity, &dirtyState{})
-	state := val.(*dirtyState)
-	// Record ALL GVR+ns pairs that triggered this dirty mark BEFORE setting pending,
-	// so the goroutine's drain always sees every entry.
-	for pair := range dirtyPairs {
-		state.addEntry(pair.gvrKey, pair.ns)
-	}
-	state.pending.Store(true)
-
-	if loaded {
-		return
-	}
-
-	go func() {
-		if sem != nil {
-			sem <- struct{}{}
-			defer func() { <-sem }()
-		}
-
-		defer rw.dirtyKeys.Delete(identity)
-		defer func() {
-			if r := recover(); r != nil {
-				buf := make([]byte, 4096)
-				n := runtime.Stack(buf, false)
-				slog.Error("resource-watcher: panic in L1 refresh",
-					slog.Any("error", r),
-					slog.String("stack", string(buf[:n])))
-			}
-		}()
-
-		// Loop-until-clean: resolve, then check if new events arrived
-		// during resolution. If yes, resolve again with the latest
-		// informer snapshot. No debounce — the loop exits as soon as
-		// no new events arrived during the last resolve.
-		// One goroutine per identity; new events set pending=true
-		// instead of spawning competing goroutines.
-		for state.pending.Swap(false) {
-			entries := state.drainEntries()
-			dirtySet := NewDirtySet(entries)
-
-			var allCascade []string
-			for _, pg := range pages {
-				refreshCtx, cancel := context.WithTimeout(WithDirtySet(ctx, dirtySet), 60*time.Second)
-				cascade := fn(refreshCtx, triggerGVR, []string{pg.key})
-				cancel()
-				allCascade = append(allCascade, cascade...)
-			}
-
-			slog.Info("refresh done",
-				slog.String("key", identity),
-				slog.Int("cascade", len(allCascade)),
-				slog.String("trigger", triggerGVR.String()))
-
-			if len(allCascade) > 0 {
-				cascadeGroups := make(map[string][]pageKey)
-				for _, ck := range allCascade {
-					info, ok := ParseResolvedKey(ck)
-					if !ok {
-						cascadeGroups[ck] = append(cascadeGroups[ck], pageKey{key: ck, page: 0})
-						continue
-					}
-					baseKey := ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
-					cascadeGroups[baseKey] = append(cascadeGroups[baseKey], pageKey{key: ck, page: info.Page})
-				}
-				for bk, cps := range cascadeGroups {
-					hasPage0 := false
-					for _, p := range cps {
-						if p.page == 0 {
-							hasPage0 = true
-							break
-						}
-					}
-					if !hasPage0 {
-						cascadeGroups[bk] = append([]pageKey{{key: bk, page: 0}}, cps...)
-					}
-				}
-				// Pass the parent's GVR info so cascade resolves build a
-				// non-empty DirtySet that bypasses stale API result cache.
-				parentGVRKey := ""
-				parentNS := ""
-				if len(pages) > 0 {
-					if pInfo, ok := ParseResolvedKey(pages[0].key); ok {
-						parentGVRKey = GVRToKey(pInfo.GVR)
-						parentNS = pInfo.NS
-					}
-				}
-				for _, cPages := range cascadeGroups {
-					sort.Slice(cPages, func(i, j int) bool { return cPages[i].page < cPages[j].page })
-					rw.markDirtySequential(ctx, triggerGVR, parentGVRKey, parentNS, cPages, fn)
-				}
-			}
-		}
-	}()
-}
-
-// markDirtySequential resolves a group of paginated L1 keys sequentially
-// in a single goroutine. Uses the first key's base as the dirty key
-// identity so the entire group is coalesced.
-// gvrKey and ns identify the GVR+namespace that triggered the dirty mark
-// so the refresh context carries a targeted DirtySet instead of a blanket bypass.
-func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR schema.GroupVersionResource, gvrKey string, ns string, pages []pageKey, fn L1RefreshFunc) {
-	if len(pages) == 0 {
-		return
-	}
-	// Use the base key (first page's key stripped of pagination) as identity.
-	// All pagination variants coalesce into one goroutine.
-	identity := pages[0].key
-	if info, ok := ParseResolvedKey(identity); ok {
-		identity = ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
-	}
-
-	val, loaded := rw.dirtyKeys.LoadOrStore(identity, &dirtyState{})
-	state := val.(*dirtyState)
-	// Record which GVR+ns triggered this dirty mark BEFORE setting pending,
-	// so the goroutine's drain always sees the entry.
-	if gvrKey != "" {
-		state.addEntry(gvrKey, ns)
-	}
-	state.pending.Store(true)
-
-	if loaded {
-		return
-	}
-
-	go func() {
-		defer rw.dirtyKeys.Delete(identity)
-		defer func() {
-			if r := recover(); r != nil {
-				buf := make([]byte, 4096)
-				n := runtime.Stack(buf, false)
-				slog.Error("resource-watcher: panic in L1 refresh",
-					slog.Any("error", r),
-					slog.String("stack", string(buf[:n])))
-			}
-		}()
-
-		for state.pending.Swap(false) {
-			entries := state.drainEntries()
-			dirtySet := NewDirtySet(entries)
-
-			var allCascade []string
-			for _, pg := range pages {
-				refreshCtx, cancel := context.WithTimeout(WithDirtySet(ctx, dirtySet), 60*time.Second)
-				cascade := fn(refreshCtx, triggerGVR, []string{pg.key})
-				cancel()
-				allCascade = append(allCascade, cascade...)
-			}
-
-			if len(allCascade) > 0 {
-				cascadeGroups := make(map[string][]pageKey)
-				for _, ck := range allCascade {
-					info, ok := ParseResolvedKey(ck)
-					if !ok {
-						cascadeGroups[ck] = append(cascadeGroups[ck], pageKey{key: ck, page: 0})
-						continue
-					}
-					baseKey := ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
-					cascadeGroups[baseKey] = append(cascadeGroups[baseKey], pageKey{key: ck, page: info.Page})
-				}
-				for bk, cps := range cascadeGroups {
-					hasPage0 := false
-					for _, p := range cps {
-						if p.page == 0 {
-							hasPage0 = true
-							break
-						}
-					}
-					if !hasPage0 {
-						cascadeGroups[bk] = append([]pageKey{{key: bk, page: 0}}, cps...)
-					}
-				}
-				// Pass the parent's GVR info so cascade resolves build a
-				// non-empty DirtySet that bypasses stale API result cache.
-				parentGVRKey := ""
-				parentNS := ""
-				if len(pages) > 0 {
-					if pInfo, ok := ParseResolvedKey(pages[0].key); ok {
-						parentGVRKey = GVRToKey(pInfo.GVR)
-						parentNS = pInfo.NS
-					}
-				}
-				for _, cPages := range cascadeGroups {
-					sort.Slice(cPages, func(i, j int) bool { return cPages[i].page < cPages[j].page })
-					rw.markDirtySequential(ctx, triggerGVR, parentGVRKey, parentNS, cPages, fn)
-				}
-			}
-		}
-	}()
 }
 
 // WaitForSync blocks until all started informers have completed their initial sync.
