@@ -219,12 +219,20 @@ func RegisterL1Dependencies(ctx context.Context, c Cache, tracker *DependencyTra
 	}
 
 	// Cluster-wide deps: only for GVRs that were LISTed (name="").
+	// Uses its own dedup map (seenCluster) instead of 'seen' because
+	// when a ref has NS="" AND Name="" (cluster-scoped list), the
+	// per-resource loop above already inserts the identical key into
+	// 'seen', causing this loop to skip the cluster-wide registration.
+	// The SAdd in the per-resource loop writes the same dep set entry,
+	// but the skip hides the cluster log and — more critically — skips
+	// the baseKey registration for paginated variants.
+	seenCluster := make(map[string]bool)
 	clusterRegistered := 0
 	for _, ref := range refs {
 		if ref.Name == "" {
 			key := L1ResourceDepKey(ref.GVRKey, "", "")
-			if !seen[key] {
-				seen[key] = true
+			if !seenCluster[key] {
+				seenCluster[key] = true
 				err := c.SAddWithTTL(ctx, key, l1Key, ReverseIndexTTL)
 				slog.Info("RegisterL1Dependencies: SAddWithTTL cluster",
 					slog.String("depKey", key),
@@ -241,7 +249,7 @@ func RegisterL1Dependencies(ctx context.Context, c Cache, tracker *DependencyTra
 		slog.Info("RegisterL1Dependencies: cluster-wide deps registered",
 			slog.String("l1Key", l1Key),
 			slog.Int("clusterDeps", clusterRegistered),
-			slog.Int("perResourceDeps", len(seen)-clusterRegistered))
+			slog.Int("perResourceDeps", len(seen)))
 	}
 }
 
