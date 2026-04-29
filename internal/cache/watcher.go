@@ -517,12 +517,7 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 	for _, dep := range clusterDeps {
 		members, err := rw.cache.SMembers(ctx, dep.redisKey)
 		if err != nil {
-			slog.Warn("triggerL1RefreshBatch: SMembers error", slog.String("key", dep.redisKey), slog.Any("err", err))
 			continue
-		}
-		if len(members) == 0 {
-			slog.Info("triggerL1RefreshBatch: cluster dep has 0 members",
-				slog.String("depKey", dep.redisKey))
 		}
 		for _, k := range members {
 			allKeys[k] = true

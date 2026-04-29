@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"log/slog"
 	"path"
 	"strings"
 	"sync"
@@ -430,20 +429,6 @@ func (c *MemCache) SAddWithTTL(_ context.Context, key, member string, ttl time.D
 		return nil
 	}
 	c.saddInternal(key, member, ttl)
-	if strings.Contains(key, "l1dep:") {
-		v, ok := c.sets.Load(key)
-		count := 0
-		if ok {
-			se := v.(*memSetEntry)
-			se.mu.RLock()
-			count = len(se.members)
-			se.mu.RUnlock()
-		}
-		slog.Info("MemCache.SAddWithTTL: dep",
-			slog.String("key", key),
-			slog.String("member", member),
-			slog.Int("totalMembers", count))
-	}
 	return nil
 }
 

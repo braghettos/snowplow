@@ -165,9 +165,6 @@ func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.E
 		return
 	}
 	if ctx.Err() != nil {
-		slog.Warn("prewarm: context cancelled",
-			slog.Int("depth", depth),
-			slog.Int("pendingRefs", len(refs)))
 		return
 	}
 
@@ -184,21 +181,7 @@ func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.E
 		return
 	}
 
-	// Log each depth level so we can trace how far the tree walk gets.
-	for _, r := range unvisited {
-		slog.Info("prewarm: resolving",
-			slog.Int("depth", depth),
-			slog.String("resource", r.gvr.Resource),
-			slog.String("ns", r.ns),
-			slog.String("name", r.name))
-	}
-
 	resolved := resolveL1RefsCollect(ctx, user, ep, accessToken, c, dynClient, unvisited, authnNS)
-
-	slog.Info("prewarm: depth done",
-		slog.Int("depth", depth),
-		slog.Int("resolved", len(resolved)),
-		slog.Int("totalVisited", len(visited)))
 
 	var nextRefs []l1Ref
 	for _, res := range resolved {
@@ -208,12 +191,6 @@ func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.E
 		}
 		actionRefIDs := extractActionRefIDs(res.Object)
 		nextRefs = append(nextRefs, extractChildWidgetRefs(ctx, c, childItems, cache.CacheIdentity(ctx, user.Username), actionRefIDs)...)
-	}
-
-	if len(nextRefs) > 0 {
-		slog.Info("prewarm: next level",
-			slog.Int("depth", depth+1),
-			slog.Int("childRefs", len(nextRefs)))
 	}
 
 	recursivePreWarm(ctx, user, ep, accessToken, c, dynClient, nextRefs, authnNS, visited, depth+1)
