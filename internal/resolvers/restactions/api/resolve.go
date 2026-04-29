@@ -382,6 +382,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			}
 
 			// ── /call path L1 lookup ────────────────────────────────────────
+			// For nested /call paths (e.g. compositions-list calling
+			// compositions-get-ns-and-crd), try L1 first. If L1 misses
+			// and we're in a background refresh (DirtySet present), resolve
+			// inline via CallResolver instead of HTTP round-trip back to
+			// snowplow, which would timeout under high load.
 			if c != nil && verb == http.MethodGet {
 				if callGVR, callNS, callName := cache.ParseCallPath(call.Path); callGVR.Resource != "" && callName != "" {
 					l1Key := cache.ResolvedKey(identity, callGVR, callNS, callName, 0, 0)
@@ -392,6 +397,24 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						_ = handler(io.NopCloser(bytes.NewReader(l1Raw)))
 						mu.Unlock()
 						return true
+					}
+
+					// L1 miss: try inline resolution during background refresh.
+					// This avoids the HTTP self-call that causes context timeout
+					// at 50K scale when snowplow is under heavy load.
+					if callResolver := cache.CallResolverFromContext(ctx); callResolver != nil {
+						if ir := cache.InformerReaderFromContext(ctx); ir != nil {
+							if obj, ok := ir.GetObject(callGVR, callNS, callName); ok {
+								raw, rerr := callResolver(ctx, obj.Object, l1Key, opts.AuthnNS)
+								if rerr == nil && len(raw) > 0 {
+									handler := jsonHandler(ctx, jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter})
+									mu.Lock()
+									_ = handler(io.NopCloser(bytes.NewReader(raw)))
+									mu.Unlock()
+									return true
+								}
+							}
+						}
 					}
 				}
 			}

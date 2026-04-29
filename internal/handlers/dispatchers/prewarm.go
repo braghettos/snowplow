@@ -545,6 +545,26 @@ func warmL1RestActionsForUser(ctx context.Context, c cache.Cache, dynClient k8sd
 	)
 	rctx = cache.WithCache(rctx, c)
 
+	// Inject inline /call resolver so nested RESTAction calls resolve
+	// in-process from the informer instead of HTTP round-trip.
+	if cache.InformerReaderFromContext(rctx) != nil {
+		rctx = cache.WithCallResolver(rctx, func(callCtx context.Context, obj map[string]any, resolvedKey, callAuthnNS string) ([]byte, error) {
+			result, err := l1cache.ResolveAndCache(callCtx, l1cache.Input{
+				Cache:       c,
+				Obj:         obj,
+				ResolvedKey: resolvedKey,
+				AuthnNS:     callAuthnNS,
+			})
+			if err != nil {
+				return nil, err
+			}
+			if result == nil {
+				return nil, nil
+			}
+			return result.Raw, nil
+		})
+	}
+
 	// Use binding identity for cache keys during prewarm.
 	identity := cache.CacheIdentity(rctx, user.Username)
 

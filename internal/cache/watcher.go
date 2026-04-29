@@ -801,9 +801,19 @@ func (rw *ResourceWatcher) markDirtySequentialBatch(ctx context.Context, trigger
 						cascadeGroups[bk] = append([]pageKey{{key: bk, page: 0}}, cps...)
 					}
 				}
+				// Pass the parent's GVR info so cascade resolves build a
+				// non-empty DirtySet that bypasses stale API result cache.
+				parentGVRKey := ""
+				parentNS := ""
+				if len(pages) > 0 {
+					if pInfo, ok := ParseResolvedKey(pages[0].key); ok {
+						parentGVRKey = GVRToKey(pInfo.GVR)
+						parentNS = pInfo.NS
+					}
+				}
 				for _, cPages := range cascadeGroups {
 					sort.Slice(cPages, func(i, j int) bool { return cPages[i].page < cPages[j].page })
-					rw.markDirtySequential(ctx, triggerGVR, "", "", cPages, fn)
+					rw.markDirtySequential(ctx, triggerGVR, parentGVRKey, parentNS, cPages, fn)
 				}
 			}
 		}
@@ -886,9 +896,19 @@ func (rw *ResourceWatcher) markDirtySequential(ctx context.Context, triggerGVR s
 						cascadeGroups[bk] = append([]pageKey{{key: bk, page: 0}}, cps...)
 					}
 				}
+				// Pass the parent's GVR info so cascade resolves build a
+				// non-empty DirtySet that bypasses stale API result cache.
+				parentGVRKey := ""
+				parentNS := ""
+				if len(pages) > 0 {
+					if pInfo, ok := ParseResolvedKey(pages[0].key); ok {
+						parentGVRKey = GVRToKey(pInfo.GVR)
+						parentNS = pInfo.NS
+					}
+				}
 				for _, cPages := range cascadeGroups {
 					sort.Slice(cPages, func(i, j int) bool { return cPages[i].page < cPages[j].page })
-					rw.markDirtySequential(ctx, triggerGVR, "", "", cPages, fn)
+					rw.markDirtySequential(ctx, triggerGVR, parentGVRKey, parentNS, cPages, fn)
 				}
 			}
 		}

@@ -13,6 +13,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/observability"
+	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions/l1cache"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -198,6 +199,38 @@ func refreshSingleL1(ctx context.Context, c cache.Cache, user jwtutil.UserInfo, 
 	// The closure in MakeL1Refresher injects it before calling us.
 	if rw := cache.RBACWatcherFromContext(ctx); rw != nil {
 		rctx = cache.WithRBACWatcher(rctx, rw)
+	}
+
+	// Propagate InformerReader so nested resolution can read from informer.
+	if ir := cache.InformerReaderFromContext(ctx); ir != nil {
+		rctx = cache.WithInformerReader(rctx, ir)
+	}
+
+	// Propagate DirtySet so nested resolution bypasses stale API result cache.
+	if ds := cache.DirtySetFromContext(ctx); ds != nil {
+		rctx = cache.WithDirtySet(rctx, ds)
+	}
+
+	// Inject inline /call resolver so nested RESTAction calls (e.g.
+	// compositions-list → compositions-get-ns-and-crd) resolve in-process
+	// from the informer instead of making an HTTP round-trip back to
+	// snowplow, which times out under high load at 50K scale.
+	if cache.InformerReaderFromContext(rctx) != nil {
+		rctx = cache.WithCallResolver(rctx, func(callCtx context.Context, obj map[string]any, resolvedKey, callAuthnNS string) ([]byte, error) {
+			result, err := l1cache.ResolveAndCache(callCtx, l1cache.Input{
+				Cache:       c,
+				Obj:         obj,
+				ResolvedKey: resolvedKey,
+				AuthnNS:     callAuthnNS,
+			})
+			if err != nil {
+				return nil, err
+			}
+			if result == nil {
+				return nil, nil
+			}
+			return result.Raw, nil
+		})
 	}
 
 	// If the key's identity differs from the real username, it's a binding

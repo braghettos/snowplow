@@ -160,6 +160,32 @@ func RBACWatcherFromContext(ctx context.Context) *RBACWatcher {
 	return rw
 }
 
+// CallResolver resolves a nested /call RESTAction inline (in-process)
+// without making an HTTP round-trip. During background refresh, the
+// L1 refresh function injects one via WithCallResolver so that nested
+// /call paths (e.g. compositions-list → compositions-get-ns-and-crd)
+// are resolved from the informer instead of calling back to snowplow
+// over HTTP, which would timeout under high load.
+//
+// Parameters: ctx, obj (the target RESTAction CR as unstructured map),
+// resolvedKey (L1 key to write), authnNS.
+// Returns the serialized resolved output (same as HTTP /call response body).
+type CallResolver func(ctx context.Context, obj map[string]any, resolvedKey, authnNS string) ([]byte, error)
+
+type callResolverKey struct{}
+
+// WithCallResolver returns a context carrying an inline /call resolver.
+func WithCallResolver(ctx context.Context, fn CallResolver) context.Context {
+	return context.WithValue(ctx, callResolverKey{}, fn)
+}
+
+// CallResolverFromContext extracts the CallResolver from ctx.
+// Returns nil if not set (callers fall back to HTTP).
+func CallResolverFromContext(ctx context.Context) CallResolver {
+	fn, _ := ctx.Value(callResolverKey{}).(CallResolver)
+	return fn
+}
+
 type bindingIdentityKey struct{}
 
 // WithBindingIdentity returns a context carrying the user's binding identity
