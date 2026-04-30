@@ -343,13 +343,6 @@ def kubectl(*args, input_data=None, timeout_secs=120):
         return 1, "", f"kubectl timed out after {timeout_secs}s"
 
 
-def redis_cmd(*args):
-    rc, out, _ = kubectl(
-        "exec", "deployment/snowplow", "-n", NS, "-c", "redis",
-        "--", "redis-cli", *args)
-    return out.strip() if rc == 0 else ""
-
-
 def pct(data, p):
     s = sorted(data)
     return s[max(0, int(round(p / 100.0 * len(s))) - 1)]
@@ -421,10 +414,10 @@ def wait_for_l1_warmup(timeout=300):
     log("Waiting for L1 warmup ...")
     deadline = time.time() + timeout
     while time.time() < deadline:
-        # Primary signal: cache has keys (works for both Redis and MemCache)
+        # Primary signal: in-process cache has keys
         rt = get_runtime_metrics()
         if rt:
-            keys = rt.get("cache_key_count", rt.get("redis_key_count", 0))
+            keys = rt.get("cache_key_count", 0)
             if keys > 0:
                 log(f"L1 warmup detected ({keys} cache keys)")
                 return True
@@ -453,11 +446,12 @@ def _read_l1_ready_ts():
 
 
 def wait_for_l1_ready(since_epoch=None, timeout=120):
-    """Wait until snowplow writes a fresh L1-ready sentinel to Redis.
+    """Wait until snowplow writes a fresh L1-ready sentinel.
 
-    Snowplow writes ``snowplow:l1:ready`` (a Unix epoch) after every L1
-    warmup or informer-triggered L1 refresh completes.  This is fully
-    deterministic — no log scraping, no key-count heuristics.
+    Snowplow writes ``snowplow:l1:ready`` (a Unix epoch) into the
+    in-process cache after every L1 warmup or informer-triggered L1
+    refresh completes.  This is fully deterministic — no log scraping,
+    no key-count heuristics.
 
     Args:
         since_epoch: Unix timestamp *before* the cluster mutation.  The
@@ -616,6 +610,53 @@ def cleanup_rogue_rbac():
     ]:
         kubectl(*cmd)
     log("Cleaned up rogue RBAC from previous runs")
+
+
+# ── Cluster-state introspection helpers (shared by counts + assertions) ─────
+
+def _parse_ns_name(out):
+    """Parse `kubectl ... -o custom-columns=NS:...,NAME:...` output into list of (ns, name)."""
+    return [(p[0], p[1]) for line in (out or "").splitlines()
+            if (p := line.split(None, 1)) and len(p) >= 2]
+
+
+def _count(resource):
+    """Count all instances of a resource cluster-wide (or in cluster scope)."""
+    rc, out, _ = kubectl("get", resource, "-A", "--no-headers")
+    if rc != 0 or not out.strip():
+        return 0
+    return len([l for l in out.splitlines() if l.strip()])
+
+
+def _count_match(resource, name_prefix="", ns_prefix=""):
+    """Count instances of `resource` whose name and/or namespace match prefixes."""
+    rc, out, _ = kubectl("get", resource, "-A", "--no-headers",
+                         "-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
+    if rc != 0 or not out.strip():
+        return 0
+    n = 0
+    for ns, name in _parse_ns_name(out):
+        if name_prefix and not name.startswith(name_prefix):
+            continue
+        if ns_prefix and not ns.startswith(ns_prefix):
+            continue
+        n += 1
+    return n
+
+
+def _crd_exists(crd):
+    rc, _, _ = kubectl("get", "crd", crd, "--no-headers")
+    return rc == 0
+
+
+def _count_bench_argo():
+    """Argo apps in bench-* namespaces OR with bench-app- name prefix."""
+    rc, out, _ = kubectl("get", "applications.argoproj.io", "-A", "--no-headers",
+                         "-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
+    if rc != 0 or not out.strip():
+        return 0
+    return sum(1 for ns, name in _parse_ns_name(out)
+               if ns.startswith("bench-") or name.startswith("bench-app-"))
 
 
 def create_bench_namespaces(start, end):
@@ -835,7 +876,24 @@ def delete_all_compositiondefinitions():
         log(f"  {remaining} CompositionDefinitions remaining ...")
         time.sleep(10)
     else:
-        log("WARNING: CompositionDefinitions still remaining after timeout")
+        # Force-patch finalizers on any stuck CompositionDefinitions
+        rc, out, _ = kubectl("get", "compositiondefinitions.core.krateo.io", "-A",
+                             "--no-headers", "-o",
+                             "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
+        stuck = _parse_ns_name(out) if rc == 0 else []
+        if stuck:
+            log(f"  Patching finalizers off {len(stuck)} stuck CompositionDefinitions ...")
+            def _patch_cd(item):
+                ns, name = item
+                kubectl("patch", "compositiondefinitions.core.krateo.io", name, "-n", ns,
+                        "--type=merge", f"-p={FINALIZER_PATCH}")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+                list(ex.map(_patch_cd, stuck))
+            time.sleep(20)
+            if _count("compositiondefinitions.core.krateo.io") > 0:
+                log("WARNING: CompositionDefinitions still remaining after force-patch")
+            else:
+                log("All CompositionDefinitions deleted (after force-patch)")
 
     # Wait for CRD to disappear (core provider deletes it after CD is gone)
     deadline = time.time() + 120
@@ -846,6 +904,86 @@ def delete_all_compositiondefinitions():
             return
         time.sleep(5)
     log("WARNING: CRD still exists after CD deletion — may need manual cleanup")
+
+
+def cleanup_orphan_repoes():
+    """Clear finalizers on orphan repoes that survive controller restarts.
+
+    The composition.krateo.io/finalizer is set by composition-dynamic-controller
+    and only removed when the controller successfully reconciles the parent.
+    After crashes or scale-downs, repoes can remain stuck — and patching their
+    finalizers fails when their parent namespace is Terminating.
+
+    Pattern (mirrors /tmp/cleanup-orphan-repoes.sh):
+      1. Recreate parent namespace (idempotent; lets API server accept ops)
+      2. Patch finalizers null in parallel
+      3. Bulk delete per namespace
+    """
+    for resource_kind in ("repoes.github.ogen.krateo.io", "repoes.git.krateo.io"):
+        rc, out, _ = kubectl("get", resource_kind, "-A", "--no-headers",
+                             "-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
+        if rc != 0 or not out.strip():
+            continue
+        items = _parse_ns_name(out)
+        if not items:
+            continue
+        log(f"Clearing finalizers on {len(items)} orphan {resource_kind} ...")
+        # Recreate any missing namespaces (idempotent, may rc!=0 if exists)
+        for ns in {ns for ns, _ in items}:
+            kubectl("create", "namespace", ns)
+        # Clear finalizers via patch
+        def _patch(item):
+            ns, name = item
+            kubectl("patch", resource_kind, name, "-n", ns,
+                    "--type=merge", f"-p={FINALIZER_PATCH}")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
+            list(ex.map(_patch, items))
+        time.sleep(3)
+        # Bulk delete per namespace
+        by_ns = {}
+        for ns, name in items:
+            by_ns.setdefault(ns, []).append(name)
+        for ns, names in by_ns.items():
+            kubectl("delete", resource_kind, *names, "-n", ns,
+                    "--ignore-not-found", "--wait=false")
+
+
+def _drain_argo_apps(timeout=300):
+    """Wait for Argo apps to drain naturally; force-patch+delete any stragglers.
+
+    Replaces inline argo cleanup that referenced a stale `out` variable from
+    inside a while loop after the loop exited.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rc, out, _ = kubectl("get", "applications.argoproj.io", "-A", "--no-headers",
+                             "-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
+        items = _parse_ns_name(out) if rc == 0 else []
+        if not items:
+            log("Argo applications drained")
+            return
+        if int(time.time()) % 30 < 10:
+            log(f"  Waiting for controllers to clean {len(items)} Argo apps ...")
+        time.sleep(10)
+    # Force path: re-list to catch any apps spawned during the wait
+    rc, out, _ = kubectl("get", "applications.argoproj.io", "-A", "--no-headers",
+                         "-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
+    items = _parse_ns_name(out) if rc == 0 else []
+    if not items:
+        log("Argo applications drained (post-timeout)")
+        return
+    log(f"  Force-patching {len(items)} stuck Argo apps ...")
+
+    def _patch_and_delete(item):
+        ns, name = item
+        kubectl("patch", "applications.argoproj.io", name, "-n", ns,
+                "--type=merge", f"-p={FINALIZER_PATCH}")
+        kubectl("delete", "applications.argoproj.io", name, "-n", ns,
+                "--ignore-not-found", "--wait=false")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
+        list(ex.map(_patch_and_delete, items))
+    time.sleep(10)
+    log("Argo applications cleaned (forced)")
 
 
 def delete_bench_namespaces():
@@ -1203,7 +1341,7 @@ def wait_for_namespace_gone(ns_name, timeout=120):
 def wait_for_l1_key_gone(pattern, timeout=60):
     """Wait for L1 keys to be evicted. With MemCache, keys are evicted
     by the background refresh overwriting them or the eviction goroutine.
-    Without Redis, we just wait for the timeout as a convergence delay."""
+    We just wait for the timeout as a convergence delay."""
     log(f"Waiting {min(timeout, 10)}s for L1 key eviction ({pattern}) ...")
     time.sleep(min(timeout, 10))
     return True
@@ -1300,33 +1438,49 @@ def delete_bench_rbac():
     """
     chunk_size = 500
 
-    def _delete_kind(kind, namespace=None):
-        """Delete all bench-app-* resources of a given kind."""
-        if namespace:
-            rc, out, _ = kubectl("get", kind, "-n", namespace, "--no-headers", "-o", "name")
-        else:
-            rc, out, _ = kubectl("get", kind, "--no-headers", "-o", "name")
-        names = [
-            line.split("/", 1)[-1]
-            for line in out.splitlines()
-            if "bench-app" in line
-        ]
+    def _delete_cluster_kind(kind):
+        """Delete all bench-app-* cluster-scoped resources of a given kind."""
+        rc, out, _ = kubectl("get", kind, "--no-headers", "-o", "name")
+        names = [line.split("/", 1)[-1] for line in out.splitlines()
+                 if "bench-app" in line]
         if not names:
             return
-        ns_args = ["-n", namespace] if namespace else []
         for i in range(0, len(names), chunk_size):
-            kubectl("delete", kind, *ns_args, *names[i:i + chunk_size],
+            kubectl("delete", kind, *names[i:i + chunk_size],
                     "--ignore-not-found", "--wait=false")
-        suffix = f" in {namespace}" if namespace else ""
-        log(f"Deleted {len(names)} {kind}s{suffix} (bench-app-*)")
+        log(f"Deleted {len(names)} {kind}s (bench-app-*)")
+
+    def _delete_namespaced_kind_all_ns(kind):
+        """Delete all bench-app-* namespaced resources across ALL namespaces.
+
+        Today's bug: previous version only swept NS=krateo-system, missing
+        Roles/RoleBindings created inside bench-ns-* and demo-system.
+        """
+        rc, out, _ = kubectl("get", kind, "-A", "--no-headers", "-o",
+                             "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
+        if rc != 0 or not out.strip():
+            return
+        items = [(ns, name) for ns, name in _parse_ns_name(out)
+                 if name.startswith("bench-app-") or name.startswith("bench-")]
+        if not items:
+            return
+        # Group by namespace for bulk deletion
+        by_ns = {}
+        for ns, name in items:
+            by_ns.setdefault(ns, []).append(name)
+        for ns, names in by_ns.items():
+            for i in range(0, len(names), chunk_size):
+                kubectl("delete", kind, *names[i:i + chunk_size], "-n", ns,
+                        "--ignore-not-found", "--wait=false")
+        log(f"Deleted {len(items)} {kind}s across {len(by_ns)} namespaces (bench-*)")
 
     # Delete all 4 resource types in parallel (they are independent).
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
         futures = [
-            ex.submit(_delete_kind, "clusterrolebinding"),
-            ex.submit(_delete_kind, "clusterrole"),
-            ex.submit(_delete_kind, "rolebinding", NS),
-            ex.submit(_delete_kind, "role", NS),
+            ex.submit(_delete_cluster_kind, "clusterrolebinding"),
+            ex.submit(_delete_cluster_kind, "clusterrole"),
+            ex.submit(_delete_namespaced_kind_all_ns, "rolebinding"),
+            ex.submit(_delete_namespaced_kind_all_ns, "role"),
         ]
         for f in concurrent.futures.as_completed(futures):
             try:
@@ -1346,7 +1500,7 @@ def clean_environment():
     5. Delete Argo apps (in all namespaces, patch finalizers first)
     6. Delete bench namespaces (normal delete, not force-finalize)
     7. Delete RBAC (roles/rolebindings in krateo-system + clusterroles/bindings)
-    8. Deploy image + restart pod (flushes Redis)
+    8. Deploy image + restart pod (clears in-process cache)
     """
     section("Cleaning environment")
 
@@ -1388,28 +1542,14 @@ def clean_environment():
     # Step 3+4: Delete CompositionDefinition → core provider cleans CRD
     delete_all_compositiondefinitions()
 
-    # Step 5: Wait for controllers to finish cleaning children.
-    # All controllers stay running — they handle Argo apps, panels, repos
-    # naturally via finalizers. No scaling to 0.
-    deadline = time.time() + 300
-    while time.time() < deadline:
-        rc, out, _ = kubectl("get", "applications.argoproj.io", "--all-namespaces",
-                             "--no-headers")
-        argo_remaining = len([l for l in (out or "").strip().split("\n") if l.strip()]) if rc == 0 and out.strip() else 0
-        if argo_remaining == 0:
-            break
-        if int(time.time()) % 30 < 10:
-            log(f"  Waiting for controllers to clean {argo_remaining} Argo apps ...")
-        time.sleep(10)
-    if argo_remaining > 0:
-        log(f"  Force-patching {argo_remaining} stuck Argo apps ...")
-        for ns_name in sorted(set(l.split()[0] for l in (out or "").strip().split("\n") if l.strip())):
-            kubectl("patch", "applications.argoproj.io", "--all", "-n", ns_name,
-                    "--type=merge", '-p={"metadata":{"finalizers":null}}')
-            kubectl("delete", "applications.argoproj.io", "--all", "-n", ns_name,
-                    "--ignore-not-found", "--wait=false")
-        time.sleep(10)
-    log(f"Argo applications cleaned")
+    # Step 5: Drain Argo apps (controllers stay running and process finalizers
+    # naturally; force-patch + delete stragglers after timeout).
+    _drain_argo_apps(timeout=300)
+
+    # Step 5.5: Clear orphan repo finalizers. Patching a repo whose namespace
+    # is Terminating fails; cleanup_orphan_repoes recreates the namespace
+    # first, then patches+deletes. Today's run had 89 stuck repoes here.
+    cleanup_orphan_repoes()
 
     # Step 6: Delete bench namespaces (normal delete, wait for termination)
     delete_bench_namespaces()
@@ -1426,18 +1566,66 @@ def clean_environment():
                         "--ignore-not-found", "--wait=false")
                 log(f"Deleted {len(bench_items)} {res} in krateo-system")
 
-    # Step 8: Deploy image + restart pod (flushes Redis sidecar).
+    # Step 8: Deploy image + restart pod (clears in-process cache).
     # No scaling — all controllers stay running throughout.
     tag = os.environ.get("EXPECTED_IMAGE_TAG")
     if tag:
         log(f"Deploying snowplow image tag {tag} ...")
         kubectl("set", "image", "deployment/snowplow",
                 f"snowplow=ghcr.io/braghettos/snowplow:{tag}", "-n", "krateo-system")
-    log("Restarting snowplow pod to flush Redis cache ...")
+    log("Restarting snowplow pod to clear in-process cache ...")
     kubectl("rollout", "restart", "deployment/snowplow", "-n", "krateo-system")
     kubectl("rollout", "status", "deployment/snowplow", "-n", "krateo-system",
             "--timeout=600s")
-    log("  Snowplow pod restarted — Redis flushed")
+    log("  Snowplow pod restarted — in-process cache cleared")
+
+
+def cluster_dirty_state():
+    """Return a dict {category: count} of bench leftovers in the cluster.
+
+    Categories with count > 0 indicate the cluster is not in a state suitable
+    for a fresh test run. This is the ground-truth signal used by assert_clean
+    to decide whether to call clean_environment().
+    """
+    state = {
+        "bench_namespaces": count_bench_ns(),
+        "compositions": count_compositions() if _crd_exists(f"{COMP_RES}.{COMP_GVR}") else 0,
+        "compositiondefinitions": _count("compositiondefinitions.core.krateo.io"),
+        "argo_apps_bench": _count_bench_argo(),
+        "ogen_repoes": _count("repoes.github.ogen.krateo.io"),
+        "git_repoes": _count("repoes.git.krateo.io"),
+        "bench_clusterroles": _count_match("clusterrole", name_prefix="bench-"),
+        "bench_clusterrolebindings": _count_match("clusterrolebinding", name_prefix="bench-"),
+        "bench_roles_namespaced": _count_match("role", name_prefix="bench-"),
+        "bench_rolebindings_namespaced": _count_match("rolebinding", name_prefix="bench-"),
+    }
+    return state
+
+
+def assert_clean(retry_with_cleanup=True):
+    """Assert cluster has no bench leftovers. If dirty and retry_with_cleanup,
+    invoke clean_environment() once and re-check; raise if still dirty.
+
+    Today's failure mode this prevents: test runs blind into a cluster with
+    543 stuck Roles or 89 orphan repoes left from a prior aborted run, and
+    then aborts mid-deploy after wasting 30+ minutes.
+    """
+    section("Pre-flight: cluster state")
+    state = cluster_dirty_state()
+    dirty = {k: v for k, v in state.items() if v > 0}
+    if not dirty:
+        log("Pre-flight: cluster clean")
+        return
+    log(f"Pre-flight DIRTY: {dirty}")
+    if not retry_with_cleanup:
+        raise RuntimeError(f"Cluster dirty, abort: {dirty}")
+    log("Pre-flight: invoking clean_environment() ...")
+    clean_environment()
+    state = cluster_dirty_state()
+    dirty = {k: v for k, v in state.items() if v > 0}
+    if dirty:
+        raise RuntimeError(f"Cluster STILL dirty after cleanup: {dirty}")
+    log("Pre-flight: cluster clean after cleanup")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1456,7 +1644,7 @@ def run_phase_functional(tokens):
     token = tokens["admin"]
     # Verify cache is populated and metrics are live
     rt = get_runtime_metrics() or {}
-    cache_keys = rt.get("cache_key_count", rt.get("redis_key_count", 0))
+    cache_keys = rt.get("cache_key_count", 0)
     record("Warmup: cache has keys", cache_keys > 0, note=f"cache_key_count={cache_keys}")
     m = cache_metrics(token)
     l1_hits = m.get("l1_hits", 0) + m.get("raw_hits", 0)
@@ -1494,11 +1682,11 @@ def run_phase_functional(tokens):
     # T4 — Object cache verification (checks that a /call populates cache keys)
     section("T4 — Object Cache Verification")
     rt_before = get_runtime_metrics() or {}
-    keys_before = rt_before.get("cache_key_count", rt_before.get("redis_key_count", 0))
+    keys_before = rt_before.get("cache_key_count", 0)
     http_get(WIDGET_ENDPOINTS[0][1], token)
     time.sleep(2)
     rt_after = get_runtime_metrics() or {}
-    keys_after = rt_after.get("cache_key_count", rt_after.get("redis_key_count", 0))
+    keys_after = rt_after.get("cache_key_count", 0)
     record("Object cache populated after /call", keys_after >= keys_before,
            note=f"before={keys_before} after={keys_after}")
 
@@ -1545,7 +1733,7 @@ def run_phase_functional(tokens):
     # T9 — Cache key count (must run before T10 which invalidates L1 via CRUD)
     section("T9 — Cache Key Count")
     rt9 = get_runtime_metrics() or {}
-    total_keys = rt9.get("cache_key_count", rt9.get("redis_key_count", 0))
+    total_keys = rt9.get("cache_key_count", 0)
     record(f"Cache has keys: {total_keys}", total_keys > 100, note=f"total={total_keys}")
 
     # T10 — Informer CRUD (deliberately mutates resources — may invalidate L1)
@@ -2234,8 +2422,10 @@ def run_phase_browser():
 
     try:
         from playwright.sync_api import sync_playwright
-    except ImportError:
-        log("Playwright not installed — skipping browser phase")
+    except ImportError as e:
+        import traceback
+        log(f"Playwright import failed — skipping browser phase: {type(e).__name__}: {e}")
+        log("Traceback: " + traceback.format_exc().replace("\n", " | "))
         log("Install: pip install playwright && python -m playwright install chromium")
         return
 
@@ -2394,23 +2584,56 @@ def _browser_measure_navigation(page, page_path, label, min_calls=0):
         _prev_count = _cur_count
         page.wait_for_timeout(1000)
 
-    # Measure /call waterfall
+    # Measure /call waterfall + cluster calls into progressive-rendering levels.
+    # A new level starts when the next call's startTime exceeds the max end-time
+    # of the previous level + GAP_MS — i.e., the frontend waited for the current
+    # batch to complete before dispatching the next one.
     result = page.evaluate("""() => {
+        const GAP_MS = 150;
         const entries = performance.getEntriesByType('resource');
         const calls = entries
             .filter(e => e.name.includes('/call'))
             .sort((a, b) => a.startTime - b.startTime);
-        if (calls.length === 0) return { callCount: 0, waterfallMs: 0, calls: [] };
+        if (calls.length === 0) return { callCount: 0, waterfallMs: 0, calls: [], levels: [] };
         const first = calls[0].startTime;
         const last = Math.max(...calls.map(c => c.startTime + c.duration));
+        const callsRel = calls.map(c => ({
+            name: new URL(c.name).searchParams.get('name') || c.name.split('/').pop(),
+            duration: Math.round(c.duration),
+            startTime: Math.round(c.startTime - first),
+            endTime: Math.round(c.startTime + c.duration - first),
+        }));
+        // Cluster into levels by gap from running max-end-time.
+        const levels = [];
+        let cur = null;
+        let curMaxEnd = -Infinity;
+        for (const c of callsRel) {
+            if (cur === null || c.startTime > curMaxEnd + GAP_MS) {
+                if (cur !== null) levels.push(cur);
+                cur = { level: levels.length + 1, count: 0, startMs: c.startTime,
+                        endMs: c.endTime, names: {} };
+                curMaxEnd = c.endTime;
+            }
+            cur.count += 1;
+            if (c.endTime > cur.endMs) cur.endMs = c.endTime;
+            if (c.endTime > curMaxEnd) curMaxEnd = c.endTime;
+            cur.names[c.name] = (cur.names[c.name] || 0) + 1;
+        }
+        if (cur !== null) levels.push(cur);
+        for (const lv of levels) {
+            lv.durationMs = lv.endMs - lv.startMs;
+            // Top 3 RESTAction names by count
+            lv.topNames = Object.entries(lv.names)
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 3)
+                .map(([n, k]) => `${n}×${k}`);
+            delete lv.names;
+        }
         return {
             callCount: calls.length,
             waterfallMs: Math.round(last - first),
-            calls: calls.map(c => ({
-                name: new URL(c.name).searchParams.get('name') || c.name.split('/').pop(),
-                duration: Math.round(c.duration),
-                startTime: Math.round(c.startTime - first),
-            })),
+            calls: callsRel.map(c => ({ name: c.name, duration: c.duration, startTime: c.startTime })),
+            levels: levels,
         };
     }""")
 
@@ -2445,6 +2668,7 @@ def _browser_measure_navigation(page, page_path, label, min_calls=0):
         "domContentLoaded": (nav or {}).get("domContentLoaded", 0),
         "loadComplete": (nav or {}).get("loadComplete", 0),
         "calls": result.get("calls", []),
+        "levels": result.get("levels", []),
         "httpOk": ok_count,
         "httpErr": err_count,
     }
@@ -2486,8 +2710,10 @@ def run_phase_browser_comparison():
 
     try:
         from playwright.sync_api import sync_playwright
-    except ImportError:
-        log("Playwright not installed — skipping Phase 5")
+    except ImportError as e:
+        import traceback
+        log(f"Playwright import failed — skipping Phase 5: {type(e).__name__}: {e}")
+        log("Traceback: " + traceback.format_exc().replace("\n", " | "))
         log("Install: pip install playwright && python -m playwright install chromium")
         return
 
@@ -2892,6 +3118,8 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, token=None, 
             "loadComplete_p50": pct(lc_vals, 50) if lc_vals else 0,
             "loadComplete_p90": pct(lc_vals, 90) if lc_vals else 0,
             "callCount": navs[0]["callCount"] if navs else 0,
+            "levels_warm_last": last_nav.get("levels", []),
+            "levels_cold": (navs[0].get("levels", []) if navs else []),
         }
 
     return {
@@ -2910,8 +3138,10 @@ def run_phase_browser_scaling(tokens):
 
     try:
         from playwright.sync_api import sync_playwright
-    except ImportError:
-        log("Playwright not installed — skipping Phase 6")
+    except ImportError as e:
+        import traceback
+        log(f"Playwright import failed — skipping Phase 6: {type(e).__name__}: {e}")
+        log("Traceback: " + traceback.format_exc().replace("\n", " | "))
         log("Install: pip install playwright && python -m playwright install chromium")
         return
 
@@ -3032,11 +3262,11 @@ def run_phase_browser_scaling(tokens):
             if r:
                 all_results.append(r)
 
-            # Redis memory snapshot at peak scale
+            # Heap and key-count snapshot at peak scale
             if cache_mode == "ON":
                 rt_mem = get_runtime_metrics() or {}
                 heap = rt_mem.get("heap_alloc_mb", 0)
-                keys = rt_mem.get("cache_key_count", rt_mem.get("redis_key_count", 0))
+                keys = rt_mem.get("cache_key_count", 0)
                 log(f"    CACHE heap={heap:.0f}MB keys={keys}")
 
             # Pod restart check at peak scale — assert zero restarts
@@ -3209,7 +3439,27 @@ def run_phase_browser_scaling(tokens):
                   f"│ {off_warm:>8d}ms {off_wf:>7d}ms {off_calls:>5d} "
                   f"│ {color}{speedup:>6.1f}x{RESET}{anomaly} {conv_str:>7s}")
 
+            # Per-level frontend rendering breakdown (warm last nav)
+            on_levels = on_pg.get("levels_warm_last", []) if on_pg else []
+            off_levels = off_pg.get("levels_warm_last", []) if off_pg else []
+            max_lv = max(len(on_levels), len(off_levels))
+            for i in range(max_lv):
+                ol = on_levels[i] if i < len(on_levels) else None
+                fl = off_levels[i] if i < len(off_levels) else None
+                on_str = (f"{ol['durationMs']:>5d}ms ({ol['count']:>3d} calls)"
+                          if ol else f"{'—':>17s}")
+                off_str = (f"{fl['durationMs']:>5d}ms ({fl['count']:>3d} calls)"
+                           if fl else f"{'—':>17s}")
+                # Top names from whichever side has data, prefer ON
+                top = (ol or fl or {}).get("topNames", [])
+                top_str = ", ".join(top[:2])
+                print(f"  {'':>6s} {'  L' + str(i + 1):<22s} {'':>4s} {'':>5s} "
+                      f"│ {on_str:>19s}{'':>6s} "
+                      f"│ {off_str:>20s}{'':>7s} "
+                      f"│ {top_str}")
+
         print(f"  {'':>6s} {'warm=last nav, p50=median all navs, Conv=cache convergence time, * = incomplete load':>100s}")
+        print(f"  {'':>6s} {'L1..Ln = progressive-rendering levels (gap >150ms between batches), warm last nav':>100s}")
 
     # ── Performance regression assertions ──
     for entry in all_results:
@@ -3274,11 +3524,6 @@ def get_runtime_metrics():
             return json.loads(r.read())
     except Exception:
         return None
-
-
-def get_redis_memory_mb():
-    """Return 0 — Redis sidecar removed. Kept for API compatibility."""
-    return 0.0
 
 
 def _scaleuser_name(i):
@@ -3415,7 +3660,7 @@ def delete_synthetic_users():
 
     # Active users are in-process (MemCache sync.Map) — they're cleaned up
     # when the user's clientconfig secret is deleted (UserSecretWatcher fires
-    # SRemUser). No manual Redis SREM needed.
+    # SRemUser). No manual external eviction needed.
     log("  Synthetic users cleaned up (in-process cache clears on secret deletion)")
 
 
@@ -3440,7 +3685,7 @@ def wait_for_active_users(expected_min, timeout=120):
 def measure_warmup_after_restart(expected_users, timeout=300):
     """Restart the snowplow pod and measure time until L1 is ready.
 
-    Returns dict with warmup_ms, peak_heap_mb, peak_goroutines, redis_mb
+    Returns dict with warmup_ms, peak_heap_mb, peak_goroutines
     or None on timeout.
     """
     # Record pre-restart state
@@ -3466,12 +3711,10 @@ def measure_warmup_after_restart(expected_users, timeout=300):
         ts = _read_l1_ready_ts()
         if ts > 0:
             warmup_ms = int((time.time() - t0) * 1000)
-            redis_mb = get_redis_memory_mb()
             return {
                 "warmup_ms": warmup_ms,
                 "peak_heap_mb": peak_heap,
                 "peak_goroutines": peak_goroutines,
-                "redis_mb": redis_mb,
             }
         time.sleep(3)
 
@@ -3483,7 +3726,7 @@ def measure_first_login_warmup(new_start, new_end, total_expected, tokens, timeo
 
     Also measures latency impact on existing admin user during the burst.
 
-    Returns dict with warmup_ms, peak_heap_mb, peak_goroutines, redis_mb,
+    Returns dict with warmup_ms, peak_heap_mb, peak_goroutines,
     admin_latency_ms, or None on timeout.
     """
     admin_token = tokens.get("admin")
@@ -3529,14 +3772,12 @@ def measure_first_login_warmup(new_start, new_end, total_expected, tokens, timeo
             # Also verify active user count
             if m and m.get("active_users", 0) >= total_expected:
                 warmup_ms = int((time.time() - t0) * 1000)
-                redis_mb = get_redis_memory_mb()
                 admin_during = (statistics.median(admin_during_latencies)
                                 if admin_during_latencies else 0)
                 return {
                     "warmup_ms": warmup_ms,
                     "peak_heap_mb": peak_heap,
                     "peak_goroutines": peak_goroutines,
-                    "redis_mb": redis_mb,
                     "admin_baseline_ms": admin_baseline,
                     "admin_during_ms": admin_during,
                 }
@@ -3549,7 +3790,6 @@ def measure_first_login_warmup(new_start, new_end, total_expected, tokens, timeo
         "warmup_ms": warmup_ms,
         "peak_heap_mb": peak_heap,
         "peak_goroutines": peak_goroutines,
-        "redis_mb": get_redis_memory_mb(),
         "admin_baseline_ms": admin_baseline,
         "admin_during_ms": admin_during,
         "timeout": True,
@@ -3559,9 +3799,9 @@ def measure_first_login_warmup(new_start, new_end, total_expected, tokens, timeo
 def run_phase_user_scaling(tokens):
     phase_banner(7, "MULTI-USER SCALING (warmup + first-login burst)")
 
-    # ── Step 0: Clean environment ──
+    # ── Step 0: Clean environment + pre-flight assertion ──
     section("Step 0: Clean environment")
-    clean_environment()
+    assert_clean(retry_with_cleanup=True)
     enable_cache()
     if not wait_for_snowplow():
         log("ERROR: snowplow not healthy after cleanup")
@@ -3600,8 +3840,7 @@ def run_phase_user_scaling(tokens):
     if baseline:
         log(f"  Baseline warmup: {baseline['warmup_ms']}ms, "
             f"heap={baseline['peak_heap_mb']:.0f}MB, "
-            f"goroutines={baseline['peak_goroutines']}, "
-            f"redis={baseline['redis_mb']:.0f}MB")
+            f"goroutines={baseline['peak_goroutines']}")
     else:
         log("  WARNING: baseline warmup measurement timed out")
 
@@ -3633,8 +3872,7 @@ def run_phase_user_scaling(tokens):
                 admin_impact = f", admin latency {ratio:.1f}x baseline"
             log(f"  N={target_count}: warmup={status}, "
                 f"heap={result['peak_heap_mb']:.0f}MB, "
-                f"goroutines={result['peak_goroutines']}, "
-                f"redis={result['redis_mb']:.0f}MB"
+                f"goroutines={result['peak_goroutines']}"
                 f"{admin_impact}")
 
             cumulative_results.append({
@@ -3666,8 +3904,7 @@ def run_phase_user_scaling(tokens):
         timed_out = full_warmup.get("timeout", False)
         log(f"  Full warmup (1000 users): {full_warmup['warmup_ms']}ms, "
             f"heap={full_warmup['peak_heap_mb']:.0f}MB, "
-            f"goroutines={full_warmup['peak_goroutines']}, "
-            f"redis={full_warmup['redis_mb']:.0f}MB")
+            f"goroutines={full_warmup['peak_goroutines']}")
         cumulative_results.append({
             "users": max(USER_COUNTS),
             "type": "cold_start",
@@ -3740,7 +3977,7 @@ def run_phase_user_scaling(tokens):
     # ── Summary table ──
     section("PHASE 7 RESULTS")
     print(f"\n  {BOLD}{'Type':<14s} {'Users':>6s} {'Added':>6s} │ {'Warmup':>10s} "
-          f"{'Heap(MB)':>10s} {'Goroutines':>11s} {'Redis(MB)':>10s} "
+          f"{'Heap(MB)':>10s} {'Goroutines':>11s} "
           f"│ {'Admin Baseline':>15s} {'Admin During':>13s}{RESET}")
     print(f"  {'─' * 120}")
 
@@ -3748,8 +3985,7 @@ def run_phase_user_scaling(tokens):
         print(f"  {'cold-start':<14s} {'2':>6s} {'—':>6s} │ "
               f"{baseline['warmup_ms']:>8d}ms "
               f"{baseline['peak_heap_mb']:>10.0f} "
-              f"{baseline['peak_goroutines']:>11d} "
-              f"{baseline['redis_mb']:>10.0f} │ "
+              f"{baseline['peak_goroutines']:>11d} │ "
               f"{'—':>15s} {'—':>13s}")
 
     for entry in cumulative_results:
@@ -3764,15 +4000,14 @@ def run_phase_user_scaling(tokens):
               f"{entry.get('added', '—'):>6} │ "
               f"{warmup_str:>10s} "
               f"{entry.get('peak_heap_mb', 0):>10.0f} "
-              f"{entry.get('peak_goroutines', 0):>11d} "
-              f"{entry.get('redis_mb', 0):>10.0f} │ "
+              f"{entry.get('peak_goroutines', 0):>11d} │ "
               f"{admin_base_str:>15s} {admin_during_str:>13s}")
 
     # Print cache OFF baseline row
     if off_results.get("admin_dashboard_p50", 0) > 0:
         print(f"  {'─' * 120}")
         print(f"  {'cache-OFF':<14s} {'—':>6s} {'—':>6s} │ "
-              f"{'—':>10s} {'—':>10s} {'—':>11s} {'—':>10s} │ "
+              f"{'—':>10s} {'—':>10s} {'—':>11s} │ "
               f"{'—':>15s} "
               f"{off_results['admin_dashboard_p50']:>11d}ms")
 
@@ -3814,7 +4049,24 @@ def main():
                         help="Smoke mode: limit scaling to stages 1-3")
     parser.add_argument("--iters", type=int, default=ITERS,
                         help=f"Iterations for measurements (default: {ITERS})")
+    parser.add_argument("--clean-only", action="store_true",
+                        help="Run cleanup + assert_clean and exit (no test).")
     args = parser.parse_args()
+
+    if args.clean_only:
+        verify_deployed_image()
+        cleanup_rogue_rbac()
+        # Only run clean_environment (which restarts the pod) if cluster is dirty.
+        state = cluster_dirty_state()
+        dirty = {k: v for k, v in state.items() if v > 0}
+        if dirty:
+            log(f"Pre-flight DIRTY: {dirty}")
+            clean_environment()
+            assert_clean(retry_with_cleanup=False)
+        else:
+            log("Pre-flight: cluster already clean, skipping clean_environment")
+        log("Cluster clean. Exiting.")
+        sys.exit(0)
 
     ITERS = args.iters
     SMOKE = args.smoke
@@ -3831,6 +4083,7 @@ def main():
 
     verify_deployed_image()
     cleanup_rogue_rbac()
+    assert_clean(retry_with_cleanup=True)
     tokens = login_all()
 
     if 1 in phases:
