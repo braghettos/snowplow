@@ -14,12 +14,12 @@ import (
 	"sync/atomic"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
-	httpcall "github.com/krateoplatformops/plumbing/http/request"
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/maps"
 	"github.com/krateoplatformops/plumbing/ptr"
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	httpcall "github.com/krateoplatformops/snowplow/internal/httpcall"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"

@@ -15,11 +15,11 @@ import (
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/env"
-	"github.com/krateoplatformops/plumbing/http/request"
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/ptr"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
+	"github.com/krateoplatformops/snowplow/internal/httpcall"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -121,8 +121,8 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	}
 
 	dict := map[string]any{}
-	callOpts := request.RequestOptions{
-		RequestInfo: request.RequestInfo{
+	callOpts := httpcall.RequestOptions{
+		RequestInfo: httpcall.RequestInfo{
 			Path: uri,
 			Verb: ptr.To(strings.ToUpper(opts.verb)),
 			Headers: []string{
@@ -139,7 +139,7 @@ func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		callOpts.Payload = ptr.To(string(opts.dat))
 	}
 
-	rt := request.Do(req.Context(), callOpts)
+	rt := httpcall.Do(req.Context(), callOpts)
 	if rt.Status == response.StatusFailure {
 		if rt.Code == http.StatusNotFound && strings.ToUpper(opts.verb) == http.MethodGet && c != nil {
 			_ = c.SetNotFound(req.Context(), callCacheKey(opts))
