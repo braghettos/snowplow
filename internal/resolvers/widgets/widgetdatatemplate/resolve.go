@@ -2,6 +2,7 @@ package widgetdatatemplate
 
 import (
 	"context"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -150,12 +151,15 @@ func Resolve(ctx context.Context, opts ResolveOptions) ([]EvalResult, error) {
 		wg       sync.WaitGroup
 		errOnce  sync.Once
 		firstErr error
+		sem      = make(chan struct{}, runtime.GOMAXPROCS(0))
 	)
 	for _, w := range work {
 		wg.Add(1)
 		dsCopy := deepCopyValue(opts.DataSource).(map[string]any)
+		sem <- struct{}{}
 		go func(w workItem) {
 			defer wg.Done()
+			defer func() { <-sem }()
 			if err := eval(w, dsCopy); err != nil {
 				errOnce.Do(func() { firstErr = err })
 			}

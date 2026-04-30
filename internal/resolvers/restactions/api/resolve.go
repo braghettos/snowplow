@@ -490,12 +490,20 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				return false
 			}
 		} else {
-			// Iterator: N independent calls — run concurrently.
+			// Iterator: N independent calls — run concurrently with bounded
+			// fan-out. Without this cap, a single API that expands to N
+			// per-namespace calls (e.g., 50 namespaces) spawned N goroutines.
+			// At 50K compositions × 3 users prewarming, this contributed to
+			// the 24K goroutine peak measured in v0.25.280. Mirrors the
+			// pattern used at the level fan-out below.
+			iterSem := make(chan struct{}, runtime.GOMAXPROCS(0))
 			var wg sync.WaitGroup
 			for _, call := range tmp {
 				wg.Add(1)
+				iterSem <- struct{}{}
 				go func(c httpcall.RequestOptions) {
 					defer wg.Done()
+					defer func() { <-iterSem }()
 					runOne(c, dictMu)
 				}(call)
 			}
