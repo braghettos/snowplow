@@ -2536,41 +2536,63 @@ def run_phase_browser_comparison():
     print(f"  browser discover and request more widget levels.")
 
     # ── Record pass/fail ──
-    # Compare MEDIAN PER-CALL DURATION, not total waterfall.
-    # Total waterfall penalizes deeper progressive rendering: when cache is ON,
-    # each call is faster so the browser reaches more levels and issues more
-    # requests. More calls = longer total waterfall even though each call is
-    # faster. Median per-call duration isolates what cache actually improves.
-    off_durations = []
-    warmed_durations = []
-    for m in results.get("cache_off", []):
-        off_durations.extend(c["duration"] for c in m.get("calls", []) if c.get("duration", 0) > 0)
-    for m in results.get("cache_on_warmed", []):
-        warmed_durations.extend(c["duration"] for c in m.get("calls", []) if c.get("duration", 0) > 0)
+    # Compare PER-RESTACTION MEDIAN DURATION, only on RESTActions that appear in
+    # BOTH the OFF and WARMED runs. The previous implementation compared the
+    # global per-call median, which is invalid: cache ON unlocks deeper
+    # progressive rendering, so the warmed run includes calls that have no
+    # equivalent in OFF. Those extra calls are inherently more expensive, so the
+    # warmed global median was dragged up by calls that simply don't exist in
+    # OFF. Bucketing by RESTAction name makes the comparison apples-to-apples.
+    def bucket_by_name(measurements):
+        b = {}
+        for m in measurements:
+            for c in m.get("calls", []):
+                if c.get("duration", 0) > 0:
+                    b.setdefault(c.get("name", "?"), []).append(c["duration"])
+        return b
 
+    off_buckets = bucket_by_name(results.get("cache_off", []))
+    warmed_buckets = bucket_by_name(results.get("cache_on_warmed", []))
     off_calls = sum(m["callCount"] for m in results.get("cache_off", []))
     warmed_calls = sum(m["callCount"] for m in results.get("cache_on_warmed", []))
 
-    if len(off_durations) >= 3 and len(warmed_durations) >= 3:
-        med_off = pct(off_durations, 50)
-        med_warmed = pct(warmed_durations, 50)
-        speedup = med_off / med_warmed if med_warmed > 0 else 0
-        record(f"Browser: warmed per-call faster than no cache ({speedup:.1f}x)",
-               speedup > 1.0, med_warmed,
-               note=f"med/call: off={med_off}ms warmed={med_warmed}ms "
-                    f"calls: off={off_calls} warmed={warmed_calls}")
-    elif len(off_durations) > 0 and len(warmed_durations) > 0:
-        # Few calls — fall back to total waterfall but with a warning
+    common = sorted(set(off_buckets) & set(warmed_buckets))
+    warmed_only = sorted(set(warmed_buckets) - set(off_buckets))
+
+    if len(common) >= 1:
+        # Per-bucket speedups; pass when the median bucket-speedup is > 1.0x.
+        # Median (not arithmetic mean) resists outliers from rarely-called
+        # endpoints, and lets a single slow bucket fail the test only if the
+        # majority of buckets also regressed.
+        bucket_speedups = []
+        for name in common:
+            off_med = pct(off_buckets[name], 50)
+            warmed_med = pct(warmed_buckets[name], 50)
+            if off_med > 0 and warmed_med > 0:
+                bucket_speedups.append((name, off_med, warmed_med, off_med / warmed_med))
+
+        if bucket_speedups:
+            speedups_only = sorted(s[3] for s in bucket_speedups)
+            median_speedup = speedups_only[len(speedups_only) // 2]
+            wins = sum(1 for s in bucket_speedups if s[3] > 1.0)
+            warmed_only_note = f" warmed-only={len(warmed_only)}" if warmed_only else ""
+            record(f"Browser: warmed per-call faster than no cache ({median_speedup:.1f}x)",
+                   median_speedup > 1.0, 0,
+                   note=f"median bucket speedup={median_speedup:.2f}x; wins={wins}/{len(bucket_speedups)} "
+                        f"buckets; calls: off={off_calls} warmed={warmed_calls}{warmed_only_note}")
+        else:
+            record("Browser: per-call comparison", False,
+                   note="zero valid bucket pairs (all medians were 0)")
+    else:
+        # No overlap between runs: fall back to total-waterfall comparison.
         off_waterfall = [m["waterfallMs"] for m in results.get("cache_off", []) if m["waterfallMs"] > 0]
         warmed_waterfall = [m["waterfallMs"] for m in results.get("cache_on_warmed", []) if m["waterfallMs"] > 0]
         avg_off = sum(off_waterfall) / len(off_waterfall) if off_waterfall else 0
         avg_warmed = sum(warmed_waterfall) / len(warmed_waterfall) if warmed_waterfall else 0
         speedup = avg_off / avg_warmed if avg_warmed > 0 else 0
-        record(f"Browser: warmed cache waterfall ({speedup:.1f}x, <3 calls per scenario)",
+        record(f"Browser: warmed cache waterfall ({speedup:.1f}x, no per-RESTAction overlap)",
                speedup > 1.0, int(avg_warmed),
-               note=f"off={int(avg_off)}ms warmed={int(avg_warmed)}ms (few calls, waterfall fallback)")
-    else:
-        record("Browser: waterfall comparison", False, note="insufficient data")
+               note=f"off={int(avg_off)}ms warmed={int(avg_warmed)}ms (waterfall fallback)")
 
     # Re-enable cache for subsequent phases
     enable_cache()
