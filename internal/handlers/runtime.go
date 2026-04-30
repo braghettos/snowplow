@@ -10,12 +10,30 @@ import (
 
 // RuntimeMetrics holds the JSON structure returned by /metrics/runtime.
 type RuntimeMetrics struct {
-	HeapAllocMB    float64 `json:"heap_alloc_mb"`
-	HeapSysMB      float64 `json:"heap_sys_mb"`
-	GoroutineCount int     `json:"goroutine_count"`
-	NumGC          uint32  `json:"num_gc"`
-	ActiveUsers    int     `json:"active_users"`
-	CacheKeyCount  int64   `json:"cache_key_count"`
+	HeapAllocMB    float64        `json:"heap_alloc_mb"`
+	HeapSysMB      float64        `json:"heap_sys_mb"`
+	GoroutineCount int            `json:"goroutine_count"`
+	NumGC          uint32         `json:"num_gc"`
+	ActiveUsers    int            `json:"active_users"`
+	CacheKeyCount  int64          `json:"cache_key_count"`
+	ClusterDep     ClusterDepInfo `json:"cluster_dep"`
+}
+
+// ClusterDepInfo mirrors the cluster-wide dep instrumentation counters from
+// MetricsSnapshot. The two *_per_namespace_list_* fields drive the Option A
+// go/no-go signal (W_ns / W headline ratio per design doc §3.4).
+type ClusterDepInfo struct {
+	SAddTotal                 int64   `json:"sadd_total"`
+	SAddByResolve             int64   `json:"sadd_by_resolve"`
+	SAddByResolveNSList       int64   `json:"writes_per_namespace_list_resolve"`
+	SAddByRegister            int64   `json:"sadd_by_register"`
+	SAddByRegisterNSList      int64   `json:"writes_per_namespace_list_register"`
+	SAddDeduped               int64   `json:"sadd_deduped"`
+	SetSizeMax                int64   `json:"set_size_max"`
+	SetSizeAvg                float64 `json:"set_size_avg"`
+	SMembersTotal             int64   `json:"smembers_total"`
+	SMembersBytes             int64   `json:"smembers_bytes"`
+	WritesPerNamespaceListSum int64   `json:"writes_per_namespace_list"`
 }
 
 // RuntimeMetricsHandler returns an http.Handler that serves /metrics/runtime.
@@ -40,6 +58,7 @@ func RuntimeMetricsHandler(c cache.Cache) http.Handler {
 			redisKeyCount = c.DBSize(ctx)
 		}
 
+		snap := cache.GlobalMetrics.Snapshot()
 		m := RuntimeMetrics{
 			HeapAllocMB:    float64(ms.HeapAlloc) / (1024 * 1024),
 			HeapSysMB:      float64(ms.HeapSys) / (1024 * 1024),
@@ -47,6 +66,19 @@ func RuntimeMetricsHandler(c cache.Cache) http.Handler {
 			NumGC:          ms.NumGC,
 			ActiveUsers:    activeUsers,
 			CacheKeyCount:  redisKeyCount,
+			ClusterDep: ClusterDepInfo{
+				SAddTotal:                 snap.ClusterDepSAddTotal,
+				SAddByResolve:             snap.ClusterDepSAddByResolve,
+				SAddByResolveNSList:       snap.ClusterDepSAddByResolveNSList,
+				SAddByRegister:            snap.ClusterDepSAddByRegister,
+				SAddByRegisterNSList:      snap.ClusterDepSAddByRegisterNSList,
+				SAddDeduped:               snap.ClusterDepSAddDeduped,
+				SetSizeMax:                snap.ClusterDepSetSizeMax,
+				SetSizeAvg:                snap.ClusterDepSetSizeAvg,
+				SMembersTotal:             snap.ClusterDepSMembersTotal,
+				SMembersBytes:             snap.ClusterDepSMembersBytes,
+				WritesPerNamespaceListSum: snap.ClusterDepSAddByResolveNSList + snap.ClusterDepSAddByRegisterNSList,
+			},
 		}
 
 		w.Header().Set("Content-Type", "application/json")

@@ -232,7 +232,16 @@ func RegisterL1Dependencies(ctx context.Context, c Cache, tracker *DependencyTra
 			key := L1ResourceDepKey(ref.GVRKey, "", "")
 			if !seenCluster[key] {
 				seenCluster[key] = true
-				_ = c.SAddWithTTL(ctx, key, l1Key, ReverseIndexTTL)
+				// Instrumentation: cluster-wide dep writer (RegisterL1Dependencies).
+				// Per design doc §2 row 3 — instrument only this primary SAdd
+				// (keys.go:235). The sibling baseKey SAdd below is the same
+				// dep set; leaving it uninstrumented keeps counters aligned
+				// with the call-site inventory.
+				GlobalMetrics.ClusterDepSAddByRegister.Add(1)
+				if ref.NS != "" {
+					GlobalMetrics.ClusterDepSAddByRegisterNSList.Add(1)
+				}
+				SAddClusterDepInstrumented(ctx, c, key, l1Key, ReverseIndexTTL)
 				clusterRegistered++
 				if baseKey != "" {
 					_ = c.SAddWithTTL(ctx, key, baseKey, ReverseIndexTTL)

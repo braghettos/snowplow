@@ -347,7 +347,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 										_ = c.SAddWithTTL(ctx, depKey, apiCacheKey, cache.ReverseIndexTTL)
 										if pathName == "" {
 											clusterDep := cache.L1ResourceDepKey(gvrKey, "", "")
-											_ = c.SAddWithTTL(ctx, clusterDep, apiCacheKey, cache.ReverseIndexTTL)
+											// Instrumentation: cluster-wide dep writer (resolve, mu!=nil).
+											cache.GlobalMetrics.ClusterDepSAddByResolve.Add(1)
+											if pathNS != "" {
+												cache.GlobalMetrics.ClusterDepSAddByResolveNSList.Add(1)
+											}
+											cache.SAddClusterDepInstrumented(ctx, c, clusterDep, apiCacheKey, cache.ReverseIndexTTL)
 										}
 									}
 									return true
@@ -362,7 +367,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 										_ = c.SAddWithTTL(ctx, depKey, apiCacheKey, cache.ReverseIndexTTL)
 										if pathName == "" {
 											clusterDep := cache.L1ResourceDepKey(gvrKey, "", "")
-											_ = c.SAddWithTTL(ctx, clusterDep, apiCacheKey, cache.ReverseIndexTTL)
+											// Instrumentation: cluster-wide dep writer (resolve, mu==nil).
+											cache.GlobalMetrics.ClusterDepSAddByResolve.Add(1)
+											if pathNS != "" {
+												cache.GlobalMetrics.ClusterDepSAddByResolveNSList.Add(1)
+											}
+											cache.SAddClusterDepInstrumented(ctx, c, clusterDep, apiCacheKey, cache.ReverseIndexTTL)
 										}
 									}
 									return true

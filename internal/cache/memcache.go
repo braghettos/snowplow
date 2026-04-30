@@ -399,7 +399,8 @@ func (c *MemCache) ScanKeys(_ context.Context, pattern string) ([]string, error)
 // ── Set operations ───────────────────────────────────────────────────────────
 
 // saddInternal adds a member to a set with TTL. Shared by public methods.
-func (c *MemCache) saddInternal(key, member string, ttl time.Duration) {
+// Returns 1 if the member was newly added, 0 if it already existed (dedup).
+func (c *MemCache) saddInternal(key, member string, ttl time.Duration) int {
 	exp := expiresAt(ttl)
 	for {
 		v, loaded := c.sets.LoadOrStore(key, &memSetEntry{
@@ -407,7 +408,7 @@ func (c *MemCache) saddInternal(key, member string, ttl time.Duration) {
 			expiresAt: exp,
 		})
 		if !loaded {
-			return // freshly created
+			return 1 // freshly created — member is new
 		}
 		se := v.(*memSetEntry)
 		se.mu.Lock()
@@ -417,10 +418,14 @@ func (c *MemCache) saddInternal(key, member string, ttl time.Duration) {
 			c.sets.Delete(key)
 			continue // retry LoadOrStore
 		}
+		added := 0
+		if !se.members[member] {
+			added = 1
+		}
 		se.members[member] = true
 		se.expiresAt = exp
 		se.mu.Unlock()
-		return
+		return added
 	}
 }
 
@@ -430,6 +435,36 @@ func (c *MemCache) SAddWithTTL(_ context.Context, key, member string, ttl time.D
 	}
 	c.saddInternal(key, member, ttl)
 	return nil
+}
+
+// SAddWithTTLN behaves like SAddWithTTL but returns the number of members
+// actually added (0 means the member was already present). Used for dedup
+// detection in instrumentation; zero added cost — saddInternal already
+// computes the count.
+func (c *MemCache) SAddWithTTLN(_ context.Context, key, member string, ttl time.Duration) (int, error) {
+	if c == nil {
+		return 0, nil
+	}
+	return c.saddInternal(key, member, ttl), nil
+}
+
+// SCard returns the cardinality of the set at key. Returns 0 if the set is
+// absent or expired. O(1) — used for sampled cluster-wide dep size gauges.
+func (c *MemCache) SCard(_ context.Context, key string) (int64, error) {
+	if c == nil {
+		return 0, nil
+	}
+	v, ok := c.sets.Load(key)
+	if !ok {
+		return 0, nil
+	}
+	se := v.(*memSetEntry)
+	se.mu.Lock()
+	defer se.mu.Unlock()
+	if isExpired(se.expiresAt) {
+		return 0, nil
+	}
+	return int64(len(se.members)), nil
 }
 
 func (c *MemCache) SAddMultiWithTTL(_ context.Context, key string, members []string, ttl time.Duration) error {

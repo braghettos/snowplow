@@ -1,10 +1,16 @@
 package cache
 
 import (
+	"context"
 	"sync/atomic"
+	"time"
 
 	"github.com/krateoplatformops/snowplow/internal/observability"
 )
+
+// clusterDepSampleEvery samples SCard once per N SAdds against cluster-wide
+// dep keys. 128 chosen per design §3.2: ~40 samples/sec at 5K SAdds/sec.
+const clusterDepSampleEvery = 128
 
 type Metrics struct {
 	GetHits         atomic.Int64
@@ -21,6 +27,24 @@ type Metrics struct {
 	CallMisses      atomic.Int64
 	NegativeHits    atomic.Int64
 	ExpiryRefreshes atomic.Int64
+
+	// ── Cluster-wide dep instrumentation (Option A measurement) ────────
+	// All counters are atomic.Int64; no locks. Sampled SCard runs on
+	// every 128th SAdd via ClusterDepSAddSampler (no goroutine).
+	ClusterDepSAddTotal            atomic.Int64
+	ClusterDepSAddByResolve        atomic.Int64
+	ClusterDepSAddByResolveNSList  atomic.Int64
+	ClusterDepSAddByRegister       atomic.Int64
+	ClusterDepSAddByRegisterNSList atomic.Int64
+	ClusterDepSAddDeduped          atomic.Int64
+	ClusterDepSetSizeMax           atomic.Int64
+	ClusterDepSetSizeSumLast       atomic.Int64
+	ClusterDepSampledKeys          atomic.Int64
+	ClusterDepSMembersTotal        atomic.Int64
+	ClusterDepSMembersBytes        atomic.Int64
+	// ClusterDepSAddSampler is a free-running counter incremented on every
+	// SAdd against a cluster-wide dep key. Modulo 128 selects the sample.
+	ClusterDepSAddSampler atomic.Int64
 }
 
 // Inc atomically increments the given counter and updates the OTel metric.
@@ -48,6 +72,18 @@ type MetricsSnapshot struct {
 	ListHitRate     float64 `json:"list_hit_rate"`
 	RBACHitRate     float64 `json:"rbac_hit_rate"`
 	L1HitRate       float64 `json:"l1_hit_rate"`
+
+	// Cluster-wide dep instrumentation (write-path measurement, no behavior).
+	ClusterDepSAddTotal            int64   `json:"cluster_dep_sadd_total"`
+	ClusterDepSAddByResolve        int64   `json:"cluster_dep_sadd_by_resolve"`
+	ClusterDepSAddByResolveNSList  int64   `json:"cluster_dep_writes_per_namespace_list_resolve"`
+	ClusterDepSAddByRegister       int64   `json:"cluster_dep_sadd_by_register"`
+	ClusterDepSAddByRegisterNSList int64   `json:"cluster_dep_writes_per_namespace_list_register"`
+	ClusterDepSAddDeduped          int64   `json:"cluster_dep_sadd_deduped"`
+	ClusterDepSetSizeMax           int64   `json:"cluster_dep_set_size_max"`
+	ClusterDepSetSizeAvg           float64 `json:"cluster_dep_set_size_avg"`
+	ClusterDepSMembersTotal        int64   `json:"cluster_dep_smembers_total"`
+	ClusterDepSMembersBytes        int64   `json:"cluster_dep_smembers_bytes"`
 }
 
 var GlobalMetrics = &Metrics{}
@@ -73,11 +109,24 @@ func (m *Metrics) snapshotFromAtomics() MetricsSnapshot {
 		CallMisses:      m.CallMisses.Load(),
 		NegativeHits:    m.NegativeHits.Load(),
 		ExpiryRefreshes: m.ExpiryRefreshes.Load(),
+
+		ClusterDepSAddTotal:            m.ClusterDepSAddTotal.Load(),
+		ClusterDepSAddByResolve:        m.ClusterDepSAddByResolve.Load(),
+		ClusterDepSAddByResolveNSList:  m.ClusterDepSAddByResolveNSList.Load(),
+		ClusterDepSAddByRegister:       m.ClusterDepSAddByRegister.Load(),
+		ClusterDepSAddByRegisterNSList: m.ClusterDepSAddByRegisterNSList.Load(),
+		ClusterDepSAddDeduped:          m.ClusterDepSAddDeduped.Load(),
+		ClusterDepSetSizeMax:           m.ClusterDepSetSizeMax.Load(),
+		ClusterDepSMembersTotal:        m.ClusterDepSMembersTotal.Load(),
+		ClusterDepSMembersBytes:        m.ClusterDepSMembersBytes.Load(),
 	}
 	s.GetHitRate = hitRate(s.GetHits, s.GetMisses)
 	s.ListHitRate = hitRate(s.ListHits, s.ListMisses)
 	s.RBACHitRate = hitRate(s.RBACHits, s.RBACMisses)
 	s.L1HitRate = hitRate(s.L1Hits, s.L1Misses)
+	if sampled := m.ClusterDepSampledKeys.Load(); sampled > 0 {
+		s.ClusterDepSetSizeAvg = float64(m.ClusterDepSetSizeSumLast.Load()) / float64(sampled)
+	}
 	return s
 }
 
@@ -86,4 +135,41 @@ func hitRate(hits, misses int64) float64 {
 		return float64(hits) / float64(total) * 100
 	}
 	return 0
+}
+
+// SAddClusterDepInstrumented performs a SAdd against a cluster-wide dep key
+// and updates GlobalMetrics atomically: total counter, dedup counter (when
+// the member already existed), and a sampled SCard every clusterDepSampleEvery
+// calls (no goroutine — uses a free-running atomic sampler). Per-site
+// counters (ByResolve / ByRegister and their *NSList variants) are
+// incremented by the caller before invoking this helper.
+//
+// The function preserves the existing "discard error, do not block writer"
+// semantics of the SAdd call sites — errors are intentionally ignored.
+func SAddClusterDepInstrumented(ctx context.Context, c Cache, key, member string, ttl time.Duration) {
+	if c == nil {
+		return
+	}
+	added, _ := c.SAddWithTTLN(ctx, key, member, ttl)
+	GlobalMetrics.ClusterDepSAddTotal.Add(1)
+	if added == 0 {
+		GlobalMetrics.ClusterDepSAddDeduped.Add(1)
+	}
+	// Sampled SCard: one in clusterDepSampleEvery writes pulls the size.
+	if GlobalMetrics.ClusterDepSAddSampler.Add(1)%clusterDepSampleEvery == 0 {
+		if size, err := c.SCard(ctx, key); err == nil {
+			GlobalMetrics.ClusterDepSetSizeSumLast.Add(size)
+			GlobalMetrics.ClusterDepSampledKeys.Add(1)
+			// Update high-water mark with a CAS loop.
+			for {
+				cur := GlobalMetrics.ClusterDepSetSizeMax.Load()
+				if size <= cur {
+					break
+				}
+				if GlobalMetrics.ClusterDepSetSizeMax.CompareAndSwap(cur, size) {
+					break
+				}
+			}
+		}
+	}
 }

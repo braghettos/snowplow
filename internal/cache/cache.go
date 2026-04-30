@@ -60,10 +60,17 @@ type Cache interface {
 	// ── Set (Redis SET data structure) ───────────────────────────────────
 	ScanKeys(ctx context.Context, pattern string) ([]string, error)
 	SAddWithTTL(ctx context.Context, key, member string, ttl time.Duration) error
+	// SAddWithTTLN behaves like SAddWithTTL but returns the number of members
+	// actually added (0 means the member already existed — i.e. dedup).
+	// Used by instrumentation to count cluster-wide dep dedup hits.
+	SAddWithTTLN(ctx context.Context, key, member string, ttl time.Duration) (int, error)
 	SAddMultiWithTTL(ctx context.Context, key string, members []string, ttl time.Duration) error
 	SRemMembers(ctx context.Context, key string, members ...string) error
 	ReplaceSetWithTTL(ctx context.Context, key string, members []string, ttl time.Duration) error
 	SMembers(ctx context.Context, key string) ([]string, error)
+	// SCard returns the cardinality of the set at key (0 if absent or expired).
+	// Used by sampled instrumentation; O(1) on MemCache.
+	SCard(ctx context.Context, key string) (int64, error)
 
 	// ── List assembly ────────────────────────────────────────────────────
 	AssembleListFromIndex(ctx context.Context, gvr schema.GroupVersionResource, namespace string) ([]byte, bool, error)

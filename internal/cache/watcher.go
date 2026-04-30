@@ -723,6 +723,9 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 		if err != nil {
 			continue
 		}
+		// Instrumentation: cluster-wide dep reader (event invalidation).
+		GlobalMetrics.ClusterDepSMembersTotal.Add(1)
+		GlobalMetrics.ClusterDepSMembersBytes.Add(int64(len(members)))
 		for _, k := range members {
 			allKeys[k] = true
 		}
