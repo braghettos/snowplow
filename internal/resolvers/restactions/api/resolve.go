@@ -345,6 +345,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 										gvrKey := cache.GVRToKey(pathGVR)
 										depKey := cache.L1ResourceDepKey(gvrKey, pathNS, pathName)
 										_ = c.SAddWithTTL(ctx, depKey, apiCacheKey, cache.ReverseIndexTTL)
+										if pathName == "" {
+											clusterDep := cache.L1ResourceDepKey(gvrKey, "", "")
+											_ = c.SAddWithTTL(ctx, clusterDep, apiCacheKey, cache.ReverseIndexTTL)
+										}
 									}
 									return true
 								}
@@ -356,6 +360,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 										gvrKey := cache.GVRToKey(pathGVR)
 										depKey := cache.L1ResourceDepKey(gvrKey, pathNS, pathName)
 										_ = c.SAddWithTTL(ctx, depKey, apiCacheKey, cache.ReverseIndexTTL)
+										if pathName == "" {
+											clusterDep := cache.L1ResourceDepKey(gvrKey, "", "")
+											_ = c.SAddWithTTL(ctx, clusterDep, apiCacheKey, cache.ReverseIndexTTL)
+										}
 									}
 									return true
 								}
