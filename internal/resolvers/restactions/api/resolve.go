@@ -315,21 +315,25 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						}
 
 						if directHit {
-							// Marshal the informer data to bytes immediately.
-							// This captures the shared informer maps as owned []byte
-							// and serves as the API result cache entry. The bytes are
-							// then unmarshaled into an independent copy that JQ can
-							// safely mutate (gojq's deleteEmpty writes to maps in-place).
-							// Cost: ~2ms marshal + ~2ms unmarshal per namespace vs
-							// 6.9s total from the Redis GET + decompress path.
+							// Marshal the informer data to bytes for the L1 cache
+							// entry (raw bytes are the cache value below).
 							raw, merr := json.Marshal(directData)
 							if merr != nil {
 								return false
 							}
-							var safeData any
-							if uerr := json.Unmarshal(raw, &safeData); uerr != nil {
-								return false
-							}
+							// Independent copy for JQ which mutates maps in-place
+							// (gojq's normalizeNumbers / deleteEmpty). safeCopyJSON
+							// walks the tree directly — pprof at 50K identified the
+							// previous json.Unmarshal round-trip as the dominant
+							// allocator (~25% of total alloc, ~21 GB/s sustained,
+							// ~32% gcAssistAlloc CPU). The walk also coerces every
+							// numeric leaf to float64, which is required because
+							// gojq.normalizeNumbers panics on int64 (the v0.25.283
+							// regression). Unstructured trees from K8s informers
+							// contain int64 fields (metadata.generation,
+							// status.observedGeneration, etc.) so the coercion is
+							// load-bearing, not cosmetic.
+							safeData := safeCopyJSON(directData)
 
 							handlerOpts := jsonHandlerOptions{
 								key: id, out: dict, filter: apiCall.Filter,
