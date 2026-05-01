@@ -315,21 +315,21 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						}
 
 						if directHit {
-							// Marshal the informer data to bytes for the L1 cache
-							// entry (raw bytes are the cache value below).
+							// Marshal the informer data to bytes immediately.
+							// This captures the shared informer maps as owned []byte
+							// and serves as the API result cache entry. The bytes are
+							// then unmarshaled into an independent copy that JQ can
+							// safely mutate (gojq's deleteEmpty writes to maps in-place).
+							// Cost: ~2ms marshal + ~2ms unmarshal per namespace vs
+							// 6.9s total from the Redis GET + decompress path.
 							raw, merr := json.Marshal(directData)
 							if merr != nil {
 								return false
 							}
-							// Independent copy for JQ which mutates maps in-place
-							// (gojq's normalizeNumbers / deleteEmpty). Walking the
-							// in-memory tree avoids a json.Unmarshal that pprof
-							// identified as the dominant allocator at 50K scale —
-							// ~25% of total alloc, contributing to ~21 GB/s
-							// sustained allocation rate and ~32% gcAssistAlloc CPU.
-							// Informer-decoded objects are pure JSON types so
-							// DeepCopyJSON is safe.
-							var safeData any = maps.DeepCopyJSON(directData.(map[string]any))
+							var safeData any
+							if uerr := json.Unmarshal(raw, &safeData); uerr != nil {
+								return false
+							}
 
 							handlerOpts := jsonHandlerOptions{
 								key: id, out: dict, filter: apiCall.Filter,
