@@ -32,25 +32,6 @@ const (
 	headerAcceptJSON = "Accept: application/json"
 )
 
-// decodedTreeCacheCapacity bounds the number of (GVR, ns, name|"") entries
-// kept in the process-wide decoded-tree side-cache. At 8 GiB pod limit and
-// the worst-case observed list size of ~30 MiB after safeCopyJSON, this cap
-// keeps the cache footprint well below 200 MiB even when fully populated.
-//
-// Sized to comfortably cover the dashboard's distinct list keys (≤a few
-// hundred (GVR, ns) combinations across all observed workloads) plus
-// frequently-accessed singletons.
-const decodedTreeCacheCapacity = 4096
-
-// resolveDecodedCache is the process-wide decoded-tree side-cache used by
-// the informer-hit branch in Resolve. Reads return a fresh safeCopyJSON
-// over the cached canonical tree so gojq mutations remain isolated. Writes
-// happen on each cold informer hit alongside the existing L1 raw-bytes
-// cache write.
-//
-// See decoded_cache.go for the lifecycle and keying contract.
-var resolveDecodedCache = newDecodedTreeCache(decodedTreeCacheCapacity)
-
 type ResolveOptions struct {
 	RC      *rest.Config
 	AuthnNS string
@@ -334,74 +315,25 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						}
 
 						if directHit {
-							// Compute a stable stamp from the informer object(s).
-							// stampForObject hashes resourceVersion (set by the API
-							// server, monotonic per object). stampForList XORs
-							// fnv64(name + 0x00 + rv) across items so the result
-							// is order-independent. This is the cache key invariant
-							// for the decoded-tree side-cache.
-							var stamp uint64
-							if pathName == "" {
-								// Need the original informer slice for the fingerprint;
-								// it was discarded above when we built directData.
-								// Re-fetch — informer reads are zero-I/O zero-copy
-								// (returns the same shared pointers).
-								if items, ok := ir.ListObjects(pathGVR, pathNS); ok {
-									stamp = stampForList(items)
-								}
-							} else {
-								if obj, ok := ir.GetObject(pathGVR, pathNS, pathName); ok {
-									stamp = stampForObject(obj)
-								}
+							// Marshal the informer data to bytes for the L1 cache
+							// entry (raw bytes are the cache value below).
+							raw, merr := json.Marshal(directData)
+							if merr != nil {
+								return false
 							}
-
-							decodedKey := decodedCacheKey{
-								gvr: pathGVR, ns: pathNS, name: pathName,
-							}
-
-							// Decoded-tree cache lookup. On hit, both walks of the
-							// informer tree (json.Marshal + safeCopyJSON) are
-							// skipped: we get a freshly-copied float64-normalized
-							// tree directly. The L1 raw-bytes cache may already
-							// hold the matching bytes (populated alongside this
-							// entry on the previous miss); if it does not, the
-							// warm-path replay (Step B) will repopulate.
-							var safeData any
-							var raw []byte
-							if stamp != 0 {
-								if cached, hit := resolveDecodedCache.Get(decodedKey, stamp); hit {
-									safeData = cached
-								}
-							}
-							if safeData == nil {
-								// Miss: marshal once, safeCopy once, then populate
-								// both caches from the resulting tree.
-								//
-								// safeCopyJSON walks the unstructured tree directly
-								// (avoiding the json.Unmarshal round-trip — pprof
-								// at 50K identified that round-trip as the dominant
-								// allocator, ~25% of total alloc). The walk also
-								// coerces every numeric leaf to float64, which is
-								// load-bearing: gojq.normalizeNumbers panics on
-								// int64, and informer trees contain int64 fields
-								// (metadata.generation, status.observedGeneration,
-								// status.replicas). The v0.25.283 regression was
-								// exactly this gap.
-								var merr error
-								raw, merr = json.Marshal(directData)
-								if merr != nil {
-									return false
-								}
-								canonical := safeCopyJSON(directData)
-								if stamp != 0 {
-									resolveDecodedCache.Set(decodedKey, stamp, canonical)
-								}
-								// safeCopyJSON again to obtain the per-call mutable
-								// copy. This is identical in cost to a single
-								// safeCopyJSON; we cache the canonical and return
-								// independent copies on subsequent reads.
-								safeData = safeCopyJSON(canonical)
-							}
+							// Independent copy for JQ which mutates maps in-place
+							// (gojq's normalizeNumbers / deleteEmpty). safeCopyJSON
+							// walks the tree directly — pprof at 50K identified the
+							// previous json.Unmarshal round-trip as the dominant
+							// allocator (~25% of total alloc, ~21 GB/s sustained,
+							// ~32% gcAssistAlloc CPU). The walk also coerces every
+							// numeric leaf to float64, which is required because
+							// gojq.normalizeNumbers panics on int64 (the v0.25.283
+							// regression). Unstructured trees from K8s informers
+							// contain int64 fields (metadata.generation,
+							// status.observedGeneration, etc.) so the coercion is
+							// load-bearing, not cosmetic.
+							safeData := safeCopyJSON(directData)
 
 							handlerOpts := jsonHandlerOptions{
 								key: id, out: dict, filter: apiCall.Filter,
@@ -411,13 +343,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								herr := jsonHandlerDirect(ctx, handlerOpts, safeData)
 								mu.Unlock()
 								if herr == nil {
-									// Only write to the L1 raw-bytes cache when
-									// we actually marshaled this turn. On a
-									// decoded-cache hit raw is nil — the bytes
-									// were already populated on the original
-									// miss for this stamp, and the L1 entry
-									// remains valid until UPDATE invalidation.
-									if c != nil && raw != nil {
+									if c != nil {
 										apiCacheKey := cache.APIResultKey(identity, pathGVR, pathNS, pathName)
 										_ = c.SetAPIResultRaw(ctx, apiCacheKey, raw)
 										gvrKey := cache.GVRToKey(pathGVR)
@@ -437,7 +363,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								}
 							} else {
 								if herr := jsonHandlerDirect(ctx, handlerOpts, safeData); herr == nil {
-									if c != nil && raw != nil {
+									if c != nil {
 										apiCacheKey := cache.APIResultKey(identity, pathGVR, pathNS, pathName)
 										_ = c.SetAPIResultRaw(ctx, apiCacheKey, raw)
 										gvrKey := cache.GVRToKey(pathGVR)
