@@ -10,13 +10,24 @@ import (
 
 // RuntimeMetrics holds the JSON structure returned by /metrics/runtime.
 type RuntimeMetrics struct {
-	HeapAllocMB    float64        `json:"heap_alloc_mb"`
-	HeapSysMB      float64        `json:"heap_sys_mb"`
-	GoroutineCount int            `json:"goroutine_count"`
-	NumGC          uint32         `json:"num_gc"`
-	ActiveUsers    int            `json:"active_users"`
-	CacheKeyCount  int64          `json:"cache_key_count"`
-	ClusterDep     ClusterDepInfo `json:"cluster_dep"`
+	HeapAllocMB    float64         `json:"heap_alloc_mb"`
+	HeapSysMB      float64         `json:"heap_sys_mb"`
+	GoroutineCount int             `json:"goroutine_count"`
+	NumGC          uint32          `json:"num_gc"`
+	ActiveUsers    int             `json:"active_users"`
+	CacheKeyCount  int64           `json:"cache_key_count"`
+	ClusterDep     ClusterDepInfo  `json:"cluster_dep"`
+	WatchEvents    WatchEventsInfo `json:"watch_events"`
+}
+
+// WatchEventsInfo exposes informer event delivery counters. DeleteTombstone
+// is the smoking-gun signal: when non-zero, the reflector synthesized a
+// Delete via relist because the original watch event was lost.
+type WatchEventsInfo struct {
+	Add             int64 `json:"add"`
+	Update          int64 `json:"update"`
+	Delete          int64 `json:"delete"`
+	DeleteTombstone int64 `json:"delete_tombstone"`
 }
 
 // ClusterDepInfo mirrors the cluster-wide dep instrumentation counters from
@@ -78,6 +89,12 @@ func RuntimeMetricsHandler(c cache.Cache) http.Handler {
 				SMembersTotal:             snap.ClusterDepSMembersTotal,
 				SMembersBytes:             snap.ClusterDepSMembersBytes,
 				WritesPerNamespaceListSum: snap.ClusterDepSAddByResolveNSList + snap.ClusterDepSAddByRegisterNSList,
+			},
+			WatchEvents: WatchEventsInfo{
+				Add:             snap.WatchEventsAdd,
+				Update:          snap.WatchEventsUpdate,
+				Delete:          snap.WatchEventsDelete,
+				DeleteTombstone: snap.WatchEventsDeleteTombstone,
 			},
 		}
 
