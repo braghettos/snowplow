@@ -155,6 +155,33 @@ func IsAPIResultKey(key string) bool {
 	return strings.HasPrefix(key, "snowplow:api-result:")
 }
 
+// ParseAPIResultKey parses a snowplow:api-result cache key into its
+// components. Symmetric with ParseResolvedKey. The identity is the binding
+// identity (or username) used at write-time by APIResultKey().
+//
+// LIST form (5 colon-separated parts): snowplow:api-result:{identity}:{gvr}:{ns}
+// GET  form (6 colon-separated parts): snowplow:api-result:{identity}:{gvr}:{ns}:{name}
+//
+// Returns ok=false if the key is not a well-formed api-result key.
+func ParseAPIResultKey(key string) (identity string, gvr schema.GroupVersionResource, namespace, name string, ok bool) {
+	parts := strings.SplitN(key, ":", 6)
+	if len(parts) < 5 || parts[0] != "snowplow" || parts[1] != "api-result" {
+		return
+	}
+	identity = parts[2]
+	gvr = ParseGVRKey(parts[3])
+	namespace = parts[4]
+	if len(parts) == 6 {
+		name = parts[5]
+	}
+	if gvr.Resource == "" {
+		ok = false
+		return
+	}
+	ok = true
+	return
+}
+
 // ResolvedKeyBase returns the base key without pagination suffix.
 // Used to group paginated variants for sequential resolution.
 func ResolvedKeyBase(username string, gvr schema.GroupVersionResource, namespace, name string) string {
