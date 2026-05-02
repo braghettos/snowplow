@@ -239,6 +239,18 @@ func (rw *ResourceWatcher) Start(ctx context.Context) {
 	}()
 }
 
+// HotQueueLen returns the current depth of the HOT priority workqueue.
+// Read-only observability hook for /metrics/runtime.
+func (rw *ResourceWatcher) HotQueueLen() int { return rw.hotQ.Len() }
+
+// WarmQueueLen returns the current depth of the WARM priority workqueue.
+// Read-only observability hook for /metrics/runtime.
+func (rw *ResourceWatcher) WarmQueueLen() int { return rw.warmQ.Len() }
+
+// ColdQueueLen returns the current depth of the COLD priority workqueue.
+// Read-only observability hook for /metrics/runtime.
+func (rw *ResourceWatcher) ColdQueueLen() int { return rw.coldQ.Len() }
+
 // runWorkers launches GOMAXPROCS worker goroutines that drain the three
 // priority queues (HOT > WARM > COLD). On context cancellation all
 // queues are shut down and workers exit.

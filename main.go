@@ -45,7 +45,36 @@ var (
 	// every request context so resolve.go can read from the informer
 	// store instead of Redis.
 	globalInformerReader cache.InformerReader
+
+	// globalResourceWatcher is set by startBackgroundServices after the
+	// ResourceWatcher is created. Read-only observability hook used by
+	// /metrics/runtime to surface HOT/WARM/COLD workqueue depths.
+	globalResourceWatcher *cache.ResourceWatcher
 )
+
+// workQueueLensAdapter implements handlers.WorkQueueLens by reading the
+// package-level globalResourceWatcher at call time. Returns zeros until
+// the watcher is wired (handler is registered before startBackgroundServices runs).
+type workQueueLensAdapter struct{}
+
+func (workQueueLensAdapter) HotQueueLen() int {
+	if globalResourceWatcher == nil {
+		return 0
+	}
+	return globalResourceWatcher.HotQueueLen()
+}
+func (workQueueLensAdapter) WarmQueueLen() int {
+	if globalResourceWatcher == nil {
+		return 0
+	}
+	return globalResourceWatcher.WarmQueueLen()
+}
+func (workQueueLensAdapter) ColdQueueLen() int {
+	if globalResourceWatcher == nil {
+		return 0
+	}
+	return globalResourceWatcher.ColdQueueLen()
+}
 
 func init() {
 	// Disable HTTP/2 client globally. K8s clients created by the plumbing
@@ -210,12 +239,17 @@ func main() {
 	mux.HandleFunc("GET /debug/pprof/goroutine", http.DefaultServeMux.ServeHTTP)
 	mux.HandleFunc("GET /debug/pprof/profile", http.DefaultServeMux.ServeHTTP)
 
+	// Enable mutex + block profiling for HOT-tier contention analysis.
+	// Sampling rates match Go community defaults for production-safe overhead.
+	runtime.SetMutexProfileFraction(5) // sample 1-in-5 mutex contention events
+	runtime.SetBlockProfileRate(10000) // sample blocking events lasting >10µs
+
 	mux.Handle("GET /swagger/", httpSwagger.WrapHandler)
 
 	mux.Handle("GET /health", handlers.HealthCheck(serviceName, build, kubeutil.ServiceAccountNamespace))
 	mux.Handle("GET /ready", handlers.ReadinessCheck())
 	mux.Handle("GET /metrics/cache", chain.Then(handlers.CacheMetrics()))
-	mux.Handle("GET /metrics/runtime", handlers.RuntimeMetricsHandler(appCache))
+	mux.Handle("GET /metrics/runtime", handlers.RuntimeMetricsHandler(appCache, workQueueLensAdapter{}))
 	mux.Handle("GET /api-info/names", chain.Then(handlers.Plurals()))
 	// Create RBACWatcher early so the middleware can compute binding identities.
 	// Start() is called later in startBackgroundServices.
@@ -339,6 +373,7 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cach
 		cc.SetGVRNotifier(resourceWatcher.AddGVR)
 	}
 	globalInformerReader = resourceWatcher // InformerReader interface — reads from informer store
+	globalResourceWatcher = resourceWatcher // exposes HOT/WARM/COLD queue depths to /metrics/runtime
 	resourceWatcher.SetL1Refresher(dispatchers.MakeL1Refresher(c, rc, authnNS, signKey, rbacWatcher))
 
 	// Load warmup config early to get autoDiscoverGroups for CRD informer filtering.

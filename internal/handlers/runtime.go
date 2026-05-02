@@ -18,6 +18,24 @@ type RuntimeMetrics struct {
 	CacheKeyCount  int64           `json:"cache_key_count"`
 	ClusterDep     ClusterDepInfo  `json:"cluster_dep"`
 	WatchEvents    WatchEventsInfo `json:"watch_events"`
+	WorkQueues     WorkQueuesInfo  `json:"work_queues"`
+}
+
+// WorkQueueLens is the read-side observability surface of the priority
+// workqueue (HOT > WARM > COLD). Implemented by *cache.ResourceWatcher.
+type WorkQueueLens interface {
+	HotQueueLen() int
+	WarmQueueLen() int
+	ColdQueueLen() int
+}
+
+// WorkQueuesInfo exposes the current depth of the three L1 refresh
+// priority queues. Non-zero hot_len under load indicates HOT-tier
+// worker saturation (architect report 2026-05-02 §6/§7 #1).
+type WorkQueuesInfo struct {
+	HotLen  int `json:"hot_len"`
+	WarmLen int `json:"warm_len"`
+	ColdLen int `json:"cold_len"`
 }
 
 // WatchEventsInfo exposes informer event delivery counters. DeleteTombstone
@@ -49,7 +67,8 @@ type ClusterDepInfo struct {
 
 // RuntimeMetricsHandler returns an http.Handler that serves /metrics/runtime.
 // It collects Go runtime stats, active user count, and total cache key count.
-func RuntimeMetricsHandler(c cache.Cache) http.Handler {
+// queues may be nil before the ResourceWatcher is wired in startBackgroundServices.
+func RuntimeMetricsHandler(c cache.Cache, queues WorkQueueLens) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
@@ -67,6 +86,15 @@ func RuntimeMetricsHandler(c cache.Cache) http.Handler {
 		var redisKeyCount int64
 		if c != nil {
 			redisKeyCount = c.DBSize(ctx)
+		}
+
+		var wqInfo WorkQueuesInfo
+		if queues != nil {
+			wqInfo = WorkQueuesInfo{
+				HotLen:  queues.HotQueueLen(),
+				WarmLen: queues.WarmQueueLen(),
+				ColdLen: queues.ColdQueueLen(),
+			}
 		}
 
 		snap := cache.GlobalMetrics.Snapshot()
@@ -96,6 +124,7 @@ func RuntimeMetricsHandler(c cache.Cache) http.Handler {
 				Delete:          snap.WatchEventsDelete,
 				DeleteTombstone: snap.WatchEventsDeleteTombstone,
 			},
+			WorkQueues: wqInfo,
 		}
 
 		w.Header().Set("Content-Type", "application/json")
