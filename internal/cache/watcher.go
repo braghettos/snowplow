@@ -1126,6 +1126,14 @@ func (rw *ResourceWatcher) handleEvent(ctx context.Context, gvr schema.GroupVers
 	if !ok {
 		return
 	}
+	switch eventType {
+	case "add":
+		GlobalMetrics.WatchEventsAdd.Add(1)
+	case "update":
+		GlobalMetrics.WatchEventsUpdate.Add(1)
+	case "delete":
+		GlobalMetrics.WatchEventsDelete.Add(1)
+	}
 	ns, name := uns.GetNamespace(), uns.GetName()
 
 	// Skip noisy configmap updates from system namespaces (e.g. cluster-kubestore
@@ -1372,6 +1380,11 @@ func toUnstructured(obj any) (*unstructured.Unstructured, bool) {
 	case *unstructured.Unstructured:
 		return v, true
 	case k8scache.DeletedFinalStateUnknown:
+		// Tombstone: reflector synthesized this Delete because the watch
+		// stream missed it and a subsequent relist found the object gone.
+		// Counted separately so a non-zero value is direct evidence of
+		// watch event loss.
+		GlobalMetrics.WatchEventsDeleteTombstone.Add(1)
 		if u, ok := v.Obj.(*unstructured.Unstructured); ok {
 			return u, true
 		}

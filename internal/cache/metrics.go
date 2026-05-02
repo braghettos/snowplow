@@ -45,6 +45,18 @@ type Metrics struct {
 	// ClusterDepSAddSampler is a free-running counter incremented on every
 	// SAdd against a cluster-wide dep key. Modulo 128 selects the sample.
 	ClusterDepSAddSampler atomic.Int64
+
+	// ── Watch event delivery instrumentation (drift detection) ───────────
+	// Counts every Add/Update/Delete that successfully reached handleEvent
+	// after toUnstructured. WatchEventsDeleteTombstone counts the subset
+	// of Deletes that were synthesized by the reflector's relist path
+	// (k8scache.DeletedFinalStateUnknown) — i.e., the watch stream missed
+	// the original Delete and the informer recovered it by re-LISTing.
+	// A non-zero tombstone count is direct evidence of watch event loss.
+	WatchEventsAdd             atomic.Int64
+	WatchEventsUpdate          atomic.Int64
+	WatchEventsDelete          atomic.Int64
+	WatchEventsDeleteTombstone atomic.Int64
 }
 
 // Inc atomically increments the given counter and updates the OTel metric.
@@ -84,6 +96,14 @@ type MetricsSnapshot struct {
 	ClusterDepSetSizeAvg           float64 `json:"cluster_dep_set_size_avg"`
 	ClusterDepSMembersTotal        int64   `json:"cluster_dep_smembers_total"`
 	ClusterDepSMembersBytes        int64   `json:"cluster_dep_smembers_bytes"`
+
+	// Watch event delivery instrumentation. WatchEventsDeleteTombstone is
+	// the smoking-gun counter for watch-stream event loss: when non-zero,
+	// the reflector recovered a Delete by relist instead of by watch.
+	WatchEventsAdd             int64 `json:"watch_events_add"`
+	WatchEventsUpdate          int64 `json:"watch_events_update"`
+	WatchEventsDelete          int64 `json:"watch_events_delete"`
+	WatchEventsDeleteTombstone int64 `json:"watch_events_delete_tombstone"`
 }
 
 var GlobalMetrics = &Metrics{}
@@ -119,6 +139,11 @@ func (m *Metrics) snapshotFromAtomics() MetricsSnapshot {
 		ClusterDepSetSizeMax:           m.ClusterDepSetSizeMax.Load(),
 		ClusterDepSMembersTotal:        m.ClusterDepSMembersTotal.Load(),
 		ClusterDepSMembersBytes:        m.ClusterDepSMembersBytes.Load(),
+
+		WatchEventsAdd:             m.WatchEventsAdd.Load(),
+		WatchEventsUpdate:          m.WatchEventsUpdate.Load(),
+		WatchEventsDelete:          m.WatchEventsDelete.Load(),
+		WatchEventsDeleteTombstone: m.WatchEventsDeleteTombstone.Load(),
 	}
 	s.GetHitRate = hitRate(s.GetHits, s.GetMisses)
 	s.ListHitRate = hitRate(s.ListHits, s.ListMisses)
