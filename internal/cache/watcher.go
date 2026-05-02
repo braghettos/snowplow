@@ -277,7 +277,7 @@ func (rw *ResourceWatcher) processNext(ctx context.Context) bool {
 			if shutdown {
 				return false
 			}
-			rw.dispatchItem(ctx, item)
+			rw.processItem(ctx, item)
 			rw.hotQ.Done(item)
 			return true
 		}
@@ -287,7 +287,7 @@ func (rw *ResourceWatcher) processNext(ctx context.Context) bool {
 			if shutdown {
 				return false
 			}
-			rw.dispatchItem(ctx, item)
+			rw.processItem(ctx, item)
 			rw.warmQ.Done(item)
 			return true
 		}
@@ -297,7 +297,7 @@ func (rw *ResourceWatcher) processNext(ctx context.Context) bool {
 			if shutdown {
 				return false
 			}
-			rw.dispatchItem(ctx, item)
+			rw.processItem(ctx, item)
 			rw.coldQ.Done(item)
 			return true
 		}
@@ -309,18 +309,6 @@ func (rw *ResourceWatcher) processNext(ctx context.Context) bool {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
-}
-
-// dispatchItem routes a workqueue item to the appropriate worker by
-// inspecting the prefix. Items prefixed with apiResultRefreshPrefix are
-// background api-result refresh jobs (SWR async overwrite for ADD events);
-// all other items are resolved-key identities handled by processItem.
-func (rw *ResourceWatcher) dispatchItem(ctx context.Context, item string) {
-	if strings.HasPrefix(item, apiResultRefreshPrefix) {
-		rw.refreshSingleAPIResult(ctx, strings.TrimPrefix(item, apiResultRefreshPrefix))
-		return
-	}
-	rw.processItem(ctx, item)
 }
 
 // processItem resolves all pages for a single identity (resolved key base).
@@ -816,16 +804,26 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 		slog.Int("cold", len(coldKeys)))
 
 	// ── Phase 3: Separate API result keys from resolved keys ─────────────
-	// Two policies, by event type:
-	//   • DELETE: eager removal. A leaked deleted resource visible in a
-	//     stale list is a correctness/UX hazard (user clicks → 404). The
-	//     marshal cost is paid lazily on the next read.
-	//   • ADD: SWR-compliant async overwrite. The api-result key keeps
-	//     serving its previous bytes until enqueueAPIResultRefresh's
-	//     background worker re-marshals from the informer and overwrites
-	//     in place via SetAPIResultRaw. Readers never block on the refresh.
-	//   • UPDATE/PATCH: unchanged. Natural TTL (60s) handles staleness;
-	//     in-place mutations do not justify proactive cache work.
+	// Eager eviction on both ADD and DELETE.
+	//
+	// The user-facing tier is the resolved-widget cache (snowplow:resolved:*),
+	// refreshed by processItem → ResolveWidget → SetResolvedRaw. That refresh
+	// re-runs the resolve pipeline, whose inner /call paths read api-result
+	// (snowplow:api-result:*) FIRST (resolve.go:217). If api-result still
+	// holds the pre-event bytes, processItem computes a stale resolved-widget
+	// output and writes that to the user-visible tier — even though the
+	// informer is already fresh.
+	//
+	// DirtySet bypass (resolve.go:217 / context.go:124-130) is meant to skip
+	// stale api-result for the dirty GVR — but it depends on the bucket being
+	// populated for the identity at processItem time, which races with
+	// concurrent batches. Eager eviction on the watcher side removes the
+	// race entirely: the next inner /call falls through to the informer
+	// because there is nothing to read.
+	//
+	// Trade-off: the next inner /call pays a marshal cost (already accepted
+	// for the DELETE branch). UPDATE/PATCH stays untouched — natural TTL
+	// (60s) handles in-place mutations.
 	filterResolved := func(keys map[string]bool) map[string]bool {
 		resolved := make(map[string]bool, len(keys))
 		for key := range keys {
@@ -835,22 +833,14 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 		}
 		return resolved
 	}
-	// Collect api-result keys once for both DELETE and ADD branches.
 	var apiResultKeys []string
 	for key := range allKeys {
 		if IsAPIResultKey(key) {
 			apiResultKeys = append(apiResultKeys, key)
 		}
 	}
-	if hasDelete && len(apiResultKeys) > 0 {
-		// Correctness override on SWR: see comment block above.
+	if (hasDelete || hasAdd) && len(apiResultKeys) > 0 {
 		_ = rw.cache.Delete(ctx, apiResultKeys...)
-	}
-	if hasAdd && !hasDelete && len(apiResultKeys) > 0 {
-		// SWR async overwrite. Skip when delete already removed the keys
-		// in this batch — a refresh enqueue would just re-create them and
-		// the next reader will lazy-load anyway.
-		rw.enqueueAPIResultRefresh(apiResultKeys)
 	}
 	hotKeys = filterResolved(hotKeys)
 	warmKeys = filterResolved(warmKeys)
