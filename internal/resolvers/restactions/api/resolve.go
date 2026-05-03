@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/http/response"
@@ -26,6 +27,69 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 )
+
+// instrumentedDictWrite wraps a dictMu critical section with a
+// "restaction.api.dict_write" OTel span recording wait time, hold time,
+// and dict size before lock acquisition. Per the design 1-pager at
+// /tmp/snowplow-runs/dictmu-otel-span-design-2026-05-03.md the span is
+// emitted at every critical-section entry; attribute work is guarded by
+// span.IsRecording() so the OTEL_ENABLED=false path stays at ~15 ns/site
+// (no-op Start/End plus a predicted-false branch).
+//
+// fn runs inside mu.Lock()/mu.Unlock() (or unlocked if mu == nil — the
+// "single" fan-out shape at the informer-direct mu==nil branch). Callers
+// that need to capture an error or other state from the locked region do
+// so via closure variables in fn — fn returns nothing here on purpose to
+// keep the helper signature unaware of caller-specific result types.
+//
+// extra is appended to the standard attribute set; pass nil at sites that
+// do not need additional attributes.
+func instrumentedDictWrite(
+	ctx context.Context,
+	mu *sync.Mutex,
+	dict map[string]any,
+	site, intent string,
+	extra []attribute.KeyValue,
+	fn func(),
+) {
+	_, span := apiHandlerTracer.Start(ctx, "restaction.api.dict_write")
+	recording := span.IsRecording()
+	var waitStart, holdStart time.Time
+	if recording {
+		waitStart = time.Now()
+	}
+	if mu != nil {
+		mu.Lock()
+	}
+	var sizeBefore int
+	if recording {
+		holdStart = time.Now()
+		sizeBefore = len(dict)
+	}
+	fn()
+	if mu != nil {
+		mu.Unlock()
+	}
+	if recording {
+		done := time.Now()
+		fanout := "single"
+		if mu != nil {
+			fanout = "iterator"
+		}
+		attrs := make([]attribute.KeyValue, 0, 6+len(extra))
+		attrs = append(attrs,
+			attribute.String("dict.site", site),
+			attribute.String("dict.intent", intent),
+			attribute.String("fanout.kind", fanout),
+			attribute.Int("dict.size_before", sizeBefore),
+			attribute.Int64("dict.wait_ns", holdStart.Sub(waitStart).Nanoseconds()),
+			attribute.Int64("dict.hold_ns", done.Sub(holdStart).Nanoseconds()),
+		)
+		attrs = append(attrs, extra...)
+		span.SetAttributes(attrs...)
+	}
+	span.End()
+}
 
 const (
 	//annotationKeyVerboseAPI = "krateo.io/verbose"
@@ -168,9 +232,14 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 
 		// createRequestOptions reads from dict — take a snapshot under lock
 		// so concurrent writers in this level don't cause a data race.
-		dictMu.Lock()
-		tmp := createRequestOptions(log, apiCall, dict)
-		dictMu.Unlock()
+		var tmp []httpcall.RequestOptions
+		instrumentedDictWrite(ctx, dictMu, dict, "snapshot", "read",
+			[]attribute.KeyValue{
+				attribute.String("restaction.api.name", id),
+			},
+			func() {
+				tmp = createRequestOptions(log, apiCall, dict)
+			})
 
 		if len(tmp) == 0 {
 			log.Warn("empty request options for http call", slog.Any("name", id))
@@ -233,14 +302,28 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 									})
 									if mu != nil {
 										origHandler := handler
+										apiL1Extra := []attribute.KeyValue{
+											attribute.String("restaction.api.name", id),
+											attribute.String("api.gvr", pathGVR.String()),
+											attribute.String("api.namespace", pathNS),
+											attribute.Int("payload.bytes", len(raw)),
+										}
+										if pathName != "" {
+											apiL1Extra = append(apiL1Extra,
+												attribute.String("api.name", pathName))
+										}
 										handler = func(r io.ReadCloser) error {
 											data, rerr := io.ReadAll(r)
 											if rerr != nil {
 												return rerr
 											}
-											mu.Lock()
-											defer mu.Unlock()
-											return origHandler(io.NopCloser(bytes.NewReader(data)))
+											var herr error
+											instrumentedDictWrite(ctx, mu, dict, "api_l1", "append",
+												apiL1Extra,
+												func() {
+													herr = origHandler(io.NopCloser(bytes.NewReader(data)))
+												})
+											return herr
 										}
 									}
 								}
@@ -338,10 +421,23 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							handlerOpts := jsonHandlerOptions{
 								key: id, out: dict, filter: apiCall.Filter,
 							}
+							directExtra := []attribute.KeyValue{
+								attribute.String("restaction.api.name", id),
+								attribute.String("api.gvr", pathGVR.String()),
+								attribute.String("api.namespace", pathNS),
+								attribute.Int("payload.bytes", len(raw)),
+							}
+							if pathName != "" {
+								directExtra = append(directExtra,
+									attribute.String("api.name", pathName))
+							}
 							if mu != nil {
-								mu.Lock()
-								herr := jsonHandlerDirect(ctx, handlerOpts, safeData)
-								mu.Unlock()
+								var herr error
+								instrumentedDictWrite(ctx, mu, dict, "informer_direct", "append",
+									directExtra,
+									func() {
+										herr = jsonHandlerDirect(ctx, handlerOpts, safeData)
+									})
 								if herr == nil {
 									if c != nil {
 										apiCacheKey := cache.APIResultKey(identity, pathGVR, pathNS, pathName)
@@ -362,7 +458,13 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 									return true
 								}
 							} else {
-								if herr := jsonHandlerDirect(ctx, handlerOpts, safeData); herr == nil {
+								var herr error
+								instrumentedDictWrite(ctx, nil, dict, "informer_direct", "append",
+									directExtra,
+									func() {
+										herr = jsonHandlerDirect(ctx, handlerOpts, safeData)
+									})
+								if herr == nil {
 									if c != nil {
 										apiCacheKey := cache.APIResultKey(identity, pathGVR, pathNS, pathName)
 										_ = c.SetAPIResultRaw(ctx, apiCacheKey, raw)
@@ -404,12 +506,20 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			if c != nil && verb == http.MethodGet {
 				if callGVR, callNS, callName := cache.ParseCallPath(call.Path); callGVR.Resource != "" && callName != "" {
 					l1Key := cache.ResolvedKey(identity, callGVR, callNS, callName, 0, 0)
+					callExtra := []attribute.KeyValue{
+						attribute.String("restaction.api.name", id),
+						attribute.String("api.gvr", callGVR.String()),
+						attribute.String("api.namespace", callNS),
+						attribute.String("api.name", callName),
+					}
 					if l1Raw, l1Hit, _ := c.GetRaw(ctx, l1Key); l1Hit {
 						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 						handler := jsonHandler(ctx, jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter})
-						mu.Lock()
-						_ = handler(io.NopCloser(bytes.NewReader(l1Raw)))
-						mu.Unlock()
+						instrumentedDictWrite(ctx, mu, dict, "call_l1", "append",
+							callExtra,
+							func() {
+								_ = handler(io.NopCloser(bytes.NewReader(l1Raw)))
+							})
 						return true
 					}
 
@@ -422,9 +532,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								raw, rerr := callResolver(ctx, obj.Object, l1Key, opts.AuthnNS)
 								if rerr == nil && len(raw) > 0 {
 									handler := jsonHandler(ctx, jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter})
-									mu.Lock()
-									_ = handler(io.NopCloser(bytes.NewReader(raw)))
-									mu.Unlock()
+									instrumentedDictWrite(ctx, mu, dict, "call_inline", "append",
+										callExtra,
+										func() {
+											_ = handler(io.NopCloser(bytes.NewReader(raw)))
+										})
 									return true
 								}
 							}
@@ -445,6 +557,29 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			}
 
 			// ── Fallback → live HTTP call ──────────────────────────────────
+			//
+			// Re-parse call.Path to recover GVR / NS / Name for the dictMu
+			// span attributes at the http_fallback and err_write sites below.
+			// pathGVR / callGVR computed at the top of runOne are scoped to
+			// their respective branches and not visible here. Try K8s-API
+			// shape first; if that doesn't match, try the /call shape. Both
+			// parsers are pure string ops and return empty Resource on
+			// mismatch — non-Snowplow paths simply emit empty GVR attrs.
+			fbGVR, fbNS, fbName := cache.ParseK8sAPIPath(call.Path)
+			if fbGVR.Resource == "" {
+				fbGVR, fbNS, fbName = cache.ParseCallPath(call.Path)
+			}
+			fallbackBaseExtra := func() []attribute.KeyValue {
+				attrs := []attribute.KeyValue{
+					attribute.String("restaction.api.name", id),
+					attribute.String("api.gvr", fbGVR.String()),
+					attribute.String("api.namespace", fbNS),
+				}
+				if fbName != "" {
+					attrs = append(attrs, attribute.String("api.name", fbName))
+				}
+				return attrs
+			}
 			{
 				plain := jsonHandler(ctx, jsonHandlerOptions{
 					key: id, out: dict, filter: apiCall.Filter,
@@ -454,9 +589,15 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					if rerr != nil {
 						return rerr
 					}
-					mu.Lock()
-					defer mu.Unlock()
-					return plain(io.NopCloser(bytes.NewReader(data)))
+					httpExtra := append(fallbackBaseExtra(),
+						attribute.Int("payload.bytes", len(data)))
+					var herr error
+					instrumentedDictWrite(ctx, mu, dict, "http_fallback", "append",
+						httpExtra,
+						func() {
+							herr = plain(io.NopCloser(bytes.NewReader(data)))
+						})
+					return herr
 				}
 			}
 
@@ -470,13 +611,15 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					slog.String("error", res.Message))
 
 				errMap, merr := response.AsMap(res)
-				mu.Lock()
-				if merr == nil && len(errMap) > 0 {
-					dict[call.ErrorKey] = errMap
-				} else {
-					dict[call.ErrorKey] = res.Message
-				}
-				mu.Unlock()
+				instrumentedDictWrite(ctx, mu, dict, "err_write", "error",
+					fallbackBaseExtra(),
+					func() {
+						if merr == nil && len(errMap) > 0 {
+							dict[call.ErrorKey] = errMap
+						} else {
+							dict[call.ErrorKey] = res.Message
+						}
+					})
 				return call.ContinueOnError
 			}
 
