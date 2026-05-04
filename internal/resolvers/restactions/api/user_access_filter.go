@@ -46,19 +46,45 @@ func applyUserAccessFilter(ctx context.Context, apiCall *templates.API, computed
 	log := xcontext.Logger(ctx)
 	start := time.Now()
 
+	// Audit counters captured by the deferred audit emission below. Declaring
+	// them here (rather than at the loop site) lets every return path —
+	// including FAIL-CLOSED early returns for missing UserInfo / missing
+	// RBACEvaluator — fire exactly one audit log entry. Auditors aggregating
+	// on the structured `audit=user_access_filter` event would otherwise
+	// undercount denials when the helper bails out early (architect review
+	// blocker, 2026-05-04).
+	var (
+		inCount  int
+		outCount int
+		denied   int
+		jqErrors int
+	)
+	defer func() {
+		auditUserAccessFilter(ctx, apiCall, inCount, outCount, denied, jqErrors, time.Since(start))
+	}()
+
 	items, ok := computed.([]any)
 	if !ok {
 		log.Warn("userAccessFilter: response not an array, skipping",
 			slog.String("api", apiCall.Name),
 			slog.String("type", fmt.Sprintf("%T", computed)))
+		// inCount/outCount remain 0; audit reflects the skip. Returning
+		// computed unchanged matches the documented contract — single-object
+		// responses are still gated by rbac.UserCan upstream.
 		return computed
 	}
+	inCount = len(items)
 
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
 		log.Error("userAccessFilter: cannot read user identity, returning empty",
 			slog.String("api", apiCall.Name),
 			slog.Any("err", err))
+		// FAIL-CLOSED: every input item is effectively denied by the
+		// fail-closed policy; reflect that in the audit counters so an
+		// operator sees `denied == items_in` and can correlate the spike
+		// with the absent UserInfo error log.
+		denied = inCount
 		return []any{}
 	}
 
@@ -74,6 +100,8 @@ func applyUserAccessFilter(ctx context.Context, apiCall *templates.API, computed
 	if ev == nil {
 		log.Error("userAccessFilter: RBACWatcher not in context, returning empty",
 			slog.String("api", apiCall.Name))
+		// FAIL-CLOSED: same accounting as the missing-UserInfo path above.
+		denied = inCount
 		return []any{}
 	}
 
@@ -81,7 +109,6 @@ func applyUserAccessFilter(ctx context.Context, apiCall *templates.API, computed
 	nsFrom := ptr.Deref(f.NamespaceFrom, "")
 
 	out := make([]any, 0, len(items))
-	var jqErrors, denied int
 	for _, item := range items {
 		ns := ""
 		if nsFrom != "" {
@@ -111,7 +138,7 @@ func applyUserAccessFilter(ctx context.Context, apiCall *templates.API, computed
 		}
 		out = append(out, item)
 	}
+	outCount = len(out)
 
-	auditUserAccessFilter(ctx, apiCall, len(items), len(out), denied, jqErrors, time.Since(start))
 	return out
 }

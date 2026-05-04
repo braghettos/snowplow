@@ -560,6 +560,19 @@ func warmL1RestActionsForUser(ctx context.Context, c cache.Cache, dynClient k8sd
 
 	// Inject inline /call resolver so nested RESTAction calls resolve
 	// in-process from the informer instead of HTTP round-trip.
+	//
+	// Q-RBAC-DECOUPLE C(d) — nested userAccessFilter dispatch contract:
+	// the l1cache.ResolveAndCache call below does NOT thread snowplowEndpointFn
+	// through l1cache.Input on purpose. The nested resolver inherits
+	// cache.WithSnowplowEndpoint via callCtx — installed once on the prewarm
+	// ctx at WarmL1FromEntryPoints (prewarm.go:312-316) and inherited by the
+	// per-user rctx built here. If a future refactor removes the context
+	// fallback in `internal/resolvers/restactions/api/resolve.go` (the
+	// `cache.SnowplowEndpointFromContext(ctx)` branch around the dispatch
+	// fork, currently ~line 263), audit THIS site first or thread
+	// snowplowEndpointFn into l1cache.Input — otherwise nested /call
+	// dispatch under userAccessFilter will silently break during prewarm
+	// (architect review concern #2, 2026-05-04).
 	if cache.InformerReaderFromContext(rctx) != nil {
 		rctx = cache.WithCallResolver(rctx, func(callCtx context.Context, obj map[string]any, resolvedKey, callAuthnNS string) ([]byte, error) {
 			result, err := l1cache.ResolveAndCache(callCtx, l1cache.Input{

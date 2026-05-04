@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -271,4 +272,92 @@ func TestEndpointDispatchFork(t *testing.T) {
 			t.Errorf("expected only demo-system, got %v", got)
 		}
 	})
+
+	// PM ask D4 (2026-05-04): operator escape-hatch end-to-end.
+	// When BOTH UserAccessFilter and EndpointRef are set, EndpointRef wins —
+	// the dispatched call must go to the EndpointRef-resolved endpoint
+	// carrying the EndpointRef-provided token (NOT the snowplow-SA token),
+	// AND the userAccessFilter must still be applied to the response.
+	t.Run("UAF_set_EndpointRef_set_UsesRefEndpoint_FilterStillApplies", func(t *testing.T) {
+		// External data server — this is what EndpointRef points at via the
+		// Secret. Records which token the dispatcher actually sent.
+		extCap := &capturedReq{}
+		extSrv := newMockK8s(t, `{"items":["demo-system","tenant-a","tenant-b"]}`, extCap)
+		defer extSrv.Close()
+
+		// Fake K8s API server — responds to the Secret GET with a payload
+		// whose data points at extSrv.URL with a custom EXT-TOKEN. The SA
+		// callback (saEndpointFor) is wired with a different token so we
+		// can prove EndpointRef wins by inspecting the captured Authorization
+		// header on extSrv.
+		k8sSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !strings.Contains(r.URL.Path, "/secrets/ext-endpoint") {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			// Encode Secret data as base64 (the apimachinery codec
+			// expects this for Secret.Data values).
+			w.Header().Set("Content-Type", "application/json")
+			payload := `{
+				"apiVersion":"v1",
+				"kind":"Secret",
+				"metadata":{"name":"ext-endpoint","namespace":"tenants"},
+				"data":{
+					"server-url":"` + b64(extSrv.URL) + `",
+					"token":"` + b64("EXT-TOKEN") + `"
+				}
+			}`
+			_, _ = w.Write([]byte(payload))
+		}))
+		defer k8sSrv.Close()
+
+		fr := newFakeRBAC()
+		fr.Allow("list", "", "namespaces", "demo-system")
+		ctx := dispatchCtx(t, fr)
+
+		api := &templates.API{
+			Name:        "ns",
+			Path:        "/api/v1/namespaces",
+			EndpointRef: &templates.Reference{Name: "ext-endpoint", Namespace: "tenants"},
+			UserAccessFilter: &templates.UserAccessFilter{
+				Verb: "list", Resource: "namespaces",
+				NamespaceFrom: ptr.To("."),
+			},
+			Filter: ptr.To(`[.ns.items[]]`),
+		}
+
+		dict := Resolve(ctx, ResolveOptions{
+			RC:               &rest.Config{Host: k8sSrv.URL},
+			Items:            []*templates.API{api},
+			SnowplowEndpoint: saEndpointFor(extSrv), // SA callback set, but MUST NOT be used.
+		})
+
+		if extCap.count == 0 {
+			t.Fatal("expected dispatch to extSrv via EndpointRef, got 0 calls")
+		}
+		// The captured Authorization header must carry the EndpointRef
+		// secret's EXT-TOKEN, NOT the snowplow-SA token.
+		if !strings.HasSuffix(extCap.authHeader, "EXT-TOKEN") {
+			t.Errorf("expected EndpointRef token EXT-TOKEN, got auth=%q", extCap.authHeader)
+		}
+		if strings.Contains(extCap.authHeader, "SNOWPLOW-SA") {
+			t.Errorf("snowplow-SA token must NOT be used when EndpointRef is set, got %q", extCap.authHeader)
+		}
+		if strings.Contains(extCap.authHeader, "USER-JWT") {
+			t.Errorf("user JWT must be suppressed when UAF is set, got %q", extCap.authHeader)
+		}
+		// And the filter must still apply: only demo-system survives.
+		got, ok := dict["ns"].([]any)
+		if !ok {
+			b, _ := json.Marshal(dict)
+			t.Fatalf("expected []any in dict[ns], got %s", string(b))
+		}
+		if len(got) != 1 || got[0] != "demo-system" {
+			t.Errorf("filter must still apply on EndpointRef path; expected only demo-system, got %v", got)
+		}
+	})
 }
+
+// b64 encodes a string for inclusion in a Secret.Data JSON payload.
+// Secret.Data values are []byte and the JSON codec expects base64.
+func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }

@@ -176,6 +176,18 @@ type rbacEvaluatorKey struct{}
 // informer factory + synthetic RBAC objects) install one here. Production
 // code should keep using WithRBACWatcher; the helper consumers fall back
 // to the watcher when no evaluator override is present.
+//
+// IMPORTANT — TEST ISOLATION ONLY:
+// Tests must NOT install both WithRBACWatcher and WithRBACEvaluator in the
+// same context. The mock-wins-when-both-installed precedence in
+// applyUserAccessFilter (see resolvers/restactions/api/user_access_filter.go)
+// exists strictly for unit-test isolation; in a production-shaped context
+// it would silently bypass the real informer-backed evaluator, producing
+// inconsistent RBAC decisions between code paths that read the watcher
+// directly (e.g. RBACWatcher.EvaluateRBAC) and those routing through
+// applyUserAccessFilter. The envtest harness (see
+// internal/handlers/restactions_envtest_test.go) deliberately wires only
+// WithRBACWatcher to verify the real path.
 func WithRBACEvaluator(ctx context.Context, ev RBACEvaluator) context.Context {
 	if ev == nil {
 		return ctx
