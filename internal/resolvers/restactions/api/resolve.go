@@ -178,6 +178,31 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		}
 	}
 
+	// V3_SYNCMAP: hot path for api_l1 / informer_direct merges. The
+	// `dict` map remains the canonical surface for snapshot reads
+	// (createRequestOptions reads dict to template the next call), for
+	// the err_write site, and for the legacy slice/extras seed. At the
+	// end of each topological level, sd is drained into dict so the
+	// next level's snapshot reads include this level's merge results.
+	// Per architect's design v2.1 § V3 + bench fa74572 V3_SYNCMAP.
+	sd := newSyncDict(dict)
+
+	// drainHotIntoDict copies sd's hot keys into dict under dictMu.
+	// Called between topological levels to make this level's results
+	// visible to the next level's snapshot reads.
+	drainHotIntoDict := func(mu *sync.Mutex) {
+		hot := sd.Drain()
+		if mu != nil {
+			mu.Lock()
+		}
+		for k, v := range hot {
+			dict[k] = v
+		}
+		if mu != nil {
+			mu.Unlock()
+		}
+	}
+
 	log.Debug("base dict for api resolver", slog.Int("dict_keys", len(dict)))
 
 	// Collect all API request paths executed during resolution.
@@ -490,10 +515,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								var herr error
 								computed, cerr := jsonHandlerDirectCompute(ctx, handlerOpts, safeData, sliceSnap)
 								if cerr == nil {
-									instrumentedDictWrite(ctx, nil, dict, "informer_direct", "append",
+									// V3_SYNCMAP: lock-free merge via sync.Map CAS.
+									instrumentedDictWrite(ctx, nil, nil, "informer_direct", "append",
 										directExtra,
 										func() {
-											mergeIntoDict(dict, id, computed)
+											sd.Merge(id, computed)
 										})
 								} else {
 									herr = cerr
@@ -726,6 +752,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			if !resolveAPI(level[0], &dictMu) {
 				break // fatal error — stop processing further levels
 			}
+			// V3_SYNCMAP: drain hot keys into dict so the next level's
+			// snapshot/createRequestOptions sees this level's results.
+			drainHotIntoDict(&dictMu)
 			continue
 		}
 
@@ -756,12 +785,23 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		}
 		levelWg.Wait()
 
+		// V3_SYNCMAP: drain hot keys into dict so the next level's
+		// snapshot/createRequestOptions sees this level's results.
+		drainHotIntoDict(&dictMu)
+
 		if atomic.LoadInt32(&levelFailed) != 0 {
 			log.Warn("at least one API in level failed, stopping resolution",
 				slog.Int("level", levelIdx), slog.Any("apis", level))
 			break
 		}
 	}
+
+	// V3_SYNCMAP: final drain in case the last level was interrupted by
+	// ctx cancellation — drainHotIntoDict at end-of-level only fires on
+	// successful completion. A nil mutex passed here is safe: at this
+	// point we are the sole owner of dict (all level goroutines have
+	// joined). The drain is idempotent if already executed.
+	drainHotIntoDict(nil)
 
 	// Store the collected API request paths in the resolved output.
 	// Deduplicate to keep the list compact (iterator calls often share
