@@ -26,6 +26,7 @@ import (
 	"log/slog"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
+	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/snowplow/apis"
 	v1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
@@ -84,6 +85,12 @@ type Input struct {
 	// ResolvedKey to disable caching, because Extras are NOT part of
 	// the key.
 	Extras map[string]any
+
+	// SnowplowEndpoint is the elevated-call provider for api[] entries
+	// that declare UserAccessFilter. Plumbed through to
+	// restactions.ResolveOptions and ultimately api.ResolveOptions. nil
+	// is permitted; UserAccessFilter calls will be rejected at runtime.
+	SnowplowEndpoint func() (*endpoints.Endpoint, error)
 }
 
 // Result is what both HTTP and widget callers need from one resolution.
@@ -134,12 +141,13 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 	tracker := cache.NewDependencyTracker()
 	tctx := cache.WithDependencyTracker(xcontext.BuildContext(ctx), tracker)
 	if _, err := restactions.Resolve(tctx, restactions.ResolveOptions{
-		In:      &cr,
-		SArc:    in.SArc,
-		AuthnNS: in.AuthnNS,
-		PerPage: in.PerPage,
-		Page:    in.Page,
-		Extras:  in.Extras,
+		In:               &cr,
+		SArc:             in.SArc,
+		AuthnNS:          in.AuthnNS,
+		PerPage:          in.PerPage,
+		Page:             in.Page,
+		Extras:           in.Extras,
+		SnowplowEndpoint: in.SnowplowEndpoint,
 	}); err != nil {
 		log.Error("unable to resolve rest action",
 			slog.String("name", cr.GetName()),

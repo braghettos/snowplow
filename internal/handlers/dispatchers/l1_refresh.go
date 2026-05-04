@@ -43,7 +43,11 @@ type userContext struct {
 // the refresh runs (stale-while-revalidate).
 // rbacWatcher may be nil; when non-nil it is injected into the refresh context
 // so UserCan uses in-memory RBAC evaluation instead of SSAR API calls.
-func MakeL1Refresher(c cache.Cache, rc *rest.Config, authnNS, signKey string, rbacWatcher *cache.RBACWatcher) cache.L1RefreshFunc {
+//
+// snowplowEndpointFn is the elevated-call provider for api[] entries that
+// declare userAccessFilter (Q-RBAC-DECOUPLE C(d)). May be nil; that disables
+// elevated dispatch during background refresh.
+func MakeL1Refresher(c cache.Cache, rc *rest.Config, authnNS, signKey string, rbacWatcher *cache.RBACWatcher, snowplowEndpointFn func() (*endpoints.Endpoint, error)) cache.L1RefreshFunc {
 	// User context cache: loaded once per user, shared across all goroutines.
 	// Avoids 50K K8s Secret GETs when 50K events arrive for the same users.
 	var (
@@ -97,6 +101,14 @@ func MakeL1Refresher(c cache.Cache, rc *rest.Config, authnNS, signKey string, rb
 		if rbacWatcher != nil {
 			ctx = cache.WithRBACWatcher(ctx, rbacWatcher)
 		}
+		// Inject snowplow-SA endpoint provider so api[] entries that
+		// declare userAccessFilter resolve correctly during the
+		// background refresh path (Q-RBAC-DECOUPLE C(d)).
+		if snowplowEndpointFn != nil {
+			ctx = cache.WithSnowplowEndpoint(ctx, func() (any, error) {
+				return snowplowEndpointFn()
+			})
+		}
 
 		ctx, span := l1RefreshTracer.Start(ctx, "l1.refresh",
 			trace.WithAttributes(
@@ -137,7 +149,7 @@ func MakeL1Refresher(c cache.Cache, rc *rest.Config, authnNS, signKey string, rb
 			}
 
 			for _, k := range keys {
-				ok, cascade := refreshSingleL1(ctx, c, uc.user, uc.endpoint, uc.accessToken, k.info, k.raw, authnNS)
+				ok, cascade := refreshSingleL1(ctx, c, uc.user, uc.endpoint, uc.accessToken, k.info, k.raw, authnNS, snowplowEndpointFn)
 				if ok {
 					totalRefreshed++
 					allCascade = append(allCascade, cascade...)
@@ -186,7 +198,11 @@ func MakeL1Refresher(c cache.Cache, rc *rest.Config, authnNS, signKey string, rb
 // Returns (ok, cascadeKeys): ok indicates success, cascadeKeys contains L1 keys
 // that depend on the refreshed resource and should be enqueued for refresh too
 // (cascading invalidation for RESTAction → widget dependency chains).
-func refreshSingleL1(ctx context.Context, c cache.Cache, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, info cache.ResolvedKeyInfo, rawKey, authnNS string) (bool, []string) {
+//
+// snowplowEndpointFn is forwarded to ResolveRESTActionBackground so api[]
+// entries that declare userAccessFilter resolve correctly during the
+// background refresh path.
+func refreshSingleL1(ctx context.Context, c cache.Cache, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, info cache.ResolvedKeyInfo, rawKey, authnNS string, snowplowEndpointFn func() (*endpoints.Endpoint, error)) (bool, []string) {
 	rctx := xcontext.BuildContext(ctx,
 		xcontext.WithUserConfig(ep),
 		xcontext.WithUserInfo(user),
@@ -206,6 +222,14 @@ func refreshSingleL1(ctx context.Context, c cache.Cache, user jwtutil.UserInfo, 
 		rctx = cache.WithInformerReader(rctx, ir)
 	}
 
+	// Propagate snowplow-SA endpoint provider (Q-RBAC-DECOUPLE C(d)) so
+	// nested resolutions of api[] entries with userAccessFilter can dispatch
+	// elevated calls. Refresh closure here also wraps snowplowEndpointFn
+	// directly into ctx for parity (see MakeL1Refresher.refreshFn).
+	if snEp := cache.SnowplowEndpointFromContext(ctx); snEp != nil {
+		rctx = cache.WithSnowplowEndpoint(rctx, snEp)
+	}
+
 	// Propagate DirtySet so nested resolution bypasses stale API result cache.
 	if ds := cache.DirtySetFromContext(ctx); ds != nil {
 		rctx = cache.WithDirtySet(rctx, ds)
@@ -215,6 +239,19 @@ func refreshSingleL1(ctx context.Context, c cache.Cache, user jwtutil.UserInfo, 
 	// compositions-list → compositions-get-ns-and-crd) resolve in-process
 	// from the informer instead of making an HTTP round-trip back to
 	// snowplow, which times out under high load at 50K scale.
+	//
+	// Q-RBAC-DECOUPLE C(d) — nested userAccessFilter dispatch contract:
+	// the l1cache.ResolveAndCache call below does NOT thread snowplowEndpointFn
+	// through l1cache.Input on purpose. The nested resolver inherits
+	// cache.WithSnowplowEndpoint via callCtx — installed at lines 107-111
+	// above and propagated into rctx at lines 229-231. If a future refactor
+	// removes the context fallback in
+	// `internal/resolvers/restactions/api/resolve.go` (the
+	// `cache.SnowplowEndpointFromContext(ctx)` branch around the dispatch
+	// fork, currently ~line 263), audit THIS site first or thread
+	// snowplowEndpointFn into l1cache.Input — otherwise nested /call
+	// dispatch under userAccessFilter will silently break (architect
+	// review concern #2, 2026-05-04).
 	if cache.InformerReaderFromContext(rctx) != nil {
 		rctx = cache.WithCallResolver(rctx, func(callCtx context.Context, obj map[string]any, resolvedKey, callAuthnNS string) ([]byte, error) {
 			result, err := l1cache.ResolveAndCache(callCtx, l1cache.Input{
@@ -269,7 +306,7 @@ func refreshSingleL1(ctx context.Context, c cache.Cache, user jwtutil.UserInfo, 
 		return true, nil
 
 	case info.GVR.Group == templatesGroup && info.GVR.Resource == restactionResource:
-		_, err := ResolveRESTActionBackground(rctx, c, got.Unstructured.Object, rawKey, authnNS, info.PerPage, info.Page)
+		_, err := ResolveRESTActionBackground(rctx, c, got.Unstructured.Object, rawKey, authnNS, info.PerPage, info.Page, snowplowEndpointFn)
 		if err != nil {
 			slog.Info("refreshSingleL1: RESTAction resolve failed",
 				slog.String("key", rawKey), slog.Any("err", err))

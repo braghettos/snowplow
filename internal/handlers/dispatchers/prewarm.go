@@ -294,12 +294,25 @@ func FilterWidgetGVRs(cfg *cache.WarmupConfig) []schema.GroupVersionResource {
 // identity group. Users with identical RBAC bindings share L1 entries, so
 // only one representative user per group is resolved. RBAC decisions are
 // populated organically during resolution.
+//
+// snowplowEndpointFn is the elevated-call provider for api[] entries that
+// declare userAccessFilter. Injected into prewarm contexts so the warmup
+// path also resolves cyberjoker-class RESTActions correctly.
 func WarmL1FromEntryPoints(ctx context.Context, c cache.Cache, rc *rest.Config,
-	authnNS, signKey string, entryPoints []cache.EntryPoint, rbacWatcher *cache.RBACWatcher) {
+	authnNS, signKey string, entryPoints []cache.EntryPoint, rbacWatcher *cache.RBACWatcher, snowplowEndpointFn func() (*endpoints.Endpoint, error)) {
 	log := slog.Default()
 	if len(entryPoints) == 0 || authnNS == "" {
 		log.Info("L1 entry-point warmup: skipped (no entry points or authn namespace)")
 		return
+	}
+
+	// Inject snowplow-SA endpoint provider into the warmup ctx so all
+	// downstream resolutions (widget→apiref→l1cache→restactions→api) can
+	// dispatch elevated calls.
+	if snowplowEndpointFn != nil {
+		ctx = cache.WithSnowplowEndpoint(ctx, func() (any, error) {
+			return snowplowEndpointFn()
+		})
 	}
 
 	users, err := discoverUsers(ctx, rc, authnNS)
@@ -547,6 +560,19 @@ func warmL1RestActionsForUser(ctx context.Context, c cache.Cache, dynClient k8sd
 
 	// Inject inline /call resolver so nested RESTAction calls resolve
 	// in-process from the informer instead of HTTP round-trip.
+	//
+	// Q-RBAC-DECOUPLE C(d) — nested userAccessFilter dispatch contract:
+	// the l1cache.ResolveAndCache call below does NOT thread snowplowEndpointFn
+	// through l1cache.Input on purpose. The nested resolver inherits
+	// cache.WithSnowplowEndpoint via callCtx — installed once on the prewarm
+	// ctx at WarmL1FromEntryPoints (prewarm.go:312-316) and inherited by the
+	// per-user rctx built here. If a future refactor removes the context
+	// fallback in `internal/resolvers/restactions/api/resolve.go` (the
+	// `cache.SnowplowEndpointFromContext(ctx)` branch around the dispatch
+	// fork, currently ~line 263), audit THIS site first or thread
+	// snowplowEndpointFn into l1cache.Input — otherwise nested /call
+	// dispatch under userAccessFilter will silently break during prewarm
+	// (architect review concern #2, 2026-05-04).
 	if cache.InformerReaderFromContext(rctx) != nil {
 		rctx = cache.WithCallResolver(rctx, func(callCtx context.Context, obj map[string]any, resolvedKey, callAuthnNS string) ([]byte, error) {
 			result, err := l1cache.ResolveAndCache(callCtx, l1cache.Input{

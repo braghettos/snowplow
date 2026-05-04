@@ -1,0 +1,45 @@
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: compositions-panels
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    "krateo.io/verbose": "true"
+spec:
+  api:
+  - name: namespaces
+    path: "/api/v1/namespaces"
+    # Q-RBAC-DECOUPLE C(d): elevated read via snowplow's SA, then
+    # per-user RBAC drop using the namespace name as the RBAC namespace.
+    userAccessFilter:
+      verb: list
+      group: ""
+      resource: namespaces
+      namespaceFrom: "."
+    filter: "[.namespaces.items[] | .metadata.name]"
+  - name: compositionspanels
+    dependsOn:
+      name: namespaces
+      iterator: .namespaces
+    path: ${ "/apis/widgets.templates.krateo.io/v1beta1/namespaces/" + (.) + "/panels" }
+    continueOnError: true
+    filter: >
+      [.compositionspanels.items[]?
+       | select((.metadata.labels // {})["krateo.io/portal-page"] == "compositions")
+       | del(.metadata.managedFields, .metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"])]
+  filter: >
+    {
+      compositionspanels: (
+        (.compositionspanels // []) as $items
+        | ($items | sort_by(.metadata.creationTimestamp // "") | reverse) as $sorted
+        | (.slice.offset  // 0)                 as $offset
+        | (.slice.perPage // ($sorted | length)) as $perPage
+        | [
+            $sorted
+            | length as $len
+            | range($offset; $offset + $perPage)
+            | select(. < $len)         # avoid out-of-bounds
+            | $sorted[.]
+          ]
+      )
+    }

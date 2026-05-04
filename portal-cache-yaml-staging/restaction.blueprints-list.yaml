@@ -1,0 +1,39 @@
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: blueprints-list
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    "krateo.io/verbose": "true"
+spec:
+  api:
+  - filter: '[.namespaces.items[] | .metadata.name]'
+    name: namespaces
+    path: /api/v1/namespaces
+    # Q-RBAC-DECOUPLE C(d): elevated read via snowplow's SA, then
+    # per-user RBAC drop using the namespace name as the RBAC namespace.
+    userAccessFilter:
+      verb: list
+      group: ""
+      resource: namespaces
+      namespaceFrom: "."
+  - continueOnError: true
+    dependsOn:
+      iterator: .namespaces
+      name: namespaces
+    name: allCompositionDefinitions
+    path: ${ "/apis/core.krateo.io/v1alpha1/namespaces/" + (.) + "/compositiondefinitions"}
+  filter: >
+    {
+      list: (
+        if (.allCompositionDefinitions | type) == "array" then
+          [.allCompositionDefinitions[]?.items[]? | del(.metadata.managedFields, .metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"])]
+        elif (.allCompositionDefinitions | type) == "object" then
+          [.allCompositionDefinitions.items[]? | del(.metadata.managedFields, .metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"])]
+        else
+          []
+        end
+      )
+    }
+
+

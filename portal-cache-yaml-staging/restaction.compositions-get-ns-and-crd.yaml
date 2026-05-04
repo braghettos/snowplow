@@ -1,0 +1,41 @@
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: compositions-get-ns-and-crd
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    "krateo.io/verbose": "true"
+spec:
+  api:
+  - name: crds
+    path: "/apis/apiextensions.k8s.io/v1/customresourcedefinitions"
+    # Q-RBAC-DECOUPLE C(d): elevated read via snowplow's SA, then
+    # per-user RBAC drop. CRDs are cluster-scoped so no namespaceFrom
+    # (the RBAC check uses namespace="" → CRB-only matching).
+    userAccessFilter:
+      verb: list
+      group: apiextensions.k8s.io
+      resource: customresourcedefinitions
+    filter: "[.crds.items[] | select(.spec.group == \"composition.krateo.io\") | {storedVersions: .status.storedVersions[0], plural: .status.acceptedNames.plural} ]"
+    continueOnError: true
+  - name: namespaces
+    path: "/api/v1/namespaces"
+    # Q-RBAC-DECOUPLE C(d): elevated read via snowplow's SA, then
+    # per-user RBAC drop using the namespace name as the RBAC namespace.
+    userAccessFilter:
+      verb: list
+      group: ""
+      resource: namespaces
+      namespaceFrom: "."
+    filter: "[.namespaces.items[] | .metadata.name]"
+    continueOnError: true
+  filter: >
+    [
+      .crds[] as $crd |
+      .namespaces[] as $ns |
+      {
+        plural: $crd.plural,
+        version: $crd.storedVersions,
+        namespace: $ns
+      }
+    ]

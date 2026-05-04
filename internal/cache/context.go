@@ -160,6 +160,49 @@ func RBACWatcherFromContext(ctx context.Context) *RBACWatcher {
 	return rw
 }
 
+// RBACEvaluator is the minimal contract callers (e.g. applyUserAccessFilter
+// in resolvers/restactions/api) need from the RBACWatcher: a single in-memory
+// access-check method. *RBACWatcher implements it. Existing as a 1-method
+// interface keeps the call sites trivially mockable in unit tests without
+// requiring a full informer factory at test time (Q-RBACC-IMPL-1).
+type RBACEvaluator interface {
+	EvaluateRBAC(username string, groups []string, verb string, gr schema.GroupResource, namespace string) bool
+}
+
+type rbacEvaluatorKey struct{}
+
+// WithRBACEvaluator attaches a test-friendly RBACEvaluator to ctx. Callers
+// that prefer interface-based mocking over the full RBACWatcher (with its
+// informer factory + synthetic RBAC objects) install one here. Production
+// code should keep using WithRBACWatcher; the helper consumers fall back
+// to the watcher when no evaluator override is present.
+//
+// IMPORTANT — TEST ISOLATION ONLY:
+// Tests must NOT install both WithRBACWatcher and WithRBACEvaluator in the
+// same context. The mock-wins-when-both-installed precedence in
+// applyUserAccessFilter (see resolvers/restactions/api/user_access_filter.go)
+// exists strictly for unit-test isolation; in a production-shaped context
+// it would silently bypass the real informer-backed evaluator, producing
+// inconsistent RBAC decisions between code paths that read the watcher
+// directly (e.g. RBACWatcher.EvaluateRBAC) and those routing through
+// applyUserAccessFilter. The envtest harness (see
+// internal/handlers/restactions_envtest_test.go) deliberately wires only
+// WithRBACWatcher to verify the real path.
+func WithRBACEvaluator(ctx context.Context, ev RBACEvaluator) context.Context {
+	if ev == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, rbacEvaluatorKey{}, ev)
+}
+
+// RBACEvaluatorFromContext returns the test-mock RBACEvaluator if any was
+// installed via WithRBACEvaluator. Returns nil otherwise. Callers fall back
+// to RBACWatcherFromContext.
+func RBACEvaluatorFromContext(ctx context.Context) RBACEvaluator {
+	ev, _ := ctx.Value(rbacEvaluatorKey{}).(RBACEvaluator)
+	return ev
+}
+
 // CallResolver resolves a nested /call RESTAction inline (in-process)
 // without making an HTTP round-trip. During background refresh, the
 // L1 refresh function injects one via WithCallResolver so that nested
@@ -184,6 +227,60 @@ func WithCallResolver(ctx context.Context, fn CallResolver) context.Context {
 func CallResolverFromContext(ctx context.Context) CallResolver {
 	fn, _ := ctx.Value(callResolverKey{}).(CallResolver)
 	return fn
+}
+
+// SnowplowEndpointFn is the callback shape used by api[] entries that
+// declare userAccessFilter to obtain the snowplow ServiceAccount endpoint
+// at dispatch time. The callback re-reads the projected SA token on each
+// invocation (~10µs tmpfs read) so token rotation is handled transparently.
+//
+// Stored in context so all paths (HTTP /call, widget apiref, L1 refresh,
+// prewarm) inherit one provider without per-dispatcher threading. The
+// resolver sites accept the provider on ResolveOptions for explicit unit
+// testing; nil ResolveOptions.SnowplowEndpoint falls back to this context
+// value (Q-RBAC-DECOUPLE C(d)).
+type SnowplowEndpointFn func() (any, error)
+
+type snowplowEndpointKey struct{}
+
+// WithSnowplowEndpoint returns a context carrying the snowplow-SA endpoint
+// provider for elevated userAccessFilter dispatch. The value type is
+// intentionally `any` to avoid a cache→plumbing/endpoints import cycle;
+// the api package re-asserts it back to its own callback shape.
+func WithSnowplowEndpoint(ctx context.Context, fn func() (any, error)) context.Context {
+	if fn == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, snowplowEndpointKey{}, fn)
+}
+
+// SnowplowEndpointFromContext extracts the snowplow-SA endpoint provider
+// from ctx. Returns nil when not set.
+func SnowplowEndpointFromContext(ctx context.Context) func() (any, error) {
+	fn, _ := ctx.Value(snowplowEndpointKey{}).(func() (any, error))
+	return fn
+}
+
+type restActionNameKey struct{}
+
+// WithRESTActionName returns a context carrying the RESTAction name being
+// resolved. Used for audit/observability so per-call helpers (e.g.
+// applyUserAccessFilter) can attribute their work to the originating
+// RESTAction CR. Mirrors the WithRBACWatcher / WithUserInfo pattern.
+//
+// Per Q-RBACC-IMPL-2 (architect recommendation 2026-05-04).
+func WithRESTActionName(ctx context.Context, name string) context.Context {
+	if name == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, restActionNameKey{}, name)
+}
+
+// RESTActionNameFromContext extracts the RESTAction name from ctx, returning
+// "" if no name was set (e.g. /jq endpoint, unit tests).
+func RESTActionNameFromContext(ctx context.Context) string {
+	name, _ := ctx.Value(restActionNameKey{}).(string)
+	return name
 }
 
 type bindingIdentityKey struct{}

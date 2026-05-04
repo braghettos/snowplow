@@ -1,0 +1,37 @@
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: sidebar-nav-menu-items
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    "krateo.io/verbose": "true"
+spec:
+  api:
+  - name: namespaces
+    path: "/api/v1/namespaces"
+    # Q-RBAC-DECOUPLE C(d): elevated read via snowplow's SA, then
+    # per-user RBAC drop using the namespace name as the RBAC namespace.
+    userAccessFilter:
+      verb: list
+      group: ""
+      resource: namespaces
+      namespaceFrom: "."
+    filter: "[.namespaces.items[] | .metadata.name]"
+  - name: navmenuitems
+    continueOnError: true
+    dependsOn:
+      name: namespaces
+      iterator: .namespaces
+    path: ${ "/apis/widgets.templates.krateo.io/v1beta1/namespaces/" + (.) + "/navmenuitems" }
+  filter: >
+    {
+      navmenuitems: (
+        if (.navmenuitems | type) == "array" then
+          [.navmenuitems[]?.items[]?]
+        elif (.navmenuitems | type) == "object" then
+          [.navmenuitems.items[]?]
+        else
+          []
+        end | sort_by(.spec.widgetData.order)
+      )
+    }

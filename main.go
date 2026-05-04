@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/plumbing/kubeutil"
 	"github.com/krateoplatformops/plumbing/server/use"
@@ -28,6 +29,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/handlers"
 	"github.com/krateoplatformops/snowplow/internal/observability"
 	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
+	apiresolve "github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
 	httpSwagger "github.com/swaggo/http-swagger"
 	"k8s.io/client-go/rest"
@@ -181,6 +183,23 @@ func main() {
 		sarc.NextProtos = []string{"http/1.1"} // disable HTTP2 to avoid h2 frame crashes
 	}
 
+	// Snowplow-SA endpoint provider, used by api[] entries that declare
+	// userAccessFilter (Q-RBAC-DECOUPLE C(d) v2). The closure captures the
+	// in-cluster *rest.Config once at startup; api.SnowplowEndpointFromConfig
+	// re-reads BearerTokenFile on every call so projected SA token rotation
+	// is picked up automatically (~10µs tmpfs read). Returns an error when
+	// not in-cluster — userAccessFilter calls will be rejected at runtime
+	// with an explicit log line.
+	var snowplowEndpointFn func() (*endpoints.Endpoint, error)
+	if sarc != nil {
+		rc := sarc
+		snowplowEndpointFn = func() (*endpoints.Endpoint, error) {
+			return apiresolve.SnowplowEndpointFromConfig(rc)
+		}
+	} else {
+		log.Warn("no in-cluster config; userAccessFilter calls will be rejected at runtime")
+	}
+
 	// No Redis ping or disk store needed — MemCache is always available.
 
 	// Initialize OpenTelemetry SDK (no-op when OTEL_ENABLED != "true").
@@ -220,6 +239,15 @@ func main() {
 			}
 			if globalInformerReader != nil {
 				ctx = cache.WithInformerReader(ctx, globalInformerReader)
+			}
+			// Snowplow-SA endpoint provider for elevated userAccessFilter
+			// dispatch. Wrapped to the type-erased shape that
+			// cache.SnowplowEndpointFromContext returns; api.Resolve
+			// re-asserts back to *endpoints.Endpoint.
+			if snowplowEndpointFn != nil {
+				ctx = cache.WithSnowplowEndpoint(ctx, func() (any, error) {
+					return snowplowEndpointFn()
+				})
 			}
 			r = r.WithContext(ctx)
 			next.ServeHTTP(w, r)
@@ -264,7 +292,7 @@ func main() {
 	mux.Handle("GET /call", chain.Append(
 		userCfg,
 		withCache,
-		handlers.Dispatcher(dispatchers.All())).
+		handlers.Dispatcher(dispatchers.All(snowplowEndpointFn))).
 		Then(handlers.Call()))
 	mux.Handle("POST /call", chain.Append(userCfg, withCache).Then(handlers.Call()))
 	mux.Handle("PUT /call", chain.Append(userCfg, withCache).Then(handlers.Call()))
@@ -310,7 +338,7 @@ func main() {
 	// Previously this ran before ListenAndServe, causing startup probe failures
 	// when informer sync + L2/RBAC warmup exceeded the probe timeout.
 	if appCache != nil {
-		go startBackgroundServices(ctx, log, appCache, *authnNS, *warmupConfigPath, *signKey, globalRBACWatcher)
+		go startBackgroundServices(ctx, log, appCache, *authnNS, *warmupConfigPath, *signKey, globalRBACWatcher, snowplowEndpointFn)
 	}
 	<-ctx.Done()
 
@@ -350,7 +378,7 @@ func recoveryMiddleware(next http.Handler) http.Handler {
 // Warmup and informer sync use a separate background context so that a SIGTERM
 // received during startup (e.g. from a failing liveness probe) does not abort
 // the warmup — the server will start with a fully warm cache regardless.
-func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cache, authnNS, warmupConfigPath, signKey string, rbacWatcher *cache.RBACWatcher) {
+func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cache, authnNS, warmupConfigPath, signKey string, rbacWatcher *cache.RBACWatcher, snowplowEndpointFn func() (*endpoints.Endpoint, error)) {
 	rc, err := rest.InClusterConfig()
 	if err != nil {
 		log.Warn("not running in-cluster; background cache services disabled", slog.Any("err", err))
@@ -374,7 +402,7 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cach
 	}
 	globalInformerReader = resourceWatcher // InformerReader interface — reads from informer store
 	globalResourceWatcher = resourceWatcher // exposes HOT/WARM/COLD queue depths to /metrics/runtime
-	resourceWatcher.SetL1Refresher(dispatchers.MakeL1Refresher(c, rc, authnNS, signKey, rbacWatcher))
+	resourceWatcher.SetL1Refresher(dispatchers.MakeL1Refresher(c, rc, authnNS, signKey, rbacWatcher, snowplowEndpointFn))
 
 	// Load warmup config early to get autoDiscoverGroups for CRD informer filtering.
 	warmupCfg, err := cache.LoadWarmupConfig(warmupConfigPath)
@@ -454,6 +482,13 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cach
 	if globalInformerReader != nil {
 		warmupCtx = cache.WithInformerReader(warmupCtx, globalInformerReader)
 	}
+	// Inject snowplow-SA endpoint provider so warmup-driven resolutions
+	// of api[] entries with userAccessFilter use the in-cluster SA.
+	if snowplowEndpointFn != nil {
+		warmupCtx = cache.WithSnowplowEndpoint(warmupCtx, func() (any, error) {
+			return snowplowEndpointFn()
+		})
+	}
 
 	// Phase 5: Pre-warm L1 (resolved widget + RESTAction output) for every
 	// known user. Uses its own context because warmupCtx is cancelled when
@@ -470,6 +505,11 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cach
 		if globalInformerReader != nil {
 			l1Ctx = cache.WithInformerReader(l1Ctx, globalInformerReader)
 		}
+		if snowplowEndpointFn != nil {
+			l1Ctx = cache.WithSnowplowEndpoint(l1Ctx, func() (any, error) {
+				return snowplowEndpointFn()
+			})
+		}
 
 		feCfg, feErr := cache.LoadFrontendConfig(frontendConfigPath)
 		if feErr != nil {
@@ -485,6 +525,6 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cach
 		log.Info("L1 warmup: using frontend entry points",
 			slog.Int("entryPoints", len(eps)),
 			slog.String("configPath", frontendConfigPath))
-		dispatchers.WarmL1FromEntryPoints(l1Ctx, c, rc, authnNS, signKey, eps, rbacWatcher)
+		dispatchers.WarmL1FromEntryPoints(l1Ctx, c, rc, authnNS, signKey, eps, rbacWatcher, snowplowEndpointFn)
 	}()
 }

@@ -103,12 +103,67 @@ spec:
                     payload:
                       description: Payload is the request body
                       type: string
+                    userAccessFilter:
+                      description: |-
+                        UserAccessFilter declares a per-user RBAC check applied to each item
+                        of the call's response array. Snowplow evaluates the check via
+                        RBACWatcher.EvaluateRBAC (in-memory, ~10-50 µs per item, zero K8s
+                        API roundtrips) using the user identity from xcontext.UserInfo(ctx).
+
+                        Presence of UserAccessFilter on an api[] entry has TWO effects:
+                          1. The HTTP call is dispatched using snowplow's own ServiceAccount
+                             identity (the in-cluster SA token + CA mounted in the pod,
+                             exposed via rest.InClusterConfig() and converted to an
+                             endpoints.Endpoint at request time).
+                          2. The response is filtered per requesting user before being merged
+                             into the resolution dict.
+
+                        If EndpointRef IS set, EndpointRef wins (operator escape hatch);
+                        the filter still applies.
+                      properties:
+                        group:
+                          description: |-
+                            Group is the K8s API group of the filtered resource. Empty string
+                            for core resources (e.g. namespaces, pods).
+                          type: string
+                        namespaceFrom:
+                          description: |-
+                            NamespaceFrom is a jq expression evaluated against each item to
+                            extract the namespace used in the RBAC check. When empty or omitted
+                            the filter treats the resource as cluster-scoped (namespace="").
+                          type: string
+                        resource:
+                          description: Resource is the K8s plural resource name.
+                          type: string
+                        verb:
+                          description: 'Verb is the RBAC verb to evaluate. One of:
+                            get, list, watch.'
+                          enum:
+                          - get
+                          - list
+                          - watch
+                          type: string
+                      required:
+                      - resource
+                      - verb
+                      type: object
                     verb:
                       description: Verb is the request method (GET if omitted)
                       type: string
                   required:
                   - name
                   type: object
+                  x-kubernetes-validations:
+                  - message: api[].userAccessFilter requires non-empty verb and resource
+                    rule: '!(has(self.userAccessFilter) && (self.userAccessFilter.verb
+                      == '''' || self.userAccessFilter.resource == ''''))'
+                  - message: api[].userAccessFilter is only allowed with read HTTP
+                      verbs (GET, HEAD)
+                    rule: '!(has(self.userAccessFilter) && has(self.verb) && !(self.verb
+                      in [''GET'',''HEAD'',''get'',''head'']))'
+                  - message: api[].userAccessFilter is incompatible with exportJwt=true
+                    rule: '!(has(self.userAccessFilter) && has(self.exportJwt) &&
+                      self.exportJwt == true)'
                 type: array
                 x-kubernetes-list-type: atomic
               filter:
