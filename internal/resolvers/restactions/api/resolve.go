@@ -252,7 +252,24 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		// all writes to the shared dict so that JQ handlers can safely append.
 		//
 		// For single-call entries (the common case) we skip goroutine overhead.
+		//
+		// V0_HOIST: snapshot dict["slice"] once at start of runOne under
+		// brief lock so jsonHandler*Compute can be called outside the lock
+		// without racing with sibling iterator writers (which may grow the
+		// map and trigger concurrent-map-read panics on go runtime). Slice
+		// is set exactly once at the top of Resolve and is never mutated by
+		// the fanout, so a single snapshot is correct.
 		runOne := func(call httpcall.RequestOptions, mu *sync.Mutex) (continueOnErr bool) {
+			var sliceSnap any
+			if mu != nil {
+				mu.Lock()
+				if si, ok := dict["slice"]; ok {
+					sliceSnap = si
+				}
+				mu.Unlock()
+			} else if si, ok := dict["slice"]; ok {
+				sliceSnap = si
+			}
 			call.Endpoint = &ep
 			verb := strings.ToUpper(ptr.Deref(call.Verb, http.MethodGet))
 
@@ -295,40 +312,42 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								GroupResource: schema.GroupResource{Group: pathGVR.Group, Resource: pathGVR.Resource},
 								Namespace:     pathNS,
 							}) {
+								// V0_HOIST: at api_l1, raw bytes are already in
+								// hand. Compute (Unmarshal + JQ) runs WITHOUT
+								// dictMu; only the merge-into-dict step takes
+								// the lock. gojq-purity-required: raw bytes
+								// were just fetched from L1 — no informer
+								// alias, safeCopyJSON not needed for raw byte
+								// path (parsing into a fresh tree).
 								handler := call.ResponseHandler
 								if handler == nil {
-									handler = jsonHandler(ctx, jsonHandlerOptions{
-										key: id, out: dict, filter: apiCall.Filter,
-									})
-									if mu != nil {
-										origHandler := handler
-										apiL1Extra := []attribute.KeyValue{
-											attribute.String("restaction.api.name", id),
-											attribute.String("api.gvr", pathGVR.String()),
-											attribute.String("api.namespace", pathNS),
-											attribute.Int("payload.bytes", len(raw)),
-										}
-										if pathName != "" {
-											apiL1Extra = append(apiL1Extra,
-												attribute.String("api.name", pathName))
-										}
-										handler = func(r io.ReadCloser) error {
-											data, rerr := io.ReadAll(r)
-											if rerr != nil {
-												return rerr
-											}
-											var herr error
-											instrumentedDictWrite(ctx, mu, dict, "api_l1", "append",
-												apiL1Extra,
-												func() {
-													herr = origHandler(io.NopCloser(bytes.NewReader(data)))
-												})
-											return herr
-										}
+									apiL1Extra := []attribute.KeyValue{
+										attribute.String("restaction.api.name", id),
+										attribute.String("api.gvr", pathGVR.String()),
+										attribute.String("api.namespace", pathNS),
+										attribute.Int("payload.bytes", len(raw)),
 									}
-								}
-								if herr := handler(io.NopCloser(bytes.NewReader(raw))); herr == nil {
-									return true // L1 API cache hit
+									if pathName != "" {
+										apiL1Extra = append(apiL1Extra,
+											attribute.String("api.name", pathName))
+									}
+									handlerOpts := jsonHandlerOptions{
+										key: id, out: dict, filter: apiCall.Filter,
+									}
+									// gojq-purity-required: raw is fresh bytes; safeCopyJSON not required for this path.
+									computed, cerr := jsonHandlerCompute(ctx, handlerOpts, raw, sliceSnap)
+									if cerr == nil {
+										instrumentedDictWrite(ctx, mu, dict, "api_l1", "append",
+											apiL1Extra,
+											func() {
+												mergeIntoDict(dict, id, computed)
+											})
+										return true // L1 API cache hit
+									}
+								} else {
+									if herr := handler(io.NopCloser(bytes.NewReader(raw))); herr == nil {
+										return true // L1 API cache hit
+									}
 								}
 							}
 						}
@@ -431,14 +450,20 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								directExtra = append(directExtra,
 									attribute.String("api.name", pathName))
 							}
+							// V0_HOIST: at informer_direct, JQ runs on safeData
+							// (already safeCopyJSON-wrapped above) BEFORE
+							// taking dictMu. Only mergeIntoDict is locked.
+							// gojq-purity-required: safeData is the
+							// safeCopyJSON output — independent of informer
+							// storage, gojq is free to mutate it.
 							if mu != nil {
-								var herr error
-								instrumentedDictWrite(ctx, mu, dict, "informer_direct", "append",
-									directExtra,
-									func() {
-										herr = jsonHandlerDirect(ctx, handlerOpts, safeData)
-									})
-								if herr == nil {
+								computed, cerr := jsonHandlerDirectCompute(ctx, handlerOpts, safeData, sliceSnap)
+								if cerr == nil {
+									instrumentedDictWrite(ctx, mu, dict, "informer_direct", "append",
+										directExtra,
+										func() {
+											mergeIntoDict(dict, id, computed)
+										})
 									if c != nil {
 										apiCacheKey := cache.APIResultKey(identity, pathGVR, pathNS, pathName)
 										_ = c.SetAPIResultRaw(ctx, apiCacheKey, raw)
@@ -458,12 +483,21 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 									return true
 								}
 							} else {
+								// mu==nil: single-fanout shape, already
+								// lock-free. Hoist still applies for code
+								// symmetry — no contention but identical
+								// gojq-purity discipline.
 								var herr error
-								instrumentedDictWrite(ctx, nil, dict, "informer_direct", "append",
-									directExtra,
-									func() {
-										herr = jsonHandlerDirect(ctx, handlerOpts, safeData)
-									})
+								computed, cerr := jsonHandlerDirectCompute(ctx, handlerOpts, safeData, sliceSnap)
+								if cerr == nil {
+									instrumentedDictWrite(ctx, nil, dict, "informer_direct", "append",
+										directExtra,
+										func() {
+											mergeIntoDict(dict, id, computed)
+										})
+								} else {
+									herr = cerr
+								}
 								if herr == nil {
 									if c != nil {
 										apiCacheKey := cache.APIResultKey(identity, pathGVR, pathNS, pathName)
@@ -514,12 +548,17 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					}
 					if l1Raw, l1Hit, _ := c.GetRaw(ctx, l1Key); l1Hit {
 						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
-						handler := jsonHandler(ctx, jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter})
-						instrumentedDictWrite(ctx, mu, dict, "call_l1", "append",
-							callExtra,
-							func() {
-								_ = handler(io.NopCloser(bytes.NewReader(l1Raw)))
-							})
+						// V0_HOIST: gojq-purity-required: l1Raw is fresh
+						// L1 bytes — parsed into a fresh tree, not aliasing informer.
+						handlerOpts := jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter}
+						computed, cerr := jsonHandlerCompute(ctx, handlerOpts, l1Raw, sliceSnap)
+						if cerr == nil {
+							instrumentedDictWrite(ctx, mu, dict, "call_l1", "append",
+								callExtra,
+								func() {
+									mergeIntoDict(dict, id, computed)
+								})
+						}
 						return true
 					}
 
@@ -531,12 +570,18 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							if obj, ok := ir.GetObject(callGVR, callNS, callName); ok {
 								raw, rerr := callResolver(ctx, obj.Object, l1Key, opts.AuthnNS)
 								if rerr == nil && len(raw) > 0 {
-									handler := jsonHandler(ctx, jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter})
-									instrumentedDictWrite(ctx, mu, dict, "call_inline", "append",
-										callExtra,
-										func() {
-											_ = handler(io.NopCloser(bytes.NewReader(raw)))
-										})
+									// V0_HOIST: gojq-purity-required:
+									// raw is freshly produced bytes from
+									// callResolver (independent tree).
+									handlerOpts := jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter}
+									computed, cerr := jsonHandlerCompute(ctx, handlerOpts, raw, sliceSnap)
+									if cerr == nil {
+										instrumentedDictWrite(ctx, mu, dict, "call_inline", "append",
+											callExtra,
+											func() {
+												mergeIntoDict(dict, id, computed)
+											})
+									}
 									return true
 								}
 							}
@@ -581,9 +626,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				return attrs
 			}
 			{
-				plain := jsonHandler(ctx, jsonHandlerOptions{
+				handlerOpts := jsonHandlerOptions{
 					key: id, out: dict, filter: apiCall.Filter,
-				})
+				}
 				call.ResponseHandler = func(r io.ReadCloser) error {
 					data, rerr := io.ReadAll(r)
 					if rerr != nil {
@@ -591,13 +636,18 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					}
 					httpExtra := append(fallbackBaseExtra(),
 						attribute.Int("payload.bytes", len(data)))
-					var herr error
+					// V0_HOIST: gojq-purity-required: data is freshly read
+					// HTTP response bytes — parsed into a fresh tree.
+					computed, cerr := jsonHandlerCompute(ctx, handlerOpts, data, sliceSnap)
+					if cerr != nil {
+						return cerr
+					}
 					instrumentedDictWrite(ctx, mu, dict, "http_fallback", "append",
 						httpExtra,
 						func() {
-							herr = plain(io.NopCloser(bytes.NewReader(data)))
+							mergeIntoDict(dict, id, computed)
 						})
-					return herr
+					return nil
 				}
 			}
 

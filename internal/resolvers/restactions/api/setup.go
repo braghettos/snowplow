@@ -69,6 +69,10 @@ func evalJQ(q string, ds any) string {
 		return q
 	}
 
+	// gojq-purity-required: `ds` is endpoint-reference data passed by
+	// the caller (resolveOne). Endpoint refs are JSON-decoded fresh
+	// from the K8s API per-resolve and are not aliased with informer
+	// storage. gojq is free to mutate.
 	out, err := jqutil.Eval(context.TODO(),
 		jqutil.EvalOptions{
 			Query:        q,

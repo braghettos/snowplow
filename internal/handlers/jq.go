@@ -66,6 +66,9 @@ func JQ() http.HandlerFunc {
 			return
 		}
 
+		// gojq-purity-required: `in.Data` is freshly JSON-decoded from
+		// the HTTP request body (line above), independent tree owned by
+		// this request goroutine. gojq is free to mutate.
 		res, err := jqutil.Eval(req.Context(), jqutil.EvalOptions{
 			Query:        in.Query,
 			Data:         in.Data,

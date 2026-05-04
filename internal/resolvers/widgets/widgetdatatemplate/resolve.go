@@ -110,6 +110,10 @@ func Resolve(ctx context.Context, opts ResolveOptions) ([]EvalResult, error) {
 	eval := func(w workItem, ds map[string]any) error {
 		s := w.expression
 		if exp, ok := jqutil.MaybeQuery(w.expression); ok {
+			// gojq-purity-required: `ds` is the widget DataSource — a
+			// per-call deep-copy when small (deepCopyValue at line ~150)
+			// or sequential-only-no-share when large (>50K). Either way
+			// this goroutine owns ds; gojq is free to mutate.
 			val, err := jqutil.Eval(ctx, jqutil.EvalOptions{
 				Query: exp, Data: ds, Unquote: false,
 				ModuleLoader: jqsupport.ModuleLoader(),

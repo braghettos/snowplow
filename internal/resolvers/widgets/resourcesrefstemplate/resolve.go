@@ -85,6 +85,9 @@ func evalJQ(q string, ds any) string {
 		return q
 	}
 
+	// gojq-purity-required: `ds` is the per-call resourceRef template
+	// data (caller-owned struct, not informer-aliased). gojq is free to
+	// mutate.
 	out, err := jqutil.Eval(context.TODO(),
 		jqutil.EvalOptions{
 			Query:        q,

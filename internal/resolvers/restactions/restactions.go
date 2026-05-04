@@ -63,6 +63,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, e
 		q := ptr.Deref(opts.In.Spec.Filter, "")
 		_, jqSpan := restactionResolveTracer.Start(ctx, "restaction.jq.eval")
 		jqSpan.SetAttributes(attribute.Int("restaction.filter_len", len(q)))
+		// gojq-purity-required: `dict` is the resolved-API output map
+		// owned by this goroutine. Every informer-sourced value inside
+		// it has already been safeCopyJSON'd by api.Resolve before
+		// landing here (see internal/resolvers/restactions/api/resolve.go
+		// at the informer_direct site). gojq is free to mutate.
 		s, err := jqutil.Eval(context.TODO(), jqutil.EvalOptions{
 			Query: q, Data: dict,
 			ModuleLoader: jqsupport.ModuleLoader(),

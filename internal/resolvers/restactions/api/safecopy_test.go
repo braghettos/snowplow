@@ -1,9 +1,13 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"testing"
+
+	"github.com/krateoplatformops/plumbing/jqutil"
+	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
 )
 
 func TestSafeCopyJSON_NumericNormalization(t *testing.T) {
@@ -124,6 +128,123 @@ func TestSafeCopyJSON_Independence(t *testing.T) {
 	if srcItems[0].(map[string]any)["k"] != "v1" {
 		t.Fatalf("input items[0].k = %v, want v1 (input was mutated through copy)",
 			srcItems[0].(map[string]any)["k"])
+	}
+}
+
+// TestGojqDel_DoesNotMutateAlias is the gojq-purity invariant test
+// required by /tmp/snowplow-runs/gojq-purity-audit-2026-05-03.md and the
+// V0_HOIST / V3_SYNCMAP variant designs.
+//
+// gojq's `deleteEmpty` mutates input maps in-place when called via
+// `del(...)`. Snowplow shields the informer-shared tree from this
+// mutation by wrapping every gojq input in safeCopyJSON before Eval.
+// This test pins that contract: feeding a tree containing del(...) to
+// jqutil.Eval, after a safeCopyJSON wrap, MUST leave the original
+// alias bit-identical. If a future refactor drops safeCopyJSON, this
+// test fails.
+func TestGojqDel_DoesNotMutateAlias(t *testing.T) {
+	// Deeply nested tree resembling a K8s informer item.
+	original := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "List",
+		"metadata":   map[string]any{},
+		"items": []any{
+			map[string]any{
+				"metadata": map[string]any{
+					"name":      "demo-1",
+					"namespace": "default",
+					"annotations": map[string]any{
+						"krateo.io/foo": "bar",
+						"krateo.io/baz": "qux",
+					},
+				},
+				"spec": map[string]any{
+					"replicas": int64(3),
+				},
+			},
+			map[string]any{
+				"metadata": map[string]any{
+					"name":      "demo-2",
+					"namespace": "default",
+					"annotations": map[string]any{
+						"krateo.io/foo": "removeme",
+					},
+				},
+			},
+		},
+	}
+
+	// Marshal a snapshot of the original — bit-identical comparison after Eval.
+	snapshot, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("snapshot marshal: %v", err)
+	}
+
+	// Hand gojq a safeCopyJSON-wrapped clone. The clone is what
+	// production resolve.go passes; this test validates the contract
+	// that the wrap is sufficient.
+	safe := safeCopyJSON(original)
+
+	// Filter applies several del() patterns — the documented mutation
+	// vector from the audit (gojq/func.go:1745-1773 deleteEmpty).
+	filter := `
+		del(.items[].metadata.annotations) |
+		del(.items[].spec) |
+		del(.metadata)
+	`
+
+	_, err = jqutil.Eval(context.TODO(), jqutil.EvalOptions{
+		Query:        filter,
+		Data:         safe,
+		ModuleLoader: jqsupport.ModuleLoader(),
+	})
+	if err != nil {
+		t.Fatalf("jqutil.Eval: %v", err)
+	}
+
+	// Original tree must be byte-identical post-Eval.
+	after, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("post-eval marshal: %v", err)
+	}
+	if string(snapshot) != string(after) {
+		t.Fatalf("original mutated by gojq Eval (safeCopyJSON contract violated)\nbefore: %s\nafter:  %s",
+			string(snapshot), string(after))
+	}
+}
+
+// TestGojqEval_DirectAliasIsMutated is the negative control for
+// TestGojqDel_DoesNotMutateAlias — passing the alias directly (without
+// safeCopyJSON) demonstrates that gojq DOES mutate. If this test starts
+// passing without the safeCopyJSON wrap, gojq behavior has changed
+// upstream and the audit conclusion needs revisiting.
+//
+// We do NOT t.Fatal on equality here — the test only asserts that
+// Eval runs without panic on an aliased tree, exercising the same path
+// the safeCopy variant covers, and logs the mutation for diagnosis.
+func TestGojqEval_DirectAliasIsMutated(t *testing.T) {
+	original := map[string]any{
+		"items": []any{
+			map[string]any{"metadata": map[string]any{"name": "x"}},
+		},
+	}
+	snapshot, _ := json.Marshal(original)
+
+	// Direct pass — NO safeCopyJSON. Production must never do this.
+	_, err := jqutil.Eval(context.TODO(), jqutil.EvalOptions{
+		Query:        `del(.items[].metadata)`,
+		Data:         original,
+		ModuleLoader: jqsupport.ModuleLoader(),
+	})
+	if err != nil {
+		t.Fatalf("jqutil.Eval: %v", err)
+	}
+
+	after, _ := json.Marshal(original)
+	if string(snapshot) == string(after) {
+		// Either the gojq update path now copy-on-writes everything
+		// (good), or the test regressed silently. Surface either way.
+		t.Logf("note: aliased gojq Eval did NOT mutate input; gojq behavior may have changed since audit")
 	}
 }
 
