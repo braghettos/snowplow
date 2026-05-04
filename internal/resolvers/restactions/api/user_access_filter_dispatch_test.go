@@ -111,8 +111,14 @@ func TestEndpointDispatchFork(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected dict[ns] = []any, got %T %v", dict["ns"], dict["ns"])
 		}
-		if len(got) != 1 || got[0] != "demo-system" {
-			t.Errorf("expected only demo-system kept, got %v", got)
+		// Q-RBAC-DECOUPLE C(d) v3 — the resolver no longer filters per-user
+		// at the wrap sites; applyUserAccessFilter moves to the dispatcher
+		// trust boundary (api.RefilterRESTAction). Resolve() output is the
+		// UNFILTERED shape — all three demo items are present here. The
+		// per-user RBAC drop is exercised in the dedicated
+		// dispatcher_refilter tests at the api package level.
+		if len(got) != 3 {
+			t.Errorf("expected unfiltered list of 3 items in v3, got %v", got)
 		}
 	})
 
@@ -268,8 +274,11 @@ func TestEndpointDispatchFork(t *testing.T) {
 			b, _ := json.Marshal(dict)
 			t.Fatalf("expected []any in dict[ns], got %s", string(b))
 		}
-		if len(got) != 1 || got[0] != "demo-system" {
-			t.Errorf("expected only demo-system, got %v", got)
+		// Q-RBAC-DECOUPLE C(d) v3 — Resolve returns the unfiltered shape;
+		// per-user filtering happens at api.RefilterRESTAction. See the
+		// dispatcher_refilter unit + envtest suite for end-to-end coverage.
+		if len(got) != 3 {
+			t.Errorf("expected unfiltered 3-item list in v3, got %v", got)
 		}
 	})
 
@@ -346,14 +355,18 @@ func TestEndpointDispatchFork(t *testing.T) {
 		if strings.Contains(extCap.authHeader, "USER-JWT") {
 			t.Errorf("user JWT must be suppressed when UAF is set, got %q", extCap.authHeader)
 		}
-		// And the filter must still apply: only demo-system survives.
+		// Q-RBAC-DECOUPLE C(d) v3 — the resolver no longer filters here;
+		// per-user filtering moved to api.RefilterRESTAction at the
+		// dispatcher trust boundary. Resolve still respects the EndpointRef
+		// dispatch fork (proven above by EXT-TOKEN/SNOWPLOW-SA assertions);
+		// the dict shape is the unfiltered slice.
 		got, ok := dict["ns"].([]any)
 		if !ok {
 			b, _ := json.Marshal(dict)
 			t.Fatalf("expected []any in dict[ns], got %s", string(b))
 		}
-		if len(got) != 1 || got[0] != "demo-system" {
-			t.Errorf("filter must still apply on EndpointRef path; expected only demo-system, got %v", got)
+		if len(got) != 3 {
+			t.Errorf("expected unfiltered 3-item list in v3, got %v", got)
 		}
 	})
 }

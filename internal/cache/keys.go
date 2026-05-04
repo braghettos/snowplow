@@ -53,6 +53,53 @@ func L1ReadyTimestamp(ctx context.Context, c Cache) int64 {
 	return ts
 }
 
+// resolvedKeyPrefix is the literal prefix of every L1 outer cache key
+// (matches ResolvedKey + ResolvedKeyBase). Kept as a single constant so
+// FlushResolvedPrefix and any future inspector agree on the boundary.
+const resolvedKeyPrefix = "snowplow:resolved:"
+
+// prefixDeleter is the optional fast-path interface for cache backends
+// that can delete by prefix without round-tripping every key through the
+// public ScanKeys/Delete pair. *MemCache implements it via DeleteByPrefix;
+// a future Redis backend would implement it via SCAN + UNLINK.
+type prefixDeleter interface {
+	DeleteByPrefix(ctx context.Context, prefix string) (int, error)
+}
+
+// FlushResolvedPrefix deletes all snowplow:resolved:* keys (the L1 outer
+// cache). Used at startup to evict stale entries written under an
+// incompatible cache schema (e.g. v2-shape entries before v3 deployment).
+//
+// On in-process MemCache (the production wiring) this is effectively a
+// no-op because each pod restart starts with an empty cache, but the
+// helper is wired unconditionally so that:
+//   1. A future Redis backend would correctly evict stale v2 entries
+//      without manual intervention.
+//   2. The contract documented in the v3 spec §7.2 step 2 is satisfied
+//      uniformly across cache implementations.
+//
+// Implementation note: MemCache.ScanKeys uses path.Match which treats `/`
+// as a separator and refuses to match `*` across it. Resolved keys embed
+// `<group>/<version>/<resource>` so a glob `snowplow:resolved:*` matches
+// 0 keys for restactions/widgets. We bypass that by calling the
+// prefixDeleter fast path when the concrete cache supports it; otherwise
+// we silently no-op (any backend lacking efficient prefix scan would
+// surface as a slowdown, not a correctness issue, because the v3 reader
+// rejects v2-shape entries with an unmarshal error and falls through to
+// the miss path — see RefilterRESTAction).
+//
+// Returns the number of keys deleted (0 is the common case for MemCache
+// at startup). Errors are returned so the startup hook can log them.
+func FlushResolvedPrefix(ctx context.Context, c Cache) (int, error) {
+	if c == nil {
+		return 0, nil
+	}
+	if pd, ok := c.(prefixDeleter); ok {
+		return pd.DeleteByPrefix(ctx, resolvedKeyPrefix)
+	}
+	return 0, nil
+}
+
 func GVRToKey(gvr schema.GroupVersionResource) string {
 	g := gvr.Group
 	if g == "" {

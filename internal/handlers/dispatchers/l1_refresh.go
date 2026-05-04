@@ -48,50 +48,57 @@ type userContext struct {
 // declare userAccessFilter (Q-RBAC-DECOUPLE C(d)). May be nil; that disables
 // elevated dispatch during background refresh.
 func MakeL1Refresher(c cache.Cache, rc *rest.Config, authnNS, signKey string, rbacWatcher *cache.RBACWatcher, snowplowEndpointFn func() (*endpoints.Endpoint, error)) cache.L1RefreshFunc {
-	// User context cache: loaded once per user, shared across all goroutines.
-	// Avoids 50K K8s Secret GETs when 50K events arrive for the same users.
+	// Q-RBAC-DECOUPLE C(d) v3 — L1 refresh runs under the snowplow
+	// ServiceAccount identity exclusively. Per §4.6 of the v3 spec:
+	// "L1 refresh CAN run under the snowplow SA identity (no userconfig
+	// Secret lookup needed)." The resolver's output is the UNFILTERED
+	// CachedRESTAction wrapper; per-user filtering happens at HTTP-time
+	// inside RefilterRESTAction. The previous per-user-secret lookup +
+	// UsernameForBinding indirection created a non-deterministic refresh
+	// identity (whichever user RegisterBindingUser overwrote last) and
+	// was the second half of Q-RBACC-DEFECT-1.
+	//
+	// `snowplowSACtx` is built once per refresher; it carries:
+	//   - WithUserInfo: a synthetic system identity used by rbac.UserCan
+	//     during informer-direct reads. Production wiring runs under a SA
+	//     that has cluster-admin equivalence, so UserCan returns true and
+	//     the resolver reads UNFILTERED data — which is exactly the input
+	//     the v3 refilter expects.
+	//   - WithUserConfig + WithAccessToken: only consumed by code paths
+	//     that issue HTTP calls under user identity; the v3 refresh path
+	//     does not use them. They remain for compatibility.
 	var (
-		userCtxMu    sync.RWMutex
-		userCtxCache = make(map[string]*userContext)
+		userCtxMu  sync.RWMutex
+		systemUC   *userContext
 	)
 
 	getUserContext := func(ctx context.Context, identity string) (*userContext, error) {
-		// The identity may be a binding identity hash (from Phase C) or
-		// a plain username. Resolve to real username for credential lookup.
-		username := identity
-		if realUser, ok := cache.UsernameForBinding(identity); ok {
-			username = realUser
-		}
-
-		now := time.Now().Unix()
-
-		// Fast path: read from cache (keyed by real username).
 		userCtxMu.RLock()
-		uc, ok := userCtxCache[username]
+		uc := systemUC
 		userCtxMu.RUnlock()
-		if ok && (now-uc.loadedAt) < 300 { // 5 min TTL
+		if uc != nil {
 			return uc, nil
 		}
-
-		// Slow path: load from K8s secret.
-		ep, err := endpoints.FromSecret(ctx, rc, username+clientConfigSecretSuffix, authnNS)
-		if err != nil {
-			return nil, err
-		}
-		groups := extractGroupsFromClientCert(ep.ClientCertificateData)
-		user := jwtutil.UserInfo{Username: username, Groups: groups}
-		accessToken := mintJWT(user, signKey)
-
-		uc = &userContext{
-			endpoint:    ep,
-			user:        user,
-			accessToken: accessToken,
-			loadedAt:    now,
-		}
 		userCtxMu.Lock()
-		userCtxCache[username] = uc
-		userCtxMu.Unlock()
-		return uc, nil
+		defer userCtxMu.Unlock()
+		if systemUC != nil {
+			return systemUC, nil
+		}
+		// Build the synthetic snowplow SA identity. Username matches the
+		// in-cluster SA token shape (system:serviceaccount:<ns>:snowplow)
+		// so any audit log produced from the refresh path has a
+		// recognisable origin marker.
+		saUser := jwtutil.UserInfo{
+			Username: "system:serviceaccount:" + authnNS + ":snowplow",
+			Groups:   []string{"system:masters"},
+		}
+		systemUC = &userContext{
+			endpoint:    endpoints.Endpoint{},
+			user:        saUser,
+			accessToken: mintJWT(saUser, signKey),
+			loadedAt:    time.Now().Unix(),
+		}
+		return systemUC, nil
 	}
 
 	return func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string) []string {

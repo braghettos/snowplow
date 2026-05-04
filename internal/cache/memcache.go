@@ -376,6 +376,14 @@ func (c *MemCache) AtomicUpdateJSON(_ context.Context, key string, fn func([]byt
 // ScanKeys returns all non-expired keys matching the given glob pattern.
 // Supports * and ? wildcards via path.Match (compatible with Redis SCAN
 // glob semantics for the patterns used in this codebase).
+//
+// CAVEAT: path.Match treats `/` as a directory separator and refuses to
+// match `*` across one. Many snowplow cache keys embed `<group>/<version>/
+// <resource>` literally (e.g. snowplow:resolved:{user}:templates.krateo.io/
+// v1/restactions:...). Glob patterns like `snowplow:resolved:*` therefore
+// match ZERO restaction L1 entries — callers iterating per-prefix should
+// use DeleteByPrefix or DBSizeByPrefix below, which do prefix matching
+// directly without path.Match.
 func (c *MemCache) ScanKeys(_ context.Context, pattern string) ([]string, error) {
 	if c == nil {
 		return nil, nil
@@ -394,6 +402,36 @@ func (c *MemCache) ScanKeys(_ context.Context, pattern string) ([]string, error)
 		return true
 	})
 	return keys, nil
+}
+
+// DeleteByPrefix removes every (non-expired) key whose name starts with
+// the given prefix. Returns the count of deletions. Concrete method on
+// *MemCache only — callers reach it via the type assertion in
+// cache.FlushResolvedPrefix because the Cache interface intentionally
+// stays minimal. Used by the v3 startup hook to evict stale L1 outer
+// entries written under an incompatible cache schema.
+func (c *MemCache) DeleteByPrefix(_ context.Context, prefix string) (int, error) {
+	if c == nil || prefix == "" {
+		return 0, nil
+	}
+	// Two-phase: collect first to avoid mutating during Range.
+	var victims []string
+	c.kv.Range(func(k, v any) bool {
+		key := k.(string)
+		e := v.(*memEntry)
+		if isExpired(e.expiresAt) {
+			c.kv.Delete(k)
+			return true
+		}
+		if strings.HasPrefix(key, prefix) {
+			victims = append(victims, key)
+		}
+		return true
+	})
+	for _, k := range victims {
+		c.kv.Delete(k)
+	}
+	return len(victims), nil
 }
 
 // ── Set operations ───────────────────────────────────────────────────────────

@@ -351,9 +351,14 @@ func WarmL1FromEntryPoints(ctx context.Context, c cache.Cache, rc *rest.Config,
 		if bid == "" {
 			bid = u.userInfo.Username // fallback: treat as unique
 		}
-		// Register the mapping for L1 refresh credential lookup.
-		cache.RegisterBindingUser(bid, u.userInfo.Username)
-
+		// Q-RBAC-DECOUPLE C(d) v3 — prewarm fills the UNFILTERED L1 shape
+		// (cachedRESTAction wrapper). RefilterRESTAction at HTTP-time
+		// produces each user's per-user view, so we no longer need to pin
+		// a representative user per binding identity for credential
+		// lookup. The cache.RegisterBindingUser call that was here in v2
+		// has been removed per spec §11 rule #3 (non-negotiable): keeping
+		// it would re-introduce the user-rotation defect that
+		// Q-RBACC-DEFECT-1 caught in production.
 		if g, ok := groups[bid]; ok {
 			g.members++
 		} else {

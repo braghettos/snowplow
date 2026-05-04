@@ -160,6 +160,27 @@ func main() {
 		mc.StartEviction(context.Background())
 		appCache = mc
 		log.Info("in-process cache enabled")
+
+		// Q-RBAC-DECOUPLE C(d) v3 — flush any stale snowplow:resolved:*
+		// entries written under an incompatible schema (e.g. v2-shape
+		// CachedRESTAction wrappers from a previous image roll). On the
+		// production in-process MemCache this is a no-op because each
+		// pod restart starts with an empty cache, but the call is made
+		// unconditionally so a future Redis backend would automatically
+		// evict pre-v3 entries without manual intervention. Per spec
+		// §7.2 step 2: "v3 reader rejects v2-shape entries with an
+		// unmarshal error, falls through to miss path, the resolver
+		// fills with v3-shape" — the flush is belt-and-suspenders.
+		flushCtx, flushCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		flushed, ferr := cache.FlushResolvedPrefix(flushCtx, appCache)
+		flushCancel()
+		if ferr != nil {
+			log.Warn("v3 startup: cache flush failed (continuing — v3 reader still rejects v2-shape entries)",
+				slog.Any("err", ferr))
+		} else if flushed > 0 {
+			log.Info("v3 startup: flushed stale L1 outer entries",
+				slog.Int("flushed", flushed))
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), []os.Signal{

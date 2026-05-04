@@ -11,6 +11,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
+	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions/l1cache"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -61,7 +62,14 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			// cached output is orders of magnitude faster than
 			// re-running the full RESTAction pipeline. At 50K
 			// compositions this saves ~10-15 s per widget refresh.
-			if status, ok := lookupL1(ctx, c, l1Key); ok {
+			//
+			// Q-RBAC-DECOUPLE C(d) v3 — refilter the v3 wrapper bytes
+			// per the requesting user before extracting the status
+			// subtree. Trust-boundary discipline matches the dispatcher:
+			// on ANY error from refilter, fall through to the miss path
+			// (resolveViaL1Cache below). NEVER return the unfiltered
+			// status to the caller.
+			if status, ok := lookupL1Refiltered(ctx, c, l1Key); ok {
 				// Record the restaction GVR in the dependency tracker
 				// even on L1 hit. The widget dispatcher uses the
 				// tracker to register deps (widgets.go:267). Without
@@ -157,7 +165,13 @@ func resolveInline(ctx context.Context, opts ResolveOptions) (map[string]any, er
 		return map[string]any{}, err
 	}
 
-	if _, err = restactions.Resolve(ctx, restactions.ResolveOptions{
+	// inline path: no L1 write, so we don't need the per-api ProtectedDict.
+	// The CR's Status was populated by Resolve from the unfiltered dict via
+	// the outer JQ. SECURITY: this path is only used when there is no cache
+	// in context; it is acceptable for tests but in production it would
+	// bypass the v3 refilter trust boundary. The widget apiref dispatcher
+	// only uses this path when c == nil (see Resolve() above).
+	if _, _, err = restactions.Resolve(ctx, restactions.ResolveOptions{
 		In:      &ra,
 		SArc:    opts.RC,
 		AuthnNS: opts.AuthnNS,
@@ -171,15 +185,37 @@ func resolveInline(ctx context.Context, opts ResolveOptions) (map[string]any, er
 	return rawExtensionToMap(ra.Status)
 }
 
-// lookupL1 reads a RESTAction L1 entry and extracts its status map.
-// Returns (status, true) on hit, (nil, false) on miss or decode failure.
-func lookupL1(ctx context.Context, c cache.Cache, l1Key string) (map[string]any, bool) {
+// lookupL1Refiltered reads a RESTAction L1 entry, runs the v3 per-user
+// refilter against the cached wrapper, and extracts the resulting status
+// map. Returns (status, true) on hit + successful refilter; (nil, false)
+// on miss, on any refilter error, or on decode failure.
+//
+// SECURITY: refilter failures are treated as misses — the caller falls
+// through to a fresh resolve under the requesting user. NEVER return the
+// raw cached status; the cached wrapper holds the unfiltered ProtectedDict
+// shape and would leak items to a user lacking the corresponding RBAC.
+func lookupL1Refiltered(ctx context.Context, c cache.Cache, l1Key string) (map[string]any, bool) {
 	raw, hit, err := c.GetRaw(ctx, l1Key)
 	if err != nil || !hit || len(raw) == 0 {
 		return nil, false
 	}
+	refiltered, refErr := func() (out []byte, ferr error) {
+		defer func() {
+			if r := recover(); r != nil {
+				ferr = fmt.Errorf("v3 refilter panic in apiref: %v", r)
+				out = nil
+			}
+		}()
+		return api.RefilterRESTAction(ctx, c, raw)
+	}()
+	if refErr != nil {
+		slog.Warn("apiref: L1 refilter failed; treating as miss",
+			slog.String("l1Key", l1Key),
+			slog.Any("err", refErr))
+		return nil, false
+	}
 	var cached map[string]any
-	if json.Unmarshal(raw, &cached) != nil {
+	if json.Unmarshal(refiltered, &cached) != nil {
 		return nil, false
 	}
 	status, ok := cached["status"].(map[string]any)

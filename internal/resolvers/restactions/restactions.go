@@ -45,7 +45,23 @@ type ResolveOptions struct {
 	SnowplowEndpoint func() (*endpoints.Endpoint, error)
 }
 
-func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, error) {
+// Resolve runs the per-api fan-out (api.Resolve) and the outer JQ filter,
+// populating opts.In.Status.Raw with the final wire-shape body.
+//
+// Q-RBAC-DECOUPLE C(d) v3 — additionally returns the unfiltered
+// per-api intermediate `dict` (the ProtectedDict in spec terms) so
+// l1cache.ResolveAndCache can stash it inside a CachedRESTAction wrapper
+// for per-user refiltering at HTTP-time. Callers that don't need it (the
+// inline / no-cache fast path in apiref) ignore the third return.
+//
+// SECURITY: opts.In.Status.Raw is the OUTER-JQ output computed against
+// the UNFILTERED dict (no applyUserAccessFilter on protected slots —
+// those wraps moved to api.RefilterRESTAction). Anything that serves
+// opts.In.Status.Raw as a wire body MUST go through RefilterRESTAction
+// first or it leaks the unfiltered shape. Production wiring satisfies
+// this via the dispatcher refilter at internal/handlers/dispatchers/
+// restactions.go and internal/resolvers/widgets/apiref/resolve.go.
+func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, map[string]any, error) {
 	// Attach RESTAction name to ctx for audit/observability helpers in
 	// the api package (e.g. applyUserAccessFilter audit log via
 	// cache.RESTActionNameFromContext). Per Q-RBACC-IMPL-2.
@@ -90,7 +106,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, e
 		}
 		jqSpan.End()
 		if err != nil {
-			return opts.In, fmt.Errorf("unable to resolve filter: %w", err)
+			return opts.In, dict, fmt.Errorf("unable to resolve filter: %w", err)
 		}
 
 		raw = []byte(s)
@@ -98,7 +114,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, e
 		var err error
 		raw, err = json.Marshal(dict)
 		if err != nil {
-			return opts.In, err
+			return opts.In, dict, err
 		}
 	}
 
@@ -113,7 +129,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, e
 		opts.In.ManagedFields = nil
 	}
 
-	return opts.In, nil
+	return opts.In, dict, nil
 }
 
 // IsVerbose returns true if the object has the AnnotationKeyConnectorVerbose
