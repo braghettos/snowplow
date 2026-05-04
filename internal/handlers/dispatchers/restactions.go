@@ -7,6 +7,7 @@ import (
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
+	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/snowplow/internal/cache"
@@ -19,16 +20,23 @@ import (
 
 var restactionTracer = otel.Tracer("snowplow/dispatchers")
 
-func RESTAction() http.Handler {
+// RESTAction builds the HTTP /call dispatcher for the restactions GVR.
+// snowplowEndpointFn is the elevated-call provider plumbed through to
+// l1cache.Input.SnowplowEndpoint; pass nil when not running in-cluster
+// (userAccessFilter calls will be rejected at the resolver with an explicit
+// log line).
+func RESTAction(snowplowEndpointFn func() (*endpoints.Endpoint, error)) http.Handler {
 	return &restActionHandler{
-		authnNS: env.String("AUTHN_NAMESPACE", ""),
-		verbose: env.True("DEBUG"),
+		authnNS:          env.String("AUTHN_NAMESPACE", ""),
+		verbose:          env.True("DEBUG"),
+		snowplowEndpoint: snowplowEndpointFn,
 	}
 }
 
 type restActionHandler struct {
-	authnNS string
-	verbose bool
+	authnNS          string
+	verbose          bool
+	snowplowEndpoint func() (*endpoints.Endpoint, error)
 }
 
 var _ http.Handler = (*restActionHandler)(nil)
@@ -134,13 +142,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		sfCtx = context.WithoutCancel(req.Context())
 	}
 	result, resolveErr := l1cache.ResolveAndCache(sfCtx, l1cache.Input{
-		Cache:       c,
-		Obj:         got.Unstructured.Object,
-		ResolvedKey: resolvedKey,
-		AuthnNS:     r.authnNS,
-		PerPage:     perPage,
-		Page:        page,
-		Extras:      extras,
+		Cache:            c,
+		Obj:              got.Unstructured.Object,
+		ResolvedKey:      resolvedKey,
+		AuthnNS:          r.authnNS,
+		PerPage:          perPage,
+		Page:             page,
+		Extras:           extras,
+		SnowplowEndpoint: r.snowplowEndpoint,
 	})
 	if resolveErr != nil {
 		response.InternalError(wri, resolveErr)
@@ -198,14 +207,20 @@ func (errEmptyResolve) Error() string {
 // l1_refresh.go already imports this package and calls this function;
 // moving the call site to l1cache directly would churn l1_refresh
 // without any correctness or performance benefit.
-func ResolveRESTActionBackground(ctx context.Context, c cache.Cache, obj map[string]interface{}, resolvedKey, authnNS string, perPage, page int) ([]byte, error) {
+//
+// snowplowEndpointFn may be nil; that disables userAccessFilter dispatch
+// during background refresh (the warm cache will only contain entries
+// resolvable without elevated access). Production wiring threads it from
+// MakeL1Refresher / WarmL1FromEntryPoints.
+func ResolveRESTActionBackground(ctx context.Context, c cache.Cache, obj map[string]interface{}, resolvedKey, authnNS string, perPage, page int, snowplowEndpointFn func() (*endpoints.Endpoint, error)) ([]byte, error) {
 	result, err := l1cache.ResolveAndCache(ctx, l1cache.Input{
-		Cache:       c,
-		Obj:         obj,
-		ResolvedKey: resolvedKey,
-		AuthnNS:     authnNS,
-		PerPage:     perPage,
-		Page:        page,
+		Cache:            c,
+		Obj:              obj,
+		ResolvedKey:      resolvedKey,
+		AuthnNS:          authnNS,
+		PerPage:          perPage,
+		Page:             page,
+		SnowplowEndpoint: snowplowEndpointFn,
 	})
 	if err != nil {
 		return nil, err

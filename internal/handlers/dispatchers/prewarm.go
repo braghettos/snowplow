@@ -294,12 +294,25 @@ func FilterWidgetGVRs(cfg *cache.WarmupConfig) []schema.GroupVersionResource {
 // identity group. Users with identical RBAC bindings share L1 entries, so
 // only one representative user per group is resolved. RBAC decisions are
 // populated organically during resolution.
+//
+// snowplowEndpointFn is the elevated-call provider for api[] entries that
+// declare userAccessFilter. Injected into prewarm contexts so the warmup
+// path also resolves cyberjoker-class RESTActions correctly.
 func WarmL1FromEntryPoints(ctx context.Context, c cache.Cache, rc *rest.Config,
-	authnNS, signKey string, entryPoints []cache.EntryPoint, rbacWatcher *cache.RBACWatcher) {
+	authnNS, signKey string, entryPoints []cache.EntryPoint, rbacWatcher *cache.RBACWatcher, snowplowEndpointFn func() (*endpoints.Endpoint, error)) {
 	log := slog.Default()
 	if len(entryPoints) == 0 || authnNS == "" {
 		log.Info("L1 entry-point warmup: skipped (no entry points or authn namespace)")
 		return
+	}
+
+	// Inject snowplow-SA endpoint provider into the warmup ctx so all
+	// downstream resolutions (widget→apiref→l1cache→restactions→api) can
+	// dispatch elevated calls.
+	if snowplowEndpointFn != nil {
+		ctx = cache.WithSnowplowEndpoint(ctx, func() (any, error) {
+			return snowplowEndpointFn()
+		})
 	}
 
 	users, err := discoverUsers(ctx, rc, authnNS)
