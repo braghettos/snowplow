@@ -7,9 +7,11 @@ import (
 	"log/slog"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
+	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/plumbing/jqutil"
 	"github.com/krateoplatformops/plumbing/ptr"
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
 
@@ -36,18 +38,29 @@ type ResolveOptions struct {
 	PerPage int
 	Page    int
 	Extras  map[string]any
+	// SnowplowEndpoint is the elevated-call provider used by api.Resolve
+	// when a UserAccessFilter is present on an api[] entry. Threaded
+	// through l1cache.Input from the dispatcher constructors.
+	// See api.ResolveOptions.SnowplowEndpoint for the contract.
+	SnowplowEndpoint func() (*endpoints.Endpoint, error)
 }
 
 func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, error) {
+	// Attach RESTAction name to ctx for audit/observability helpers in
+	// the api package (e.g. applyUserAccessFilter audit log via
+	// cache.RESTActionNameFromContext). Per Q-RBACC-IMPL-2.
+	ctx = cache.WithRESTActionName(ctx, opts.In.GetName())
+
 	_, apiSpan := restactionResolveTracer.Start(ctx, "restaction.api_resolve")
 	dict := api.Resolve(ctx, api.ResolveOptions{
-		RC:      opts.SArc,
-		AuthnNS: opts.AuthnNS,
-		Verbose: isVerbose(opts.In),
-		Items:   opts.In.Spec.API,
-		PerPage: opts.PerPage,
-		Page:    opts.Page,
-		Extras:  opts.Extras,
+		RC:               opts.SArc,
+		AuthnNS:          opts.AuthnNS,
+		Verbose:          isVerbose(opts.In),
+		Items:            opts.In.Spec.API,
+		PerPage:          opts.PerPage,
+		Page:             opts.Page,
+		Extras:           opts.Extras,
+		SnowplowEndpoint: opts.SnowplowEndpoint,
 	})
 	if dict == nil {
 		dict = map[string]any{}

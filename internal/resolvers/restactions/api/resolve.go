@@ -15,6 +15,7 @@ import (
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
+	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/maps"
 	"github.com/krateoplatformops/plumbing/ptr"
@@ -104,6 +105,18 @@ type ResolveOptions struct {
 	PerPage int
 	Page    int
 	Extras  map[string]any
+
+	// SnowplowEndpoint, if non-nil, is invoked once per api[] entry that
+	// declares UserAccessFilter to obtain the snowplow ServiceAccount
+	// endpoint used to dispatch the elevated read. Implementations should
+	// re-read BearerTokenFile per call (~10µs tmpfs read) so projected SA
+	// token rotation is picked up automatically (Q-RBACC-IMPL-8).
+	//
+	// nil is permitted; in that case any UserAccessFilter call is rejected
+	// with a runtime error log (the migration sequence is: ship snowplow
+	// image with this wired BEFORE migrating any RESTAction YAML to use
+	// userAccessFilter).
+	SnowplowEndpoint func() (*endpoints.Endpoint, error)
 }
 
 func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
@@ -206,23 +219,82 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			log.Warn("api not found in apiMap", slog.Any("name", id))
 			return true
 		}
+
+		// Validate the userAccessFilter shape early. CEL admission already
+		// enforces this at apply time, but RESTActions admitted under an
+		// older CRD (no CEL rules) need the same guard at runtime. Errors
+		// HARD-FAIL the api[] entry — a degenerate filter would silently
+		// leak items to the requesting user (Q-RBACC-IMPL-5).
+		if err := validateUserAccessFilter(apiCall); err != nil {
+			log.Error("userAccessFilter rejected at runtime",
+				slog.String("api", id), slog.Any("err", err))
+			return false
+		}
+
 		if apiCall.Headers == nil {
 			apiCall.Headers = []string{headerAcceptJSON}
 		}
 
 		if accessToken, _ := xcontext.AccessToken(ctx); accessToken != "" {
-			if apiCall.EndpointRef == nil || ptr.Deref(apiCall.ExportJWT, false) {
+			if shouldInjectUserJWT(apiCall) {
 				apiCall.Headers = append(apiCall.Headers,
 					fmt.Sprintf("Authorization: Bearer %s", accessToken))
 			}
 		}
 
-		// Resolve the endpoint
-		ep, err := mapper.resolveOne(ctx, apiCall.EndpointRef)
-		if err != nil {
-			log.Error("unable to resolve api endpoint reference",
-				slog.String("name", id), slog.Any("ref", apiCall.EndpointRef), slog.Any("error", err))
-			return false
+		// Endpoint dispatch fork.
+		// - userAccessFilter set & no EndpointRef → snowplow-SA dispatch
+		//   (the migration target: cyberjoker compositions discovery
+		//   without cluster-wide RBAC). Endpoint comes from a callback so
+		//   the projected SA token is re-read on every call.
+		// - EndpointRef wins (operator escape hatch). The filter still
+		//   applies to the response if userAccessFilter is set.
+		// - Otherwise: the original mapper handles the user-secret /
+		//   internal-clientconfig lookup unchanged.
+		var ep endpoints.Endpoint
+		if apiCall.UserAccessFilter != nil && apiCall.EndpointRef == nil {
+			// Resolve the snowplow-SA endpoint provider. opts.SnowplowEndpoint
+			// (set explicitly by the dispatcher constructors per Q-RBACC-IMPL-7)
+			// wins; otherwise fall back to the context-stored provider that
+			// main.go installs once via the withSnowplowEndpoint middleware.
+			// The fallback path keeps the widget→apiref→l1cache→restactions
+			// chain working without per-dispatcher threading.
+			snowplowEndpointFn := opts.SnowplowEndpoint
+			if snowplowEndpointFn == nil {
+				if anyFn := cache.SnowplowEndpointFromContext(ctx); anyFn != nil {
+					snowplowEndpointFn = func() (*endpoints.Endpoint, error) {
+						v, err := anyFn()
+						if err != nil {
+							return nil, err
+						}
+						ep, ok := v.(*endpoints.Endpoint)
+						if !ok || ep == nil {
+							return nil, fmt.Errorf("snowplow endpoint context value type %T is not *endpoints.Endpoint", v)
+						}
+						return ep, nil
+					}
+				}
+			}
+			if snowplowEndpointFn == nil {
+				log.Error("userAccessFilter set but no snowplow endpoint configured",
+					slog.String("name", id))
+				return false
+			}
+			snEp, snErr := snowplowEndpointFn()
+			if snErr != nil || snEp == nil {
+				log.Error("failed to obtain snowplow endpoint",
+					slog.String("name", id), slog.Any("err", snErr))
+				return false
+			}
+			ep = *snEp
+		} else {
+			var err error
+			ep, err = mapper.resolveOne(ctx, apiCall.EndpointRef)
+			if err != nil {
+				log.Error("unable to resolve api endpoint reference",
+					slog.String("name", id), slog.Any("ref", apiCall.EndpointRef), slog.Any("error", err))
+				return false
+			}
 		}
 		if opts.Verbose {
 			ep.Debug = opts.Verbose
@@ -337,6 +409,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 									// gojq-purity-required: raw is fresh bytes; safeCopyJSON not required for this path.
 									computed, cerr := jsonHandlerCompute(ctx, handlerOpts, raw, sliceSnap)
 									if cerr == nil {
+										// Per-user RBAC drop on list-shaped responses.
+										// No-op when apiCall.UserAccessFilter == nil.
+										computed = applyUserAccessFilter(ctx, apiCall, computed)
 										instrumentedDictWrite(ctx, mu, dict, "api_l1", "append",
 											apiL1Extra,
 											func() {
@@ -459,6 +534,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							if mu != nil {
 								computed, cerr := jsonHandlerDirectCompute(ctx, handlerOpts, safeData, sliceSnap)
 								if cerr == nil {
+									// Per-user RBAC drop on list-shaped responses.
+									// No-op when apiCall.UserAccessFilter == nil.
+									computed = applyUserAccessFilter(ctx, apiCall, computed)
 									instrumentedDictWrite(ctx, mu, dict, "informer_direct", "append",
 										directExtra,
 										func() {
@@ -490,6 +568,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								var herr error
 								computed, cerr := jsonHandlerDirectCompute(ctx, handlerOpts, safeData, sliceSnap)
 								if cerr == nil {
+									// Per-user RBAC drop on list-shaped responses.
+									// No-op when apiCall.UserAccessFilter == nil.
+									computed = applyUserAccessFilter(ctx, apiCall, computed)
 									instrumentedDictWrite(ctx, nil, dict, "informer_direct", "append",
 										directExtra,
 										func() {
@@ -553,6 +634,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						handlerOpts := jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter}
 						computed, cerr := jsonHandlerCompute(ctx, handlerOpts, l1Raw, sliceSnap)
 						if cerr == nil {
+							// Per-user RBAC drop on list-shaped responses.
+							// No-op when apiCall.UserAccessFilter == nil.
+							computed = applyUserAccessFilter(ctx, apiCall, computed)
 							instrumentedDictWrite(ctx, mu, dict, "call_l1", "append",
 								callExtra,
 								func() {
@@ -576,6 +660,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 									handlerOpts := jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter}
 									computed, cerr := jsonHandlerCompute(ctx, handlerOpts, raw, sliceSnap)
 									if cerr == nil {
+										// Per-user RBAC drop on list-shaped responses.
+										// No-op when apiCall.UserAccessFilter == nil.
+										computed = applyUserAccessFilter(ctx, apiCall, computed)
 										instrumentedDictWrite(ctx, mu, dict, "call_inline", "append",
 											callExtra,
 											func() {
@@ -642,6 +729,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					if cerr != nil {
 						return cerr
 					}
+					// Per-user RBAC drop on list-shaped responses.
+					// No-op when apiCall.UserAccessFilter == nil.
+					computed = applyUserAccessFilter(ctx, apiCall, computed)
 					instrumentedDictWrite(ctx, mu, dict, "http_fallback", "append",
 						httpExtra,
 						func() {
