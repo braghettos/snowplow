@@ -269,6 +269,34 @@ func resolveInline(ctx context.Context, opts ResolveOptions) (map[string]any, er
 // raw cached status; the cached wrapper holds the unfiltered ProtectedDict
 // shape and would leak items to a user lacking the corresponding RBAC.
 func lookupL1Refiltered(ctx context.Context, c cache.Cache, l1Key string) (map[string]any, bool, bool) {
+	// Q-RBACC-L2-1 — L2 fast path. The L2 entry, when present, holds the
+	// pre-decoded status map and the hasUAF flag, so the apiref path
+	// avoids both the per-user refilter AND the json.Unmarshal that
+	// follows it. The L2 key folds (l1Key, binding identity, groups
+	// hash); cohorts sharing identical RBAC bindings share one entry.
+	//
+	// Q-RBACC-L2-1 architect-review CONCERN-1 (2026-05-05):
+	// L2Entry.Status is populated AT WRITE TIME by every writer
+	// (dispatcher L1-HIT-then-fresh, l1cache MISS path, apiref MISS
+	// path) — so on a hit the field is immutable and the read here is
+	// race-free. NEVER mutate l2e.Status from this read site; doing so
+	// would re-introduce the data race the post-hit lazy-fill design
+	// caused. If Status is nil on a hit, that signals a writer encoded
+	// a malformed wrapper (defensive against future codec migration);
+	// fall through to a fresh refilter and treat the L2 entry as a
+	// soft miss — the subsequent L2Put below overwrites it with a
+	// well-formed entry.
+	user, uerr := xcontext.UserInfo(ctx)
+	var identity, groupsHash string
+	if uerr == nil {
+		identity = cache.CacheIdentity(ctx, user.Username)
+		groupsHash = cache.HashGroups(user.Groups)
+		if l2e, l2hit := cache.L2Get(l1Key, identity, groupsHash); l2hit && l2e.Status != nil {
+			cache.EmitL2HitAudit(ctx, l1Key, identity, l1Key, user.Username)
+			return l2e.Status, l2e.HasUAF, true
+		}
+	}
+
 	raw, hit, err := c.GetRaw(ctx, l1Key)
 	if err != nil || !hit || len(raw) == 0 {
 		return nil, false, false
@@ -306,6 +334,18 @@ func lookupL1Refiltered(ctx context.Context, c cache.Cache, l1Key string) (map[s
 	// per-user-projected shape via the outer JQ). The wrapper holds
 	// `cr.spec.api[*].userAccessFilter` verbatim.
 	hasUAF := wrapperHasUAF(raw)
+
+	// Q-RBACC-L2-1 — populate L2 with the freshly-computed refilter
+	// output, including the pre-decoded status and the hasUAF flag
+	// (which the dispatcher MISS-path L2 write inside l1cache cannot
+	// derive without re-decoding the wrapper). The L2 write inside
+	// l1cache.ResolveAndCache uses hasUAF=false; here we upgrade it
+	// with the correct flag so the next L2 hit on this entry returns
+	// hasUAF correctly to the widget caller.
+	if identity != "" {
+		cache.L2Put(l1Key, identity, groupsHash, refiltered, status, hasUAF, "v3", len(raw))
+	}
+
 	return status, hasUAF, true
 }
 

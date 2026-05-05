@@ -2,6 +2,7 @@ package dispatchers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -102,6 +103,54 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				}
 				lookupSpan.End()
 				if hit {
+					// Q-RBACC-L2-1 — POST-REFILTER L2 LOOKUP.
+					// Before the per-user refilter (which is expensive
+					// for the cyberjoker hot path: 1.0–1.4 s on a 1.9 KB
+					// output), check the L2 cache. The L2 key folds in
+					// the binding identity + groups hash, so cohorts
+					// sharing identical RBAC bindings share one entry.
+					// On hit: skip refilter entirely, serve bytes.
+					// On miss: fall through to the existing refilter
+					// path; the leader writes L2 below.
+					groupsHash := cache.HashGroups(user.Groups)
+					if l2e, l2hit := cache.L2Get(resolvedKey, identity, groupsHash); l2hit {
+						_, l2Span := restactionTracer.Start(req.Context(), "restaction.l2_refilter_lookup",
+							trace.WithAttributes(
+								attribute.String("cache.key", resolvedKey),
+								attribute.Bool("l2.hit", true),
+								attribute.Int("l2.size_bytes", l2e.SizeBytes),
+								attribute.String("l2.l1_key", resolvedKey),
+								attribute.String("user", user.Username),
+							))
+						l2Span.End()
+						if httpSpan := trace.SpanFromContext(req.Context()); httpSpan.IsRecording() {
+							httpSpan.AddEvent("cache.hit", trace.WithAttributes(
+								attribute.String("cache.key", resolvedKey),
+								attribute.String("cache.layer", "l2"),
+							))
+						}
+						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
+						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
+						cache.TouchKey(cache.ResolvedKeyBase(identity, gvr, nsn.Namespace, nsn.Name))
+						cache.EmitL2HitAudit(req.Context(), resolvedKey, identity, nsn.Name, user.Username)
+						log.Info("RESTAction resolved from L2",
+							slog.String("key", resolvedKey),
+							slog.String("user", user.Username),
+							slog.String("source", "L2-cache"),
+							slog.String("duration", util.ETA(start)))
+						wri.Header().Set("Content-Type", "application/json")
+						wri.WriteHeader(http.StatusOK)
+						_, writeSpan := restactionTracer.Start(req.Context(), "http.write",
+							trace.WithAttributes(
+								attribute.Bool("cache.hit", true),
+								attribute.String("cache.layer", "l2"),
+								attribute.Int("http.response.body.size", l2e.SizeBytes),
+							))
+						_, _ = wri.Write(l2e.Refiltered)
+						writeSpan.End()
+						return
+					}
+
 					// Q-RBAC-DECOUPLE C(d) v3 — refilter the cached
 					// (binding-identity-shared) entry per the requesting
 					// user. The trust-boundary contract is non-negotiable:
@@ -154,6 +203,29 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
 						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
 						cache.TouchKey(cache.ResolvedKeyBase(identity, gvr, nsn.Namespace, nsn.Name))
+						// Q-RBACC-L2-1 — write the freshly-computed refilter
+						// output to L2 for the next request from this
+						// (l1Key, identity, groupsHash) cohort. SetL2 enforces
+						// the size cap and reduction-ratio gate (admin ×
+						// compositions-panels ratio ~0.95 → skipped here, by
+						// design — see spec §1.3). rawL1Size lets the gate
+						// run; passing 0 would bypass the gate.
+						//
+						// Q-RBACC-L2-1 architect-review CONCERN-1 (2026-05-05):
+						// pre-decode the status map AT WRITE TIME so apiref
+						// readers never observe Status==nil after an L2 hit.
+						// The previous shape (write nil + lazy-fill on the
+						// apiref read path) opened a data race on the entry
+						// pointer shared via sync.Map. By moving the decode
+						// inside the dispatcher (the leader of the
+						// singleflight refilter), the L2 entry's Status is
+						// immutable from Set time onward and apiref hits are
+						// race-free read-only. Decode cost: one
+						// json.Unmarshal per L1-HIT-then-fresh-refilter (i.e.
+						// once per cold L2 cohort) — amortised across the
+						// thundering-herd burst by the singleflight upstream.
+						l2Status := decodeStatusForL2(refiltered)
+						cache.L2Put(resolvedKey, identity, groupsHash, refiltered, l2Status, false, "v3", len(raw))
 						log.Info("RESTAction resolved from cache",
 							slog.String("key", resolvedKey),
 							slog.String("user", user.Username),
@@ -259,6 +331,11 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		}
 	}
 
+	// Q-RBACC-L2-1 — L1-MISS-path L2 write happens inside
+	// l1cache.ResolveAndCache (single writer; benefits prewarm + apiref
+	// MISS uniformly). The dispatcher only needs the L1-HIT-then-fresh-
+	// refilter L2 write above.
+
 	pathAttr := "inline"
 	if resolvedKey != "" {
 		pathAttr = "singleflight"
@@ -277,6 +354,29 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		))
 	_, _ = wri.Write(body)
 	writeSpan.End()
+}
+
+// decodeStatusForL2 extracts the "status" subtree from a v3 refiltered
+// CR JSON blob, returning nil on any decode failure. Used by the L1-HIT
+// L2 write path to populate L2Entry.Status at write time so apiref
+// readers never need to lazy-fill (which would race on the shared
+// sync.Map entry pointer — Q-RBACC-L2-1 architect-review CONCERN-1).
+//
+// Failure-mode: nil status. apiref readers treat nil Status as a soft
+// miss and fall through to refilter; the next refilter completes and
+// L2Put overwrites the entry with a Status-populated copy. Net effect
+// of a transient decode failure is one extra refilter, never an
+// incorrect response.
+func decodeStatusForL2(refiltered []byte) map[string]any {
+	if len(refiltered) == 0 {
+		return nil
+	}
+	var cr map[string]any
+	if err := json.Unmarshal(refiltered, &cr); err != nil {
+		return nil
+	}
+	st, _ := cr["status"].(map[string]any)
+	return st
 }
 
 // errEmptyResolveResult indicates the shared l1cache helper returned

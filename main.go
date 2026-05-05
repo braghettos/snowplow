@@ -162,6 +162,13 @@ func main() {
 		appCache = mc
 		log.Info("in-process cache enabled")
 
+		// Q-RBACC-L2-1 — start the L2 post-refilter cache LRU sweep on
+		// the same 30s cadence as the L1 eviction loop. No-op when
+		// CACHE_L2_REFILTER_ENABLED is unset/false; safe to call
+		// unconditionally. Cancellation flows from the parent ctx via
+		// the eviction loop's own ticker.
+		cache.StartL2EvictionLoop(context.Background())
+
 		// Q-RBAC-DECOUPLE C(d) v3 — flush any stale snowplow:resolved:*
 		// entries written under an incompatible schema (e.g. v2-shape
 		// CachedRESTAction wrappers from a previous image roll). On the
