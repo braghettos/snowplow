@@ -29,10 +29,18 @@ spec:
       namespaceFrom: "."
     filter: "[.namespaces.items[] | .metadata.name]"
     continueOnError: true
+  # Q-RBAC-DECOUPLE C(d) v5 — D2 fix (audit 2026-05-05).
+  # The (.crds // [])[] / (.namespaces // [])[] form short-circuits when
+  # either api[] entry's err-write branch fires (any failure in resolve.go
+  # leaves dict[call.ErrorKey] set and dict["crds"]/dict["namespaces"]
+  # absent). Without the // [] default, jq evaluates .crds[] → null[] →
+  # "cannot iterate over: null" → 500. With it, the cross-product is
+  # len(crds) × len(namespaces) (zero when either is empty), so partial
+  # / total upstream failure degrades to 200 with body [].
   filter: >
     [
-      .crds[] as $crd |
-      .namespaces[] as $ns |
+      (.crds // [])[] as $crd |
+      (.namespaces // [])[] as $ns |
       {
         plural: $crd.plural,
         version: $crd.storedVersions,
