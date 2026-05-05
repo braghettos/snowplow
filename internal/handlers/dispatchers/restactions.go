@@ -112,7 +112,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 								out = nil
 							}
 						}()
-						return api.RefilterRESTAction(req.Context(), c, raw)
+						// Q-RBAC-DECOUPLE C(d) v3 §2.6 — singleflight
+						// dedup. 80 burst requests for the same
+						// (l1key, user, groups) coalesce into one
+						// RefilterRESTAction execution; followers
+						// share the result. Cuts ~2.4 GB transient
+						// alloc + ~4 s CPU peak under cluster-restart
+						// thundering-herd.
+						return api.RefilterRESTActionDeduped(req.Context(), c, raw, resolvedKey)
 					}()
 					if refErr != nil {
 						refilterSpan.RecordError(refErr)

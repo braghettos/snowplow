@@ -206,7 +206,12 @@ func lookupL1Refiltered(ctx context.Context, c cache.Cache, l1Key string) (map[s
 				out = nil
 			}
 		}()
-		return api.RefilterRESTAction(ctx, c, raw)
+		// Q-RBAC-DECOUPLE C(d) v3 §2.6 — singleflight dedup. Widget
+		// apiref hits this on concurrent dashboard fan-out where N
+		// widgets in the same dashboard reference the same RESTAction
+		// (e.g. a row of cards over compositions-list). Coalesce them
+		// into one refilter execution per (l1key, user, groups).
+		return api.RefilterRESTActionDeduped(ctx, c, raw, l1Key)
 	}()
 	if refErr != nil {
 		slog.Warn("apiref: L1 refilter failed; treating as miss",
