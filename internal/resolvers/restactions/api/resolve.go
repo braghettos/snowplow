@@ -409,9 +409,14 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 									// gojq-purity-required: raw is fresh bytes; safeCopyJSON not required for this path.
 									computed, cerr := jsonHandlerCompute(ctx, handlerOpts, raw, sliceSnap)
 									if cerr == nil {
-										// Per-user RBAC drop on list-shaped responses.
-										// No-op when apiCall.UserAccessFilter == nil.
-										computed = applyUserAccessFilter(ctx, apiCall, computed)
+										// Q-RBAC-DECOUPLE C(d) v3 — per-user
+										// applyUserAccessFilter is now invoked
+										// from RefilterRESTAction at the
+										// dispatcher trust boundary; the
+										// resolver writes UNFILTERED values
+										// into the dict so a single L1 entry
+										// can be safely shared across all
+										// users in a binding-identity group.
 										instrumentedDictWrite(ctx, mu, dict, "api_l1", "append",
 											apiL1Extra,
 											func() {
@@ -534,9 +539,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							if mu != nil {
 								computed, cerr := jsonHandlerDirectCompute(ctx, handlerOpts, safeData, sliceSnap)
 								if cerr == nil {
-									// Per-user RBAC drop on list-shaped responses.
-									// No-op when apiCall.UserAccessFilter == nil.
-									computed = applyUserAccessFilter(ctx, apiCall, computed)
+									// Q-RBAC-DECOUPLE C(d) v3 — see refilter.go;
+									// applyUserAccessFilter moves to the
+									// dispatcher trust boundary.
 									instrumentedDictWrite(ctx, mu, dict, "informer_direct", "append",
 										directExtra,
 										func() {
@@ -568,9 +573,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 								var herr error
 								computed, cerr := jsonHandlerDirectCompute(ctx, handlerOpts, safeData, sliceSnap)
 								if cerr == nil {
-									// Per-user RBAC drop on list-shaped responses.
-									// No-op when apiCall.UserAccessFilter == nil.
-									computed = applyUserAccessFilter(ctx, apiCall, computed)
+									// Q-RBAC-DECOUPLE C(d) v3 — see refilter.go;
+									// applyUserAccessFilter moves to the
+									// dispatcher trust boundary.
 									instrumentedDictWrite(ctx, nil, dict, "informer_direct", "append",
 										directExtra,
 										func() {
@@ -627,48 +632,42 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						attribute.String("api.namespace", callNS),
 						attribute.String("api.name", callName),
 					}
-					if l1Raw, l1Hit, _ := c.GetRaw(ctx, l1Key); l1Hit {
+					// Q-RBAC-DECOUPLE C(d) v3 — child /call slot is stored
+					// as an opaque reference; the parent's L1 entry holds
+					// only the pointer. RefilterRESTAction recurses into
+					// the child at HTTP-time so each user gets the child's
+					// per-user-refiltered output. Avoids inlining the (large)
+					// child body into every parent and avoids serving the
+					// resolving user's pre-filtered child to other users.
+					if _, l1Hit, _ := c.GetRaw(ctx, l1Key); l1Hit {
 						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
-						// V0_HOIST: gojq-purity-required: l1Raw is fresh
-						// L1 bytes — parsed into a fresh tree, not aliasing informer.
-						handlerOpts := jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter}
-						computed, cerr := jsonHandlerCompute(ctx, handlerOpts, l1Raw, sliceSnap)
-						if cerr == nil {
-							// Per-user RBAC drop on list-shaped responses.
-							// No-op when apiCall.UserAccessFilter == nil.
-							computed = applyUserAccessFilter(ctx, apiCall, computed)
-							instrumentedDictWrite(ctx, mu, dict, "call_l1", "append",
-								callExtra,
-								func() {
-									mergeIntoDict(dict, id, computed)
-								})
-						}
+						childRef := MarshalChildRESTActionRef(callGVR, callNS, callName, l1Key, apiCall.Filter)
+						instrumentedDictWrite(ctx, mu, dict, "call_l1", "append",
+							callExtra,
+							func() {
+								dict[id] = childRef
+							})
 						return true
 					}
 
 					// L1 miss: try inline resolution during background refresh.
 					// This avoids the HTTP self-call that causes context timeout
-					// at 50K scale when snowplow is under heavy load.
+					// at 50K scale when snowplow is under heavy load. After
+					// the callResolver returns successfully the child has been
+					// written to L1 (l1cache.ResolveAndCache writes on success),
+					// so we still emit a child reference — RefilterRESTAction
+					// will hit the freshly-written child entry.
 					if callResolver := cache.CallResolverFromContext(ctx); callResolver != nil {
 						if ir := cache.InformerReaderFromContext(ctx); ir != nil {
 							if obj, ok := ir.GetObject(callGVR, callNS, callName); ok {
 								raw, rerr := callResolver(ctx, obj.Object, l1Key, opts.AuthnNS)
 								if rerr == nil && len(raw) > 0 {
-									// V0_HOIST: gojq-purity-required:
-									// raw is freshly produced bytes from
-									// callResolver (independent tree).
-									handlerOpts := jsonHandlerOptions{key: id, out: dict, filter: apiCall.Filter}
-									computed, cerr := jsonHandlerCompute(ctx, handlerOpts, raw, sliceSnap)
-									if cerr == nil {
-										// Per-user RBAC drop on list-shaped responses.
-										// No-op when apiCall.UserAccessFilter == nil.
-										computed = applyUserAccessFilter(ctx, apiCall, computed)
-										instrumentedDictWrite(ctx, mu, dict, "call_inline", "append",
-											callExtra,
-											func() {
-												mergeIntoDict(dict, id, computed)
-											})
-									}
+									childRef := MarshalChildRESTActionRef(callGVR, callNS, callName, l1Key, apiCall.Filter)
+									instrumentedDictWrite(ctx, mu, dict, "call_inline", "append",
+										callExtra,
+										func() {
+											dict[id] = childRef
+										})
 									return true
 								}
 							}
@@ -729,9 +728,9 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					if cerr != nil {
 						return cerr
 					}
-					// Per-user RBAC drop on list-shaped responses.
-					// No-op when apiCall.UserAccessFilter == nil.
-					computed = applyUserAccessFilter(ctx, apiCall, computed)
+					// Q-RBAC-DECOUPLE C(d) v3 — see refilter.go;
+					// applyUserAccessFilter moves to the dispatcher trust
+					// boundary.
 					instrumentedDictWrite(ctx, mu, dict, "http_fallback", "append",
 						httpExtra,
 						func() {

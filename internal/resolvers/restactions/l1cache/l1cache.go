@@ -31,6 +31,7 @@ import (
 	v1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
+	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -140,7 +141,7 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 
 	tracker := cache.NewDependencyTracker()
 	tctx := cache.WithDependencyTracker(xcontext.BuildContext(ctx), tracker)
-	if _, err := restactions.Resolve(tctx, restactions.ResolveOptions{
+	_, dict, err := restactions.Resolve(tctx, restactions.ResolveOptions{
 		In:               &cr,
 		SArc:             in.SArc,
 		AuthnNS:          in.AuthnNS,
@@ -148,7 +149,8 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 		Page:             in.Page,
 		Extras:           in.Extras,
 		SnowplowEndpoint: in.SnowplowEndpoint,
-	}); err != nil {
+	})
+	if err != nil {
 		log.Error("unable to resolve rest action",
 			slog.String("name", cr.GetName()),
 			slog.String("namespace", cr.GetNamespace()),
@@ -162,8 +164,15 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 		slog.String("name", cr.Name),
 		slog.String("namespace", cr.Namespace))
 
+	// Q-RBAC-DECOUPLE C(d) v3 — write the v3 wire shape so the dispatcher
+	// can refilter per-user on every L1 hit. CR.Status (the OUTER-JQ output
+	// computed against the UNFILTERED dict by restactions.Resolve above) is
+	// retained inside the wrapper for back-compat / debugging visibility,
+	// but it is NEVER served verbatim to a user — RefilterRESTAction
+	// re-runs the outer JQ against the per-user-refiltered dict and
+	// overwrites Status before re-marshaling for the wire.
 	_, marshalSpan := tracer.Start(ctx, "http.marshal")
-	raw, merr := json.Marshal(&cr)
+	raw, merr := api.MarshalCached(&cr, dict)
 	if merr == nil {
 		marshalSpan.SetAttributes(attribute.Int("http.response.body.size", len(raw)))
 	}
@@ -190,15 +199,39 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 		cache.RegisterL1Dependencies(tctx, in.Cache, tracker, in.ResolvedKey)
 	}
 
-	// Decode the status subtree from the serialized form. This is
-	// cheaper than re-walking cr.Status.Raw via runtime encoders and
-	// guarantees the returned map has exactly the shape consumers see
-	// on a subsequent L1 hit (lookupL1 in the apiref path).
-	var wrapper map[string]any
-	if uerr := json.Unmarshal(raw, &wrapper); uerr != nil {
+	// Q-RBAC-DECOUPLE C(d) v3 — Result.Status is the requesting user's
+	// per-user-refiltered status, computed by api.RefilterRESTAction
+	// against the bytes we just wrote. This keeps the apiref-path
+	// (widgets→apiref→l1cache) trust-boundary invariant: every status
+	// returned to a caller has been refiltered for the requesting user.
+	//
+	// Falling back to the raw-decoded shape (the v0/v2 path) is unsafe in
+	// v3: `raw` is the v3 wrapper, so the old `wrapper["status"]` lookup
+	// does not exist on the wrapper, and even if it did the value would
+	// be the UNFILTERED outer-JQ output computed under whatever user
+	// happened to drive the resolver. In v3 the outer JQ is recomputed
+	// per-user inside RefilterRESTAction.
+	//
+	// On any refilter error we return the wrapper's raw bytes with
+	// Status=nil so the apiref caller can decide to fall through to a
+	// fresh resolve (the same trust-boundary discipline the dispatcher
+	// applies on L1 hit).
+	refiltered, refErr := api.RefilterRESTAction(ctx, in.Cache, raw)
+	if refErr != nil {
+		log.Warn("resolveAndCacheInner: refilter failed; returning raw without status",
+			slog.String("name", cr.Name),
+			slog.String("ns", cr.Namespace),
+			slog.Any("err", refErr))
 		return &Result{Raw: raw}, nil
 	}
-	status, _ := wrapper["status"].(map[string]any)
+
+	var status map[string]any
+	if len(refiltered) > 0 {
+		var refWrapper map[string]any
+		if uerr := json.Unmarshal(refiltered, &refWrapper); uerr == nil {
+			status, _ = refWrapper["status"].(map[string]any)
+		}
+	}
 
 	// Diagnostic for S7: log item count for list-type RESTActions (e.g.
 	// compositions-list). The JQ filter produces {"list": [...items...]},

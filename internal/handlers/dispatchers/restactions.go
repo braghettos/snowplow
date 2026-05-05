@@ -2,6 +2,7 @@ package dispatchers
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -12,11 +13,24 @@ import (
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
+	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions/l1cache"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
+
+// errRefilterPanic wraps a recovered panic from RefilterRESTAction so the
+// fall-through logic at the L1-hit branch can treat panics identically to
+// explicit refilter errors. NEVER serve the cached bytes if refilter
+// panicked — same trust-boundary discipline as the error path.
+type errRefilterPanic struct {
+	panicValue any
+}
+
+func (e errRefilterPanic) Error() string {
+	return fmt.Sprintf("v3 refilter panic: %v", e.panicValue)
+}
 
 var restactionTracer = otel.Tracer("snowplow/dispatchers")
 
@@ -78,43 +92,89 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 				}
 				lookupSpan.End()
 				if hit {
+					// Q-RBAC-DECOUPLE C(d) v3 — refilter the cached
+					// (binding-identity-shared) entry per the requesting
+					// user. The trust-boundary contract is non-negotiable:
+					// if RefilterRESTAction returns ANY error, we MUST
+					// fall through to the miss path. Serving the cached
+					// bytes verbatim would re-introduce Q-RBACC-DEFECT-1
+					// (silent RBAC leak between users in the same binding
+					// group). The miss path is correct; just slower.
+					_, refilterSpan := restactionTracer.Start(req.Context(), "restaction.refilter",
+						trace.WithAttributes(
+							attribute.String("cache.key", resolvedKey),
+							attribute.String("user", user.Username),
+						))
+					refiltered, refErr := func() (out []byte, err error) {
+						defer func() {
+							if r := recover(); r != nil {
+								err = errRefilterPanic{panicValue: r}
+								out = nil
+							}
+						}()
+						// Q-RBAC-DECOUPLE C(d) v3 §2.6 — singleflight
+						// dedup. 80 burst requests for the same
+						// (l1key, user, groups) coalesce into one
+						// RefilterRESTAction execution; followers
+						// share the result. Cuts ~2.4 GB transient
+						// alloc + ~4 s CPU peak under cluster-restart
+						// thundering-herd.
+						return api.RefilterRESTActionDeduped(req.Context(), c, raw, resolvedKey)
+					}()
+					if refErr != nil {
+						refilterSpan.RecordError(refErr)
+						refilterSpan.End()
+						log.Warn("L1 refilter failed; falling through to miss path",
+							slog.String("key", resolvedKey),
+							slog.String("user", user.Username),
+							slog.Any("err", refErr))
+						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawMisses, "raw_misses")
+						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Misses, "l1_misses")
+					} else {
+						refilterSpan.SetAttributes(
+							attribute.Int("response.bytes", len(refiltered)),
+						)
+						refilterSpan.End()
+						if httpSpan := trace.SpanFromContext(req.Context()); httpSpan.IsRecording() {
+							httpSpan.AddEvent("cache.hit", trace.WithAttributes(
+								attribute.String("cache.key", resolvedKey),
+								attribute.String("cache.layer", "l1"),
+							))
+						}
+						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
+						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
+						cache.TouchKey(cache.ResolvedKeyBase(identity, gvr, nsn.Namespace, nsn.Name))
+						log.Info("RESTAction resolved from cache",
+							slog.String("key", resolvedKey),
+							slog.String("user", user.Username),
+							slog.String("resource", gvr.Resource),
+							slog.String("name", nsn.Name),
+							slog.String("namespace", nsn.Namespace),
+							slog.String("source", "L1-cache"),
+							slog.String("duration", util.ETA(start)))
+						wri.Header().Set("Content-Type", "application/json")
+						wri.WriteHeader(http.StatusOK)
+						_, writeSpan := restactionTracer.Start(req.Context(), "http.write",
+							trace.WithAttributes(
+								attribute.Bool("cache.hit", true),
+								attribute.Int("http.response.body.size", len(refiltered)),
+							))
+						_, _ = wri.Write(refiltered)
+						writeSpan.End()
+						return
+					}
+					// fall-through to miss path (resolveAndCache below)
+				} else {
 					if httpSpan := trace.SpanFromContext(req.Context()); httpSpan.IsRecording() {
-						httpSpan.AddEvent("cache.hit", trace.WithAttributes(
+						httpSpan.AddEvent("cache.miss", trace.WithAttributes(
 							attribute.String("cache.key", resolvedKey),
 							attribute.String("cache.layer", "l1"),
 						))
 					}
-					cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawHits, "raw_hits")
-					cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
-					cache.TouchKey(cache.ResolvedKeyBase(identity, gvr, nsn.Namespace, nsn.Name))
-					log.Info("RESTAction resolved from cache",
-						slog.String("key", resolvedKey),
-						slog.String("user", user.Username),
-						slog.String("resource", gvr.Resource),
-						slog.String("name", nsn.Name),
-						slog.String("namespace", nsn.Namespace),
-						slog.String("source", "L1-cache"),
-						slog.String("duration", util.ETA(start)))
-					wri.Header().Set("Content-Type", "application/json")
-					wri.WriteHeader(http.StatusOK)
-					_, writeSpan := restactionTracer.Start(req.Context(), "http.write",
-						trace.WithAttributes(
-							attribute.Bool("cache.hit", true),
-							attribute.Int("http.response.body.size", len(raw)),
-						))
-					_, _ = wri.Write(raw)
-					writeSpan.End()
-					return
+					cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawMisses, "raw_misses")
+					cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Misses, "l1_misses")
+					log.Info("restaction: L1 miss", slog.String("key", resolvedKey))
 				}
-				if httpSpan := trace.SpanFromContext(req.Context()); httpSpan.IsRecording() {
-					httpSpan.AddEvent("cache.miss", trace.WithAttributes(
-						attribute.String("cache.key", resolvedKey),
-						attribute.String("cache.layer", "l1"),
-					))
-				}
-				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.RawMisses, "raw_misses")
-				cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Misses, "l1_misses")
-				log.Info("restaction: L1 miss", slog.String("key", resolvedKey))
 			}
 		}
 	}

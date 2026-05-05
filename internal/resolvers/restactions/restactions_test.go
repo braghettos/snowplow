@@ -144,7 +144,11 @@ func resolveRESTAction(name string) func(ctx context.Context, t *testing.T, c *e
 			t.Fail()
 		}
 
-		res, err := Resolve(ctx, ResolveOptions{
+		// Q-RBAC-DECOUPLE C(d) v3 — Resolve now returns (cr, dict, err);
+		// the dict is the unfiltered ProtectedDict consumed by l1cache for
+		// per-user refilter at HTTP-time. This test only inspects the CR
+		// so the dict is discarded.
+		res, _, err := Resolve(ctx, ResolveOptions{
 			In:      &cr,
 			SArc:    c.Client().RESTConfig(),
 			AuthnNS: namespace,
