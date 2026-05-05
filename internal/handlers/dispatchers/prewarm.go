@@ -161,6 +161,28 @@ func preWarmChildWidgets(parentCtx context.Context, c cache.Cache, resolved *uns
 
 // recursivePreWarm resolves refs into L1 cache, then extracts their children
 // and recurses until maxDepth or no more children are found.
+//
+// Q-RBACC-L2-1 — L2 prewarm coverage (PR review N3, 2026-05-05).
+// This function transitively populates the L2 post-refilter cache via
+// the call chain:
+//
+//   recursivePreWarm → resolveL1RefsCollect → widgets.Resolve
+//     → resolveApiRef → apiref.Resolve → resolveViaL1Cache
+//     → l1cache.ResolveAndCache → cache.L2Put
+//
+// The architect-deviation #2 design point (single L2 writer at
+// l1cache.ResolveAndCache) is what makes this "free": ANY caller that
+// passes through l1cache.ResolveAndCache populates L2 alongside L1.
+// Coverage is empirically verified by
+// internal/resolvers/restactions/l1cache/prewarm_l2_coverage_test.go,
+// which asserts that ResolveAndCache (called with the prewarm-shaped
+// Input) advances cache.GlobalMetrics.L2Writes.
+//
+// Consequence: when CACHE_L2_REFILTER_ENABLED=true at startup and
+// active users / warmable RAs are present, L2 entries are populated
+// before pod becomes Ready (per OQ-5 spec). The +30 s pod-startup
+// budget is amortised over both L1 and L2 fill — no separate L2
+// prewarm pass is required.
 func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, c cache.Cache, dynClient k8sdynamic.Interface, refs []l1Ref, authnNS string, visited map[string]bool, depth int) {
 	if len(refs) == 0 {
 		return
@@ -559,6 +581,13 @@ type l1Ref struct {
 
 // warmL1RestActionsForUser resolves the explicitly-configured RESTActions for
 // a single user and stores them in L1 cache. Returns the number warmed.
+//
+// Q-RBACC-L2-1 — L2 prewarm coverage (PR review N3, 2026-05-05).
+// This function calls l1cache.ResolveAndCache directly (line below),
+// which is the single L2 writer per architect-deviation #2. So every
+// RESTAction warmed here also lands in L2 (subject to the reduction
+// ratio gate / size cap). Empirical verification in
+// internal/resolvers/restactions/l1cache/prewarm_l2_coverage_test.go.
 func warmL1RestActionsForUser(ctx context.Context, c cache.Cache, dynClient k8sdynamic.Interface, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, ras []cache.WarmupRestAction, authnNS string) int64 {
 	log := slog.Default()
 	raGVR := schema.GroupVersionResource{
