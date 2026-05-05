@@ -1602,6 +1602,84 @@ def cluster_dirty_state():
     return state
 
 
+# Auto-detect thresholds for the destructive-clean guard. If a baseline
+# cluster has more than this many compositions or bench-namespaces, we
+# assume it is the customer-shape Phase-6 baseline (per
+# feedback_test_scale_50k.md) and refuse to wipe it. Operators who really
+# want to clean a baseline cluster must pass --allow-destructive-clean.
+SCALE_GUARD_COMPOSITIONS = 1000
+SCALE_GUARD_BENCH_NAMESPACES = 100
+
+
+def _destructive_clean_guard(state, allow_destructive):
+    """Return (blocks: bool, reason: str).
+
+    The CRB-delete scenario (and --clean-only) used to call
+    clean_environment() unconditionally whenever cluster_dirty_state() showed
+    any nonzero counter. That is wrong on a customer-shape Phase-6 baseline
+    (~50K compositions, ~50 bench namespaces): the bench would happily wipe
+    tens of thousands of compositions just to "warm up" a single scenario.
+
+    Guard rules:
+      - If allow_destructive is True, never block (operator opted in).
+      - Else, if compositions > SCALE_GUARD_COMPOSITIONS, block.
+      - Else, if bench_namespaces > SCALE_GUARD_BENCH_NAMESPACES, block.
+      - Otherwise, allow.
+    """
+    if allow_destructive:
+        return False, ""
+    comps = int(state.get("compositions", 0) or 0)
+    nss = int(state.get("bench_namespaces", 0) or 0)
+    if comps > SCALE_GUARD_COMPOSITIONS:
+        return True, (f"compositions={comps} > {SCALE_GUARD_COMPOSITIONS} "
+                      "(looks like the Phase-6 baseline; refusing to wipe)")
+    if nss > SCALE_GUARD_BENCH_NAMESPACES:
+        return True, (f"bench_namespaces={nss} > {SCALE_GUARD_BENCH_NAMESPACES} "
+                      "(looks like the Phase-6 baseline; refusing to wipe)")
+    return False, ""
+
+
+def _self_test_destructive_clean_guard():
+    """Sanity-check the destructive-clean guard with synthetic states.
+
+    Run via:  python3 snowplow_test.py --self-test
+    No cluster contact, no I/O beyond stdout. Exits non-zero on failure.
+    """
+    cases = [
+        # (label, state, allow_destructive, expect_blocks)
+        ("clean cluster",
+         {"compositions": 0, "bench_namespaces": 0}, False, False),
+        ("small dev dirt (50 comps)",
+         {"compositions": 50, "bench_namespaces": 2}, False, False),
+        ("Phase-6 baseline shape",
+         {"compositions": 46539, "bench_namespaces": 49}, False, True),
+        ("Phase-6 baseline + opt-in override",
+         {"compositions": 46539, "bench_namespaces": 49}, True, False),
+        ("just-over-comp threshold",
+         {"compositions": 1001, "bench_namespaces": 0}, False, True),
+        ("at-comp threshold (boundary, not blocked)",
+         {"compositions": 1000, "bench_namespaces": 0}, False, False),
+        ("just-over-ns threshold",
+         {"compositions": 0, "bench_namespaces": 101}, False, True),
+        ("at-ns threshold (boundary, not blocked)",
+         {"compositions": 0, "bench_namespaces": 100}, False, False),
+        ("missing keys are treated as zero",
+         {}, False, False),
+    ]
+    failed = 0
+    for label, state, allow, expect in cases:
+        blocks, reason = _destructive_clean_guard(state, allow)
+        status = "OK " if blocks == expect else "FAIL"
+        if blocks != expect:
+            failed += 1
+        log(f"  [{status}] {label}: blocks={blocks} expect={expect} "
+            f"reason={reason!r}")
+    if failed:
+        log(f"self-test FAILED: {failed} case(s)")
+        sys.exit(1)
+    log(f"self-test OK: {len(cases)} case(s) passed")
+
+
 def assert_clean(retry_with_cleanup=True):
     """Assert cluster has no bench leftovers. If dirty and retry_with_cleanup,
     invoke clean_environment() once and re-check; raise if still dirty.
@@ -4258,19 +4336,44 @@ def main():
                         help="Run a single named scenario instead of phases. "
                              "Supported: 'crb-delete' (Q-RBAC-DECOUPLE C(d) v5 "
                              "D1/D2/D3 reproduction).")
+    parser.add_argument("--allow-destructive-clean", action="store_true",
+                        default=False,
+                        help="Allow scenarios and --clean-only to wipe the "
+                             "cluster even when it looks like the Phase-6 "
+                             "customer-shape baseline (>1000 compositions or "
+                             ">100 bench namespaces). OFF by default — see "
+                             "feedback_test_scale_50k.md.")
+    parser.add_argument("--self-test", action="store_true", default=False,
+                        help="Run in-process unit checks for the "
+                             "destructive-clean guard and exit. No cluster "
+                             "contact.")
     args = parser.parse_args()
+
+    if args.self_test:
+        _self_test_destructive_clean_guard()
+        sys.exit(0)
 
     if args.scenario == "crb-delete":
         verify_deployed_image()
         cleanup_rogue_rbac()
         # Bring the cluster to a clean baseline so we measure ONLY the
-        # CRB-delete impact, not pre-existing dirt.
+        # CRB-delete impact, not pre-existing dirt — UNLESS the cluster
+        # looks like the production-scale Phase-6 baseline, in which case
+        # we refuse to wipe it (see feedback_test_scale_50k.md).
         state = cluster_dirty_state()
         dirty = {k: v for k, v in state.items() if v > 0}
         if dirty:
             log(f"Pre-flight DIRTY: {dirty}")
-            clean_environment()
-            assert_clean(retry_with_cleanup=False)
+            blocks, reason = _destructive_clean_guard(
+                state, args.allow_destructive_clean)
+            if blocks:
+                log(f"Pre-flight: SCALE guard active — {reason}")
+                log("Pre-flight: skipping clean_environment(); proceeding "
+                    "with scenario on the existing cluster. Pass "
+                    "--allow-destructive-clean to override.")
+            else:
+                clean_environment()
+                assert_clean(retry_with_cleanup=False)
         tokens = login_all()
         crb_delete_burst(tokens)
         all_passed = print_report()
@@ -4279,11 +4382,20 @@ def main():
     if args.clean_only:
         verify_deployed_image()
         cleanup_rogue_rbac()
-        # Only run clean_environment (which restarts the pod) if cluster is dirty.
+        # Only run clean_environment (which restarts the pod) if cluster is
+        # dirty AND the SCALE guard does not block. The guard prevents
+        # accidental wipes of the Phase-6 customer-shape baseline.
         state = cluster_dirty_state()
         dirty = {k: v for k, v in state.items() if v > 0}
         if dirty:
             log(f"Pre-flight DIRTY: {dirty}")
+            blocks, reason = _destructive_clean_guard(
+                state, args.allow_destructive_clean)
+            if blocks:
+                log(f"Pre-flight: SCALE guard active — {reason}")
+                log("Pre-flight: refusing to clean. Pass "
+                    "--allow-destructive-clean to override.")
+                sys.exit(2)
             clean_environment()
             assert_clean(retry_with_cleanup=False)
         else:
