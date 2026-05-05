@@ -102,6 +102,20 @@ func MakeL1Refresher(c cache.Cache, rc *rest.Config, authnNS, signKey string, rb
 	}
 
 	return func(ctx context.Context, triggerGVR schema.GroupVersionResource, l1Keys []string) []string {
+		// Q-RBAC-DECOUPLE C(d) v4 §2.2 (Fix-3a) — flag the refresh ctx as
+		// system-identity. Read site: the dispatch-fork predicate in
+		// internal/resolvers/restactions/api/resolve.go. With the flag
+		// set, ALL api[] entries (UAF and non-UAF alike) route through
+		// the snowplow elevated endpoint instead of attempting the
+		// per-user clientconfig lookup at endpoints.go — which would
+		// otherwise try to resolve a non-existent Secret named after the
+		// synthesized SA identity and error out (Q-RBACC-DEFECT-3).
+		//
+		// MUST be set BEFORE WithSnowplowEndpoint and BEFORE the closure
+		// hands ctx to refreshSingleL1, so every downstream propagation
+		// inherits the flag. NEVER set this flag on a real-user ctx.
+		ctx = cache.WithSystemIdentity(ctx)
+
 		// Inject RBACWatcher for local RBAC evaluation during background refresh.
 		// Without this, UserCan falls back to SSAR (K8s API), which saturates
 		// the rate limiter with 345K calls at 50K scale.

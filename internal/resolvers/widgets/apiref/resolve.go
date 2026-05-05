@@ -69,7 +69,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			// on ANY error from refilter, fall through to the miss path
 			// (resolveViaL1Cache below). NEVER return the unfiltered
 			// status to the caller.
-			if status, ok := lookupL1Refiltered(ctx, c, l1Key); ok {
+			if status, hasUAF, ok := lookupL1Refiltered(ctx, c, l1Key); ok {
 				// Record the restaction GVR in the dependency tracker
 				// even on L1 hit. The widget dispatcher uses the
 				// tracker to register deps (widgets.go:267). Without
@@ -79,11 +79,22 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 				if tracker := cache.TrackerFromContext(ctx); tracker != nil {
 					tracker.AddGVR(restActionGVR)
 					tracker.AddResource(restActionGVR, opts.ApiRef.Namespace, opts.ApiRef.Name)
+					// Q-RBAC-DECOUPLE C(d) v4 §2.3 (Fix-W) — propagate
+					// UAF-touching to the parent (widget) tracker on the
+					// HIT path. The widget dispatcher reads this flag to
+					// SKIP the widget L1 write when the widget's body
+					// inlines a per-user-filtered apiref view that must
+					// not be shared across users in the same binding-
+					// identity group.
+					if hasUAF {
+						tracker.MarkUAFTouching()
+					}
 					slog.Debug("apiref: L1 hit, added restaction dep to tracker",
 						slog.String("l1Key", l1Key),
 						slog.String("apiRef", opts.ApiRef.Name),
 						slog.Int("page", opts.Page),
-						slog.Int("perPage", opts.PerPage))
+						slog.Int("perPage", opts.PerPage),
+						slog.Bool("uafTouching", hasUAF))
 				} else {
 					slog.Warn("apiref: L1 hit but NO tracker in context",
 						slog.String("l1Key", l1Key))
@@ -105,7 +116,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 
 	// L1 miss: fall through to shared resolver.
 	if l1Key != "" {
-		status, err := resolveViaL1Cache(ctx, c, opts, l1Key)
+		status, hasUAF, err := resolveViaL1Cache(ctx, c, opts, l1Key)
 		// Register the restaction dep in the CALLER's tracker even on
 		// L1 miss. l1cache.ResolveAndCache creates its own tracker, so
 		// the widget's tracker doesn't get the restaction ref automatically.
@@ -115,6 +126,15 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 			if tracker := cache.TrackerFromContext(ctx); tracker != nil {
 				tracker.AddGVR(restActionGVR)
 				tracker.AddResource(restActionGVR, opts.ApiRef.Namespace, opts.ApiRef.Name)
+				// Q-RBAC-DECOUPLE C(d) v4 §2.3 (Fix-W) — propagate
+				// UAF-touching to the parent (widget) tracker on the
+				// MISS path so the widget dispatcher's L1-write gate
+				// trips correctly on the very first request that
+				// resolves a UAF-protected RESTAction through the
+				// widget pipeline.
+				if hasUAF {
+					tracker.MarkUAFTouching()
+				}
 			}
 		}
 		return status, err
@@ -127,11 +147,24 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 // resolveViaL1Cache fetches the RESTAction CR and hands it off to
 // l1cache.ResolveAndCache, which runs inside the shared foreground
 // singleflight.Group and writes the L1 entry.
-func resolveViaL1Cache(ctx context.Context, c cache.Cache, opts ResolveOptions, l1Key string) (map[string]any, error) {
+//
+// Returns (status, hasUAF, err). hasUAF is true iff the resolved RESTAction
+// CR has at least one api[] entry with UserAccessFilter configured — used
+// by the caller (Resolve) to set the parent tracker's UAFTouching flag
+// (Q-RBAC-DECOUPLE C(d) v4 §2.3 / Fix-W).
+func resolveViaL1Cache(ctx context.Context, c cache.Cache, opts ResolveOptions, l1Key string) (map[string]any, bool, error) {
 	res := objects.Get(ctx, opts.ApiRef)
 	if res.Err != nil {
-		return map[string]any{}, fmt.Errorf("%s", res.Err.Message)
+		return map[string]any{}, false, fmt.Errorf("%s", res.Err.Message)
 	}
+
+	// Compute hasUAF from the unstructured CR BEFORE handing it off to
+	// l1cache.ResolveAndCache. The check is a single linear scan over
+	// cr.Spec.API (≤ 4 entries per RESTAction), cheap and unconditional
+	// (we always need the truth value for the caller). Done on the
+	// unstructured map shape to avoid a duplicate full conversion to
+	// templatesv1.RESTAction (which l1cache does internally).
+	hasUAF := unstructuredHasUAF(res.Unstructured.Object)
 
 	result, err := l1cache.ResolveAndCache(ctx, l1cache.Input{
 		Cache:       c,
@@ -144,12 +177,47 @@ func resolveViaL1Cache(ctx context.Context, c cache.Cache, opts ResolveOptions, 
 		Extras:      opts.Extras,
 	})
 	if err != nil {
-		return map[string]any{}, err
+		return map[string]any{}, hasUAF, err
 	}
 	if result == nil || result.Status == nil {
-		return map[string]any{}, nil
+		return map[string]any{}, hasUAF, nil
 	}
-	return result.Status, nil
+	return result.Status, hasUAF, nil
+}
+
+// unstructuredHasUAF returns true iff at least one api[] entry in the
+// unstructured RESTAction CR has a non-nil userAccessFilter. The check
+// runs against the raw map shape (`spec.api[*].userAccessFilter`) so we
+// avoid a duplicate full conversion to templatesv1.RESTAction (which
+// l1cache.ResolveAndCache does internally). Q-RBAC-DECOUPLE C(d) v4
+// §2.3 (Fix-W) — used by resolveViaL1Cache and by lookupL1Refiltered's
+// HIT path.
+func unstructuredHasUAF(obj map[string]any) bool {
+	if obj == nil {
+		return false
+	}
+	spec, ok := obj["spec"].(map[string]any)
+	if !ok {
+		return false
+	}
+	apis, ok := spec["api"].([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range apis {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if uaf, present := entry["userAccessFilter"]; present && uaf != nil {
+			// Defensive: a JSON null could decode as untyped nil — only
+			// report true when the field carries a structured value.
+			if m, ok := uaf.(map[string]any); ok && len(m) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // resolveInline is the no-cache fast path: no L1 lookup, no L1 write,
@@ -187,17 +255,23 @@ func resolveInline(ctx context.Context, opts ResolveOptions) (map[string]any, er
 
 // lookupL1Refiltered reads a RESTAction L1 entry, runs the v3 per-user
 // refilter against the cached wrapper, and extracts the resulting status
-// map. Returns (status, true) on hit + successful refilter; (nil, false)
-// on miss, on any refilter error, or on decode failure.
+// map. Returns (status, hasUAF, true) on hit + successful refilter;
+// (nil, false, false) on miss, on any refilter error, or on decode
+// failure.
+//
+// hasUAF reports whether the cached RESTAction CR has at least one api[]
+// entry with userAccessFilter configured — used by the caller to set the
+// parent (widget) tracker's UAFTouching flag (Q-RBAC-DECOUPLE C(d) v4
+// §2.3 / Fix-W).
 //
 // SECURITY: refilter failures are treated as misses — the caller falls
 // through to a fresh resolve under the requesting user. NEVER return the
 // raw cached status; the cached wrapper holds the unfiltered ProtectedDict
 // shape and would leak items to a user lacking the corresponding RBAC.
-func lookupL1Refiltered(ctx context.Context, c cache.Cache, l1Key string) (map[string]any, bool) {
+func lookupL1Refiltered(ctx context.Context, c cache.Cache, l1Key string) (map[string]any, bool, bool) {
 	raw, hit, err := c.GetRaw(ctx, l1Key)
 	if err != nil || !hit || len(raw) == 0 {
-		return nil, false
+		return nil, false, false
 	}
 	refiltered, refErr := func() (out []byte, ferr error) {
 		defer func() {
@@ -217,15 +291,38 @@ func lookupL1Refiltered(ctx context.Context, c cache.Cache, l1Key string) (map[s
 		slog.Warn("apiref: L1 refilter failed; treating as miss",
 			slog.String("l1Key", l1Key),
 			slog.Any("err", refErr))
-		return nil, false
+		return nil, false, false
 	}
 	var cached map[string]any
 	if json.Unmarshal(refiltered, &cached) != nil {
-		return nil, false
+		return nil, false, false
 	}
 	status, ok := cached["status"].(map[string]any)
 	if !ok {
-		return nil, false
+		return nil, false, false
 	}
-	return status, true
+	// Q-RBAC-DECOUPLE C(d) v4 §2.3 (Fix-W) — derive hasUAF from the
+	// cached wrapper bytes (NOT from `refiltered`, which has the
+	// per-user-projected shape via the outer JQ). The wrapper holds
+	// `cr.spec.api[*].userAccessFilter` verbatim.
+	hasUAF := wrapperHasUAF(raw)
+	return status, hasUAF, true
+}
+
+// wrapperHasUAF decodes only enough of the v3 cached wrapper to know
+// whether `cr.spec.api[*].userAccessFilter` is set on at least one
+// entry. Does NOT verify schema_version (callers do that via the
+// refilter call). Returns false on any decode failure (defensive: a
+// false-negative here just causes a per-request resolve cost; never a
+// security regression).
+func wrapperHasUAF(raw []byte) bool {
+	var top map[string]any
+	if err := json.Unmarshal(raw, &top); err != nil {
+		return false
+	}
+	cr, ok := top["cr"].(map[string]any)
+	if !ok {
+		return false
+	}
+	return unstructuredHasUAF(cr)
 }

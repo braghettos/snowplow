@@ -95,13 +95,26 @@ type Input struct {
 }
 
 // Result is what both HTTP and widget callers need from one resolution.
-// Raw is the marshaled + bulky-annotations-stripped CR (written to L1
-// and to the HTTP response body). Status is the decoded status subtree
-// of the CR, which is what the widget apiref path returns to its own
-// callers.
+//
+// Raw is the v3 wrapper bytes — written to L1, NEVER served to an HTTP
+// response. The wrapper carries the unfiltered ProtectedDict; serving
+// it to a real user would re-introduce Q-RBACC-DEFECT-2 (silent RBAC
+// leak on cache MISS).
+//
+// Refiltered is the per-user-refiltered CR JSON computed inside
+// ResolveAndCache via api.RefilterRESTAction. The dispatcher MISS path
+// MUST write Refiltered (not Raw) to the HTTP response. May be nil only
+// if the refilter call itself errored — callers detect nil and respond
+// HTTP 500 (no cached bytes are served on a refilter error). Q-RBAC-
+// DECOUPLE C(d) v4 §2.1 (Fix-2b).
+//
+// Status is the decoded status subtree of the per-user-refiltered CR —
+// the apiref-path consumer surface. Populated from Refiltered via a
+// single json.Unmarshal so Status and Refiltered cannot drift.
 type Result struct {
-	Raw    []byte
-	Status map[string]any
+	Raw        []byte
+	Refiltered []byte
+	Status     map[string]any
 }
 
 // ResolveAndCache runs the full RESTAction resolution:
@@ -141,9 +154,24 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 
 	tracker := cache.NewDependencyTracker()
 	tctx := cache.WithDependencyTracker(xcontext.BuildContext(ctx), tracker)
+
+	// Q-RBAC-DECOUPLE C(d) v4 — strictly-additive test-only SArc
+	// fallback. Production NEVER sets cache.WithTestRestConfig; the
+	// fallback is a no-op there and api.Resolve continues to call
+	// rest.InClusterConfig() when in.SArc == nil, exactly as in v3.
+	// The fallback is reserved for the §6.4-§6.6 envtest fixtures so
+	// they can exercise the real dispatcher.ServeHTTP path without an
+	// in-cluster SA mount.
+	sArc := in.SArc
+	if sArc == nil {
+		if rc, ok := cache.TestRestConfigFromContext(ctx).(*rest.Config); ok {
+			sArc = rc
+		}
+	}
+
 	_, dict, err := restactions.Resolve(tctx, restactions.ResolveOptions{
 		In:               &cr,
-		SArc:             in.SArc,
+		SArc:             sArc,
 		AuthnNS:          in.AuthnNS,
 		PerPage:          in.PerPage,
 		Page:             in.Page,
@@ -218,10 +246,17 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 	// applies on L1 hit).
 	refiltered, refErr := api.RefilterRESTAction(ctx, in.Cache, raw)
 	if refErr != nil {
-		log.Warn("resolveAndCacheInner: refilter failed; returning raw without status",
+		log.Warn("resolveAndCacheInner: refilter failed; returning raw without status or refiltered bytes",
 			slog.String("name", cr.Name),
 			slog.String("ns", cr.Namespace),
 			slog.Any("err", refErr))
+		// SECURITY (Q-RBAC-DECOUPLE C(d) v4 §2.1 Fix-2b): do NOT populate
+		// Result.Refiltered on error. The dispatcher MISS path inspects
+		// Refiltered==nil and returns HTTP 500 (no fallback to Raw, which
+		// would leak the unfiltered wrapper to the user). Result.Raw is
+		// still returned so the cache-write inspection / debug paths see
+		// what was committed to L1, but no HTTP response sink should ever
+		// dereference it.
 		return &Result{Raw: raw}, nil
 	}
 
@@ -249,7 +284,13 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 		}
 	}
 
-	return &Result{Raw: raw, Status: status}, nil
+	// Q-RBAC-DECOUPLE C(d) v4 §2.1 (Fix-2b): expose the refiltered bytes
+	// alongside Raw + Status. The dispatcher MISS path writes Refiltered
+	// to the HTTP response (NEVER Raw) so the user receives the per-user-
+	// filtered shape the cache-HIT path already serves. ZERO new CPU cost
+	// — the bytes are produced by the RefilterRESTAction call above and
+	// were silently discarded in v3.
+	return &Result{Raw: raw, Refiltered: refiltered, Status: status}, nil
 }
 
 // extractAPIRequests extracts the "apiRequests" string array from the

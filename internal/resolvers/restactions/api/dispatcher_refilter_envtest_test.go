@@ -1,5 +1,36 @@
 // Q-RBAC-DECOUPLE C(d) v3 — anti-defect test for Q-RBACC-DEFECT-1.
 //
+// === v4 ANNOTATION (Q-RBAC-DECOUPLE C(d) v4 §6.10 / §9 IMPL-4) ===
+//
+// SCOPE: this file tests the `RefilterRESTAction` HELPER's L1-HIT-path
+// behaviour via the `dispatcherSimulator` stub at line ~64 below. It
+// does NOT exercise the real `restActionHandler.ServeHTTP` and therefore
+// does NOT cover the dispatcher MISS path or the widget-L1 transitive
+// surface. The simulator's design hole is precisely what hid
+// Q-RBACC-DEFECT-2 in v3 — the simulator returns refiltered bytes
+// directly, bypassing the dispatcher MISS code that incorrectly wrote
+// `result.Raw` (the unfiltered wrapper) to the HTTP response.
+//
+// v4 anti-defect tests for the dispatcher integration live in:
+//
+//   - internal/handlers/dispatchers/restactions_miss_envtest_test.go
+//     (§6.4 — dispatcher MISS path leak / Q-RBACC-DEFECT-2)
+//   - internal/handlers/dispatchers/widgets_uaf_envtest_test.go
+//     (§6.5 — widget-L1 transitive leak / Q-RBACC-DEFECT-4)
+//   - internal/handlers/dispatchers/l1_refresh_envtest_test.go
+//     (§6.6 — L1 refresh under SA / Q-RBACC-DEFECT-3)
+//
+// Those v4 tests exercise the REAL `restActionHandler.ServeHTTP` (and
+// `widgetsHandler.ServeHTTP`) via `httptest.NewServer`. The v4 spec's
+// §6.10 codifies the lesson: every anti-defect test for a dispatcher-
+// level invariant MUST go through the real handler, NOT a simulator.
+//
+// Per spec §9 Q-RBACC-V4-IMPL-4: this v3 test is KEPT (not deleted)
+// because the simulator-based form remains a useful, fast HIT-path
+// regression for `RefilterRESTAction` itself.
+//
+// === ORIGINAL v3 CONTEXT ===
+//
 // CRITICAL CONTRACT (per the v3 spec §6.4): this test MUST FAIL on the v2
 // implementation tagged 0.25.295 (proves it catches the defect) and PASS on
 // the v3 implementation that ships in 0.25.296. The v2 path was:
