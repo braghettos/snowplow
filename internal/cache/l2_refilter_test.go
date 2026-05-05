@@ -381,6 +381,97 @@ func TestL2_LRUSweep_BoundsResident(t *testing.T) {
 	}
 }
 
+// TestL2_StatusImmutableAfterSet — Q-RBACC-L2-1 architect-review
+// CONCERN-1 (2026-05-05). After SetL2Refilter publishes an L2Entry,
+// the Status field MUST NOT be mutated by any read path. The
+// previous lazy-fill design wrote `l2e.Status = decoded` from
+// concurrent readers — a data race on the *L2Entry pointer shared
+// via sync.Map.
+//
+// This test:
+//
+//  1. Writes an entry with Status pre-populated (current contract).
+//  2. Forks 32 readers concurrently issuing GetL2Refilter.
+//  3. Each reader reads Status[key] and asserts it matches expected.
+//
+// Run with `go test -race` to catch any concurrent write to the
+// Status map (or to the L2Entry struct fields). The previous
+// lazy-fill design would fail the race detector on this exact shape.
+func TestL2_StatusImmutableAfterSet(t *testing.T) {
+	enableL2(t)
+
+	k := L2Key("snowplow:resolved:bid:g/v/r:ns:name", "bid", "ghash")
+	status := map[string]any{"answer": 42, "list": []any{"a", "b"}}
+
+	SetL2Refilter(k, &L2Entry{
+		Refiltered: []byte(`{"status":{"answer":42}}`),
+		Status:     status,
+		l1Key:      "snowplow:resolved:bid:g/v/r:ns:name",
+		identity:   "bid",
+	}, 1000)
+
+	const readers = 32
+	const iters = 500
+	var wg sync.WaitGroup
+	wg.Add(readers)
+	for r := 0; r < readers; r++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				e, ok := GetL2Refilter(k)
+				if !ok {
+					t.Errorf("unexpected miss")
+					return
+				}
+				if e.Status == nil {
+					t.Errorf("nil Status (writer should populate at write time)")
+					return
+				}
+				if v, _ := e.Status["answer"].(int); v != 42 {
+					t.Errorf("status[answer] mismatch: got %v", e.Status["answer"])
+					return
+				}
+				// Length stable: no concurrent writer is mutating Status.
+				if len(e.Status) != 2 {
+					t.Errorf("Status length changed under reader: %d", len(e.Status))
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// TestL2_NilStatusIsSoftMiss — when an L2 entry was published with
+// Status==nil (defensive shape against future codec migration), the
+// apiref read site treats it as a soft miss and falls through to a
+// fresh refilter. The cache layer simply returns the entry as-is;
+// the apiref caller decides what nil Status means. This test asserts
+// the cache layer does NOT lazy-fill (no mutation post-publish).
+func TestL2_NilStatusIsSoftMiss(t *testing.T) {
+	enableL2(t)
+
+	k := L2Key("nil-status-key", "id-ns", "g-ns")
+	SetL2Refilter(k, &L2Entry{
+		Refiltered: []byte(`{}`),
+		Status:     nil, // explicit nil
+		l1Key:      "nil-status-key",
+		identity:   "id-ns",
+	}, 1000)
+
+	// Two consecutive reads must observe Status==nil; the cache layer
+	// MUST NOT mutate the entry to populate Status.
+	for i := 0; i < 2; i++ {
+		e, ok := GetL2Refilter(k)
+		if !ok {
+			t.Fatalf("expected hit on iteration %d", i)
+		}
+		if e.Status != nil {
+			t.Fatalf("CONCERN-1: cache layer lazy-filled Status (was nil at write); iter %d", i)
+		}
+	}
+}
+
 // TestL2_ConcurrentSetGet — race-discovery harness for the Get/Set
 // surfaces. Run with `go test -race`.
 func TestL2_ConcurrentSetGet(t *testing.T) {

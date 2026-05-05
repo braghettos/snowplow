@@ -274,34 +274,26 @@ func lookupL1Refiltered(ctx context.Context, c cache.Cache, l1Key string) (map[s
 	// avoids both the per-user refilter AND the json.Unmarshal that
 	// follows it. The L2 key folds (l1Key, binding identity, groups
 	// hash); cohorts sharing identical RBAC bindings share one entry.
+	//
+	// Q-RBACC-L2-1 architect-review CONCERN-1 (2026-05-05):
+	// L2Entry.Status is populated AT WRITE TIME by every writer
+	// (dispatcher L1-HIT-then-fresh, l1cache MISS path, apiref MISS
+	// path) — so on a hit the field is immutable and the read here is
+	// race-free. NEVER mutate l2e.Status from this read site; doing so
+	// would re-introduce the data race the post-hit lazy-fill design
+	// caused. If Status is nil on a hit, that signals a writer encoded
+	// a malformed wrapper (defensive against future codec migration);
+	// fall through to a fresh refilter and treat the L2 entry as a
+	// soft miss — the subsequent L2Put below overwrites it with a
+	// well-formed entry.
 	user, uerr := xcontext.UserInfo(ctx)
 	var identity, groupsHash string
 	if uerr == nil {
 		identity = cache.CacheIdentity(ctx, user.Username)
 		groupsHash = cache.HashGroups(user.Groups)
-		if l2e, l2hit := cache.L2Get(l1Key, identity, groupsHash); l2hit {
-			// Lazy-fill: if the dispatcher wrote the L2 entry without
-			// pre-decoding the status map, decode it once here and
-			// upgrade the entry in place — subsequent L2 hits hit the
-			// cached map directly. Mutating the entry's Status field is
-			// safe because the apiref reader already treats the status
-			// as read-only and the singleflight upstream prevents
-			// concurrent fills with diverging bytes.
-			if l2e.Status == nil && len(l2e.Refiltered) > 0 {
-				var cached map[string]any
-				if json.Unmarshal(l2e.Refiltered, &cached) == nil {
-					if status, ok := cached["status"].(map[string]any); ok {
-						l2e.Status = status
-					}
-				}
-			}
-			if l2e.Status != nil {
-				cache.EmitL2HitAudit(ctx, l1Key, identity, l1Key, user.Username)
-				return l2e.Status, l2e.HasUAF, true
-			}
-			// Status missing on the entry — fall through to refilter
-			// below. Treat as a miss so we re-decode and re-Set with a
-			// usable Status.
+		if l2e, l2hit := cache.L2Get(l1Key, identity, groupsHash); l2hit && l2e.Status != nil {
+			cache.EmitL2HitAudit(ctx, l1Key, identity, l1Key, user.Username)
+			return l2e.Status, l2e.HasUAF, true
 		}
 	}
 

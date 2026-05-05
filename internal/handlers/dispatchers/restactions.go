@@ -2,6 +2,7 @@ package dispatchers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -209,7 +210,22 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 						// compositions-panels ratio ~0.95 → skipped here, by
 						// design — see spec §1.3). rawL1Size lets the gate
 						// run; passing 0 would bypass the gate.
-						cache.L2Put(resolvedKey, identity, groupsHash, refiltered, nil, false, "v3", len(raw))
+						//
+						// Q-RBACC-L2-1 architect-review CONCERN-1 (2026-05-05):
+						// pre-decode the status map AT WRITE TIME so apiref
+						// readers never observe Status==nil after an L2 hit.
+						// The previous shape (write nil + lazy-fill on the
+						// apiref read path) opened a data race on the entry
+						// pointer shared via sync.Map. By moving the decode
+						// inside the dispatcher (the leader of the
+						// singleflight refilter), the L2 entry's Status is
+						// immutable from Set time onward and apiref hits are
+						// race-free read-only. Decode cost: one
+						// json.Unmarshal per L1-HIT-then-fresh-refilter (i.e.
+						// once per cold L2 cohort) — amortised across the
+						// thundering-herd burst by the singleflight upstream.
+						l2Status := decodeStatusForL2(refiltered)
+						cache.L2Put(resolvedKey, identity, groupsHash, refiltered, l2Status, false, "v3", len(raw))
 						log.Info("RESTAction resolved from cache",
 							slog.String("key", resolvedKey),
 							slog.String("user", user.Username),
@@ -338,6 +354,29 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		))
 	_, _ = wri.Write(body)
 	writeSpan.End()
+}
+
+// decodeStatusForL2 extracts the "status" subtree from a v3 refiltered
+// CR JSON blob, returning nil on any decode failure. Used by the L1-HIT
+// L2 write path to populate L2Entry.Status at write time so apiref
+// readers never need to lazy-fill (which would race on the shared
+// sync.Map entry pointer — Q-RBACC-L2-1 architect-review CONCERN-1).
+//
+// Failure-mode: nil status. apiref readers treat nil Status as a soft
+// miss and fall through to refilter; the next refilter completes and
+// L2Put overwrites the entry with a Status-populated copy. Net effect
+// of a transient decode failure is one extra refilter, never an
+// incorrect response.
+func decodeStatusForL2(refiltered []byte) map[string]any {
+	if len(refiltered) == 0 {
+		return nil
+	}
+	var cr map[string]any
+	if err := json.Unmarshal(refiltered, &cr); err != nil {
+		return nil
+	}
+	st, _ := cr["status"].(map[string]any)
+	return st
 }
 
 // errEmptyResolveResult indicates the shared l1cache helper returned

@@ -78,10 +78,16 @@ const L2EntryV1Tag = "l2-v1"
 // Status map mirrors what apiref consumers read (`json.Unmarshal(refiltered)["status"]`)
 // — pre-decoded so the read path stays O(1).
 //
-// CONTRACT (load-bearing): downstream readers MUST treat Status as
-// READ-ONLY. The value is shared across goroutines via pointer; mutating
-// it would corrupt cached state. The widget pipeline already passes the
-// status map to gojq read-only; the contract matches existing code.
+// CONTRACT (load-bearing — Q-RBACC-L2-1 architect-review CONCERN-1,
+// 2026-05-05): EVERY field of L2Entry is IMMUTABLE once the entry has
+// been published via SetL2Refilter. Readers obtain the entry via
+// sync.Map.Load and MUST NOT mutate any field — including the Status
+// map and the Refiltered bytes. Writers MUST populate Status at write
+// time (no lazy fill); a nil Status on a hit signals "soft miss, fall
+// through to refilter". The original lazy-fill design opened a data
+// race: two readers observing Status==nil could both Unmarshal and
+// both assign, with no synchronisation on the shared *L2Entry pointer.
+// Fix: Status is computed by the writer and never mutated thereafter.
 type L2Entry struct {
 	Refiltered []byte         // exact bytes the dispatcher writes to wri.Write
 	Status     map[string]any // pre-decoded "status" object for apiref consumers
