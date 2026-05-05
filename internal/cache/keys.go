@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -18,14 +19,60 @@ const (
 	notFoundSentinel = `{"__snowplow_not_found__":true}`
 )
 
+// lastBindingIdentityForUser tracks the most recently observed binding
+// identity per username, used by the binding-identity transition audit
+// emit (Q-RBAC-DECOUPLE C(d) v5 — D3b, audit 2026-05-05).
+//
+// Bounded: one entry per active user (~1000 in production stated scale,
+// ~50K at north-star scale), each entry is a fixed-size string pair
+// (12-char hash + username). Total memory ~50KB-2.5MB. No eviction in v5
+// per Q-RBACC-V5-OQ-2; if 50K-user customers materialize and the map
+// shows up in pprof, add a periodic LRU prune.
+//
+// Exposed as package-private; the transition audit fires from within
+// CacheIdentity itself (the only legitimate writer).
+var lastBindingIdentityForUser sync.Map // map[string]string
+
 // CacheIdentity returns the binding identity from context if available,
 // falling back to the username. This is the cache key component that
 // enables sharing L1 entries across users with identical RBAC bindings.
+//
+// SIDE EFFECT (Q-RBAC-DECOUPLE C(d) v5 — D3b, audit 2026-05-05): when
+// the returned identity differs from the most recently observed identity
+// for the same username, an audit=binding_identity_transition log line
+// is emitted. Used to correlate post-CRB-change MISS bursts with the
+// keyspace flip that caused them. The first observation per username
+// does NOT emit (no transition); only changes do. Empty username is
+// never recorded (avoids polluting the map with empty keys when the
+// caller has no user info).
 func CacheIdentity(ctx context.Context, username string) string {
-	if bid := BindingIdentityFromContext(ctx); bid != "" {
-		return bid
+	bid := BindingIdentityFromContext(ctx)
+	if bid == "" {
+		return username
 	}
-	return username
+	if username != "" {
+		// LoadOrStore returns (existing, true) when a value was already
+		// present, or (input, false) on first insert. We only emit on
+		// transition (existing != bid), and we Store the new value so
+		// subsequent reads see the latest.
+		if prev, loaded := lastBindingIdentityForUser.LoadOrStore(username, bid); loaded {
+			if prevStr, ok := prev.(string); ok && prevStr != bid {
+				lastBindingIdentityForUser.Store(username, bid)
+				emitBindingIdentityTransition(ctx, username, prevStr, bid)
+			}
+		}
+	}
+	return bid
+}
+
+// resetLastBindingIdentityForTest clears the per-username last-identity
+// map. Test-only helper used by binding_identity_transition_test.go to
+// guarantee deterministic state between cases.
+func resetLastBindingIdentityForTest() {
+	lastBindingIdentityForUser.Range(func(k, _ any) bool {
+		lastBindingIdentityForUser.Delete(k)
+		return true
+	})
 }
 
 // MarkL1Ready writes a Unix-epoch timestamp to the L1 ready sentinel key.
