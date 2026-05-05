@@ -202,16 +202,57 @@ func (rw *RBACWatcher) invalidateFromBinding(ctx context.Context, obj any) {
 //     also purges the binding-identity-keyed RBAC hash and L1 resolved index
 //
 // Returns the total number of keys deleted.
+//
+// Q-RBACC-L2-1 architect-review CONCERN-2 (2026-05-05) — ORDERING is
+// load-bearing. apiref reads L2 BEFORE L1 (apiref/resolve.go: L2Get
+// runs before c.GetRaw). If we evicted L1 first, a microsecond
+// window would open where:
+//
+//   1. L1 evicted.
+//   2. Concurrent apiref read finds STALE L2, serves stale bytes
+//      against the OLD binding (G10 violation — cyberjoker post-CRB
+//      sees old-binding refiltered output).
+//   3. L2 evicted (window closes).
+//
+// Fix: evict L2 FIRST, then L1. Concurrent reads see L2 miss → fall
+// through to L1 → if L1 still present, refilter against (still-cached)
+// old wrapper but with the new identity in ctx — which produces the
+// CORRECT new-binding refilter, because RefilterRESTAction recomputes
+// per-user against the cached unfiltered ProtectedDict. Then L1
+// evicts; subsequent reads MISS at L1 too and re-resolve. Either path
+// returns new-binding bytes; no stale-L2 window.
 func (rw *RBACWatcher) purgeUserCacheData(ctx context.Context, username string) int {
 	total := 0
 
-	// Load old identity from cache BEFORE clearing it, so we can purge
-	// stale entries keyed under the previous binding identity.
+	// Phase 1: snapshot identities (no cache mutation yet).
+	//
+	// Load old identity BEFORE clearing the in-memory cache so we can
+	// purge stale entries keyed under the previous binding identity.
+	// Compute new identity ahead of any cache mutation so the L2 evict
+	// step (Phase 2) has the full identity set without ordering hazards.
 	var oldBid string
 	if v, ok := rw.identityCache.Load(username); ok {
 		oldBid = v.(string)
 	}
 	rw.identityCache.Delete(username)
+	newBid := rw.ComputeBindingIdentity(username, nil)
+
+	// Phase 2: evict L2 FIRST (architect CONCERN-2). Order matters
+	// because apiref reads L2 before L1 — flushing L1 first would
+	// expose a stale-L2 read window.
+	//
+	// EvictL2ForIdentity is no-op for unknown identities (the byIdentity
+	// reverse-index lookup misses, returning 0). Safe to call with
+	// empty / unknown values; cheap.
+	if oldBid != "" {
+		_ = EvictL2ForIdentity(ctx, oldBid)
+	}
+	if newBid != "" {
+		_ = EvictL2ForIdentity(ctx, newBid)
+	}
+	_ = EvictL2ForIdentity(ctx, username)
+
+	// Phase 3: evict L1 + RBAC hash entries.
 
 	// Purge username-keyed entries (backward compat / migration).
 	_ = rw.cache.DeleteUserRBAC(ctx, username)
@@ -248,7 +289,6 @@ func (rw *RBACWatcher) purgeUserCacheData(ctx context.Context, username string) 
 	// the new identity. We purge it because the RBAC decisions cached
 	// under the new identity may have been stale (computed before the
 	// binding change propagated).
-	newBid := rw.ComputeBindingIdentity(username, nil)
 	if newBid != "" && newBid != username && newBid != oldBid {
 		_ = rw.cache.DeleteUserRBAC(ctx, newBid)
 		total++
@@ -262,27 +302,6 @@ func (rw *RBACWatcher) purgeUserCacheData(ctx context.Context, username string) 
 			total += len(bidKeys)
 		}
 	}
-
-	// Q-RBACC-L2-1 — evict the L2 post-refilter cache entries pinned to
-	// the affected binding identities. The OLD binding identity is the
-	// one the user's L2 entries were keyed under BEFORE this CRB change
-	// fired; the NEW identity (if it differs) is the one upcoming
-	// requests will use. Both must be cleared so the FIRST
-	// post-transition request returns refilter-against-NEW-binding bytes
-	// (G10), and the OLD identity's tombstoned entries are not served to
-	// any other user that happens to land on the same identity.
-	//
-	// The username-as-fallback case (CacheIdentity returns username when
-	// no bid is in ctx) is also handled: pass `username` so the L2
-	// reverse-index by identity catches it too. evictL2ForIdentity is
-	// no-op for unknown identities (returns 0).
-	if oldBid != "" {
-		_ = EvictL2ForIdentity(ctx, oldBid)
-	}
-	if newBid != "" {
-		_ = EvictL2ForIdentity(ctx, newBid)
-	}
-	_ = EvictL2ForIdentity(ctx, username)
 
 	return total
 }
