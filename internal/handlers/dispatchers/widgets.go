@@ -24,6 +24,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/rest"
 )
 
 var widgetTracer = otel.Tracer("snowplow/dispatchers")
@@ -196,8 +197,21 @@ func resolveWidgetFromObject(ctx context.Context, c cache.Cache, got objects.Res
 	tracker := cache.NewDependencyTracker()
 	tctx := cache.WithDependencyTracker(xcontext.BuildContext(ctx), tracker)
 
+	// Q-RBAC-DECOUPLE C(d) v4 — strictly-additive test-only RC
+	// fallback. Production NEVER sets cache.WithTestRestConfig; the
+	// widget resolver continues to work with opts.RC=nil exactly as
+	// before (ValidateObjectStatus's nil-rc + non-TestMode path falls
+	// back to InClusterConfig). The fallback is reserved for the
+	// §6.5 envtest fixture so it can drive the real widgetsHandler
+	// without an in-cluster SA mount.
+	var resolveRC *rest.Config
+	if rc, ok := cache.TestRestConfigFromContext(ctx).(*rest.Config); ok {
+		resolveRC = rc
+	}
+
 	res, err := widgets.Resolve(tctx, widgets.ResolveOptions{
 		In:      got.Unstructured,
+		RC:      resolveRC,
 		AuthnNS: authnNS,
 		PerPage: perPage,
 		Page:    page,
@@ -236,7 +250,18 @@ func resolveWidgetFromObject(ctx context.Context, c cache.Cache, got objects.Res
 	// Only write deps from the tracker's ResourceRefs that are RESTAction
 	// refs (from apiRef resolution). Container widgets without apiRef
 	// have no RESTAction refs in the tracker, so nothing is registered.
-	if c != nil && resolvedKey != "" {
+	//
+	// Q-RBAC-DECOUPLE C(d) v4 §2.3 (Fix-W) — SKIP the L1 write when the
+	// widget transitively depends on a UAF-protected RESTAction. The
+	// widget body inlines the FIRST resolving user's apiref view; widget
+	// L1 keys are per binding-identity (NOT per-user), so caching the
+	// body would silently leak the first user's RBAC-filtered data to
+	// every other user in the same binding-identity group. Affected
+	// widgets fall through to Path D on every request (per-user
+	// correct). Cascade dep registration + child prewarm are also
+	// skipped because they depend on the L1 key that we did not write.
+	uafSkip := tracker.UAFTouching()
+	if c != nil && resolvedKey != "" && !uafSkip {
 		_ = c.SetResolvedRaw(ctx, resolvedKey, raw)
 		// Touch the key so it starts HOT for refresh priority.
 		if rki, ok := cache.ParseResolvedKey(resolvedKey); ok {
@@ -265,6 +290,9 @@ func resolveWidgetFromObject(ctx context.Context, c cache.Cache, got objects.Res
 		_, preWarmSpan := widgetTracer.Start(ctx, "widget.prewarm_children")
 		preWarmChildWidgets(ctx, c, res, authnNS)
 		preWarmSpan.End()
+	} else if c != nil && resolvedKey != "" && uafSkip {
+		log.Debug("widget L1 write skipped: UAF-touching",
+			slog.String("key", resolvedKey))
 	}
 
 	return &ResolveWidgetResult{Raw: raw, Resolved: res}, nil

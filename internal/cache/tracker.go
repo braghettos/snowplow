@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -20,11 +21,22 @@ type ResourceRef struct {
 // DependencyTracker records the GVRs and specific resources accessed during a
 // single resolution pass. It is safe for concurrent use (inner HTTP fan-out
 // calls run in parallel).
+//
+// Q-RBAC-DECOUPLE C(d) v4 §2.3 (Fix-W) — adds an atomic UAFTouching flag.
+// Set to true by the widget apiref resolver when it observes that the
+// resolved RESTAction CR has at least one api[] entry with UserAccessFilter
+// configured. Read by the widget dispatcher to gate the L1 write: when
+// true, the widget body would inline a per-user-filtered apiref view that
+// must NOT be shared across users in the same binding-identity group, so
+// the L1 write is SKIPPED. atomic.Bool gives us the cheapest read on the
+// hot widget HIT path with zero contention against the AddGVR /
+// AddResource mutex critical section.
 type DependencyTracker struct {
-	mu        sync.Mutex
-	gvrs      map[string]bool
-	resources []ResourceRef
-	resSeen   map[string]bool
+	mu          sync.Mutex
+	gvrs        map[string]bool
+	resources   []ResourceRef
+	resSeen     map[string]bool
+	uafTouching atomic.Bool
 }
 
 func NewDependencyTracker() *DependencyTracker {
@@ -77,6 +89,24 @@ func (t *DependencyTracker) ResourceRefs() []ResourceRef {
 	out := make([]ResourceRef, len(t.resources))
 	copy(out, t.resources)
 	return out
+}
+
+// MarkUAFTouching records that the resolution pass touched (transitively
+// or directly) at least one RESTAction whose api[] declares a
+// UserAccessFilter. The widget dispatcher reads this via UAFTouching()
+// to decide whether to skip the L1 write — see Q-RBAC-DECOUPLE C(d) v4
+// §2.3 (Fix-W for the widget L1 transitive leak).
+//
+// Idempotent: repeated calls are no-ops. Safe for concurrent invocation
+// from multiple apiref resolution goroutines (atomic.Bool.Store).
+func (t *DependencyTracker) MarkUAFTouching() {
+	t.uafTouching.Store(true)
+}
+
+// UAFTouching returns true iff MarkUAFTouching() was invoked at least
+// once during this resolution pass.
+func (t *DependencyTracker) UAFTouching() bool {
+	return t.uafTouching.Load()
 }
 
 func WithDependencyTracker(ctx context.Context, t *DependencyTracker) context.Context {
