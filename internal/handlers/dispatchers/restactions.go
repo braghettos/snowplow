@@ -12,6 +12,7 @@ import (
 	"github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateoplatformops/snowplow/internal/dynamic"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions/l1cache"
@@ -39,18 +40,27 @@ var restactionTracer = otel.Tracer("snowplow/dispatchers")
 // l1cache.Input.SnowplowEndpoint; pass nil when not running in-cluster
 // (userAccessFilter calls will be rejected at the resolver with an explicit
 // log line).
-func RESTAction(snowplowEndpointFn func() (*endpoints.Endpoint, error)) http.Handler {
+//
+// Q-RBAC-DECOUPLE C(d) v6 — Path B (audit 2026-05-04): snowplowK8sClient
+// is the in-cluster dynamic K8s client used for SA dispatch. Replaces
+// httpcall.Do for the SA branch, structurally avoiding plumbing's
+// tlsConfigFor TLS handshake bug. Both fields are nil-safe; the resolver
+// emits a runtime error log if neither is configured but a UAF api[]
+// entry tries to dispatch.
+func RESTAction(snowplowEndpointFn func() (*endpoints.Endpoint, error), snowplowK8sClient dynamic.Client) http.Handler {
 	return &restActionHandler{
-		authnNS:          env.String("AUTHN_NAMESPACE", ""),
-		verbose:          env.True("DEBUG"),
-		snowplowEndpoint: snowplowEndpointFn,
+		authnNS:           env.String("AUTHN_NAMESPACE", ""),
+		verbose:           env.True("DEBUG"),
+		snowplowEndpoint:  snowplowEndpointFn,
+		snowplowK8sClient: snowplowK8sClient,
 	}
 }
 
 type restActionHandler struct {
-	authnNS          string
-	verbose          bool
-	snowplowEndpoint func() (*endpoints.Endpoint, error)
+	authnNS           string
+	verbose           bool
+	snowplowEndpoint  func() (*endpoints.Endpoint, error)
+	snowplowK8sClient dynamic.Client
 }
 
 var _ http.Handler = (*restActionHandler)(nil)
@@ -202,14 +212,15 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		sfCtx = context.WithoutCancel(req.Context())
 	}
 	result, resolveErr := l1cache.ResolveAndCache(sfCtx, l1cache.Input{
-		Cache:            c,
-		Obj:              got.Unstructured.Object,
-		ResolvedKey:      resolvedKey,
-		AuthnNS:          r.authnNS,
-		PerPage:          perPage,
-		Page:             page,
-		Extras:           extras,
-		SnowplowEndpoint: r.snowplowEndpoint,
+		Cache:             c,
+		Obj:               got.Unstructured.Object,
+		ResolvedKey:       resolvedKey,
+		AuthnNS:           r.authnNS,
+		PerPage:           perPage,
+		Page:              page,
+		Extras:            extras,
+		SnowplowEndpoint:  r.snowplowEndpoint,
+		SnowplowK8sClient: r.snowplowK8sClient,
 	})
 	if resolveErr != nil {
 		response.InternalError(wri, resolveErr)
@@ -306,15 +317,21 @@ func (errRefilterMissing) Error() string {
 // during background refresh (the warm cache will only contain entries
 // resolvable without elevated access). Production wiring threads it from
 // MakeL1Refresher / WarmL1FromEntryPoints.
-func ResolveRESTActionBackground(ctx context.Context, c cache.Cache, obj map[string]interface{}, resolvedKey, authnNS string, perPage, page int, snowplowEndpointFn func() (*endpoints.Endpoint, error)) ([]byte, error) {
+//
+// Q-RBAC-DECOUPLE C(d) v6 — Path B: snowplowK8sClient is the in-cluster
+// dynamic client used for SA dispatch. Either field (endpoint or k8s
+// client) is sufficient to enable UAF dispatch — typically both are
+// passed in production wiring.
+func ResolveRESTActionBackground(ctx context.Context, c cache.Cache, obj map[string]interface{}, resolvedKey, authnNS string, perPage, page int, snowplowEndpointFn func() (*endpoints.Endpoint, error), snowplowK8sClient dynamic.Client) ([]byte, error) {
 	result, err := l1cache.ResolveAndCache(ctx, l1cache.Input{
-		Cache:            c,
-		Obj:              obj,
-		ResolvedKey:      resolvedKey,
-		AuthnNS:          authnNS,
-		PerPage:          perPage,
-		Page:             page,
-		SnowplowEndpoint: snowplowEndpointFn,
+		Cache:             c,
+		Obj:               obj,
+		ResolvedKey:       resolvedKey,
+		AuthnNS:           authnNS,
+		PerPage:           perPage,
+		Page:              page,
+		SnowplowEndpoint:  snowplowEndpointFn,
+		SnowplowK8sClient: snowplowK8sClient,
 	})
 	if err != nil {
 		return nil, err

@@ -11,6 +11,7 @@ import (
 	"github.com/krateoplatformops/plumbing/jwtutil"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateoplatformops/snowplow/internal/dynamic"
 	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/observability"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions/l1cache"
@@ -47,7 +48,11 @@ type userContext struct {
 // snowplowEndpointFn is the elevated-call provider for api[] entries that
 // declare userAccessFilter (Q-RBAC-DECOUPLE C(d)). May be nil; that disables
 // elevated dispatch during background refresh.
-func MakeL1Refresher(c cache.Cache, rc *rest.Config, authnNS, signKey string, rbacWatcher *cache.RBACWatcher, snowplowEndpointFn func() (*endpoints.Endpoint, error)) cache.L1RefreshFunc {
+//
+// Q-RBAC-DECOUPLE C(d) v6 — Path B: snowplowK8sClient is the in-cluster
+// dynamic K8s client used for SA dispatch, replacing httpcall.Do for the
+// elevated path. Threaded down to ResolveRESTActionBackground.
+func MakeL1Refresher(c cache.Cache, rc *rest.Config, authnNS, signKey string, rbacWatcher *cache.RBACWatcher, snowplowEndpointFn func() (*endpoints.Endpoint, error), snowplowK8sClient dynamic.Client) cache.L1RefreshFunc {
 	// Q-RBAC-DECOUPLE C(d) v3 — L1 refresh runs under the snowplow
 	// ServiceAccount identity exclusively. Per §4.6 of the v3 spec:
 	// "L1 refresh CAN run under the snowplow SA identity (no userconfig
@@ -130,6 +135,12 @@ func MakeL1Refresher(c cache.Cache, rc *rest.Config, authnNS, signKey string, rb
 				return snowplowEndpointFn()
 			})
 		}
+		// Q-RBAC-DECOUPLE C(d) v6 — Path B: install the dynamic K8s
+		// client so the SA dispatch in api.Resolve uses client-go
+		// directly, bypassing plumbing's TLS handshake bug.
+		if snowplowK8sClient != nil {
+			ctx = cache.WithSnowplowK8s(ctx, snowplowK8sClient)
+		}
 
 		ctx, span := l1RefreshTracer.Start(ctx, "l1.refresh",
 			trace.WithAttributes(
@@ -170,7 +181,7 @@ func MakeL1Refresher(c cache.Cache, rc *rest.Config, authnNS, signKey string, rb
 			}
 
 			for _, k := range keys {
-				ok, cascade := refreshSingleL1(ctx, c, uc.user, uc.endpoint, uc.accessToken, k.info, k.raw, authnNS, snowplowEndpointFn)
+				ok, cascade := refreshSingleL1(ctx, c, uc.user, uc.endpoint, uc.accessToken, k.info, k.raw, authnNS, snowplowEndpointFn, snowplowK8sClient)
 				if ok {
 					totalRefreshed++
 					allCascade = append(allCascade, cascade...)
@@ -222,8 +233,8 @@ func MakeL1Refresher(c cache.Cache, rc *rest.Config, authnNS, signKey string, rb
 //
 // snowplowEndpointFn is forwarded to ResolveRESTActionBackground so api[]
 // entries that declare userAccessFilter resolve correctly during the
-// background refresh path.
-func refreshSingleL1(ctx context.Context, c cache.Cache, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, info cache.ResolvedKeyInfo, rawKey, authnNS string, snowplowEndpointFn func() (*endpoints.Endpoint, error)) (bool, []string) {
+// background refresh path. snowplowK8sClient is the v6 Path B equivalent.
+func refreshSingleL1(ctx context.Context, c cache.Cache, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, info cache.ResolvedKeyInfo, rawKey, authnNS string, snowplowEndpointFn func() (*endpoints.Endpoint, error), snowplowK8sClient dynamic.Client) (bool, []string) {
 	rctx := xcontext.BuildContext(ctx,
 		xcontext.WithUserConfig(ep),
 		xcontext.WithUserInfo(user),
@@ -249,6 +260,11 @@ func refreshSingleL1(ctx context.Context, c cache.Cache, user jwtutil.UserInfo, 
 	// directly into ctx for parity (see MakeL1Refresher.refreshFn).
 	if snEp := cache.SnowplowEndpointFromContext(ctx); snEp != nil {
 		rctx = cache.WithSnowplowEndpoint(rctx, snEp)
+	}
+	// Q-RBAC-DECOUPLE C(d) v6 — Path B: propagate the dynamic K8s client
+	// so nested SA dispatches use client-go (no plumbing TLS bug).
+	if snK8s := cache.SnowplowK8sFromContext(ctx); snK8s != nil {
+		rctx = cache.WithSnowplowK8s(rctx, snK8s)
 	}
 
 	// Propagate DirtySet so nested resolution bypasses stale API result cache.
@@ -327,7 +343,7 @@ func refreshSingleL1(ctx context.Context, c cache.Cache, user jwtutil.UserInfo, 
 		return true, nil
 
 	case info.GVR.Group == templatesGroup && info.GVR.Resource == restactionResource:
-		_, err := ResolveRESTActionBackground(rctx, c, got.Unstructured.Object, rawKey, authnNS, info.PerPage, info.Page, snowplowEndpointFn)
+		_, err := ResolveRESTActionBackground(rctx, c, got.Unstructured.Object, rawKey, authnNS, info.PerPage, info.Page, snowplowEndpointFn, snowplowK8sClient)
 		if err != nil {
 			slog.Info("refreshSingleL1: RESTAction resolve failed",
 				slog.String("key", rawKey), slog.Any("err", err))

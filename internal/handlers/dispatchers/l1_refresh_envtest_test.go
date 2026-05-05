@@ -198,7 +198,7 @@ func TestL1Refresh_SystemIdentity_NonUAF_NoClientConfigError(t *testing.T) {
 	// system-identity check is the load-bearing v4 logic and runs
 	// independently).
 	refresh := MakeL1Refresher(c, &rest.Config{Host: upstream.URL},
-		cr.Namespace, "test-jwt-key", nil, snowplowEndpointFn)
+		cr.Namespace, "test-jwt-key", nil, snowplowEndpointFn, nil)
 
 	// Drive the refresh. Pass our test's rest.Config via the v4 ctx
 	// fallback so api.Resolve's nil-RC guard finds it (production sets

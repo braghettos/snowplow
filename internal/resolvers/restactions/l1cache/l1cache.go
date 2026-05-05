@@ -30,6 +30,7 @@ import (
 	"github.com/krateoplatformops/snowplow/apis"
 	v1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateoplatformops/snowplow/internal/dynamic"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
 	"go.opentelemetry.io/otel"
@@ -92,6 +93,10 @@ type Input struct {
 	// restactions.ResolveOptions and ultimately api.ResolveOptions. nil
 	// is permitted; UserAccessFilter calls will be rejected at runtime.
 	SnowplowEndpoint func() (*endpoints.Endpoint, error)
+
+	// SnowplowK8sClient is the in-cluster dynamic K8s client for SA
+	// dispatch (Q-RBAC-DECOUPLE C(d) v6 — Path B). nil-safe.
+	SnowplowK8sClient dynamic.Client
 }
 
 // Result is what both HTTP and widget callers need from one resolution.
@@ -170,13 +175,14 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 	}
 
 	_, dict, err := restactions.Resolve(tctx, restactions.ResolveOptions{
-		In:               &cr,
-		SArc:             sArc,
-		AuthnNS:          in.AuthnNS,
-		PerPage:          in.PerPage,
-		Page:             in.Page,
-		Extras:           in.Extras,
-		SnowplowEndpoint: in.SnowplowEndpoint,
+		In:                &cr,
+		SArc:              sArc,
+		AuthnNS:           in.AuthnNS,
+		PerPage:           in.PerPage,
+		Page:              in.Page,
+		Extras:            in.Extras,
+		SnowplowEndpoint:  in.SnowplowEndpoint,
+		SnowplowK8sClient: in.SnowplowK8sClient,
 	})
 	if err != nil {
 		log.Error("unable to resolve rest action",

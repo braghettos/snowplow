@@ -17,6 +17,7 @@ import (
 	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/plumbing/jwtutil"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateoplatformops/snowplow/internal/dynamic"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions/l1cache"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -298,8 +299,13 @@ func FilterWidgetGVRs(cfg *cache.WarmupConfig) []schema.GroupVersionResource {
 // snowplowEndpointFn is the elevated-call provider for api[] entries that
 // declare userAccessFilter. Injected into prewarm contexts so the warmup
 // path also resolves cyberjoker-class RESTActions correctly.
+//
+// Q-RBAC-DECOUPLE C(d) v6 — Path B: snowplowK8sClient is the in-cluster
+// dynamic client used for SA dispatch (replaces httpcall.Do for the
+// elevated path). Injected into the warmup ctx so prewarm-time resolution
+// also avoids the plumbing TLS bug.
 func WarmL1FromEntryPoints(ctx context.Context, c cache.Cache, rc *rest.Config,
-	authnNS, signKey string, entryPoints []cache.EntryPoint, rbacWatcher *cache.RBACWatcher, snowplowEndpointFn func() (*endpoints.Endpoint, error)) {
+	authnNS, signKey string, entryPoints []cache.EntryPoint, rbacWatcher *cache.RBACWatcher, snowplowEndpointFn func() (*endpoints.Endpoint, error), snowplowK8sClient dynamic.Client) {
 	log := slog.Default()
 	if len(entryPoints) == 0 || authnNS == "" {
 		log.Info("L1 entry-point warmup: skipped (no entry points or authn namespace)")
@@ -313,6 +319,10 @@ func WarmL1FromEntryPoints(ctx context.Context, c cache.Cache, rc *rest.Config,
 		ctx = cache.WithSnowplowEndpoint(ctx, func() (any, error) {
 			return snowplowEndpointFn()
 		})
+	}
+	// Q-RBAC-DECOUPLE C(d) v6 — Path B install for warmup ctx.
+	if snowplowK8sClient != nil {
+		ctx = cache.WithSnowplowK8s(ctx, snowplowK8sClient)
 	}
 
 	users, err := discoverUsers(ctx, rc, authnNS)
