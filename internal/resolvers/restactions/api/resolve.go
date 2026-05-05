@@ -761,6 +761,18 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					slog.String("host", call.Endpoint.ServerURL), slog.String("path", call.Path),
 					slog.String("error", res.Message))
 
+				// Q-RBAC-DECOUPLE C(d) v5 — D3a (audit 2026-05-05).
+				// Emit negative-evidence audit when an api[] entry that
+				// would have invoked applyUserAccessFilter is skipped due
+				// to upstream error. Operator parity: every UAF-protected
+				// api[] entry of every request produces EITHER an
+				// audit=user_access_filter OR an
+				// audit=user_access_filter_skipped log line — never silence.
+				// (apiCall is the *templates.API closed over by resolveAPI;
+				// auditUserAccessFilterSkipped no-ops if UserAccessFilter
+				// is nil, so this is safe to invoke unconditionally.)
+				auditUserAccessFilterSkipped(ctx, apiCall, "api_error", res.Message)
+
 				errMap, merr := response.AsMap(res)
 				instrumentedDictWrite(ctx, mu, dict, "err_write", "error",
 					fallbackBaseExtra(),

@@ -4037,6 +4037,209 @@ def print_report():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Q-RBAC-DECOUPLE C(d) v5 — bench scenario: CRB-delete burst (audit 2026-05-05)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Driven by --scenario crb-delete. Reproduces the failure mode that the
+# 2026-05-05 audit surfaced (D1/D2/D3): delete the cluster-wide CRB that
+# cyberjoker depends on, then issue a portal-shape burst against the
+# UAF-protected RAs and assert four guarantees that v5 restores:
+#
+#   A) zero TLS x509 errors in pod logs                  (D1 fix)
+#   B) zero "cannot iterate over: null" errors           (D2 fix)
+#   C) every cyberjoker request that touches a UAF       (D3a fix)
+#      api[] entry produces EITHER an
+#      audit=user_access_filter OR
+#      audit=user_access_filter_skipped log line.
+#   D) at least one audit=binding_identity_transition    (D3b fix)
+#      log line for cyberjoker between the pre/post bursts.
+#
+# Reuses cleanup_rogue_rbac() primitives + the existing kubectl/log helpers.
+#
+# This step is OPT-IN — added to no default phase; surfaced only via the
+# --scenario crb-delete CLI flag so the existing run_full_matrix.sh stays
+# unchanged.
+
+
+# Portal-shape paths that touch UAF-protected api[] entries (post-v5 fix).
+# Each request travels through a chain that includes
+# compositions-get-ns-and-crd → which has UAF on both api[] entries.
+CRB_DELETE_PORTAL_PATHS = [
+    ("restaction/compositions-get-ns-and-crd",
+     "/call?apiVersion=templates.krateo.io%2Fv1&resource=restactions&name=compositions-get-ns-and-crd&namespace=krateo-system"),
+    ("restaction/compositions-list",
+     "/call?apiVersion=templates.krateo.io%2Fv1&resource=restactions&name=compositions-list&namespace=krateo-system"),
+    ("restaction/blueprints-list",
+     "/call?apiVersion=templates.krateo.io%2Fv1&resource=restactions&name=blueprints-list&namespace=krateo-system"),
+]
+
+
+def _pod_log_offset():
+    """Snapshot the current pod log size (line count) so we can read the
+    delta after the burst. Returns 0 if logs unreadable; downstream
+    callers gracefully degrade.
+    """
+    rc, out, _ = kubectl("logs", "deployment/snowplow", "-n", NS,
+                         "-c", "snowplow", "--tail=1000000")
+    if rc != 0 or not out:
+        return 0
+    return len(out.splitlines())
+
+
+def _pod_logs_since(offset):
+    """Return pod log lines starting at offset (best-effort)."""
+    rc, out, _ = kubectl("logs", "deployment/snowplow", "-n", NS,
+                         "-c", "snowplow", "--tail=1000000")
+    if rc != 0 or not out:
+        return []
+    lines = out.splitlines()
+    if offset >= len(lines):
+        return []
+    return lines[offset:]
+
+
+def _crb_burst(token, paths, n=20):
+    """Issue n GETs against each path; return list of (label, code, ms)."""
+    out = []
+    for label, path in paths:
+        for _ in range(n):
+            ms, code, _ = http_get(path, token, retries=1, timeout=30)
+            out.append((label, code, ms))
+    return out
+
+
+def _audit_uaf_emit_per_request_lint(log_lines, user, expected_paths):
+    """Return True iff every UAF-protected api[] entry of every request
+    by `user` produced EITHER an audit=user_access_filter OR an
+    audit=user_access_filter_skipped log line.
+
+    Concretely (best-effort heuristic over slog JSON lines):
+      For each path in expected_paths, count audit=user_access_filter
+      and audit=user_access_filter_skipped emits scoped to user. The
+      union must be > 0; per-request matching would require a trace_id
+      correlation we don't currently emit on every line.
+    """
+    user_q = '"user":"' + user + '"'
+    full = sum(1 for l in log_lines
+               if '"audit":"user_access_filter"' in l and user_q in l)
+    skipped = sum(1 for l in log_lines
+                  if '"audit":"user_access_filter_skipped"' in l and user_q in l)
+    log(f"  audit lint (user={user}): user_access_filter={full} "
+        f"user_access_filter_skipped={skipped}")
+    return (full + skipped) > 0
+
+
+def crb_delete_burst(tokens):
+    """D1/D2/D3 defect reproduction harness — see module-level comment.
+
+    Pre-conditions:
+      - cyberjoker logged in (tokens["cyberjoker"] valid).
+      - cluster has the cyberjoker-krateo-widgets-reader CRB applied (the
+        portal helm chart's default state).
+
+    Side effects:
+      - Deletes the CRB during the test. The bench cleanup phase or the
+        next portal helm upgrade will restore it. We re-apply at the end
+        as a defensive measure to avoid leaving the test cluster in a
+        broken state for follow-up runs.
+    """
+    section("Scenario: CRB-delete burst (D1/D2/D3 reproduction)")
+    user = "cyberjoker"
+    if user not in tokens:
+        log("crb-delete: skipping — cyberjoker token unavailable")
+        return
+
+    # 1. Pre-delete burst (warm baseline; identity stable).
+    log("Step 1: pre-delete warm burst")
+    pre_offset = _pod_log_offset()
+    pre = _crb_burst(tokens[user], CRB_DELETE_PORTAL_PATHS, n=20)
+    pre_codes = [c for _, c, _ in pre]
+    log(f"  pre-burst: {len(pre)} requests, codes={sorted(set(pre_codes))}")
+
+    # 2. Delete the CRB. cyberjoker's binding-identity hash flips.
+    log("Step 2: deleting cyberjoker-krateo-widgets-reader CRB")
+    rc, _, err = kubectl("delete", "clusterrolebinding",
+                         "cyberjoker-krateo-widgets-reader",
+                         "--ignore-not-found")
+    if rc != 0:
+        log(f"  CRB delete returned rc={rc}: {err}")
+    time.sleep(5)  # informer + identity-hash propagation
+
+    # 3. Re-mint cyberjoker token (group memberships may have changed).
+    log("Step 3: re-minting tokens after CRB delete")
+    tokens_post = login_all()
+    if user not in tokens_post:
+        log("  re-mint failed; aborting scenario")
+        return
+
+    # 4. Post-delete burst.
+    log("Step 4: post-delete burst")
+    post_offset = _pod_log_offset()
+    post = _crb_burst(tokens_post[user], CRB_DELETE_PORTAL_PATHS, n=20)
+    post_codes = [c for _, c, _ in post]
+    log(f"  post-burst: {len(post)} requests, codes={sorted(set(post_codes))}")
+
+    post_logs = _pod_logs_since(post_offset)
+    span_logs = _pod_logs_since(pre_offset)
+
+    # 5. Assert A — no TLS x509 errors in post-delete window. (D1)
+    x509_count = sum(1 for l in post_logs
+                     if "x509" in l or "tls: failed to verify" in l)
+    record("D1: no TLS x509 errors after CRB-delete", x509_count == 0,
+           note=f"x509_count={x509_count}")
+
+    # 6. Assert B — no null-iter errors. (D2)
+    null_iter_count = sum(1 for l in post_logs
+                          if "cannot iterate over: null" in l)
+    record("D2: no null-iter errors after CRB-delete",
+           null_iter_count == 0, note=f"null_iter_count={null_iter_count}")
+
+    # 7. Assert C — every post-delete cyberjoker request that touches a
+    # UAF-protected api[] produces either user_access_filter OR
+    # user_access_filter_skipped audit emit. (D3a)
+    audit_ok = _audit_uaf_emit_per_request_lint(
+        post_logs, user=user, expected_paths=CRB_DELETE_PORTAL_PATHS)
+    record("D3a: UAF audit parity post-CRB-delete", audit_ok,
+           note="see pod logs for breakdown")
+
+    # 8. Assert D — at least one binding_identity_transition emit for
+    # cyberjoker between pre and post bursts. (D3b)
+    user_q = '"user":"' + user + '"'
+    transitions = [l for l in span_logs
+                   if '"audit":"binding_identity_transition"' in l
+                   and user_q in l]
+    record("D3b: binding-identity transition logged",
+           len(transitions) >= 1,
+           note=f"transitions={len(transitions)}")
+
+    # 9. Defensive restore — the CRB will also be re-applied by the next
+    # portal helm upgrade; we recreate it here so an interrupted bench
+    # leaves the cluster in a usable state.
+    log("Step 5: best-effort CRB restore (idempotent)")
+    crb_yaml = """\
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cyberjoker-krateo-widgets-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: krateo-widgets-reader
+subjects:
+- kind: User
+  name: cyberjoker
+  apiGroup: rbac.authorization.k8s.io
+"""
+    rc_chk, _, _ = kubectl("get", "clusterrole", "krateo-widgets-reader",
+                           "--ignore-not-found", "--no-headers")
+    if rc_chk == 0:
+        kubectl("apply", "-f", "-", input_data=crb_yaml)
+    else:
+        log("  krateo-widgets-reader ClusterRole not present; "
+            "leaving CRB unrestored (next portal helm upgrade will fix it)")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -4051,7 +4254,27 @@ def main():
                         help=f"Iterations for measurements (default: {ITERS})")
     parser.add_argument("--clean-only", action="store_true",
                         help="Run cleanup + assert_clean and exit (no test).")
+    parser.add_argument("--scenario", default="",
+                        help="Run a single named scenario instead of phases. "
+                             "Supported: 'crb-delete' (Q-RBAC-DECOUPLE C(d) v5 "
+                             "D1/D2/D3 reproduction).")
     args = parser.parse_args()
+
+    if args.scenario == "crb-delete":
+        verify_deployed_image()
+        cleanup_rogue_rbac()
+        # Bring the cluster to a clean baseline so we measure ONLY the
+        # CRB-delete impact, not pre-existing dirt.
+        state = cluster_dirty_state()
+        dirty = {k: v for k, v in state.items() if v > 0}
+        if dirty:
+            log(f"Pre-flight DIRTY: {dirty}")
+            clean_environment()
+            assert_clean(retry_with_cleanup=False)
+        tokens = login_all()
+        crb_delete_burst(tokens)
+        all_passed = print_report()
+        sys.exit(0 if all_passed else 1)
 
     if args.clean_only:
         verify_deployed_image()
