@@ -274,6 +274,25 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 		}
 	}
 
+	// Q-RBACC-L2-1 — populate the post-refilter L2 cache. Identity is
+	// the L1 key prefix (so prewarm, dispatcher MISS, apiref MISS all
+	// benefit identically). Groups hash is derived from the ctx
+	// UserInfo if present; otherwise we write under "no_groups" which
+	// matches the singleflight key convention used by
+	// RefilterRESTActionDeduped (so the dispatcher's L2-read uses the
+	// same hash). If UserInfo is missing entirely (unit-test path), we
+	// skip L2 — the L1-HIT branch will compute and cache on the next
+	// real request.
+	if in.Cache != nil && in.ResolvedKey != "" && len(refiltered) > 0 {
+		if rki, ok := cache.ParseResolvedKey(in.ResolvedKey); ok {
+			groupsHash := "no_groups"
+			if user, uerr := xcontext.UserInfo(ctx); uerr == nil {
+				groupsHash = cache.HashGroups(user.Groups)
+			}
+			cache.L2Put(in.ResolvedKey, rki.Username, groupsHash, refiltered, status, false, "v3", len(raw))
+		}
+	}
+
 	// Diagnostic for S7: log item count for list-type RESTActions (e.g.
 	// compositions-list). The JQ filter produces {"list": [...items...]},
 	// so status["list"] is the array. This lets us see whether a delete

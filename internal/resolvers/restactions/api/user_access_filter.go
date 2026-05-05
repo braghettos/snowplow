@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
@@ -13,6 +14,20 @@ import (
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
+
+// uafYieldEvery controls the cadence at which applyUserAccessFilter
+// releases its P back to the runtime (Q-RBACC-L2-1, OQ-6). The 50K-item
+// cyberjoker × compositions-panels refilter walks one tight loop with
+// per-item gojq Eval + per-item EvaluateRBAC; without yield, that loop
+// can hold a P through 30+ liveness probe windows on a freshly-restarted
+// pod and trip the SIGKILL pattern that killed v6 phase-6.
+//
+// 1024 chosen as a power-of-2 tradeoff: at 50K items the loop yields ~50
+// times (~2 µs per yield → ~100 µs total overhead, < 0.1% of refilter
+// wall). Generic yield discipline; not a refilter-specific behaviour
+// optimization. feedback_no_special_cases.md honoured: applies uniformly
+// to every applyUserAccessFilter caller, no per-RA / per-user branches.
+const uafYieldEvery = 1024
 
 // applyUserAccessFilter drops items from `computed` for which the requesting
 // user lacks the RBAC permission declared in apiCall.UserAccessFilter.
@@ -109,7 +124,15 @@ func applyUserAccessFilter(ctx context.Context, apiCall *templates.API, computed
 	nsFrom := ptr.Deref(f.NamespaceFrom, "")
 
 	out := make([]any, 0, len(items))
-	for _, item := range items {
+	for i, item := range items {
+		// Q-RBACC-L2-1, OQ-6 — yield discipline. Release the P every
+		// uafYieldEvery items so the liveness probe goroutine can run
+		// during a long refilter pass over a 50K-item input. Without
+		// this, the v6-phase-6 panels SIGKILL recurs on prewarm-time
+		// admin × compositions-panels refilter (40 MB body, ~10 s wall).
+		if i > 0 && i%uafYieldEvery == 0 {
+			runtime.Gosched()
+		}
 		ns := ""
 		if nsFrom != "" {
 			// gojq-purity-required: item came from JQ filter output via
