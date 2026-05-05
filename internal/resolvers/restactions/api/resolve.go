@@ -249,10 +249,22 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		//   the projected SA token is re-read on every call.
 		// - EndpointRef wins (operator escape hatch). The filter still
 		//   applies to the response if userAccessFilter is set.
+		// - Q-RBAC-DECOUPLE C(d) v4 §2.2 (Fix-3a) — system-identity ctx
+		//   (set by MakeL1Refresher) → snowplow-SA dispatch for ALL api
+		//   entries, regardless of UserAccessFilter. Reason: the per-user
+		//   clientconfig fallback below would attempt to load a Secret
+		//   named after the synthesized SA identity (which doesn't exist)
+		//   and ERROR out — Q-RBACC-DEFECT-3. The flag is set ONLY in
+		//   MakeL1Refresher's closure; real-user contexts never set it,
+		//   so the user-clientconfig path is preserved for HTTP requests.
 		// - Otherwise: the original mapper handles the user-secret /
 		//   internal-clientconfig lookup unchanged.
 		var ep endpoints.Endpoint
-		if apiCall.UserAccessFilter != nil && apiCall.EndpointRef == nil {
+		useSystemEndpoint := apiCall.UserAccessFilter != nil && apiCall.EndpointRef == nil
+		if !useSystemEndpoint && apiCall.EndpointRef == nil && cache.IsSystemIdentity(ctx) {
+			useSystemEndpoint = true
+		}
+		if useSystemEndpoint {
 			// Resolve the snowplow-SA endpoint provider. opts.SnowplowEndpoint
 			// (set explicitly by the dispatcher constructors per Q-RBACC-IMPL-7)
 			// wins; otherwise fall back to the context-stored provider that

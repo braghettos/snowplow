@@ -299,3 +299,77 @@ func BindingIdentityFromContext(ctx context.Context) string {
 	id, _ := ctx.Value(bindingIdentityKey{}).(string)
 	return id
 }
+
+// systemIdentityKey is the context key that flags a context as carrying a
+// synthesized system identity (today: the snowplow ServiceAccount used by
+// the L1 refresh path). Q-RBAC-DECOUPLE C(d) v4 §2.2 (Fix-3a for
+// Q-RBACC-DEFECT-3).
+type systemIdentityKey struct{}
+
+// WithSystemIdentity marks ctx as carrying a synthesized system identity
+// (e.g., the snowplow ServiceAccount built by MakeL1Refresher). The api
+// dispatch fork at internal/resolvers/restactions/api/resolve.go uses
+// this to route ALL api[] entries through the snowplow elevated endpoint
+// regardless of UserAccessFilter — because the per-user clientconfig
+// fallback at internal/resolvers/restactions/endpoints/endpoints.go
+// cannot resolve a Secret named after the synthesized SA identity (which
+// would attempt `systemserviceaccountkrateo-systemsnowplow-clientconfig`
+// — a non-existent Secret — and ERROR out).
+//
+// SECURITY (NON-NEGOTIABLE per spec §11 rule 2): this flag is RESERVED
+// for the L1 refresh path (and any future system-only resolver path).
+// It MUST NEVER be set on contexts that carry a real user identity.
+// Doing so would route real-user traffic through the snowplow SA token
+// — equivalent to bypassing per-user clientconfig and silently elevating
+// every request to cluster-admin equivalence. The §6.8 negative test
+// (restactions_systemidentity_negative_test.go) asserts the invariant.
+func WithSystemIdentity(ctx context.Context) context.Context {
+	return context.WithValue(ctx, systemIdentityKey{}, true)
+}
+
+// IsSystemIdentity returns true iff WithSystemIdentity was set on ctx.
+// Single read site today: the dispatch-fork predicate in
+// internal/resolvers/restactions/api/resolve.go.
+func IsSystemIdentity(ctx context.Context) bool {
+	v, _ := ctx.Value(systemIdentityKey{}).(bool)
+	return v
+}
+
+// testRestConfigKey is a TEST-ONLY context key used by the v4 envtest
+// fixtures (Q-RBAC-DECOUPLE C(d) v4 §6.4 - §6.6) to inject a stub
+// rest.Config so the api.Resolve `if opts.RC == nil` early guard does
+// not try (and fail) to call rest.InClusterConfig() outside an
+// in-cluster environment.
+//
+// PRODUCTION CALLERS: zero. This key is set ONLY by *_test.go files
+// in internal/handlers/dispatchers/. Production wiring relies on the
+// dispatcher's l1cache.Input.SArc being nil and the resolver falling
+// back to rest.InClusterConfig(), exactly as it does today. Reading
+// the key as an additive fallback inside l1cache.ResolveAndCache keeps
+// the change strictly additive — the production execution path is
+// bit-for-bit identical with the v3 baseline.
+//
+// Why this is acceptable scaffolding under the v4 spec §11 (no out-of-
+// scope refactor): the §6.4 envtest is load-bearing — the architect's
+// §6.10 lesson is that dispatcher-level invariants MUST be exercised
+// via the real handler. Without an SArc injection the real handler
+// cannot run outside a kubelet-mounted SA pod, defeating §6.4's intent.
+type testRestConfigKey struct{}
+
+// WithTestRestConfig is a TEST-ONLY helper. The value type is `any`
+// to avoid a cache→client-go import cycle; callers pass *rest.Config
+// and l1cache asserts the type back at the read site.
+func WithTestRestConfig(ctx context.Context, rc any) context.Context {
+	if rc == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, testRestConfigKey{}, rc)
+}
+
+// TestRestConfigFromContext returns the test-injected rest.Config (as
+// `any`) or nil. Read by l1cache.ResolveAndCache as an additive
+// fallback when in.SArc is nil — does NOT change production behavior
+// because production never calls WithTestRestConfig.
+func TestRestConfigFromContext(ctx context.Context) any {
+	return ctx.Value(testRestConfigKey{})
+}
