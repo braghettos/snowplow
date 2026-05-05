@@ -248,7 +248,8 @@ func (rw *RBACWatcher) purgeUserCacheData(ctx context.Context, username string) 
 	// the new identity. We purge it because the RBAC decisions cached
 	// under the new identity may have been stale (computed before the
 	// binding change propagated).
-	if newBid := rw.ComputeBindingIdentity(username, nil); newBid != "" && newBid != username && newBid != oldBid {
+	newBid := rw.ComputeBindingIdentity(username, nil)
+	if newBid != "" && newBid != username && newBid != oldBid {
 		_ = rw.cache.DeleteUserRBAC(ctx, newBid)
 		total++
 		bidIdx := UserResolvedIndexKey(newBid)
@@ -261,6 +262,27 @@ func (rw *RBACWatcher) purgeUserCacheData(ctx context.Context, username string) 
 			total += len(bidKeys)
 		}
 	}
+
+	// Q-RBACC-L2-1 — evict the L2 post-refilter cache entries pinned to
+	// the affected binding identities. The OLD binding identity is the
+	// one the user's L2 entries were keyed under BEFORE this CRB change
+	// fired; the NEW identity (if it differs) is the one upcoming
+	// requests will use. Both must be cleared so the FIRST
+	// post-transition request returns refilter-against-NEW-binding bytes
+	// (G10), and the OLD identity's tombstoned entries are not served to
+	// any other user that happens to land on the same identity.
+	//
+	// The username-as-fallback case (CacheIdentity returns username when
+	// no bid is in ctx) is also handled: pass `username` so the L2
+	// reverse-index by identity catches it too. evictL2ForIdentity is
+	// no-op for unknown identities (returns 0).
+	if oldBid != "" {
+		_ = EvictL2ForIdentity(ctx, oldBid)
+	}
+	if newBid != "" {
+		_ = EvictL2ForIdentity(ctx, newBid)
+	}
+	_ = EvictL2ForIdentity(ctx, username)
 
 	return total
 }

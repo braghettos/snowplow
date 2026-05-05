@@ -854,6 +854,53 @@ func (rw *ResourceWatcher) triggerL1RefreshBatch(ctx context.Context, events []l
 	if (hasDelete || hasAdd) && len(apiResultKeys) > 0 {
 		_ = rw.cache.Delete(ctx, apiResultKeys...)
 	}
+
+	// Q-RBACC-L2-1 — DELETE-driven L2 eviction. Per
+	// feedback_l1_invalidation_delete_only.md, L2 evicts ONLY on K8s
+	// DELETE events (the same rule that gates L1 outer-key deletion);
+	// UPDATE/PATCH stays SWR. We collect the L1-resolved keys touched
+	// by THIS batch and pass them to EvictL2ForL1Keys. Reverse-index
+	// keeps the eviction O(K) where K is the # of L2 entries pinned to
+	// these L1 keys (typically ≤ 50).
+	//
+	// NOTE: this fires on hasDelete only (not hasAdd); ADD events do
+	// NOT evict L2 — the L1 entry is refreshed in place and the prior
+	// L2 entry remains valid until L1 raw bytes change (next time the
+	// dispatcher computes a refilter, the new L1 wrapper produces a
+	// distinct entry that overwrites the L2 slot). This matches the
+	// stale-while-revalidate invariant.
+	if hasDelete && L2Enabled() {
+		l1Keys := make([]string, 0, len(allKeys))
+		for k := range allKeys {
+			if !IsAPIResultKey(k) {
+				l1Keys = append(l1Keys, k)
+			}
+		}
+		if len(l1Keys) > 0 {
+			_ = EvictL2ForL1Keys(ctx, l1Keys)
+		}
+	}
+
+	// Q-RBACC-L2-1 — RESTAction-CR-change L2 eviction. The L2 entry is
+	// the function of (L1 wrapper, identity, groups). When the RESTAction
+	// CR itself mutates (filter expression or api[] block change), the
+	// cached refilter bytes are invalid even though the l1Key has not
+	// changed. Per spec §2.2 row 4, evict L2 entries by (gvr, name) on
+	// ANY event affecting a RESTAction CR. The byGVRName reverse index
+	// holds only RESTAction-output entries (gvrNameFromL1Key derives from
+	// L1 keys, which today come exclusively from the RESTAction
+	// dispatcher and the apiref widget consumer); other GVRs result in a
+	// no-op lookup. NO hardcoded GVR strings — feedback_no_special_cases.md
+	// honored.
+	if L2Enabled() {
+		for _, evt := range events {
+			if evt.eventType == "delete" || evt.name == "" {
+				continue
+			}
+			_ = EvictL2ForRESTAction(ctx, evt.gvrKey, evt.name)
+		}
+	}
+
 	hotKeys = filterResolved(hotKeys)
 	warmKeys = filterResolved(warmKeys)
 	coldKeys = filterResolved(coldKeys)

@@ -57,6 +57,19 @@ type Metrics struct {
 	WatchEventsUpdate          atomic.Int64
 	WatchEventsDelete          atomic.Int64
 	WatchEventsDeleteTombstone atomic.Int64
+
+	// ── L2 post-refilter cache (Q-RBACC-L2-1) ────────────────────────────
+	// Counters surface at /metrics/runtime under l2_* keys. Hit-rate is
+	// computed by the snapshot consumer.
+	L2Hits               atomic.Int64
+	L2Misses             atomic.Int64
+	L2Writes             atomic.Int64
+	L2SkippedHighRatio   atomic.Int64
+	L2SkippedSizeCap     atomic.Int64
+	L2EvictionsL1Delete  atomic.Int64
+	L2EvictionsIdentity  atomic.Int64
+	L2EvictionsRA        atomic.Int64
+	L2EvictionsTotal     atomic.Int64
 }
 
 // Inc atomically increments the given counter and updates the OTel metric.
@@ -104,6 +117,22 @@ type MetricsSnapshot struct {
 	WatchEventsUpdate          int64 `json:"watch_events_update"`
 	WatchEventsDelete          int64 `json:"watch_events_delete"`
 	WatchEventsDeleteTombstone int64 `json:"watch_events_delete_tombstone"`
+
+	// L2 post-refilter cache (Q-RBACC-L2-1). HitRate is computed in the
+	// snapshot for parity with L1. ResidentBytes/Count are sampled once
+	// per snapshot from the live counters.
+	L2Hits              int64   `json:"l2_hits"`
+	L2Misses            int64   `json:"l2_misses"`
+	L2Writes            int64   `json:"l2_writes"`
+	L2SkippedHighRatio  int64   `json:"l2_skipped_high_ratio"`
+	L2SkippedSizeCap    int64   `json:"l2_skipped_size_cap"`
+	L2EvictionsL1Delete int64   `json:"l2_evictions_l1_delete"`
+	L2EvictionsIdentity int64   `json:"l2_evictions_identity"`
+	L2EvictionsRA       int64   `json:"l2_evictions_ra"`
+	L2EvictionsTotal    int64   `json:"l2_evictions_total"`
+	L2HitRate           float64 `json:"l2_hit_rate"`
+	L2ResidentBytes     int64   `json:"l2_resident_bytes"`
+	L2ResidentCount     int64   `json:"l2_resident_count"`
 }
 
 var GlobalMetrics = &Metrics{}
@@ -144,11 +173,24 @@ func (m *Metrics) snapshotFromAtomics() MetricsSnapshot {
 		WatchEventsUpdate:          m.WatchEventsUpdate.Load(),
 		WatchEventsDelete:          m.WatchEventsDelete.Load(),
 		WatchEventsDeleteTombstone: m.WatchEventsDeleteTombstone.Load(),
+
+		L2Hits:              m.L2Hits.Load(),
+		L2Misses:            m.L2Misses.Load(),
+		L2Writes:            m.L2Writes.Load(),
+		L2SkippedHighRatio:  m.L2SkippedHighRatio.Load(),
+		L2SkippedSizeCap:    m.L2SkippedSizeCap.Load(),
+		L2EvictionsL1Delete: m.L2EvictionsL1Delete.Load(),
+		L2EvictionsIdentity: m.L2EvictionsIdentity.Load(),
+		L2EvictionsRA:       m.L2EvictionsRA.Load(),
+		L2EvictionsTotal:    m.L2EvictionsTotal.Load(),
+		L2ResidentBytes:     L2ResidentBytes(),
+		L2ResidentCount:     L2ResidentCount(),
 	}
 	s.GetHitRate = hitRate(s.GetHits, s.GetMisses)
 	s.ListHitRate = hitRate(s.ListHits, s.ListMisses)
 	s.RBACHitRate = hitRate(s.RBACHits, s.RBACMisses)
 	s.L1HitRate = hitRate(s.L1Hits, s.L1Misses)
+	s.L2HitRate = hitRate(s.L2Hits, s.L2Misses)
 	if sampled := m.ClusterDepSampledKeys.Load(); sampled > 0 {
 		s.ClusterDepSetSizeAvg = float64(m.ClusterDepSetSizeSumLast.Load()) / float64(sampled)
 	}
