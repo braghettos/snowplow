@@ -219,7 +219,27 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		response.InternalError(wri, errEmptyResolveResult)
 		return
 	}
-	raw := result.Raw
+
+	// Q-RBAC-DECOUPLE C(d) v4 §2.1 (Fix-2b) — TRUST BOUNDARY:
+	// `cacheBody` (formerly `raw`) is the v3 wrapper held in L1; it
+	// carries the UNFILTERED ProtectedDict and MUST NEVER be written to
+	// the HTTP response. The HTTP response sink is `result.Refiltered`,
+	// which holds the per-user-refiltered CR JSON computed inside
+	// l1cache.ResolveAndCache. Renamed for clarity so a future reviewer
+	// cannot accidentally route the wrong field to wri.Write.
+	cacheBody := result.Raw
+	_ = cacheBody // referenced only by the cache write inside ResolveAndCache; kept as a named binding for grep/audit visibility.
+
+	if result.Refiltered == nil {
+		// Refilter failed inside ResolveAndCache (it logged the cause).
+		// FAIL-CLOSED: do NOT serve `cacheBody` — that would re-introduce
+		// Q-RBACC-DEFECT-2 (silent RBAC leak on cache MISS).
+		log.Error("RESTAction MISS: refilter unavailable; refusing to serve unfiltered wrapper",
+			slog.String("key", resolvedKey))
+		response.InternalError(wri, errRefilterMissingOnMiss)
+		return
+	}
+	body := result.Refiltered
 
 	// Touch the key so it starts HOT for refresh priority.
 	if resolvedKey != "" {
@@ -242,9 +262,9 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		trace.WithAttributes(
 			attribute.Bool("cache.hit", false),
 			attribute.String("path", pathAttr),
-			attribute.Int("http.response.body.size", len(raw)),
+			attribute.Int("http.response.body.size", len(body)),
 		))
-	_, _ = wri.Write(raw)
+	_, _ = wri.Write(body)
 	writeSpan.End()
 }
 
@@ -258,6 +278,20 @@ type errEmptyResolve struct{}
 
 func (errEmptyResolve) Error() string {
 	return "l1cache.ResolveAndCache returned empty result with no error"
+}
+
+// errRefilterMissingOnMiss indicates the dispatcher MISS path observed
+// `result.Refiltered == nil` after l1cache.ResolveAndCache returned
+// successfully — the refilter call inside ResolveAndCache failed (logged
+// at WARN), and FAIL-CLOSED demands HTTP 500 instead of serving the
+// unfiltered wrapper. Q-RBAC-DECOUPLE C(d) v4 §2.1 (Fix-2b for
+// Q-RBACC-DEFECT-2).
+var errRefilterMissingOnMiss = errRefilterMissing{}
+
+type errRefilterMissing struct{}
+
+func (errRefilterMissing) Error() string {
+	return "l1cache.ResolveAndCache produced no refiltered bytes (refilter error); refusing to serve unfiltered wrapper"
 }
 
 // ResolveRESTActionBackground is the entry point for the L1 refresh
