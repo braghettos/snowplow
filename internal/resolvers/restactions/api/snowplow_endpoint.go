@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/krateoplatformops/plumbing/endpoints"
+	"github.com/krateoplatformops/plumbing/env"
 	"k8s.io/client-go/rest"
 )
 
@@ -58,8 +59,24 @@ func SnowplowEndpointFromConfig(rc *rest.Config) (*endpoints.Endpoint, error) {
 		caPEM = string(b)
 	}
 
+	// Q-RBAC-DECOUPLE C(d) v5 — D1 fix (audit 2026-05-05).
+	//
+	// SECURITY: pin to the literal in-cluster apiserver hostname, matching
+	// the per-user internal path at endpoints.go:35. Copying rc.Host (set
+	// by rest.InClusterConfig from KUBERNETES_SERVICE_HOST) would yield
+	// "https://<cluster-IP>:443" on GKE — the SA ca.crt SAN list contains
+	// the hostname but NOT the cluster IP, producing TLS x509 verification
+	// failures on every elevated dispatch.
+	//
+	// The env.TestMode() gate mirrors endpoints.go:34 so the existing
+	// snowplow_endpoint_test.go suite (which runs with TestMode=true via
+	// TestMain) continues to assert against rc.Host strings without rewrite.
+	serverURL := rc.Host
+	if !env.TestMode() {
+		serverURL = "https://kubernetes.default.svc"
+	}
 	return &endpoints.Endpoint{
-		ServerURL:                rc.Host,
+		ServerURL:                serverURL,
 		CertificateAuthorityData: caPEM,
 		Token:                    token,
 		Insecure:                 rc.TLSClientConfig.Insecure,

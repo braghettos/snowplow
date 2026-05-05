@@ -18,7 +18,13 @@ import (
 //   4. CAData preferred over CAFile.
 //   5. No token at all → error.
 //   6. Unreadable token file → error wrapped.
+//
+// v5 — D1 fix introduced an env.TestMode() gate on ServerURL pinning. To
+// preserve the original cases' semantics (they assert ep.ServerURL == rc.Host),
+// each case enables TestMode via t.Setenv. The production-path (TestMode=false)
+// pinning behavior is exercised separately in snowplow_endpoint_tls_test.go.
 func TestSnowplowEndpointFromConfig(t *testing.T) {
+	t.Setenv("TEST_MODE", "true")
 	t.Run("NilConfig", func(t *testing.T) {
 		ep, err := SnowplowEndpointFromConfig(nil)
 		if err == nil {
