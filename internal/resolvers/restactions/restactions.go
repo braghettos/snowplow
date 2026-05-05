@@ -12,6 +12,7 @@ import (
 	"github.com/krateoplatformops/plumbing/ptr"
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateoplatformops/snowplow/internal/dynamic"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
 
@@ -43,6 +44,13 @@ type ResolveOptions struct {
 	// through l1cache.Input from the dispatcher constructors.
 	// See api.ResolveOptions.SnowplowEndpoint for the contract.
 	SnowplowEndpoint func() (*endpoints.Endpoint, error)
+
+	// SnowplowK8sClient is the in-cluster dynamic K8s client used by the
+	// SA-elevated dispatch path (Q-RBAC-DECOUPLE C(d) v6 — Path B).
+	// Replaces httpcall.Do for SA dispatch, structurally avoiding
+	// plumbing's tlsConfigFor bug. nil-safe: api.Resolve falls back to
+	// cache.SnowplowK8sFromContext(ctx) before erroring.
+	SnowplowK8sClient dynamic.Client
 }
 
 // Resolve runs the per-api fan-out (api.Resolve) and the outer JQ filter,
@@ -69,14 +77,15 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, m
 
 	_, apiSpan := restactionResolveTracer.Start(ctx, "restaction.api_resolve")
 	dict := api.Resolve(ctx, api.ResolveOptions{
-		RC:               opts.SArc,
-		AuthnNS:          opts.AuthnNS,
-		Verbose:          isVerbose(opts.In),
-		Items:            opts.In.Spec.API,
-		PerPage:          opts.PerPage,
-		Page:             opts.Page,
-		Extras:           opts.Extras,
-		SnowplowEndpoint: opts.SnowplowEndpoint,
+		RC:                opts.SArc,
+		AuthnNS:           opts.AuthnNS,
+		Verbose:           isVerbose(opts.In),
+		Items:             opts.In.Spec.API,
+		PerPage:           opts.PerPage,
+		Page:              opts.Page,
+		Extras:            opts.Extras,
+		SnowplowEndpoint:  opts.SnowplowEndpoint,
+		SnowplowK8sClient: opts.SnowplowK8sClient,
 	})
 	if dict == nil {
 		dict = map[string]any{}

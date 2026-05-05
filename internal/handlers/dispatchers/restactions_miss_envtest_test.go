@@ -207,7 +207,7 @@ func newMissTestEnv(t *testing.T, namespacesInUpstream []string) *missTestEnv {
 	}
 
 	authnNS := "krateo-system"
-	handler := RESTAction(snowplowEndpointFn)
+	handler := RESTAction(snowplowEndpointFn, nil)
 
 	// Per-request middleware: install ctx values that production
 	// middleware would. Reads (user, rbac) from request headers so each

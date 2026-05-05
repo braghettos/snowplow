@@ -26,6 +26,7 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateoplatformops/snowplow/internal/dynamic"
 	"github.com/krateoplatformops/snowplow/internal/handlers"
 	"github.com/krateoplatformops/snowplow/internal/observability"
 	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
@@ -221,6 +222,33 @@ func main() {
 		log.Warn("no in-cluster config; userAccessFilter calls will be rejected at runtime")
 	}
 
+	// Q-RBAC-DECOUPLE C(d) v6 — Path B (audit 2026-05-04). Build the
+	// in-cluster dynamic K8s client once at startup. The SA dispatch path
+	// in api.Resolve uses this client (via cache.SnowplowK8sFromContext)
+	// instead of httpcall.Do, structurally bypassing plumbing's
+	// tlsConfigFor bug that silently dropped CertificateAuthorityData on
+	// token-auth endpoints (the v5 D1 defect that left every SA dispatch
+	// failing x509: certificate signed by unknown authority).
+	//
+	// Construction-failure is non-fatal here: the v5 SnowplowEndpoint
+	// path stays available as a defense-in-depth fallback (it's broken
+	// for SA dispatch, but UAF api[] entries with EndpointRef set still
+	// flow through it). Production wiring expects sarc != nil and
+	// dynamic.NewClient to succeed; failure here is a strong indicator
+	// of a misconfigured pod that warrants explicit operator attention.
+	var snowplowK8sClient dynamic.Client
+	if sarc != nil {
+		var k8sErr error
+		snowplowK8sClient, k8sErr = dynamic.NewClient(sarc)
+		if k8sErr != nil {
+			log.Warn("failed to build snowplow K8s dynamic client; SA dispatch will fall back to httpcall (v5 plumbing TLS bug active)",
+				slog.Any("err", k8sErr))
+			snowplowK8sClient = nil
+		} else {
+			log.Info("snowplow K8s dynamic client built (Q-RBAC-DECOUPLE C(d) v6 — Path B SA dispatch active)")
+		}
+	}
+
 	// No Redis ping or disk store needed — MemCache is always available.
 
 	// Initialize OpenTelemetry SDK (no-op when OTEL_ENABLED != "true").
@@ -270,6 +298,10 @@ func main() {
 					return snowplowEndpointFn()
 				})
 			}
+			// Q-RBAC-DECOUPLE C(d) v6 — Path B SA dispatch client.
+			if snowplowK8sClient != nil {
+				ctx = cache.WithSnowplowK8s(ctx, snowplowK8sClient)
+			}
 			r = r.WithContext(ctx)
 			next.ServeHTTP(w, r)
 		})
@@ -313,7 +345,7 @@ func main() {
 	mux.Handle("GET /call", chain.Append(
 		userCfg,
 		withCache,
-		handlers.Dispatcher(dispatchers.All(snowplowEndpointFn))).
+		handlers.Dispatcher(dispatchers.All(snowplowEndpointFn, snowplowK8sClient))).
 		Then(handlers.Call()))
 	mux.Handle("POST /call", chain.Append(userCfg, withCache).Then(handlers.Call()))
 	mux.Handle("PUT /call", chain.Append(userCfg, withCache).Then(handlers.Call()))
@@ -359,7 +391,7 @@ func main() {
 	// Previously this ran before ListenAndServe, causing startup probe failures
 	// when informer sync + L2/RBAC warmup exceeded the probe timeout.
 	if appCache != nil {
-		go startBackgroundServices(ctx, log, appCache, *authnNS, *warmupConfigPath, *signKey, globalRBACWatcher, snowplowEndpointFn)
+		go startBackgroundServices(ctx, log, appCache, *authnNS, *warmupConfigPath, *signKey, globalRBACWatcher, snowplowEndpointFn, snowplowK8sClient)
 	}
 	<-ctx.Done()
 
@@ -399,7 +431,7 @@ func recoveryMiddleware(next http.Handler) http.Handler {
 // Warmup and informer sync use a separate background context so that a SIGTERM
 // received during startup (e.g. from a failing liveness probe) does not abort
 // the warmup — the server will start with a fully warm cache regardless.
-func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cache, authnNS, warmupConfigPath, signKey string, rbacWatcher *cache.RBACWatcher, snowplowEndpointFn func() (*endpoints.Endpoint, error)) {
+func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cache, authnNS, warmupConfigPath, signKey string, rbacWatcher *cache.RBACWatcher, snowplowEndpointFn func() (*endpoints.Endpoint, error), snowplowK8sClient dynamic.Client) {
 	rc, err := rest.InClusterConfig()
 	if err != nil {
 		log.Warn("not running in-cluster; background cache services disabled", slog.Any("err", err))
@@ -423,7 +455,7 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cach
 	}
 	globalInformerReader = resourceWatcher // InformerReader interface — reads from informer store
 	globalResourceWatcher = resourceWatcher // exposes HOT/WARM/COLD queue depths to /metrics/runtime
-	resourceWatcher.SetL1Refresher(dispatchers.MakeL1Refresher(c, rc, authnNS, signKey, rbacWatcher, snowplowEndpointFn))
+	resourceWatcher.SetL1Refresher(dispatchers.MakeL1Refresher(c, rc, authnNS, signKey, rbacWatcher, snowplowEndpointFn, snowplowK8sClient))
 
 	// Load warmup config early to get autoDiscoverGroups for CRD informer filtering.
 	warmupCfg, err := cache.LoadWarmupConfig(warmupConfigPath)
@@ -510,6 +542,9 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cach
 			return snowplowEndpointFn()
 		})
 	}
+	if snowplowK8sClient != nil {
+		warmupCtx = cache.WithSnowplowK8s(warmupCtx, snowplowK8sClient)
+	}
 
 	// Phase 5: Pre-warm L1 (resolved widget + RESTAction output) for every
 	// known user. Uses its own context because warmupCtx is cancelled when
@@ -531,6 +566,9 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cach
 				return snowplowEndpointFn()
 			})
 		}
+		if snowplowK8sClient != nil {
+			l1Ctx = cache.WithSnowplowK8s(l1Ctx, snowplowK8sClient)
+		}
 
 		feCfg, feErr := cache.LoadFrontendConfig(frontendConfigPath)
 		if feErr != nil {
@@ -546,6 +584,6 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cach
 		log.Info("L1 warmup: using frontend entry points",
 			slog.Int("entryPoints", len(eps)),
 			slog.String("configPath", frontendConfigPath))
-		dispatchers.WarmL1FromEntryPoints(l1Ctx, c, rc, authnNS, signKey, eps, rbacWatcher, snowplowEndpointFn)
+		dispatchers.WarmL1FromEntryPoints(l1Ctx, c, rc, authnNS, signKey, eps, rbacWatcher, snowplowEndpointFn, snowplowK8sClient)
 	}()
 }

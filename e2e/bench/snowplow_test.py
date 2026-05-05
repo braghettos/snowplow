@@ -4115,7 +4115,8 @@ def print_report():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Q-RBAC-DECOUPLE C(d) v5 — bench scenario: CRB-delete burst (audit 2026-05-05)
+# Q-RBAC-DECOUPLE C(d) v5/v6 — bench scenario: CRB-delete burst
+# (audit 2026-05-05; v6 update 2026-05-04)
 # ═════════════════════════════════════════════════════════════════════════════
 #
 # Driven by --scenario crb-delete. Reproduces the failure mode that the
@@ -4131,6 +4132,15 @@ def print_report():
 #      audit=user_access_filter_skipped log line.
 #   D) at least one audit=binding_identity_transition    (D3b fix)
 #      log line for cyberjoker between the pre/post bursts.
+#
+# Q-RBAC-DECOUPLE C(d) v6 — Path B (audit 2026-05-04): assertion A is
+# strengthened from "v5 host-pin closes the host-string half" to "v6
+# Path B closes the bug class structurally" — the SA dispatch now goes
+# through client-go's dynamic client (which uses rest.TLSConfigFor with
+# correct CA loading) instead of httpcall.Do (which hit plumbing's
+# tlsConfigFor early-return on token-auth+CA endpoints, the v5 D1
+# residual). On v6, assertion A passes because the failing TLS code
+# path is no longer reachable from the SA dispatch.
 #
 # Reuses cleanup_rogue_rbac() primitives + the existing kubectl/log helpers.
 #

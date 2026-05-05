@@ -261,6 +261,41 @@ func SnowplowEndpointFromContext(ctx context.Context) func() (any, error) {
 	return fn
 }
 
+// snowplowK8sKey carries the snowplow-SA dynamic K8s client used by the
+// SA-elevated dispatch path (Q-RBAC-DECOUPLE C(d) v6 — Path B). The value
+// type is intentionally `any` to avoid a cache→internal/dynamic import
+// cycle; the api package re-asserts it back to dynamic.Client.
+//
+// This is a sibling to snowplowEndpointKey: the same set of context
+// installation sites (main.go withCache, prewarm, l1_refresh) install
+// both, so every dispatch path that previously had access to the SA
+// endpoint now also has access to a client-go-backed dynamic client. The
+// SA branch of api.Resolve uses this client INSTEAD of httpcall.Do +
+// SnowplowEndpoint, structurally bypassing plumbing's tlsConfigFor bug
+// that silently drops CertificateAuthorityData on token-auth endpoints
+// (the v5 D1 defect that v6 closes).
+type snowplowK8sKey struct{}
+
+// WithSnowplowK8s returns a context carrying the snowplow-SA dynamic K8s
+// client. The value type is `any` to avoid an import cycle; the api
+// package type-asserts it back to dynamic.Client.
+//
+// nil-safe: if c is nil, returns ctx unchanged so callers don't have to
+// guard the install site.
+func WithSnowplowK8s(ctx context.Context, c any) context.Context {
+	if c == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, snowplowK8sKey{}, c)
+}
+
+// SnowplowK8sFromContext extracts the snowplow-SA dynamic K8s client from
+// ctx as `any`. Returns nil when not set. Callers re-assert to the
+// concrete dynamic.Client type.
+func SnowplowK8sFromContext(ctx context.Context) any {
+	return ctx.Value(snowplowK8sKey{})
+}
+
 type restActionNameKey struct{}
 
 // WithRESTActionName returns a context carrying the RESTAction name being

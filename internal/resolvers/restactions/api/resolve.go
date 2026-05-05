@@ -21,6 +21,7 @@ import (
 	"github.com/krateoplatformops/plumbing/ptr"
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
+	"github.com/krateoplatformops/snowplow/internal/dynamic"
 	httpcall "github.com/krateoplatformops/snowplow/internal/httpcall"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
 	"go.opentelemetry.io/otel/attribute"
@@ -116,7 +117,31 @@ type ResolveOptions struct {
 	// with a runtime error log (the migration sequence is: ship snowplow
 	// image with this wired BEFORE migrating any RESTAction YAML to use
 	// userAccessFilter).
+	//
+	// Q-RBAC-DECOUPLE C(d) v6 — Path B (audit 2026-05-04): the SA dispatch
+	// path now goes through SnowplowK8sClient (client-go dynamic client)
+	// instead of httpcall.Do(SnowplowEndpoint). This field is retained for
+	// (a) backward compatibility with existing test fixtures that wire
+	// SnowplowEndpoint directly, and (b) defense-in-depth fallback if
+	// SnowplowK8sClient is nil at the call site (the resolver logs a
+	// rejection and skips the api entry — mirrors v5's runtime guard).
 	SnowplowEndpoint func() (*endpoints.Endpoint, error)
+
+	// SnowplowK8sClient, if non-nil, is the in-cluster dynamic K8s client
+	// used by the SA-elevated dispatch path (Q-RBAC-DECOUPLE C(d) v6 —
+	// Path B). Replaces httpcall.Do for SA dispatch, structurally avoiding
+	// plumbing's tlsConfigFor bug that silently drops
+	// CertificateAuthorityData on token-auth endpoints (the v5 D1 defect).
+	//
+	// Threaded through ResolveOptions parallel to SnowplowEndpoint by all
+	// 5 dispatch layers: main.go middleware install, dispatcher
+	// constructors, l1cache.Input, prewarm.go, l1_refresh.go. nil-fallback
+	// to cache.SnowplowK8sFromContext(ctx) is provided by the SA branch.
+	//
+	// Production wiring constructs once at startup via
+	// dynamic.NewClient(rc) where rc is rest.InClusterConfig() — the same
+	// rc that builds the SA endpoint, so the trust boundary is identical.
+	SnowplowK8sClient dynamic.Client
 }
 
 func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
@@ -264,6 +289,37 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		if !useSystemEndpoint && apiCall.EndpointRef == nil && cache.IsSystemIdentity(ctx) {
 			useSystemEndpoint = true
 		}
+
+		// Q-RBAC-DECOUPLE C(d) v6 — Path B (audit 2026-05-04). Resolve the
+		// snowplow-SA dynamic K8s client used for SA-elevated dispatch.
+		// opts.SnowplowK8sClient (set explicitly by the dispatcher
+		// constructors) wins; otherwise fall back to the context-stored
+		// client that main.go installs once via WithSnowplowK8s. The
+		// fallback path keeps the widget→apiref→l1cache→restactions chain
+		// working without per-dispatcher threading.
+		//
+		// snowplowK8sClient is the structural fix for the v5 D1 TLS
+		// handshake failure: the SA dispatch path bypasses plumbing's
+		// tlsConfigFor (which silently drops CertificateAuthorityData on
+		// token-auth endpoints) and uses client-go's correct
+		// rest.TLSConfigFor. The runOne fallback below uses this client
+		// when useSystemEndpoint && snowplowK8sClient != nil.
+		var snowplowK8sClient dynamic.Client
+		if useSystemEndpoint {
+			snowplowK8sClient = opts.SnowplowK8sClient
+			if snowplowK8sClient == nil {
+				if v := cache.SnowplowK8sFromContext(ctx); v != nil {
+					if c, ok := v.(dynamic.Client); ok {
+						snowplowK8sClient = c
+					} else {
+						log.Warn("snowplow K8s client context value has unexpected type",
+							slog.String("name", id),
+							slog.String("type", fmt.Sprintf("%T", v)))
+					}
+				}
+			}
+		}
+
 		if useSystemEndpoint {
 			// Resolve the snowplow-SA endpoint provider. opts.SnowplowEndpoint
 			// (set explicitly by the dispatcher constructors per Q-RBACC-IMPL-7)
@@ -271,6 +327,14 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			// main.go installs once via the withSnowplowEndpoint middleware.
 			// The fallback path keeps the widget→apiref→l1cache→restactions
 			// chain working without per-dispatcher threading.
+			//
+			// Q-RBAC-DECOUPLE C(d) v6 — Path B carries forward the v5
+			// SnowplowEndpoint resolution as a defense-in-depth fallback
+			// for the rare case where snowplowK8sClient is nil (e.g.
+			// out-of-cluster unit tests not running envtest). The
+			// resolved ep is also still consumed by the per-RESTAction
+			// debug-log site (line ~315) and by the http_fallback path
+			// when Path B is unavailable.
 			snowplowEndpointFn := opts.SnowplowEndpoint
 			if snowplowEndpointFn == nil {
 				if anyFn := cache.SnowplowEndpointFromContext(ctx); anyFn != nil {
@@ -287,18 +351,30 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					}
 				}
 			}
-			if snowplowEndpointFn == nil {
-				log.Error("userAccessFilter set but no snowplow endpoint configured",
+			if snowplowEndpointFn == nil && snowplowK8sClient == nil {
+				log.Error("userAccessFilter set but no snowplow endpoint or K8s client configured",
 					slog.String("name", id))
 				return false
 			}
-			snEp, snErr := snowplowEndpointFn()
-			if snErr != nil || snEp == nil {
-				log.Error("failed to obtain snowplow endpoint",
-					slog.String("name", id), slog.Any("err", snErr))
-				return false
+			if snowplowEndpointFn != nil {
+				snEp, snErr := snowplowEndpointFn()
+				if snErr != nil || snEp == nil {
+					if snowplowK8sClient == nil {
+						log.Error("failed to obtain snowplow endpoint and no K8s client fallback",
+							slog.String("name", id), slog.Any("err", snErr))
+						return false
+					}
+					// Path B is available — endpoint failure is non-fatal,
+					// but log so operators see the legacy path is broken.
+					log.Warn("snowplow endpoint unavailable; falling back to client-go SA dispatch",
+						slog.String("name", id), slog.Any("err", snErr))
+				} else {
+					ep = *snEp
+				}
 			}
-			ep = *snEp
+			// If only Path B is configured (no SnowplowEndpoint), ep stays
+			// zero — the http_fallback branch below is dead code on this
+			// path (snowplowK8sClient != nil short-circuits to Path B).
 		} else {
 			var err error
 			ep, err = mapper.resolveOne(ctx, apiCall.EndpointRef)
@@ -750,6 +826,76 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						})
 					return nil
 				}
+			}
+
+			// Q-RBAC-DECOUPLE C(d) v6 — Path B SA dispatch
+			// (audit 2026-05-04). When the api entry uses SA dispatch AND
+			// a snowplow K8s client is available, dispatch via client-go's
+			// dynamic client instead of httpcall.Do. This structurally
+			// avoids plumbing's tlsConfigFor bug that silently drops
+			// CertificateAuthorityData on token-auth endpoints (the v5 D1
+			// defect). See sa_dispatch.go for the helper + error mapping.
+			//
+			// The success path runs the same call.ResponseHandler set up
+			// above, so jsonHandlerCompute / mergeIntoDict are reused
+			// unchanged (gojq-purity-required: raw bytes from
+			// json.Marshal(*unstructured.UnstructuredList) are a fresh
+			// tree, identical wire shape to apiserver-over-HTTP).
+			//
+			// The failure path emits the same err_write audit + dict
+			// entry as httpcall, mapped via clientGoErrorToStatus so
+			// downstream log shape (response.Status fields) is stable
+			// across the v5→v6 transition.
+			if useSystemEndpoint && snowplowK8sClient != nil {
+				log.Debug("dispatching SA call via client-go (Path B)",
+					slog.String("name", id), slog.String("path", call.Path))
+				saRes := dispatchSAViaClientGo(ctx, snowplowK8sClient, call.Path)
+				if saRes.err != nil {
+					log.Error("SA dispatch via client-go failed",
+						slog.String("name", id),
+						slog.String("path", call.Path),
+						slog.String("error", saRes.err.Error()))
+					auditUserAccessFilterSkipped(ctx, apiCall, "api_error", saRes.err.Error())
+					errMap, merr := response.AsMap(saRes.status)
+					instrumentedDictWrite(ctx, mu, dict, "err_write", "error",
+						fallbackBaseExtra(),
+						func() {
+							if merr == nil && len(errMap) > 0 {
+								dict[call.ErrorKey] = errMap
+							} else if saRes.status != nil {
+								dict[call.ErrorKey] = saRes.status.Message
+							} else {
+								dict[call.ErrorKey] = saRes.err.Error()
+							}
+						})
+					return call.ContinueOnError
+				}
+				// Success: feed raw bytes through the same response
+				// handler the http_fallback path uses. ResponseHandler is
+				// the closure set up above which reads a stream; wrap
+				// raw in a NopCloser to keep the contract.
+				if call.ResponseHandler != nil {
+					if herr := call.ResponseHandler(io.NopCloser(bytes.NewReader(saRes.raw))); herr != nil {
+						log.Error("response handler failed on Path B bytes",
+							slog.String("name", id), slog.Any("err", herr))
+						auditUserAccessFilterSkipped(ctx, apiCall, "api_error", herr.Error())
+						errStatus := response.New(http.StatusInternalServerError, herr)
+						errMap, merr := response.AsMap(errStatus)
+						instrumentedDictWrite(ctx, mu, dict, "err_write", "error",
+							fallbackBaseExtra(),
+							func() {
+								if merr == nil && len(errMap) > 0 {
+									dict[call.ErrorKey] = errMap
+								} else {
+									dict[call.ErrorKey] = herr.Error()
+								}
+							})
+						return call.ContinueOnError
+					}
+				}
+				log.Debug("api successfully resolved via Path B",
+					slog.String("name", id), slog.String("path", call.Path))
+				return true
 			}
 
 			log.Debug("calling api", slog.String("name", id),
