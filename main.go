@@ -101,6 +101,14 @@ func main() {
 	blizzardOn := flag.Bool("blizzard", env.Bool("BLIZZARD", false), "dump verbose output")
 	prettyLog := flag.Bool("pretty-log", env.Bool("PRETTY_LOG", true), "print a nice JSON formatted log")
 	port := flag.Int("port", env.ServicePort("PORT", 8081), "port to listen on")
+	// Q-PREWARM-R2.3 — separate HTTP server for kubernetes probes.
+	// Probes get their own goroutine, accept loop, and small mux with
+	// no middleware. Isolates /health and /ready from request-side
+	// goroutine pressure (slow /call requests cannot starve probes).
+	// 0 = disabled (single-server pre-R2 behaviour); helm chart sets
+	// 8082 to enable the split.
+	probePort := flag.Int("probe-port", env.ServicePort("PROBE_PORT", 0),
+		"if > 0, expose /health, /ready and /info on this port with no middleware")
 	authnNS := flag.String("authn-namespace", env.String("AUTHN_NAMESPACE", ""),
 		"krateo authn service clientconfig secrets namespace")
 	signKey := flag.String("jwt-sign-key", env.String("JWT_SIGN_KEY", ""), "secret key used to sign JWT tokens")
@@ -334,8 +342,21 @@ func main() {
 
 	mux.Handle("GET /swagger/", httpSwagger.WrapHandler)
 
+	// Q-PREWARM-R2.3 — probe handlers.
+	//
+	// Always register /health and /ready on the main mux too, for two
+	// reasons:
+	//   1. Backwards compatibility — older charts / operators that hit
+	//      :8081/health continue to work during the rollout window.
+	//   2. PROBE_PORT defaults to 0 (disabled). When unset the main
+	//      port is the only port serving probes, identical to pre-R2
+	//      behaviour.
+	// When PROBE_PORT > 0, the SAME handlers are also registered on a
+	// second http.Server bound to that port with NO middleware — that
+	// is the address the kubelet should target via the helm chart.
 	mux.Handle("GET /health", handlers.HealthCheck(serviceName, build, kubeutil.ServiceAccountNamespace))
 	mux.Handle("GET /ready", handlers.ReadinessCheck())
+	mux.Handle("GET /info", handlers.InfoHandler(serviceName, build, kubeutil.ServiceAccountNamespace))
 	mux.Handle("GET /metrics/cache", chain.Then(handlers.CacheMetrics()))
 	mux.Handle("GET /metrics/runtime", handlers.RuntimeMetricsHandler(appCache, workQueueLensAdapter{}))
 	mux.Handle("GET /api-info/names", chain.Then(handlers.Plurals()))
@@ -394,6 +415,48 @@ func main() {
 
 	log.Info("server is ready to handle requests", slog.String("addr", server.Addr))
 
+	// Q-PREWARM-R2.3 — probe-isolated http.Server.
+	//
+	// Bound to PROBE_PORT (default 0 = disabled). Uses its OWN mux,
+	// its OWN ReadTimeout/WriteTimeout, and NO middleware chain
+	// (no otelhttp wrapper, no CORS, no recovery, no gzip). This
+	// keeps probe response time bounded by the kernel accept queue
+	// + a single write syscall, regardless of pressure on the main
+	// :8081 server's request goroutine pool.
+	//
+	// Helm chart points livenessProbe and readinessProbe at this
+	// port once R2 ships. Until then, the kubelet still hits the
+	// main port — which now also serves the new R2 handlers, so
+	// the rollout is a strict superset of pre-R2 behaviour.
+	var probeServer *http.Server
+	if *probePort > 0 {
+		probeMux := http.NewServeMux()
+		probeMux.Handle("GET /health", handlers.HealthCheck(serviceName, build, kubeutil.ServiceAccountNamespace))
+		probeMux.Handle("GET /ready", handlers.ReadinessCheck())
+		probeMux.Handle("GET /info", handlers.InfoHandler(serviceName, build, kubeutil.ServiceAccountNamespace))
+
+		probeServer = &http.Server{
+			Addr:    fmt.Sprintf(":%d", *probePort),
+			Handler: probeMux,
+			// Short timeouts: probe traffic is sub-millisecond by
+			// design. A probe that takes >1s is a pod we want
+			// kubelet to consider unhealthy.
+			ReadTimeout:  1 * time.Second,
+			WriteTimeout: 1 * time.Second,
+			IdleTimeout:  5 * time.Second,
+		}
+
+		go func() {
+			if err := probeServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Error("probe server cannot run",
+					slog.String("addr", probeServer.Addr),
+					slog.Any("err", err))
+			}
+		}()
+
+		log.Info("probe server is ready", slog.String("addr", probeServer.Addr))
+	}
+
 	// Run cache warmup in background so /health responds immediately.
 	// Previously this ran before ListenAndServe, causing startup probe failures
 	// when informer sync + L2/RBAC warmup exceeded the probe timeout.
@@ -411,6 +474,13 @@ func main() {
 	server.SetKeepAlivesEnabled(false)
 	if err := server.Shutdown(shutCtx); err != nil {
 		log.Error("server forced to shutdown", slog.Any("err", err))
+	}
+
+	if probeServer != nil {
+		probeServer.SetKeepAlivesEnabled(false)
+		if err := probeServer.Shutdown(shutCtx); err != nil {
+			log.Error("probe server forced to shutdown", slog.Any("err", err))
+		}
 	}
 
 	log.Info("server gracefully stopped")
@@ -515,8 +585,19 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cach
 	defer syncCancel()
 	if resourceWatcher.WaitForSync(syncCtx) {
 		log.Info("informer caches synced")
+		// Q-PREWARM-R2.1 — flip the /ready gate. Pod becomes Ready
+		// from this point on, regardless of whether the L1 prewarm
+		// loop (Phase 5, runs in its own goroutine) has completed.
+		// L1 misses fall through to the foreground singleflight
+		// resolve so cold-L1 requests are slow-but-correct.
+		cache.MarkInformersReady()
 	} else {
 		log.Warn("informer caches did not sync within timeout; proceeding with warmup anyway")
+		// Even on timeout, mark ready so the pod can serve traffic.
+		// The alternative is permanent NotReady, which triggers the
+		// pre-R2 death-spiral. Operators should investigate via
+		// /metrics/runtime if WaitForSync ever returns false.
+		cache.MarkInformersReady()
 	}
 
 	// Phase 4: Run L2 warmup using the background context.
