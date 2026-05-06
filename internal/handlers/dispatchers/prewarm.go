@@ -51,6 +51,14 @@ func newUnthrottledDynClient(rc *rest.Config) (k8sdynamic.Interface, error) {
 	return k8sdynamic.NewForConfig(cfg)
 }
 
+// NewUnthrottledDynClientForPrewarm exposes the internal unthrottled
+// SA-backed dynamic client builder for use by the event-driven prewarm
+// worker pool wired in main.go (Q-PREWARM-R2R5 PR-B). Same QPS=-1 /
+// Burst=0 semantics as the synchronous path.
+func NewUnthrottledDynClientForPrewarm(rc *rest.Config) (k8sdynamic.Interface, error) {
+	return newUnthrottledDynClient(rc)
+}
+
 // prewarmFetchCR returns the unstructured.Unstructured for (gvr, ns, name).
 // Fast path: Redis L2 cache (populated by warmer.warmGVR at startup).
 // Slow path: a single GET via the shared unthrottled dynamic client, with
