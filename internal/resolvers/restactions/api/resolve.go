@@ -98,6 +98,28 @@ const (
 	headerAcceptJSON = "Accept: application/json"
 )
 
+// hasSiblingDependsOn reports whether any api[] entry in apiMap (other than
+// the entry named id) declares dependsOn.name == id.
+//
+// Used at the /call deflection site to decide whether the v3 child-ref
+// sentinel can be safely written into dict[id] (no sibling consumer ⇒ yes;
+// some sibling iterates this slot ⇒ inline-refilter instead). See the call
+// site in runOne for the full rationale.
+//
+// Generic across any parent→child→sibling iterator topology (no
+// resource-specific carve-outs).
+func hasSiblingDependsOn(apiMap map[string]*templates.API, id string) bool {
+	for sibID, sibAPI := range apiMap {
+		if sibID == id || sibAPI == nil || sibAPI.DependsOn == nil {
+			continue
+		}
+		if sibAPI.DependsOn.Name == id {
+			return true
+		}
+	}
+	return false
+}
+
 type ResolveOptions struct {
 	RC      *rest.Config
 	AuthnNS string
@@ -720,6 +742,35 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 						attribute.String("api.namespace", callNS),
 						attribute.String("api.name", callName),
 					}
+
+					// Q-RBAC-DECOUPLE C(d) v3 regression fix — sibling iterator
+					// dependency detection.
+					//
+					// The default v3 deflection writes a childRef sentinel into
+					// dict[id]. The sentinel is opaque (no .status field) and
+					// is intended to be expanded by RefilterRESTAction at HTTP
+					// dispatch time. That works for outer-JQ consumers but
+					// BREAKS sibling api[] entries that iterate over this
+					// entry's status (dependsOn.iterator = ".<id>.status…"):
+					// createRequestOptions evaluates the iterator JQ against
+					// the in-flight dict before refilter runs, finds nothing
+					// where .status used to live, and emits zero requests.
+					//
+					// Detect the sibling-iterator topology and refilter the
+					// child's L1 bytes inline instead of writing the sentinel.
+					// The refilter result is the legacy v0/v2 wire shape (full
+					// CR with cr.Status populated), so the sibling iterator
+					// resolves correctly. The trust boundary is preserved: the
+					// parent's stored L1 still holds the childRef in
+					// ProtectedDict — only intra-resolution sees the inlined
+					// per-user-filtered child.
+					//
+					// Detection key: any sibling api[] entry (excluding self)
+					// declares dependsOn.name == id. We do NOT special-case
+					// iterator presence — a direct `.<id>.status` reference
+					// from a dependent has the same problem.
+					hasSiblingDep := hasSiblingDependsOn(apiMap, id)
+
 					// Q-RBAC-DECOUPLE C(d) v3 — child /call slot is stored
 					// as an opaque reference; the parent's L1 entry holds
 					// only the pointer. RefilterRESTAction recurses into
@@ -727,8 +778,41 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					// per-user-refiltered output. Avoids inlining the (large)
 					// child body into every parent and avoids serving the
 					// resolving user's pre-filtered child to other users.
-					if _, l1Hit, _ := c.GetRaw(ctx, l1Key); l1Hit {
+					if l1Raw, l1Hit, _ := c.GetRaw(ctx, l1Key); l1Hit {
 						cache.GlobalMetrics.Inc(&cache.GlobalMetrics.L1Hits, "l1_hits")
+
+						if hasSiblingDep {
+							// Sibling iterator path: refilter inline so the
+							// dict[id] slot has the legacy CR shape with
+							// cr.Status populated for the iterator JQ to
+							// drill into.
+							refilteredRaw, rerr := RefilterRESTAction(ctx, c, l1Raw)
+							if rerr != nil {
+								log.Warn("call_l1 sibling-dep refilter failed; falling through",
+									slog.String("name", id),
+									slog.String("l1_key", l1Key),
+									slog.Any("err", rerr))
+							} else {
+								handlerOpts := jsonHandlerOptions{
+									key: id, out: dict, filter: apiCall.Filter,
+								}
+								computed, cerr := jsonHandlerCompute(ctx, handlerOpts, refilteredRaw, sliceSnap)
+								if cerr == nil {
+									instrumentedDictWrite(ctx, mu, dict, "call_l1_sibling_refilter", "append",
+										callExtra,
+										func() {
+											mergeIntoDict(dict, id, computed)
+										})
+									return true
+								}
+								log.Warn("call_l1 sibling-dep compute failed; falling through",
+									slog.String("name", id), slog.Any("err", cerr))
+							}
+							// Fall through to the default sentinel path on
+							// refilter or compute error so the resolver can
+							// still produce a (possibly degraded) result.
+						}
+
 						childRef := MarshalChildRESTActionRef(callGVR, callNS, callName, l1Key, apiCall.Filter)
 						instrumentedDictWrite(ctx, mu, dict, "call_l1", "append",
 							callExtra,
@@ -750,6 +834,48 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 							if obj, ok := ir.GetObject(callGVR, callNS, callName); ok {
 								raw, rerr := callResolver(ctx, obj.Object, l1Key, opts.AuthnNS)
 								if rerr == nil && len(raw) > 0 {
+									if hasSiblingDep {
+										// Sibling iterator path: refilter the
+										// freshly-written L1 bytes (callResolver
+										// has just persisted them) and inline.
+										// We re-fetch via c.GetRaw rather than
+										// reusing `raw` because callResolver's
+										// returned bytes are the legacy
+										// pre-cache shape on some paths and
+										// only the post-write L1 entry is
+										// guaranteed to be the v3 wrapper.
+										if l1Raw, l1Hit, _ := c.GetRaw(ctx, l1Key); l1Hit {
+											refilteredRaw, refErr := RefilterRESTAction(ctx, c, l1Raw)
+											if refErr == nil {
+												handlerOpts := jsonHandlerOptions{
+													key: id, out: dict, filter: apiCall.Filter,
+												}
+												computed, cerr := jsonHandlerCompute(ctx, handlerOpts, refilteredRaw, sliceSnap)
+												if cerr == nil {
+													instrumentedDictWrite(ctx, mu, dict, "call_inline_sibling_refilter", "append",
+														callExtra,
+														func() {
+															mergeIntoDict(dict, id, computed)
+														})
+													return true
+												}
+												log.Warn("call_inline sibling-dep compute failed; falling through",
+													slog.String("name", id), slog.Any("err", cerr))
+											} else {
+												log.Warn("call_inline sibling-dep refilter failed; falling through",
+													slog.String("name", id),
+													slog.String("l1_key", l1Key),
+													slog.Any("err", refErr))
+											}
+										} else {
+											log.Warn("call_inline sibling-dep: post-callResolver L1 miss; falling through",
+												slog.String("name", id), slog.String("l1_key", l1Key))
+										}
+										// Fall through to the default sentinel
+										// path on any refilter / compute / L1
+										// re-fetch error.
+									}
+
 									childRef := MarshalChildRESTActionRef(callGVR, callNS, callName, l1Key, apiCall.Filter)
 									instrumentedDictWrite(ctx, mu, dict, "call_inline", "append",
 										callExtra,
