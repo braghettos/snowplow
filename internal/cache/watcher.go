@@ -1318,6 +1318,31 @@ func (rw *ResourceWatcher) autoRegisterCRDInformer(uns *unstructured.Unstructure
 	rw.dynamicGVRsMu.Lock()
 	rw.dynamicGVRs[GVRToKey(newGVR)] = newGVR
 	rw.dynamicGVRsMu.Unlock()
+
+	// ── Q-PREWARM-R5 convergence fix ───────────────────────────────────
+	// Evict any L1 resolved keys that depend on the CRD's group. Such
+	// entries were resolved BEFORE this CRD existed, so their cluster-dep
+	// reverse index was never populated for the new GVR — meaning watch
+	// events for new CRs would find an empty SMembers result and never
+	// refresh the L1 entry. By DELETING the L1 keys, the next HTTP request
+	// triggers a fresh resolve at the now-correct cluster state, which
+	// re-registers the cluster-dep, and subsequent watch events converge
+	// normally. DELETE-only invalidation matches the existing
+	// stale-while-revalidate semantics (see feedback_l1_invalidation_delete_only).
+	//
+	// Generic per-group: no hardcoded GVRs, group names, or RESTAction
+	// names per feedback_no_special_cases.md.
+	if rw.cache != nil {
+		evicted := EvictL1KeysForGroup(context.Background(), rw.cache, group)
+		if evicted > 0 {
+			GlobalMetrics.CRDRegisterL1Evictions.Add(int64(evicted))
+			slog.Info("resource-watcher: evicted L1 keys on CRD auto-register (R5 convergence fix)",
+				slog.String("crd", uns.GetName()),
+				slog.String("group", group),
+				slog.String("gvr", newGVR.String()),
+				slog.Int("evicted", evicted))
+		}
+	}
 }
 
 // matchesAutoDiscoverGroup checks if a CRD group matches any configured

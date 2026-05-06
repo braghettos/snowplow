@@ -58,6 +58,13 @@ type Metrics struct {
 	WatchEventsDelete          atomic.Int64
 	WatchEventsDeleteTombstone atomic.Int64
 
+	// ── CRD auto-register convergence (Q-PREWARM-R5 fix) ─────────────────
+	// CRDRegisterL1Evictions counts L1 resolved keys evicted because a CRD
+	// for their dependency group was just auto-registered (the convergence
+	// path that R5 prewarm shortened). Non-zero values mean the cache
+	// self-healed L1 entries that were resolved before the CRD existed.
+	CRDRegisterL1Evictions atomic.Int64
+
 	// ── L2 post-refilter cache (Q-RBACC-L2-1) ────────────────────────────
 	// Counters surface at /metrics/runtime under l2_* keys. Hit-rate is
 	// computed by the snapshot consumer.
@@ -118,6 +125,11 @@ type MetricsSnapshot struct {
 	WatchEventsDelete          int64 `json:"watch_events_delete"`
 	WatchEventsDeleteTombstone int64 `json:"watch_events_delete_tombstone"`
 
+	// CRD auto-register convergence (Q-PREWARM-R5 fix). Counts L1
+	// resolved keys evicted because a CRD for their dependency group
+	// was just auto-registered. See keys.go L1ResourceDepGroupKey.
+	CRDRegisterL1Evictions int64 `json:"crd_register_l1_evictions"`
+
 	// L2 post-refilter cache (Q-RBACC-L2-1). HitRate is computed in the
 	// snapshot for parity with L1. ResidentBytes/Count are sampled once
 	// per snapshot from the live counters.
@@ -173,6 +185,8 @@ func (m *Metrics) snapshotFromAtomics() MetricsSnapshot {
 		WatchEventsUpdate:          m.WatchEventsUpdate.Load(),
 		WatchEventsDelete:          m.WatchEventsDelete.Load(),
 		WatchEventsDeleteTombstone: m.WatchEventsDeleteTombstone.Load(),
+
+		CRDRegisterL1Evictions: m.CRDRegisterL1Evictions.Load(),
 
 		L2Hits:              m.L2Hits.Load(),
 		L2Misses:            m.L2Misses.Load(),

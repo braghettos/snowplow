@@ -295,15 +295,110 @@ func L1ResourceDepKey(gvrKey, ns, name string) string {
 	return "snowplow:l1dep:" + gvrKey + ":" + ns + ":" + name
 }
 
+// L1ResourceDepGroupKey returns the SET key that maps a Kubernetes API group
+// to ALL L1 resolved keys whose resolution touched ANY GVR in that group.
+//
+// This is the convergence reverse index used by autoRegisterCRDInformer to
+// evict L1 entries that were resolved against a stale cluster state (e.g.,
+// before the CRD existed). The empty group is normalised to "core" so that
+// both `core/v1/configmaps` and `templates.krateo.io/v1/restactions` share
+// the same lookup pattern as GVRToKey.
+//
+// Q-PREWARM-R5 convergence regression (architect's H1, 2026-05-06): when R5
+// prewarm runs before a customer CRD exists, the iterator-based RESTAction
+// returns 0 namespaces, registers ZERO cluster-deps, and writes an L1 entry
+// keyed on a (now-incorrect) empty result. When the CRD later appears via
+// autoRegisterCRDInformer, watch events for its CRs find an empty
+// L1ResourceDepKey set and never refresh that L1 entry. The per-group SET
+// lets us evict those L1 entries as soon as the CRD is registered, so the
+// next HTTP request re-resolves against the true cluster state and the
+// cluster-dep gets registered properly.
+func L1ResourceDepGroupKey(group string) string {
+	if group == "" {
+		group = "core"
+	}
+	return "snowplow:l1dep-group:" + group
+}
+
+// gvrKeyGroup extracts the API group component from a GVRToKey-formatted
+// string ("group/version/resource"). Returns "core" for the empty/core
+// group, matching GVRToKey's encoding. Returns "" if the key is malformed.
+func gvrKeyGroup(gvrKey string) string {
+	idx := strings.Index(gvrKey, "/")
+	if idx <= 0 {
+		return ""
+	}
+	return gvrKey[:idx]
+}
+
+// EvictL1KeysForGroup deletes every L1 resolved key registered as depending
+// on any GVR in the given API group, then clears the per-group SET itself.
+// Returns the count of L1 keys evicted.
+//
+// Used by ResourceWatcher.autoRegisterCRDInformer to fix the Q-PREWARM-R5
+// convergence regression: when a previously-unknown CRD appears, any L1
+// entry that was resolved against the (then-stale) cluster state is now
+// authoritatively wrong, and watch events for the new CRs cannot refresh
+// it (the dependency was never recorded). DELETE-only invalidation matches
+// the existing semantics — see feedback_l1_invalidation_delete_only.md.
+//
+// The set is cleared (via SRemMembers) at the end so a subsequent CRD
+// registration for the same group does not re-evict already-resolved
+// keys (which by then will have been re-registered with deps that
+// legitimately reference the now-existing CRD).
+//
+// Thread-safety: SMembers + Delete + SRemMembers are not atomic on Cache
+// implementations without a transaction primitive; concurrent writers
+// (RegisterL1Dependencies) during eviction may register an L1 key that
+// is missed by this pass. That is acceptable because the missed key was
+// resolved AFTER the CRD became visible to the writer, so it is by
+// definition resolved against the correct cluster state and does not
+// need eviction.
+func EvictL1KeysForGroup(ctx context.Context, c Cache, group string) int {
+	if c == nil {
+		return 0
+	}
+	setKey := L1ResourceDepGroupKey(group)
+	members, err := c.SMembers(ctx, setKey)
+	if err != nil || len(members) == 0 {
+		return 0
+	}
+	// Deduplicate: an L1 key may appear once per (ns,name) ref but evict
+	// only counts unique L1 keys.
+	uniq := make(map[string]struct{}, len(members))
+	for _, k := range members {
+		uniq[k] = struct{}{}
+	}
+	keys := make([]string, 0, len(uniq))
+	for k := range uniq {
+		keys = append(keys, k)
+	}
+	if len(keys) > 0 {
+		_ = c.Delete(ctx, keys...)
+		// Clear the per-group set so the same keys are not re-evicted on
+		// the next CRD registration. SRemMembers is the only Cache-level
+		// way to drain a set in-place; callers concurrently registering
+		// new keys after this point write to a fresh empty set.
+		_ = c.SRemMembers(ctx, setKey, members...)
+	}
+	return len(keys)
+}
+
 
 // RegisterL1Dependencies registers the L1 resolved key in reverse indexes
 // based on dependencies captured by the tracker. Writes:
 // - Per-resource deps: L1ResourceDepKey(gvr, ns, name) for each specific resource
 // - Cluster-wide deps: L1ResourceDepKey(gvr, "", "") for each GVR accessed
+// - Per-group convergence deps: L1ResourceDepGroupKey(group) for each API group
 //
 // The cluster-wide dep ensures that when ANY resource of a GVR changes in
 // ANY namespace, the L1 key is found by triggerL1RefreshBatch. This is critical
 // for RESTActions like compositions-list that iterate all namespaces.
+//
+// The per-group dep (Q-PREWARM-R5 convergence fix) lets autoRegisterCRDInformer
+// evict L1 entries whose resolution touched any GVR in a newly-registered
+// CRD's group, so an L1 entry resolved before the CRD existed self-heals on
+// the next HTTP request. See L1ResourceDepGroupKey for rationale.
 func RegisterL1Dependencies(ctx context.Context, c Cache, tracker *DependencyTracker, l1Key string) {
 	if c == nil || tracker == nil {
 		return
@@ -324,6 +419,32 @@ func RegisterL1Dependencies(ctx context.Context, c Cache, tracker *DependencyTra
 	var baseKey string
 	if isPaginated && (info.Page > 0 || info.PerPage > 0) {
 		baseKey = ResolvedKeyBase(info.Username, info.GVR, info.NS, info.Name)
+	}
+
+	// ── Per-group convergence index (Q-PREWARM-R5 fix) ─────────────────
+	// Register the L1 key (and its unpaginated base) under the SET for
+	// each distinct API group accessed. We collect groups from BOTH
+	// gvrKeys (LIST-only deps) and refs (GET deps) so the eviction
+	// reach matches the full dependency surface. See L1ResourceDepGroupKey
+	// and EvictL1KeysForGroup for the convergence rationale.
+	groupSeen := make(map[string]bool)
+	registerGroupDep := func(gvrKey string) {
+		group := gvrKeyGroup(gvrKey)
+		if group == "" || groupSeen[group] {
+			return
+		}
+		groupSeen[group] = true
+		setKey := L1ResourceDepGroupKey(group)
+		_ = c.SAddWithTTL(ctx, setKey, l1Key, ReverseIndexTTL)
+		if baseKey != "" {
+			_ = c.SAddWithTTL(ctx, setKey, baseKey, ReverseIndexTTL)
+		}
+	}
+	for _, gk := range gvrKeys {
+		registerGroupDep(gk)
+	}
+	for _, ref := range refs {
+		registerGroupDep(ref.GVRKey)
 	}
 
 	// Per-resource deps (ns + name specific).
