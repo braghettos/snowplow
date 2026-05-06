@@ -175,6 +175,39 @@ FINALIZER_RESOURCES = [
 ]
 FINALIZER_PATCH = '{"metadata":{"finalizers":null}}'
 
+# Widget + RESTAction CRDs that may live inside a bench-ns-XX namespace.
+# These MUST be explicitly deleted before the namespace is force-finalized
+# via the /finalize subresource — otherwise force-finalize bypasses the
+# normal cascade-delete and the CRs survive as ghosts inside the
+# (re-created) namespace, polluting later bench runs. Discovered 2026-05-05
+# when fresh bench-ns-17 contained 908 Panel CRs from a 3-day-old run.
+WIDGET_KINDS = [
+    "panels.widgets.templates.krateo.io",
+    "buttons.widgets.templates.krateo.io",
+    "tables.widgets.templates.krateo.io",
+    "flowcharts.widgets.templates.krateo.io",
+    "navmenuitems.widgets.templates.krateo.io",
+    "eventlists.widgets.templates.krateo.io",
+    "markdowns.widgets.templates.krateo.io",
+    "yamlviewers.widgets.templates.krateo.io",
+    "tablists.widgets.templates.krateo.io",
+    "forms.widgets.templates.krateo.io",
+    "filters.widgets.templates.krateo.io",
+    "datagrids.widgets.templates.krateo.io",
+    "buttongroups.widgets.templates.krateo.io",
+    "rows.widgets.templates.krateo.io",
+    "columns.widgets.templates.krateo.io",
+    "pages.widgets.templates.krateo.io",
+    "barcharts.widgets.templates.krateo.io",
+    "linecharts.widgets.templates.krateo.io",
+    "piecharts.widgets.templates.krateo.io",
+    "paragraphs.widgets.templates.krateo.io",
+    "navmenus.widgets.templates.krateo.io",
+    "routes.widgets.templates.krateo.io",
+    "routesloaders.widgets.templates.krateo.io",
+    "restactions.templates.krateo.io",
+]
+
 # ═════════════════════════════════════════════════════════════════════════════
 # FORMATTING
 # ═════════════════════════════════════════════════════════════════════════════
@@ -986,6 +1019,60 @@ def _drain_argo_apps(timeout=300):
     log("Argo applications cleaned (forced)")
 
 
+def deep_clean_bench_namespace(ns):
+    """Delete every widget + RESTAction CR in `ns` BEFORE the namespace is
+    force-finalized.
+
+    Why this exists
+    ---------------
+    `delete_bench_namespaces` calls /api/v1/namespaces/<ns>/finalize to clear
+    spec.finalizers and delete the namespace immediately. That bypasses the
+    normal cascade-delete path: any CR still inside the namespace survives as
+    a ghost, and re-appears as soon as the namespace is recreated under the
+    same name in a later bench run. On 2026-05-05 a 2-hour-old bench-ns-17
+    contained 908 Panel CRs creationTimestamp=2026-05-03 (3 days stale) —
+    each pointed at a non-existent helm release and triggered a 404 storm
+    on the next /compositions-page resolve.
+
+    Strategy
+    --------
+    1. Bulk delete the kind with --wait=false + --force --grace-period=0.
+    2. Re-list; for any survivor, patch metadata.finalizers=null and
+       delete again.
+
+    Returns total CR count seen (pre-delete) for reporting.
+    """
+    total_seen = 0
+    for kind in WIDGET_KINDS:
+        rc, out, _ = kubectl("get", kind, "-n", ns, "--no-headers",
+                             "--ignore-not-found", "-o", "name")
+        if rc != 0 or not out.strip():
+            continue
+        names = [n.strip() for n in out.split("\n") if n.strip()]
+        if not names:
+            continue
+        total_seen += len(names)
+        # Bulk delete (don't wait — finalizer-patch fallback handles stuck CRs)
+        kubectl("delete", kind, "--all", "-n", ns, "--ignore-not-found",
+                "--wait=false", "--grace-period=0", "--force")
+        time.sleep(1)
+        # Patch any remaining stuck on finalizers
+        rc2, out2, _ = kubectl("get", kind, "-n", ns, "--no-headers",
+                               "--ignore-not-found", "-o", "name")
+        if rc2 == 0 and out2.strip():
+            stuck = [s.strip() for s in out2.split("\n") if s.strip()]
+
+            def _patch(target):
+                kubectl("patch", target, "-n", ns, "--type=merge",
+                        f"-p={FINALIZER_PATCH}")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+                list(ex.map(_patch, stuck))
+            # One last delete pass for the patched survivors
+            kubectl("delete", kind, "--all", "-n", ns, "--ignore-not-found",
+                    "--wait=false", "--grace-period=0", "--force")
+    return total_seen
+
+
 def delete_bench_namespaces():
     """Delete bench namespaces. Must be called AFTER compositions and CompositionDefinitions are deleted."""
     log("Deleting bench namespaces ...")
@@ -1007,6 +1094,22 @@ def delete_bench_namespaces():
                             "--type=merge", f"-p={FINALIZER_PATCH}")
                 with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
                     list(ex.map(patch, items))
+    # Deep-clean widget + RESTAction CRs in EVERY bench-ns BEFORE we trigger
+    # namespace deletion. force_finalize_namespace() (called below) bypasses
+    # cascade-delete; without this step CRs survive as ghosts and pollute
+    # subsequent bench runs that recreate the same namespaces.
+    log(f"Deep-cleaning widget CRs in {len(bench_ns)} bench namespaces ...")
+
+    def _deep_clean(n):
+        return n, deep_clean_bench_namespace(n)
+    total_purged = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        for n, count in ex.map(_deep_clean, bench_ns):
+            if count > 0:
+                log(f"  deep-clean: {n} purged {count} widget CRs")
+                total_purged += count
+    log(f"Deep-clean total: purged {total_purged} widget CRs across "
+        f"{len(bench_ns)} bench namespaces")
     # Batch delete all bench namespaces in one kubectl call
     kubectl("delete", "ns", *bench_ns, "--ignore-not-found", "--wait=false",
             "--force", "--grace-period=0")
