@@ -139,6 +139,13 @@ func (uw *UserSecretWatcher) onDelete(ctx context.Context, secret *corev1.Secret
 	_ = uw.cache.SRemUser(ctx, username)
 	_ = uw.cache.Delete(ctx, UserConfigKey(username))
 	uw.purgeRBACKeys(ctx, username)
+
+	// Q-PREWARM-R2R5 PR-B (R5.3) — evict per-user L1 + L2 entries.
+	// Resource DELETE → cache evict, per
+	// `feedback_l1_invalidation_delete_only.md`. The single coordinated
+	// entry point in user_evict.go handles ordering (L2 before L1 per
+	// rbac_watcher.go CONCERN-2).
+	PurgeUserOnSecretDelete(ctx, uw.cache, username)
 }
 
 func (uw *UserSecretWatcher) purgeRBACKeys(ctx context.Context, username string) {

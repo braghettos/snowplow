@@ -551,9 +551,66 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cach
 		}
 	}
 
+	// Q-PREWARM-R2R5 PR-B (R5) — event-driven prewarm wiring.
+	//
+	// PREWARM_MODE selects between the synchronous binding-group loop
+	// (legacy) and the per-user worker pool fed by the UserSecretWatcher
+	// informer (event-driven). The pool MUST be constructed BEFORE
+	// userWatcher.Start fires, otherwise the initial-LIST burst of ADD
+	// events on cold-start would hit a nil callback and be lost (the
+	// SharedInformerFactory is configured with resync=0, so ADDs are
+	// not re-emitted periodically).
+	//
+	// Spec: Q-PREWARM-R2R5-SPEC.md §2.5, §2.6.
+	prewarmMode := strings.ToLower(env.String("PREWARM_MODE", "event-driven"))
+	prewarmWorkers := env.Int("PREWARM_WORKERS", 4)
+	prewarmQueue := env.Int("PREWARM_QUEUE", 2048)
+	frontendConfigPath := env.String("FRONTEND_CONFIG", "/etc/frontend-config/config.json")
+
+	var prewarmPool *dispatchers.PrewarmWorkerPool
+	if prewarmMode == "event-driven" && authnNS != "" {
+		feCfg, feErr := cache.LoadFrontendConfig(frontendConfigPath)
+		switch {
+		case feErr != nil:
+			log.Warn("prewarm-pool: frontend config not available, falling back to no-op prewarmer",
+				slog.String("path", frontendConfigPath), slog.Any("err", feErr))
+		case len(feCfg.EntryPoints()) == 0:
+			log.Warn("prewarm-pool: no entry points in frontend config, falling back to no-op prewarmer")
+		default:
+			eps := feCfg.EntryPoints()
+			poolDynClient, dcErr := dispatchers.NewUnthrottledDynClientForPrewarm(rc)
+			if dcErr != nil {
+				log.Warn("prewarm-pool: unable to build unthrottled dyn client; L2 miss will skip fallback",
+					slog.Any("err", dcErr))
+			}
+			prewarmPool = (&dispatchers.PrewarmWorkerPool{
+				Workers:            prewarmWorkers,
+				QueueCap:           prewarmQueue,
+				Cache:              c,
+				AuthnNS:            authnNS,
+				EntryPoints:        eps,
+				RBACWatcher:        rbacWatcher,
+				SnowplowEndpointFn: snowplowEndpointFn,
+				SnowplowK8sClient:  snowplowK8sClient,
+				DynClient:          poolDynClient,
+			}).Start(ctx)
+		}
+	}
+
 	if authnNS != "" {
 		userWatcher := cache.NewUserSecretWatcher(c, rc, authnNS)
-		userWatcher.SetOnUserReady(dispatchers.MakeRBACPreWarmer(c, rc, authnNS, signKey))
+		if prewarmPool != nil {
+			userWatcher.SetOnUserReady(dispatchers.MakeEventDrivenPrewarmer(prewarmPool, rc, signKey))
+			log.Info("prewarm: event-driven mode active",
+				slog.Int("workers", prewarmWorkers),
+				slog.Int("queueCap", prewarmQueue),
+			)
+		} else {
+			userWatcher.SetOnUserReady(dispatchers.MakeRBACPreWarmer(c, rc, authnNS, signKey))
+			log.Info("prewarm: legacy mode active (synchronous WarmL1FromEntryPoints)",
+				slog.String("PREWARM_MODE", prewarmMode),
+			)
+		}
 		if err := userWatcher.Start(ctx); err != nil {
 			log.Warn("failed to start user secret watcher", slog.Any("err", err))
 		}
@@ -642,7 +699,15 @@ func startBackgroundServices(ctx context.Context, log *slog.Logger, c cache.Cach
 	// widget tree starting from the INIT/ROUTES_LOADER entry points. This
 	// warms exactly the paths the frontend will request. Falls back to the
 	// GVR-based WarmL1ForAllUsers when the config is missing.
-	frontendConfigPath := env.String("FRONTEND_CONFIG", "/etc/frontend-config/config.json")
+	//
+	// Q-PREWARM-R2R5 PR-B (R5.5) — skip when event-driven prewarm pool
+	// is active. The pool drains per-user jobs as they arrive from the
+	// UserSecretWatcher informer ADD events, so the synchronous loop
+	// would just duplicate work and concentrate CPU.
+	if prewarmPool != nil {
+		log.Info("L1 warmup: synchronous loop skipped — event-driven prewarm pool active")
+		return
+	}
 	go func() {
 		l1Ctx, l1Cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer l1Cancel()
