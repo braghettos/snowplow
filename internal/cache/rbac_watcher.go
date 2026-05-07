@@ -97,9 +97,21 @@ func (rw *RBACWatcher) Start(ctx context.Context) error {
 	// architect spec, ADD strictly EXPANDS visibility — the user's first
 	// request would otherwise pay the cold tail (cyberjoker 22.5s on
 	// ledger row 3). The 2s debounce + subject-union coalescing collapses
-	// initial-LIST storms (~50 RBs in <1s) into ONE fan-out, and the
-	// pool's inflightUsers + L1 Exists checks dedup at cohort granularity.
-	bindingAddHandler := func(obj any) { rw.scheduleCohortPrewarmFromBinding(ctx, obj) }
+	// runtime ADDs (kubectl create rolebinding mid-flight) into ONE fan-out.
+	//
+	// v0.25.313 — gate AddFunc on `rw.synced` so initial-LIST ADDs are
+	// IGNORED. R5 startup-prewarm already covers the BIDs visible at
+	// startup. The cohort-prewarm hook is for RUNTIME ADDs only — when
+	// a user gains visibility AFTER startup. Without this gate, two
+	// informer initial-LISTs (RB + CRB) each fire 1004 fan-outs at boot,
+	// pushing peak heap > 14 GiB and triggering node-eviction (observed
+	// 2026-05-07 22:55 UTC on snowplow 0.25.312 / chart 0.25.314).
+	bindingAddHandler := func(obj any) {
+		if !rw.synced {
+			return
+		}
+		rw.scheduleCohortPrewarmFromBinding(ctx, obj)
+	}
 
 	_, _ = factory.Rbac().V1().Roles().Informer().AddEventHandler(k8scache.ResourceEventHandlerFuncs{
 		UpdateFunc: func(_, n any) { rbacHandler(n) }, DeleteFunc: rbacHandler,
