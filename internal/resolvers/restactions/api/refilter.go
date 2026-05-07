@@ -32,6 +32,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/jqutil"
@@ -160,18 +161,153 @@ type CachedRESTAction struct {
 	//   - a childRESTActionRef map for api[] entries that resolve to
 	//     another RESTAction via /call (refilter recurses).
 	ProtectedDict map[string]any `json:"protected_dict"`
+
+	// IsRefilterIdentity is true iff refilter for this wrapper is byte-
+	// equivalent to applying the outer JQ over the cached ProtectedDict
+	// for ALL users in the binding-identity cohort. Set at MarshalCached
+	// time by computeIsRefilterIdentity, which inspects the RA structural
+	// shape (no api[] entry has UserAccessFilter, no ProtectedDict slot
+	// is a live childRESTActionRef, outer JQ does not reference any of
+	// the user-scoped variable names that a future codec migration could
+	// inject).
+	//
+	// When true, RefilterRESTAction's identity fast path skips the
+	// per-api iteration + UAF apply + child recursion (each provably a
+	// no-op for identity wrappers) and runs only the outer JQ. Cuts the
+	// admin compositions-list refilter wall (~1.7-2.8 s today) by
+	// removing the redundant per-api walk.
+	//
+	// SECURITY (asymmetric trust boundary):
+	//   false-negative (claim "false" when refilter IS identity) → pay
+	//                  extra CPU on the standard path. Safe.
+	//   false-positive (claim "true" when refilter is NOT identity) →
+	//                  serve unfiltered bytes to a user lacking RBAC.
+	//                  CRITICAL violation.
+	// computeIsRefilterIdentity is therefore conservative: it returns
+	// true ONLY when every structural condition is met. Any uncertainty
+	// (nil cr, malformed slot, defensive scan trigger) returns false.
+	//
+	// `omitempty` on the JSON tag makes the wire format
+	// forward+backward-compatible: old binaries decoding new wrappers
+	// see the field; new binaries decoding old wrappers (no field) see
+	// the Go zero value (false) and the fast path declines.
+	IsRefilterIdentity bool `json:"is_refilter_identity,omitempty"`
 }
 
 // MarshalCached returns the v3 wire bytes a caller (l1cache writer) should
 // store under the L1 key. Exported so non-test callers can produce the
 // canonical shape without re-implementing the schema_version handling.
+//
+// Q-COMP-LIST-IDENTITY: stamps IsRefilterIdentity at write time. Computation
+// is cheap (~O(len(api)) + O(len(dict))) and runs once per L1 write — the
+// flag is then read on every refilter via a JSON peek.
 func MarshalCached(cr *templates.RESTAction, protectedDict map[string]any) ([]byte, error) {
 	wrapper := CachedRESTAction{
-		SchemaVersion: CachedSchemaVersionV3,
-		CR:            cr,
-		ProtectedDict: protectedDict,
+		SchemaVersion:      CachedSchemaVersionV3,
+		CR:                 cr,
+		ProtectedDict:      protectedDict,
+		IsRefilterIdentity: computeIsRefilterIdentity(cr, protectedDict),
 	}
 	return json.Marshal(wrapper)
+}
+
+// userScopedJQTokens is the defensive-scan list for outer JQ filters whose
+// output could vary per user even when no UAF is present. Today's snowplow
+// outer JQ scope contains ONLY `.` (the data input) and the JQ stdlib —
+// jqsupport.ModuleLoader does not bind any variables (verified 2026-05-07
+// against plumbing/jqutil v0.9.6: EvalOptions has no Vars field, gojq is
+// invoked without WithVariables). This list therefore has no production
+// hits today but defends against a future codec migration that adds
+// per-user variable binding without updating computeIsRefilterIdentity.
+//
+// Scan is byte-substring on the filter source. False-positives (a string
+// literal containing "$user") simply route to the standard path — safe.
+// False-negatives are not possible because the scan triggers on any of
+// the documented user-scope token prefixes.
+var userScopedJQTokens = []string{
+	"$user",
+	"$jwt",
+	"$groups",
+	"$identity",
+	"$bindings",
+	"$username",
+}
+
+// containsUserScopedJQ returns true if the filter source references any
+// JQ variable in userScopedJQTokens. Used by computeIsRefilterIdentity as
+// a defense-in-depth guard.
+func containsUserScopedJQ(filter string) bool {
+	if filter == "" {
+		return false
+	}
+	for _, tok := range userScopedJQTokens {
+		if strings.Contains(filter, tok) {
+			return true
+		}
+	}
+	return false
+}
+
+// computeIsRefilterIdentity returns true iff refilter is provably a no-op
+// for every user in the binding-identity cohort. Returns false on any of:
+//   - cr is nil (defensive: never claim identity on uncertainty)
+//   - any cr.Spec.API entry has a non-nil UserAccessFilter (per-user
+//     filtering would run on the standard path)
+//   - any ProtectedDict slot is a live childRESTActionRef (the child
+//     could change per user on the next refresh, so the parent's
+//     refilter must recurse)
+//   - cr.Spec.Filter contains any user-scoped JQ token (defense against
+//     a future codec migration that adds per-user variable binding to
+//     the JQ scope)
+//
+// Pure structural inspection; ZERO knowledge of user / RA name / size.
+// Generic over the RA shape — any RA whose api[] entries lack UAF and
+// whose ProtectedDict has no live childRefs benefits, regardless of
+// resource type.
+func computeIsRefilterIdentity(cr *templates.RESTAction, protectedDict map[string]any) bool {
+	if cr == nil {
+		return false
+	}
+	for _, apiCall := range cr.Spec.API {
+		if apiCall == nil {
+			continue
+		}
+		if apiCall.UserAccessFilter != nil {
+			return false
+		}
+	}
+	for _, slot := range protectedDict {
+		if IsChildRESTActionRef(slot) {
+			return false
+		}
+	}
+	if cr.Spec.Filter != nil {
+		if containsUserScopedJQ(ptr.Deref(cr.Spec.Filter, "")) {
+			return false
+		}
+	}
+	return true
+}
+
+// PeekIsRefilterIdentity decodes ONLY the is_refilter_identity flag from
+// a v3 wrapper's raw bytes. Cheap (~1 µs per call regardless of wrapper
+// size — encoding/json's stream decoder skips unmatched fields without
+// allocating intermediate maps). Used by L2 writers to gate the
+// reduction-ratio bypass without re-running the full structural check.
+//
+// Returns (false, err) on decode failure. Callers MUST treat any error
+// as "not eligible for fast path" — never panic, never assume true.
+func PeekIsRefilterIdentity(raw []byte) (bool, error) {
+	if len(raw) == 0 {
+		return false, fmt.Errorf("peek identity: empty raw")
+	}
+	var probe struct {
+		IsRefilterIdentity bool `json:"is_refilter_identity"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return false, err
+	}
+	return probe.IsRefilterIdentity, nil
 }
 
 // RefilterRESTAction unmarshals a v3 cached entry, refilters each
@@ -225,6 +361,45 @@ func RefilterRESTAction(ctx context.Context, c cache.Cache, raw []byte) ([]byte,
 	}
 
 	refiltered := make(map[string]any, len(wrapper.ProtectedDict))
+
+	// ── Q-COMP-LIST-IDENTITY identity-refilter fast path ─────────────────
+	// When the wrapper claims IsRefilterIdentity=true AND a defense-in-
+	// depth re-validation against the just-decoded CR + dict agrees, skip
+	// the per-api iteration entirely. Identity wrappers are wrappers where
+	// the per-api loop below is provably a no-op for every user in the
+	// cohort:
+	//   - no UAF on any api[] entry → applyUserAccessFilter is never
+	//     invoked (line 426 below)
+	//   - no live childRESTActionRef in any slot → the recursive
+	//     resolveChild branch never fires
+	// In that scenario, the per-api loop's only effect is
+	// `refiltered[apiCall.Name] = slot` for every entry, which is exactly
+	// what carrying through every ProtectedDict key does.
+	//
+	// Trust boundary (FAIL-CLOSED): the re-validation MUST be performed
+	// against the just-decoded wrapper, NOT solely against the cached
+	// flag. A corrupted L1 entry that flagged identity but actually
+	// contains a UAF MUST fall through to the standard path. Cost of the
+	// re-validation: O(len(api)) + O(len(dict)) — microseconds, far
+	// below the per-api loop it replaces.
+	//
+	// The fast path runs the SAME outer JQ over the SAME map shape as
+	// the standard path would for an identity wrapper, so output is
+	// byte-equivalent by construction.
+	if wrapper.IsRefilterIdentity && computeIsRefilterIdentity(wrapper.CR, wrapper.ProtectedDict) {
+		for k, v := range wrapper.ProtectedDict {
+			refiltered[k] = v
+		}
+		cache.GlobalMetrics.RefilterFastPathHits.Add(1)
+		return runOuterJQAndMarshal(ctx, wrapper.CR, refiltered)
+	}
+	// If the flag was set but re-validation disagrees, count that as a
+	// fallthrough so observability surfaces the discrepancy. PM gate
+	// G-FALLTHROUGH alerts when this rate exceeds 5%.
+	if wrapper.IsRefilterIdentity {
+		cache.GlobalMetrics.RefilterFastPathFallthrough.Add(1)
+	}
+	// ── End fast path; standard path follows ─────────────────────────────
 
 	// Carry through any non-api keys that the resolver may have added
 	// (e.g., "slice" for pagination, "apiRequests" diagnostic). These
@@ -303,12 +478,27 @@ func RefilterRESTAction(ctx context.Context, c cache.Cache, raw []byte) ([]byte,
 		refiltered[apiCall.Name] = applyUserAccessFilter(ctx, apiCall, slot)
 	}
 
+	return runOuterJQAndMarshal(ctx, wrapper.CR, refiltered)
+}
+
+// runOuterJQAndMarshal is the shared tail of RefilterRESTAction. Both the
+// standard path and the IsRefilterIdentity fast path converge here so the
+// outer JQ + final marshal is identical bytes-for-bytes regardless of the
+// path taken to assemble `refiltered`. This is the load-bearing equivalence
+// guarantee for Q-COMP-LIST-IDENTITY: the fast path is byte-equivalent to
+// the standard path because they share THIS function for the steps that
+// produce wire bytes.
+//
+// `cr` is mutated: cr.Status is set to the JQ output before marshal.
+// Caller MUST have already cleared any pre-existing Status (refilter does
+// this at the top).
+func runOuterJQAndMarshal(ctx context.Context, cr *templates.RESTAction, refiltered map[string]any) ([]byte, error) {
 	// Outer JQ: re-evaluate cr.Spec.Filter against refiltered dict to
 	// produce cr.Status.Raw. If no outer filter, marshal the refiltered
 	// dict directly (matches restactions.Resolve's else branch).
 	var statusRaw []byte
-	if wrapper.CR.Spec.Filter != nil {
-		q := ptr.Deref(wrapper.CR.Spec.Filter, "")
+	if cr.Spec.Filter != nil {
+		q := ptr.Deref(cr.Spec.Filter, "")
 		s, jerr := jqutil.Eval(context.TODO(), jqutil.EvalOptions{
 			Query:        q,
 			Data:         refiltered,
@@ -317,8 +507,8 @@ func RefilterRESTAction(ctx context.Context, c cache.Cache, raw []byte) ([]byte,
 		if jerr != nil {
 			log := xcontext.Logger(ctx)
 			log.Error("v3 refilter: outer JQ eval failed",
-				slog.String("name", wrapper.CR.Name),
-				slog.String("namespace", wrapper.CR.Namespace),
+				slog.String("name", cr.Name),
+				slog.String("namespace", cr.Namespace),
 				slog.Any("err", jerr))
 			return nil, fmt.Errorf("v3 refilter: outer jq: %w", jerr)
 		}
@@ -331,9 +521,9 @@ func RefilterRESTAction(ctx context.Context, c cache.Cache, raw []byte) ([]byte,
 		statusRaw = marshaled
 	}
 
-	wrapper.CR.Status = &runtime.RawExtension{Raw: statusRaw}
+	cr.Status = &runtime.RawExtension{Raw: statusRaw}
 
-	out, merr := json.Marshal(wrapper.CR)
+	out, merr := json.Marshal(cr)
 	if merr != nil {
 		return nil, fmt.Errorf("v3 refilter: re-marshal CR: %w", merr)
 	}

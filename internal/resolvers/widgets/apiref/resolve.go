@@ -343,7 +343,12 @@ func lookupL1Refiltered(ctx context.Context, c cache.Cache, l1Key string) (map[s
 	// with the correct flag so the next L2 hit on this entry returns
 	// hasUAF correctly to the widget caller.
 	if identity != "" {
-		cache.L2Put(l1Key, identity, groupsHash, refiltered, status, hasUAF, "v3", len(raw))
+		// Q-COMP-LIST-IDENTITY — peek the wrapper's IsRefilterIdentity
+		// flag so the L2 reduction-ratio gate is bypassed for identity
+		// wrappers. Peek failure defaults to false → standard L2Put
+		// behavior.
+		isIdentity, _ := api.PeekIsRefilterIdentity(raw)
+		cache.L2PutWithIdentityHint(l1Key, identity, groupsHash, refiltered, status, hasUAF, "v3", len(raw), isIdentity)
 	}
 
 	return status, hasUAF, true

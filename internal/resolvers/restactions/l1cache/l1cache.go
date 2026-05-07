@@ -289,7 +289,13 @@ func resolveAndCacheInner(ctx context.Context, in Input) (*Result, error) {
 			if user, uerr := xcontext.UserInfo(ctx); uerr == nil {
 				groupsHash = cache.HashGroups(user.Groups)
 			}
-			cache.L2Put(in.ResolvedKey, rki.Username, groupsHash, refiltered, status, false, "v3", len(raw))
+			// Q-COMP-LIST-IDENTITY — peek the freshly-marshaled wrapper's
+			// IsRefilterIdentity flag and route through the identity-aware
+			// L2 writer (bypasses the reduction-ratio gate when true so
+			// admin-class wrappers actually land in L2). Peek failure
+			// defaults to false → standard L2Put behavior.
+			isIdentity, _ := api.PeekIsRefilterIdentity(raw)
+			cache.L2PutWithIdentityHint(in.ResolvedKey, rki.Username, groupsHash, refiltered, status, false, "v3", len(raw), isIdentity)
 		}
 	}
 

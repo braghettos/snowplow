@@ -77,6 +77,27 @@ type Metrics struct {
 	L2EvictionsIdentity  atomic.Int64
 	L2EvictionsRA        atomic.Int64
 	L2EvictionsTotal     atomic.Int64
+
+	// ── Q-COMP-LIST-IDENTITY identity-refilter fast path ────────────────
+	// RefilterFastPathHits counts wrappers that took the IsRefilterIdentity
+	// fast path inside RefilterRESTAction (per-api iteration skipped).
+	// RefilterFastPathFallthrough counts wrappers that claimed identity
+	// at write time but failed defense-in-depth re-validation at refilter
+	// time (or that took the standard path because of a downstream
+	// disagreement). PM gate G-FALLTHROUGH alerts when the
+	// fallthrough/(hits+fallthrough) ratio exceeds 5% — that signals the
+	// fast path is silently wrong and the standard path is masking the
+	// "performance win" the change was meant to deliver.
+	//
+	// L2WritesIdentityBypass counts L2 entries written under the
+	// reduction-ratio bypass (rawL1Size effectively zero because the
+	// wrapper claimed identity). L2HitsIdentityCohort counts L2 hits
+	// that served bytes from a wrapper that was originally written via
+	// the bypass path — observability for the steady-state win.
+	RefilterFastPathHits        atomic.Int64
+	RefilterFastPathFallthrough atomic.Int64
+	L2WritesIdentityBypass      atomic.Int64
+	L2HitsIdentityCohort        atomic.Int64
 }
 
 // Inc atomically increments the given counter and updates the OTel metric.
@@ -145,6 +166,12 @@ type MetricsSnapshot struct {
 	L2HitRate           float64 `json:"l2_hit_rate"`
 	L2ResidentBytes     int64   `json:"l2_resident_bytes"`
 	L2ResidentCount     int64   `json:"l2_resident_count"`
+
+	// Q-COMP-LIST-IDENTITY identity-refilter fast path observability.
+	RefilterFastPathHits         int64 `json:"refilter_fast_path_hits"`
+	RefilterFastPathFallthrough  int64 `json:"refilter_fast_path_fallthrough"`
+	L2WritesIdentityBypass       int64 `json:"l2_writes_identity_bypass"`
+	L2HitsIdentityCohort         int64 `json:"l2_hits_identity_cohort"`
 }
 
 var GlobalMetrics = &Metrics{}
@@ -199,6 +226,11 @@ func (m *Metrics) snapshotFromAtomics() MetricsSnapshot {
 		L2EvictionsTotal:    m.L2EvictionsTotal.Load(),
 		L2ResidentBytes:     L2ResidentBytes(),
 		L2ResidentCount:     L2ResidentCount(),
+
+		RefilterFastPathHits:        m.RefilterFastPathHits.Load(),
+		RefilterFastPathFallthrough: m.RefilterFastPathFallthrough.Load(),
+		L2WritesIdentityBypass:      m.L2WritesIdentityBypass.Load(),
+		L2HitsIdentityCohort:        m.L2HitsIdentityCohort.Load(),
 	}
 	s.GetHitRate = hitRate(s.GetHits, s.GetMisses)
 	s.ListHitRate = hitRate(s.ListHits, s.ListMisses)

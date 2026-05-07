@@ -225,7 +225,17 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 						// once per cold L2 cohort) — amortised across the
 						// thundering-herd burst by the singleflight upstream.
 						l2Status := decodeStatusForL2(refiltered)
-						cache.L2Put(resolvedKey, identity, groupsHash, refiltered, l2Status, false, "v3", len(raw))
+						// Q-COMP-LIST-IDENTITY — peek the wrapper's
+						// IsRefilterIdentity flag so the L2 reduction-
+						// ratio gate is bypassed for identity wrappers
+						// (post-refilter ≈ L1 is the EXPECTED outcome
+						// when refilter is a no-op; gating it would
+						// refuse to cache the very entries this fix is
+						// meant to make L2-cacheable). On peek failure
+						// we default to false → standard L2Put behavior,
+						// which is the trust-boundary-correct fallback.
+						isIdentity, _ := api.PeekIsRefilterIdentity(raw)
+						cache.L2PutWithIdentityHint(resolvedKey, identity, groupsHash, refiltered, l2Status, false, "v3", len(raw), isIdentity)
 						log.Info("RESTAction resolved from cache",
 							slog.String("key", resolvedKey),
 							slog.String("user", user.Username),

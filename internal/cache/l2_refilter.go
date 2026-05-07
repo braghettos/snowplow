@@ -101,6 +101,13 @@ type L2Entry struct {
 	l1Key       string
 	identity    string
 	gvrName     string // ParseResolvedKey-derived "{group}/{version}/{resource}/{name}"; "" when unparseable
+
+	// Q-COMP-LIST-IDENTITY: true if this entry was written via the
+	// identity-refilter bypass (rawL1Size=0 → reduction-ratio gate
+	// skipped). Read by L2Get to increment L2HitsIdentityCohort for
+	// observability. Generic property of the wrapper at write time, not
+	// of any user.
+	identityRefiltered bool
 }
 
 // l2Index is the in-process L2 cache. sync.Map for the hash table; an
@@ -671,5 +678,60 @@ func L2Get(l1Key, identity, groupsHash string) (*L2Entry, bool) {
 	if hk == "" {
 		return nil, false
 	}
-	return GetL2Refilter(hk)
+	e, ok := GetL2Refilter(hk)
+	if ok && e != nil && e.identityRefiltered {
+		GlobalMetrics.L2HitsIdentityCohort.Add(1)
+	}
+	return e, ok
+}
+
+// L2PutWithIdentityHint is L2Put with an explicit Q-COMP-LIST-IDENTITY
+// signal. When isRefilterIdentity == true, the reduction-ratio gate in
+// SetL2Refilter is bypassed by passing rawL1Size=0 — this is the
+// documented bypass convention (SetL2Refilter docstring above:
+// "pass 0 to bypass the reduction gate"). The bypass exists because
+// post-refilter ≈ L1 is the EXPECTED outcome for identity wrappers
+// (refilter is a no-op), so caching the wire bytes is exactly the right
+// thing — gating it would refuse to cache the very entries the fix is
+// engineered to make L2-cacheable.
+//
+// The entry-size cap (l2MaxEntryBytes, default 50 MB) STILL applies.
+// That gate is a hard memory-safety limit, unrelated to the
+// reduction-ratio policy.
+//
+// Generic property of the wrapper, not the user: any wrapper with
+// isRefilterIdentity == true gets the gate bypass, regardless of which
+// user is reading. feedback_no_special_cases.md preserved.
+//
+// When isRefilterIdentity == false, behavior is identical to L2Put
+// (the reduction-ratio gate runs as before).
+func L2PutWithIdentityHint(l1Key, identity, groupsHash string, refiltered []byte, status map[string]any, hasUAF bool, schemaVer string, rawL1Size int, isRefilterIdentity bool) {
+	if !L2Enabled() {
+		return
+	}
+	hk := L2Key(l1Key, identity, groupsHash)
+	if hk == "" || len(refiltered) == 0 {
+		return
+	}
+	e := &L2Entry{
+		Refiltered:         append([]byte(nil), refiltered...), // defensive copy
+		Status:             status,
+		HasUAF:             hasUAF,
+		SchemaVer:          schemaVer,
+		l1Key:              l1Key,
+		identity:           identity,
+		identityRefiltered: isRefilterIdentity,
+	}
+	effectiveRawL1Size := rawL1Size
+	if isRefilterIdentity {
+		effectiveRawL1Size = 0 // bypass the reduction-ratio gate
+	}
+	// Snapshot pre-write counters so we can detect whether the write
+	// actually landed (the size-cap gate inside SetL2Refilter could still
+	// reject an entry larger than l2MaxEntryBytes even on the bypass path).
+	preWrites := GlobalMetrics.L2Writes.Load()
+	SetL2Refilter(hk, e, effectiveRawL1Size)
+	if isRefilterIdentity && GlobalMetrics.L2Writes.Load() > preWrites {
+		GlobalMetrics.L2WritesIdentityBypass.Add(1)
+	}
 }
