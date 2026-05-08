@@ -118,10 +118,82 @@ func TestRuntimeMetrics_PreservesExistingShape(t *testing.T) {
 	for _, key := range []string{
 		"heap_alloc_mb", "heap_sys_mb", "goroutine_count", "num_gc",
 		"active_users", "cache_key_count",
-		"cluster_dep", "watch_events", "work_queues", "l2", "prewarm",
+		"cluster_dep", "watch_events", "work_queues", "l1", "l2", "prewarm",
 	} {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("missing top-level field %q in /metrics/runtime output", key)
+		}
+	}
+}
+
+// TestRuntimeMetrics_ExposesL1Block guards the canary-instrumentation
+// contract for Q-L1-BUDGET (0.25.319): /metrics/runtime MUST surface the
+// L1 byte-budget gauges + LRU/TTL eviction counters under top-level "l1".
+//
+// Required-field set is the architect's acceptance: resident_bytes,
+// entries, max_bytes, max_entries, evictions_lru, evictions_ttl. Without
+// these the byte-budget rollout is blind (PM cannot verify L1 evictions
+// fire under load, cannot compute utilisation %, cannot diff between
+// LRU-driven and TTL-driven evictions). Test fails loudly on JSON-key
+// drift.
+func TestRuntimeMetrics_ExposesL1Block(t *testing.T) {
+	cache.GlobalMetrics.L1EvictionsLRU.Store(17)
+	cache.GlobalMetrics.L1EvictionsTTL.Store(23)
+	t.Cleanup(func() {
+		cache.GlobalMetrics.L1EvictionsLRU.Store(0)
+		cache.GlobalMetrics.L1EvictionsTTL.Store(0)
+		cache.RegisterL1Sampler(func() (int64, int64) { return 0, 0 })
+	})
+	cache.RegisterL1Sampler(func() (int64, int64) { return 4096, 8 })
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics/runtime", nil)
+	rec := httptest.NewRecorder()
+	RuntimeMetricsHandler(nil, nil, nil).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%q", rec.Code, rec.Body.String())
+	}
+
+	var got RuntimeMetrics
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v body=%q", err, rec.Body.String())
+	}
+
+	if got.L1.ResidentBytes != 4096 {
+		t.Errorf("L1.ResidentBytes: got %d, want 4096", got.L1.ResidentBytes)
+	}
+	if got.L1.Entries != 8 {
+		t.Errorf("L1.Entries: got %d, want 8", got.L1.Entries)
+	}
+	if got.L1.EvictionsLRU != 17 {
+		t.Errorf("L1.EvictionsLRU: got %d, want 17", got.L1.EvictionsLRU)
+	}
+	if got.L1.EvictionsTTL != 23 {
+		t.Errorf("L1.EvictionsTTL: got %d, want 23", got.L1.EvictionsTTL)
+	}
+	if got.L1.MaxBytes <= 0 {
+		t.Errorf("L1.MaxBytes: got %d, want > 0 (default 2GiB or env override)", got.L1.MaxBytes)
+	}
+	if got.L1.MaxEntries <= 0 {
+		t.Errorf("L1.MaxEntries: got %d, want > 0 (default 200000 or env override)", got.L1.MaxEntries)
+	}
+
+	// Verify the JSON shape exposes snake_case keys under "l1".
+	var raw map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("raw decode: %v", err)
+	}
+	l1, ok := raw["l1"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected top-level 'l1' object, got %T", raw["l1"])
+	}
+	required := []string{
+		"resident_bytes", "entries", "max_bytes", "max_entries",
+		"evictions_lru", "evictions_ttl",
+	}
+	for _, k := range required {
+		if _, ok := l1[k]; !ok {
+			t.Errorf("missing required L1 field %q in JSON output: %v", k, l1)
 		}
 	}
 }
