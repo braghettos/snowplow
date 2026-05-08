@@ -189,7 +189,10 @@ func preWarmChildWidgets(parentCtx context.Context, c cache.Cache, resolved *uns
 
 	identity := cache.CacheIdentity(parentCtx, user.Username)
 	actionRefIDs := extractActionRefIDs(resolved.Object)
-	refs := extractChildWidgetRefs(parentCtx, c, items, identity, actionRefIDs)
+	widgetRefs, raRefs := extractChildRefs(parentCtx, c, items, identity, actionRefIDs)
+	// Combine for recursivePreWarm — it handles widget vs RA dispatch
+	// internally via the per-ref gvr.Group check.
+	refs := append(widgetRefs, raRefs...)
 	if len(refs) == 0 {
 		return
 	}
@@ -238,20 +241,45 @@ func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.E
 		return
 	}
 
-	var unvisited []l1Ref
+	// Q-COHORT-PREWARM-RA (v0.25.318): split refs into widget vs RA bins so
+	// each can take the resolver path that produces the right L1 shape:
+	//   - widgets → widgets.Resolve via resolveL1RefsCollect (produces
+	//     resourcesRefs that we recurse into for the next depth level)
+	//   - RAs (e.g. compositions-list) → l1cache.ResolveAndCache via
+	//     resolveL1RestActionsCollect (which transitively populates the
+	//     B-prime evalCache LRU through applyUserAccessFilter)
+	// Pre-Patch this function only routed widget refs; RAs reachable from
+	// the widget tree were filtered out by the widgetGroup gate inside
+	// extractChildWidgetRefs (now extractChildRefs) and never pre-warmed.
+	var (
+		unvisitedWidgets []l1Ref
+		unvisitedRAs     []l1Ref
+	)
 	for _, r := range refs {
 		key := r.gvr.String() + ":" + r.ns + ":" + r.name
 		if visited[key] {
 			continue
 		}
 		visited[key] = true
-		unvisited = append(unvisited, r)
+		if r.gvr.Group == widgetGroup {
+			unvisitedWidgets = append(unvisitedWidgets, r)
+		} else {
+			unvisitedRAs = append(unvisitedRAs, r)
+		}
 	}
-	if len(unvisited) == 0 {
+	if len(unvisitedWidgets) == 0 && len(unvisitedRAs) == 0 {
 		return
 	}
 
-	resolved := resolveL1RefsCollect(ctx, user, ep, accessToken, c, dynClient, unvisited, authnNS)
+	// Resolve the widget batch first; widgets typically anchor the tree and
+	// produce the resourcesRefs we recurse into. RA resolution is purely
+	// terminal (it populates L1 + evalCache but does not contribute new refs
+	// for the next depth level — the architect-cited reference path
+	// `warmL1RestActionsForUser` likewise stops there).
+	resolved := resolveL1RefsCollect(ctx, user, ep, accessToken, c, dynClient, unvisitedWidgets, authnNS)
+	if len(unvisitedRAs) > 0 {
+		resolveL1RestActionsCollect(ctx, user, ep, accessToken, c, dynClient, unvisitedRAs, authnNS)
+	}
 
 	var nextRefs []l1Ref
 	for _, res := range resolved {
@@ -260,7 +288,9 @@ func recursivePreWarm(ctx context.Context, user jwtutil.UserInfo, ep endpoints.E
 			continue
 		}
 		actionRefIDs := extractActionRefIDs(res.Object)
-		nextRefs = append(nextRefs, extractChildWidgetRefs(ctx, c, childItems, cache.CacheIdentity(ctx, user.Username), actionRefIDs)...)
+		childWidgets, childRAs := extractChildRefs(ctx, c, childItems, cache.CacheIdentity(ctx, user.Username), actionRefIDs)
+		nextRefs = append(nextRefs, childWidgets...)
+		nextRefs = append(nextRefs, childRAs...)
 	}
 
 	recursivePreWarm(ctx, user, ep, accessToken, c, dynClient, nextRefs, authnNS, visited, depth+1)
@@ -725,12 +755,24 @@ func warmL1RestActionsForUser(ctx context.Context, c cache.Cache, dynClient k8sd
 	return warmed
 }
 
-// extractChildWidgetRefs filters resourcesRefs items to only those that should
-// be pre-warmed. Items whose ID appears in skipIDs (action-linked refs like
+// extractChildRefs filters resourcesRefs items to those that should be
+// pre-warmed. Items whose ID appears in skipIDs (action-linked refs like
 // navigate/openDrawer/openModal) are excluded — they are deferred and only
 // resolved on user interaction.
-func extractChildWidgetRefs(ctx context.Context, c cache.Cache, items []interface{}, identity string, skipIDs map[string]bool) []l1Ref {
-	var refs []l1Ref
+//
+// Q-COHORT-PREWARM-RA (v0.25.318): widget refs and RESTAction refs are now
+// emitted on separate lists. Pre-Patch this function dropped any ref whose
+// group != widgets.templates.krateo.io, which meant `compositions-list` and
+// other RAs declared via the widget tree's `/call?` paths were never
+// pre-resolved during cohort prewarm. First-request cyberjoker traffic then
+// paid the full L1+UAF cold-fill cost (~7s on the bench cluster). Post-
+// Patch: RA refs are returned alongside widget refs so recursivePreWarm
+// can run them through resolveL1RestActionsCollect, which calls
+// l1cache.ResolveAndCache → applyUserAccessFilter and populates both the
+// per-user L1 entry AND the B-prime evalCache LRU.
+//
+// Returns (widgetRefs, raRefs). Either slice may be nil/empty.
+func extractChildRefs(ctx context.Context, c cache.Cache, items []interface{}, identity string, skipIDs map[string]bool) (widgets, ras []l1Ref) {
 	for _, item := range items {
 		m, ok := item.(map[string]interface{})
 		if !ok {
@@ -749,16 +791,18 @@ func extractChildWidgetRefs(ctx context.Context, c cache.Cache, items []interfac
 		if gvr.Resource == "" || name == "" {
 			continue
 		}
-		if gvr.Group != widgetGroup {
-			continue
-		}
 		key := cache.ResolvedKey(identity, gvr, ns, name, -1, -1)
 		if c.Exists(ctx, key) {
 			continue
 		}
-		refs = append(refs, l1Ref{gvr: gvr, ns: ns, name: name})
+		ref := l1Ref{gvr: gvr, ns: ns, name: name}
+		if gvr.Group == widgetGroup {
+			widgets = append(widgets, ref)
+		} else {
+			ras = append(ras, ref)
+		}
 	}
-	return refs
+	return widgets, ras
 }
 
 // extractActionRefIDs collects all resourceRefId values from the resolved
@@ -907,6 +951,107 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 
 	wg.Wait()
 	return results
+}
+
+// resolveL1RestActionsCollect resolves a batch of RESTAction l1Refs encountered
+// during the cohort widget-tree walk. Mirrors the body of
+// warmL1RestActionsForUser but parameterized on []l1Ref so callers (the
+// recursive walk in recursivePreWarm) can fold RA prewarm directly into the
+// per-cohort fan-out without re-enabling the legacy synchronous bypass that
+// main.go disabled when the event-driven pool became authoritative.
+//
+// Q-COHORT-PREWARM-RA (v0.25.318) — closes the cyberjoker first-request cold-
+// fill gap on `compositions-list`. Each ref runs through l1cache.ResolveAndCache
+// which transitively triggers applyUserAccessFilter and populates the B-prime
+// evalCache LRU on the cohort's RBACWatcher, so the FIRST real HTTP request
+// post-pod-restart hits a warm UAF decision cache instead of paying the
+// 2-7 s per-namespace EvaluateRBAC walk that the audit log captured at
+// 11:10:25 → 11:11:49 on 0.25.316.
+//
+// Refs whose gvr.Group is widgets.templates.krateo.io are silently skipped
+// here (defensive — the caller already separates widget vs RA buckets). RAs
+// whose L1 entry already exists for this cohort are skipped via the same
+// c.Exists short-circuit warmL1RestActionsForUser uses.
+func resolveL1RestActionsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoints.Endpoint, accessToken string, c cache.Cache, dynClient k8sdynamic.Interface, refs []l1Ref, authnNS string) {
+	if len(refs) == 0 {
+		return
+	}
+	log := slog.Default()
+
+	rctx := xcontext.BuildContext(ctx,
+		xcontext.WithUserConfig(ep),
+		xcontext.WithUserInfo(user),
+		xcontext.WithAccessToken(accessToken),
+		xcontext.WithLogger(slog.Default()),
+	)
+	rctx = cache.WithCache(rctx, c)
+
+	// Inject inline /call resolver so nested RESTAction calls resolve
+	// in-process from the informer instead of HTTP round-trip. Same
+	// rationale as warmL1RestActionsForUser — see that function for the
+	// architect's nested-userAccessFilter dispatch contract notes.
+	if cache.InformerReaderFromContext(rctx) != nil {
+		rctx = cache.WithCallResolver(rctx, func(callCtx context.Context, obj map[string]any, resolvedKey, callAuthnNS string) ([]byte, error) {
+			result, err := l1cache.ResolveAndCache(callCtx, l1cache.Input{
+				Cache:       c,
+				Obj:         obj,
+				ResolvedKey: resolvedKey,
+				AuthnNS:     callAuthnNS,
+			})
+			if err != nil {
+				return nil, err
+			}
+			if result == nil {
+				return nil, nil
+			}
+			return result.Raw, nil
+		})
+	}
+
+	identity := cache.CacheIdentity(rctx, user.Username)
+
+	for _, r := range refs {
+		// Defensive skip: caller separates widget vs RA buckets, but if a
+		// widget slipped in we do NOT want to call l1cache.ResolveAndCache
+		// on it (that path is for RESTAction-shaped CRs only).
+		if r.gvr.Group == widgetGroup {
+			continue
+		}
+
+		rKey := cache.ResolvedKey(identity, r.gvr, r.ns, r.name, -1, -1)
+		if c != nil && c.Exists(rctx, rKey) {
+			continue
+		}
+
+		cached, ok := prewarmFetchCR(rctx, c, dynClient, r.gvr, r.ns, r.name)
+		if !ok {
+			log.Warn("L1 cohort prewarm: failed to fetch RESTAction CR",
+				slog.String("group", r.gvr.Group),
+				slog.String("resource", r.gvr.Resource),
+				slog.String("name", r.name),
+				slog.String("namespace", r.ns))
+			continue
+		}
+
+		if _, err := l1cache.ResolveAndCache(rctx, l1cache.Input{
+			Cache:       c,
+			Obj:         cached.Object,
+			ResolvedKey: rKey,
+			AuthnNS:     authnNS,
+			PerPage:     -1,
+			Page:        -1,
+		}); err != nil {
+			log.Warn("L1 cohort prewarm: failed to resolve RESTAction",
+				slog.String("name", r.name),
+				slog.String("namespace", r.ns),
+				slog.Any("err", err))
+			continue
+		}
+
+		if rki, ok := cache.ParseResolvedKey(rKey); ok {
+			cache.TouchKey(cache.ResolvedKeyBase(rki.Username, rki.GVR, rki.NS, rki.Name))
+		}
+	}
 }
 
 // mintJWT creates a short-lived JWT for internal use during L1 warmup and
