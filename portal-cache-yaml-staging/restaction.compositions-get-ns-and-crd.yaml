@@ -20,12 +20,16 @@ spec:
     continueOnError: true
   - name: namespaces
     path: "/api/v1/namespaces"
-    # Q-RBAC-DECOUPLE C(d): elevated read via snowplow's SA, then
-    # per-user RBAC drop using the namespace name as the RBAC namespace.
+    # Q-RBAC-DECOUPLE C(d) + Q-UAF-FIX (2026-05-08): UAF checks
+    # `compositions` (composition.krateo.io group) to filter the namespace
+    # list to those where the user has composition visibility. Tenants
+    # whose Roles use `Resources: ["*"]` on composition.krateo.io match
+    # this check; tenants with narrower per-CRD scoping may need a
+    # different UAF idiom (deferred — see project_regression_journal.md).
     userAccessFilter:
       verb: list
-      group: ""
-      resource: namespaces
+      group: composition.krateo.io
+      resource: compositions
       namespaceFrom: "."
     filter: "[.namespaces.items[] | .metadata.name]"
     continueOnError: true

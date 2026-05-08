@@ -10,12 +10,12 @@ spec:
   - filter: '[.namespaces.items[] | .metadata.name]'
     name: namespaces
     path: /api/v1/namespaces
-    # Q-RBAC-DECOUPLE C(d): elevated read via snowplow's SA, then
-    # per-user RBAC drop using the namespace name as the RBAC namespace.
+    # Q-RBAC-DECOUPLE C(d) + Q-UAF-FIX (2026-05-08): UAF checks the
+    # `compositiondefinitions` resource that the next api[] stage queries.
     userAccessFilter:
       verb: list
-      group: ""
-      resource: namespaces
+      group: core.krateo.io
+      resource: compositiondefinitions
       namespaceFrom: "."
   - continueOnError: true
     dependsOn:

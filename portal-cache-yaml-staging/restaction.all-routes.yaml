@@ -9,12 +9,15 @@ spec:
   api:
   - name: namespaces
     path: "/api/v1/namespaces"
-    # Q-RBAC-DECOUPLE C(d): elevated read via snowplow's SA, then
-    # per-user RBAC drop using the namespace name as the RBAC namespace.
+    # Q-RBAC-DECOUPLE C(d) + Q-UAF-FIX (2026-05-08): elevated read via
+    # snowplow's SA, then per-user RBAC drop. UAF must check the SAME
+    # namespace-scoped resource the next api[] stage will hit (`routes`),
+    # NOT the cluster-scoped `namespaces` resource (which Phase-2 RB checks
+    # cannot grant by design — was a latent bug, fixed 2026-05-08).
     userAccessFilter:
       verb: list
-      group: ""
-      resource: namespaces
+      group: widgets.templates.krateo.io
+      resource: routes
       namespaceFrom: "."
     filter: "[.namespaces.items[] | .metadata.name]"
   - name: routes

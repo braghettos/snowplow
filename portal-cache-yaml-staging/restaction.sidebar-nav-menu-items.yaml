@@ -9,12 +9,12 @@ spec:
   api:
   - name: namespaces
     path: "/api/v1/namespaces"
-    # Q-RBAC-DECOUPLE C(d): elevated read via snowplow's SA, then
-    # per-user RBAC drop using the namespace name as the RBAC namespace.
+    # Q-RBAC-DECOUPLE C(d) + Q-UAF-FIX (2026-05-08): UAF checks the
+    # `navmenuitems` resource that the next api[] stage queries.
     userAccessFilter:
       verb: list
-      group: ""
-      resource: namespaces
+      group: widgets.templates.krateo.io
+      resource: navmenuitems
       namespaceFrom: "."
     filter: "[.namespaces.items[] | .metadata.name]"
   - name: navmenuitems
