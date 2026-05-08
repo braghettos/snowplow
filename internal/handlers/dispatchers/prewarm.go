@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"log/slog"
+	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -102,6 +104,35 @@ const (
 	prewarmPerPage = 5
 	prewarmPage    = 1
 )
+
+// envPrewarmInnerConcurrency overrides the per-outer-worker inner-resolve
+// concurrency. Default = max(2, GOMAXPROCS/2).
+//
+// Q-OOM-COMPLETION (v0.25.315) Patch 2 — pre-Patch the inner sem was
+// sized at GOMAXPROCS (4 on the GKE pod), allowing 4 inner concurrent
+// resolves per outer worker. With 4 outer workers that's 16 concurrent
+// decode trees × 150-300 MB each → transient RSS breach of the 16 GiB
+// cgroup. Halving to max(2, GOMAXPROCS/2)=2 caps total concurrency at
+// 4 workers × 2 = 8 trees, dropping burst RSS ~25%.
+const envPrewarmInnerConcurrency = "PREWARM_INNER_CONCURRENCY"
+
+// prewarmInnerConcurrency returns the inner-resolve concurrency cap.
+// Reads the env on each call — these calls are rare (once per
+// resolveL1RefsCollect, which is once per outer worker job) so the
+// overhead is negligible.
+func prewarmInnerConcurrency() int {
+	if v := os.Getenv(envPrewarmInnerConcurrency); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	gp := runtime.GOMAXPROCS(0)
+	half := gp / 2
+	if half < 2 {
+		return 2
+	}
+	return half
+}
 
 // ---------------------------------------------------------------------------
 // Pre-warm lifecycle control
@@ -776,8 +807,14 @@ func resolveL1RefsCollect(ctx context.Context, user jwtutil.UserInfo, ep endpoin
 	identity := cache.CacheIdentity(ctx, user.Username)
 
 	var (
-		wg      sync.WaitGroup
-		sem     = make(chan struct{}, runtime.GOMAXPROCS(0))
+		wg sync.WaitGroup
+		// Q-OOM-COMPLETION (v0.25.315) Patch 2 — inner concurrency cap.
+		// Pre-Patch: cap = GOMAXPROCS (4). With 4 outer workers ⇒ 16
+		// concurrent decode trees × 150-300 MB each ⇒ 16 GiB cgroup
+		// breach (OOM root cause). Post-Patch: cap = max(2, GOMAXPROCS/2)
+		// (2 on the bench pod). 4 outer × 2 = 8 trees ⇒ peak ≈12 GiB,
+		// comfortably under the limit.
+		sem     = make(chan struct{}, prewarmInnerConcurrency())
 		mu      sync.Mutex
 		results []*unstructured.Unstructured
 	)
