@@ -13,6 +13,7 @@ package cache
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -70,8 +71,16 @@ func (m *mockPrewarmer) snapshot() (calls int, lastUsers []string) {
 // newTestRBACWatcher constructs a minimally-initialised RBACWatcher
 // suitable for direct scheduler tests. The informer wiring is skipped;
 // we drive scheduleCohortPrewarmFromBinding directly.
+//
+// Q-OOM-COMPLETION (v0.25.315) Patch 1 — installs a bidComputerOverride
+// that assigns each username a unique BID. This preserves pre-Patch-1
+// fan-out semantics (every user → a distinct cohort representative) so
+// existing tests continue to assert their original expectations. Tests
+// that exercise BID dedup explicitly install their own override.
 func newTestRBACWatcher(c Cache) *RBACWatcher {
-	return &RBACWatcher{cache: c}
+	rw := &RBACWatcher{cache: c}
+	rw.bidComputerOverride = func(u string) string { return "bid-" + u }
+	return rw
 }
 
 // fixtureRoleBinding builds a *rbacv1.RoleBinding with the given subjects.
@@ -166,8 +175,12 @@ func TestRBACAdd_DebounceCoalesces(t *testing.T) {
 // initial-LIST storm + helm rollout) must coalesce into ONE fan-out
 // covering the union of subjects. No saturation, no panic.
 //
-// Different subjects ensure the union path is exercised — if the
-// scheduler dropped subjects on burst, we'd see a smaller union.
+// Q-OOM-COMPLETION (v0.25.315) Patch 1 — post-dedup the fan-out is
+// capped at cohortMaxFanoutDefault (32 representatives by default) even
+// when the storm produces 1004 distinct BIDs. The newTestRBACWatcher
+// stub assigns each user a unique BID, so the worst-case fan-out
+// after dedup is exactly cohortMaxFanout(). Original test asserted 1004
+// — that was the unbounded behaviour that triggered the OOM loop.
 func TestRBACAdd_DebounceCoalesces_Storm1004(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -199,8 +212,12 @@ func TestRBACAdd_DebounceCoalesces_Storm1004(t *testing.T) {
 	if calls != 1 {
 		t.Errorf("calls: got %d, want 1 (storm must coalesce)", calls)
 	}
-	if len(users) != N {
-		t.Errorf("users: got %d unique, want %d", len(users), N)
+	cap := cohortMaxFanout()
+	if len(users) > cap {
+		t.Errorf("users: got %d unique, want ≤%d (Patch 1 cap)", len(users), cap)
+	}
+	if len(users) != cap {
+		t.Errorf("users: got %d, want exactly %d (1004 unique BIDs vs cap=%d)", len(users), cap, cap)
 	}
 	for _, u := range users {
 		if _, ok := expected[u]; !ok {
@@ -303,10 +320,14 @@ func TestRBACAdd_RaceClean(t *testing.T) {
 	if calls != 1 {
 		t.Errorf("calls: got %d, want 1 (storm + race)", calls)
 	}
-	// Sanity: union should cover the unique usernames generated above.
-	want := G * N
-	if len(users) != want {
-		t.Errorf("users: got %d unique, want %d", len(users), want)
+	// Q-OOM-COMPLETION (v0.25.315) Patch 1 — post-dedup the fan-out is
+	// capped at cohortMaxFanout(). The newTestRBACWatcher stub assigns
+	// each user a unique BID, so 3200 distinct BIDs collapse to the cap.
+	// Original test asserted 3200 — that was the unbounded behaviour
+	// that contributed to the OOM loop.
+	cap := cohortMaxFanout()
+	if len(users) > cap {
+		t.Errorf("users: got %d unique, want ≤%d (Patch 1 cap)", len(users), cap)
 	}
 }
 
@@ -350,6 +371,177 @@ func TestRBACAdd_DropsArePropagated(t *testing.T) {
 	waitForCalls(t, mp, 1, 3*rbacDebounceWindow)
 	if dropCalls.Load() != 1 {
 		t.Errorf("dropCalls: got %d, want 1", dropCalls.Load())
+	}
+}
+
+// TestFireCohortPrewarm_DeduplicatesByBID — Q-OOM-COMPLETION Patch 1.
+//
+// 1000 candidates collapse to 4 distinct BIDs → exactly 4 enqueued.
+// Without dedup the OOM bundle pre-Patch-1 enqueued 1000 jobs and
+// peaked the cgroup at 16 GiB. With dedup we enqueue one representative
+// per cohort transition.
+func TestFireCohortPrewarm_DeduplicatesByBID(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := NewMem(time.Hour)
+	for i := 0; i < 1000; i++ {
+		if err := c.SAddUser(ctx, usernameForBench(i)); err != nil {
+			t.Fatalf("SAddUser: %v", err)
+		}
+	}
+
+	rw := newTestRBACWatcher(c)
+	// 4 distinct BIDs, hashed by index mod 4. Each unique BID has 250
+	// candidate users.
+	rw.bidComputerOverride = func(u string) string {
+		// Lookup by name → bucket. Stable.
+		var sum int
+		for _, b := range []byte(u) {
+			sum += int(b)
+		}
+		return "bid-bucket-" + strconv.Itoa(sum%4)
+	}
+
+	mp := &mockPrewarmer{}
+	rw.SetPrewarmer(mp)
+
+	// Group subject expansion: all 1000 active users become candidates.
+	rb := fixtureRoleBinding("rb-fanout", groupSubject("devs"))
+	rw.scheduleCohortPrewarmFromBinding(ctx, rb)
+
+	waitForCalls(t, mp, 1, 3*rbacDebounceWindow)
+	calls, users := mp.snapshot()
+	if calls != 1 {
+		t.Fatalf("calls: got %d, want 1", calls)
+	}
+	if len(users) != 4 {
+		t.Errorf("dedup users: got %d, want 4 (one rep per BID)", len(users))
+	}
+	// Every dispatched username must map to a distinct BID.
+	seenBids := make(map[string]bool, 4)
+	for _, u := range users {
+		bid := rw.bidComputerOverride(u)
+		if seenBids[bid] {
+			t.Errorf("duplicate BID dispatched: bid=%s user=%s users=%v", bid, u, users)
+		}
+		seenBids[bid] = true
+	}
+}
+
+// TestFireCohortPrewarm_SkipsUnchangedBIDs — Q-OOM-COMPLETION Patch 1.
+//
+// First fire dispatches representatives. Second fire with the SAME BID
+// per user dispatches NOTHING because all candidate BIDs match the
+// memo from the first fire. This is the production-realistic case
+// where a benign RB add doesn't actually expand any user's visibility.
+func TestFireCohortPrewarm_SkipsUnchangedBIDs(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := NewMem(time.Hour)
+	for i := 0; i < 1000; i++ {
+		if err := c.SAddUser(ctx, usernameForBench(i)); err != nil {
+			t.Fatalf("SAddUser: %v", err)
+		}
+	}
+
+	rw := newTestRBACWatcher(c)
+	// One BID across all users — represents a no-op RB add (e.g. an RB
+	// that doesn't bind to any User/Group subject the candidate users
+	// match against).
+	rw.bidComputerOverride = func(u string) string { return "bid-stable" }
+
+	mp := &mockPrewarmer{}
+	rw.SetPrewarmer(mp)
+
+	// First fire: 1 distinct BID across 1000 users → 1 representative.
+	rb := fixtureRoleBinding("rb-1", groupSubject("devs"))
+	rw.scheduleCohortPrewarmFromBinding(ctx, rb)
+	waitForCalls(t, mp, 1, 3*rbacDebounceWindow)
+	calls, users := mp.snapshot()
+	if calls != 1 || len(users) != 1 {
+		t.Fatalf("first fire: calls=%d users=%d, want 1/1", calls, len(users))
+	}
+
+	// Wait past the debounce window so a SECOND fire is independent of
+	// the first.
+	time.Sleep(rbacDebounceWindow + 200*time.Millisecond)
+
+	// Second fire: BID hasn't changed for any user → 0 enqueued.
+	rb2 := fixtureRoleBinding("rb-2", groupSubject("devs"))
+	rw.scheduleCohortPrewarmFromBinding(ctx, rb2)
+	time.Sleep(rbacDebounceWindow + 500*time.Millisecond)
+
+	calls2, _ := mp.snapshot()
+	if calls2 != 1 {
+		t.Errorf("second fire: total calls=%d, want 1 (the second fire must be a no-op because no BID changed)", calls2)
+	}
+}
+
+// TestFireCohortPrewarm_RespectsMaxFanout — Q-OOM-COMPLETION Patch 1.
+//
+// 100 distinct BIDs with MAX_FANOUT=8 → exactly 8 enqueued. The cap
+// protects against a runaway fan-out (e.g. helm rolling out 100 unique
+// RoleBindings simultaneously) from overwhelming the worker pool.
+func TestFireCohortPrewarm_RespectsMaxFanout(t *testing.T) {
+	t.Setenv(envRBACCohortMaxFanout, "8")
+	if cohortMaxFanout() != 8 {
+		t.Fatalf("cohortMaxFanout(): got %d, want 8", cohortMaxFanout())
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := NewMem(time.Hour)
+	for i := 0; i < 100; i++ {
+		if err := c.SAddUser(ctx, usernameForBench(i)); err != nil {
+			t.Fatalf("SAddUser: %v", err)
+		}
+	}
+
+	rw := newTestRBACWatcher(c)
+	// Each user has a UNIQUE BID — worst-case fan-out.
+	rw.bidComputerOverride = func(u string) string { return "bid-" + u }
+
+	mp := &mockPrewarmer{}
+	rw.SetPrewarmer(mp)
+
+	rb := fixtureRoleBinding("rb-explosion", groupSubject("devs"))
+	rw.scheduleCohortPrewarmFromBinding(ctx, rb)
+
+	waitForCalls(t, mp, 1, 3*rbacDebounceWindow)
+	calls, users := mp.snapshot()
+	if calls != 1 {
+		t.Fatalf("calls: got %d, want 1", calls)
+	}
+	if len(users) > 8 {
+		t.Errorf("max-fanout: got %d users, want ≤8", len(users))
+	}
+	if len(users) != 8 {
+		t.Errorf("max-fanout: got %d users, want exactly 8 (cap == 8 with 100 distinct BIDs)", len(users))
+	}
+}
+
+// TestFireCohortPrewarm_SyncedFalseIsNoop — when bidComputerOverride
+// is nil and the watcher is not synced, ComputeBindingIdentity returns ""
+// for all candidates → 0 enqueued. This is the pre-startup safety
+// behaviour: don't dispatch fan-outs against an empty informer cache.
+func TestFireCohortPrewarm_SyncedFalseIsNoop(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rw := &RBACWatcher{cache: NewMem(time.Hour)} // no override, no listers
+	mp := &mockPrewarmer{}
+	rw.SetPrewarmer(mp)
+
+	rb := fixtureRoleBinding("rb-presync", userSubject("alice"))
+	rw.scheduleCohortPrewarmFromBinding(ctx, rb)
+
+	time.Sleep(rbacDebounceWindow + 500*time.Millisecond)
+	calls, _ := mp.snapshot()
+	if calls != 0 {
+		t.Errorf("pre-sync: got %d calls, want 0 (synced=false must skip dispatch)", calls)
 	}
 }
 

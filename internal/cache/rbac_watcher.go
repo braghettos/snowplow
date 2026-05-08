@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +28,38 @@ import (
 // events (e.g. from thousands of leftover benchmark ClusterRoleBindings during
 // the informer's initial LIST sync) from causing continuous L1 purges.
 const rbacDebounceWindow = 2 * time.Second
+
+// cohortMaxFanoutDefault caps the number of users dispatched in a single
+// cohort fan-out after BID dedup. Even after dedup most clusters have ≤8
+// distinct BIDs; the cap is a safety belt against an explosion of new
+// distinct cohorts (e.g. helm rolling out 100+ unique RoleBindings at once).
+//
+// Q-OOM-COMPLETION (v0.25.315) Patch 1 — root cause of the 0.25.314 OOM
+// loop: a single Group-subject ADD on a 1004-active-user cluster fanned out
+// to 1004 EnqueueForUser calls; with 4 BID transitions × 4 outer × 4 inner
+// concurrent decode trees the cgroup peaked at 16 GiB and OOM-killed the
+// pod 3× in 16 minutes. Dedup-by-BID + this fan-out cap together collapse
+// the worst-case fan-out from 4016 jobs to ≤32.
+const cohortMaxFanoutDefault = 32
+
+// envRBACCohortMaxFanout overrides cohortMaxFanoutDefault. Operators set
+// this to widen (e.g. 64) or tighten (e.g. 8 for memory-constrained pods).
+const envRBACCohortMaxFanout = "RBAC_COHORT_MAX_FANOUT"
+
+// cohortMaxFanout returns the runtime fan-out cap. Read on each fire so an
+// operator can hot-tune via deploy env without restarting (the fire cadence
+// is ≥2 s so the env read cost is irrelevant).
+func cohortMaxFanout() int {
+	v := os.Getenv(envRBACCohortMaxFanout)
+	if v == "" {
+		return cohortMaxFanoutDefault
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return cohortMaxFanoutDefault
+	}
+	return n
+}
 
 // RBACPrewarmer is the minimal contract RBACWatcher needs from the
 // dispatchers PrewarmWorkerPool to fan out cohort prewarm on binding-ADD
@@ -72,6 +106,26 @@ type RBACWatcher struct {
 	// Avoids re-listing all bindings on every HTTP request. Cleared on broad
 	// RBAC changes; individual entries deleted on per-user binding invalidation.
 	identityCache sync.Map
+
+	// lastCohortBidForUser maps username → BID observed at the LAST cohort
+	// fire for that user. Distinct from identityCache because identityCache
+	// is keyed by (username, groupsCSV) — the cohort path doesn't carry
+	// per-user groups (groups come from JWT at HTTP time). This map is the
+	// dedup-state for fireCohortPrewarm: on each fire we recompute BID
+	// (groups=nil) per candidate and SKIP candidates whose BID is unchanged
+	// from the last fire. Values are short hex hashes (≤12 bytes) so
+	// retaining 1004 entries costs ~32 KB.
+	//
+	// Q-OOM-COMPLETION (v0.25.315) Patch 1.
+	lastCohortBidForUser sync.Map
+
+	// bidComputerOverride is a test-injected hook that replaces
+	// ComputeBindingIdentity inside fireCohortPrewarm. Production code
+	// leaves this nil — the production path always goes through the real
+	// lister-backed ComputeBindingIdentity. Tests set this to a
+	// deterministic stub so they can drive BID-dedup paths without
+	// wiring a full informer factory.
+	bidComputerOverride func(username string) string
 }
 
 func NewRBACWatcher(c Cache, rc *rest.Config) *RBACWatcher {
@@ -300,18 +354,97 @@ func (rw *RBACWatcher) fireCohortPrewarm(ctx context.Context) {
 		return
 	}
 
-	usernames := make([]string, 0, len(affected))
+	// Q-OOM-COMPLETION (v0.25.315) Patch 1 — dedup by binding identity.
+	//
+	// Without this dedup, a single Group-subject ADD on a 1004-user cluster
+	// produced 1004 EnqueueForUser calls. ~95 % of those users had an
+	// UNCHANGED BID (the new RB didn't actually expand THEIR visibility —
+	// they didn't match the binding's User/Group subjects, OR an existing
+	// binding already covered the new permission set). The remaining ~5 %
+	// fell into ≤8 distinct BIDs.
+	//
+	// This block recomputes BID per candidate (against the post-ADD
+	// informer state, since ADD has been processed by the time the
+	// debounce timer fires), groups by NEW BID, picks ONE representative
+	// per BID whose BID actually changed, and dispatches at most
+	// `cohortMaxFanout()` representatives. Users whose BID didn't change
+	// are SKIPPED — their L1 entries are still keyed under the same
+	// identity and require no re-resolution.
+	//
+	// Synced gate: if informers haven't synced (rw.synced == false),
+	// ComputeBindingIdentity returns "" — we treat that as a no-op and
+	// skip dispatch for the candidate. The R5 startup-prewarm covers all
+	// users at boot, and `synced=false` only happens before that.
+	type candidate struct {
+		username string
+		newBid   string
+	}
+	bidFn := rw.bidComputerOverride
+	if bidFn == nil {
+		bidFn = func(u string) string { return rw.ComputeBindingIdentity(u, nil) }
+	}
+	candidates := make([]candidate, 0, len(affected))
 	for u := range affected {
-		usernames = append(usernames, u)
+		newBid := bidFn(u)
+		if newBid == "" {
+			continue // informers not synced; skip until next event
+		}
+		candidates = append(candidates, candidate{username: u, newBid: newBid})
 	}
 
+	// Group by NEW BID; for each BID, pick the first candidate whose BID
+	// changed. This collapses the fan-out to one representative per
+	// distinct cohort transition.
+	repByBid := make(map[string]string, 8)
+	skippedSameBid := 0
+	for _, c := range candidates {
+		prev, _ := rw.lastCohortBidForUser.Load(c.username)
+		if prevBid, ok := prev.(string); ok && prevBid == c.newBid {
+			skippedSameBid++
+			continue
+		}
+		// Update the per-user BID memo regardless of whether this user
+		// is the chosen representative — every dedup-eligible user in
+		// this cohort transition has now been "observed" at the new
+		// BID. Subsequent ADDs that don't change BID will short-circuit.
+		rw.lastCohortBidForUser.Store(c.username, c.newBid)
+		if _, exists := repByBid[c.newBid]; !exists {
+			repByBid[c.newBid] = c.username
+		}
+	}
+
+	if len(repByBid) == 0 {
+		slog.Info("rbac-watcher: cohort prewarm — no BID changes; skipping fan-out",
+			slog.Int("user_subjects", len(users)),
+			slog.Int("group_subjects", len(groups)),
+			slog.Int("candidates", len(candidates)),
+			slog.Int("skipped_same_bid", skippedSameBid),
+		)
+		return
+	}
+
+	maxFanout := cohortMaxFanout()
+	usernames := make([]string, 0, len(repByBid))
+	for _, rep := range repByBid {
+		usernames = append(usernames, rep)
+		if len(usernames) >= maxFanout {
+			break
+		}
+	}
+
+	clamped := len(repByBid) - len(usernames)
 	accepted, dropped := prewarmer.EnqueueForCohort(ctx, usernames)
 	slog.Info("rbac-watcher: cohort prewarm fanned out on binding ADD",
 		slog.Int("users_total", len(usernames)),
+		slog.Int("distinct_bids", len(repByBid)),
+		slog.Int("clamped_overflow", clamped),
+		slog.Int("candidates", len(candidates)),
+		slog.Int("skipped_same_bid", skippedSameBid),
 		slog.Int("user_subjects", len(users)),
 		slog.Int("group_subjects", len(groups)),
 		slog.Int("accepted", accepted),
 		slog.Int("dropped", dropped),
+		slog.Int("max_fanout", maxFanout),
 	)
 }
 
