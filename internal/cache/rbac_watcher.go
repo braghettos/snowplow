@@ -72,10 +72,42 @@ type RBACWatcher struct {
 	// Avoids re-listing all bindings on every HTTP request. Cleared on broad
 	// RBAC changes; individual entries deleted on per-user binding invalidation.
 	identityCache sync.Map
+
+	// evalCache memoises EvaluateRBAC decisions keyed by
+	//   "username|verb|group|resource|namespace" → bool
+	//
+	// Q-OOM-FIX (v0.25.313 RCA, 2026-05-08) — heap profiling traced 56% of
+	// cumulative allocations (~4.15 TB) to crbLister.List(labels.Everything())
+	// inside EvaluateRBAC. Each call materialises the entire CRB set into a
+	// fresh slice; under the no-op UPDATE storm (~4.5/s sustained) and
+	// per-item RBAC checks at compositions-list scale this dominated the heap.
+	//
+	// Architect re-review (2026-05-08): bounded with LRU eviction at 200K
+	// entries to prevent the cache itself becoming a leak. Worst-case
+	// production density (1000 users × 10 verbs × 50 GRs × 100 namespaces
+	// = 50M keys × ~120 B = ~6 GB) is dramatically larger than typical
+	// working sets — 200K covers ~10× normal load while capping the
+	// resident bytes at ~24 MB.
+	//
+	// Invariants:
+	//   - Invalidated wholesale from invalidate() (broad RBAC change).
+	//   - Invalidated per-user from purgeUserCacheData() (binding-scoped change).
+	//   - Both paths fire under the existing rbacDebounceWindow, so cohort-
+	//     prewarm and HTTP cache stay coherent with the eval cache.
+	evalCache *evalLRU
 }
 
+// evalCacheCap bounds the EvaluateRBAC decision cache at 200K entries
+// (~24 MB resident at the typical key+bool pair size). See the doc-comment
+// on RBACWatcher.evalCache for the sizing rationale.
+const evalCacheCap = 200_000
+
 func NewRBACWatcher(c Cache, rc *rest.Config) *RBACWatcher {
-	return &RBACWatcher{cache: c, rc: rc}
+	return &RBACWatcher{
+		cache:     c,
+		rc:        rc,
+		evalCache: newEvalLRU(evalCacheCap),
+	}
 }
 
 func (rw *RBACWatcher) Start(ctx context.Context) error {
@@ -338,6 +370,13 @@ func (rw *RBACWatcher) invalidate(ctx context.Context) {
 		return true
 	})
 
+	// Q-OOM-FIX — drop the EvaluateRBAC decision cache wholesale on broad
+	// RBAC changes. Full purge (vs. per-key delete) is fine because RBAC
+	// changes are rare and the cache repopulates lazily on next request.
+	if rw.evalCache != nil {
+		rw.evalCache.Purge()
+	}
+
 	usernames, err := rw.cache.SMembers(ctx, ActiveUsersKey)
 	if err != nil || len(usernames) == 0 {
 		rw.invalidateAllRBAC(ctx)
@@ -416,6 +455,14 @@ func (rw *RBACWatcher) invalidateFromBinding(ctx context.Context, obj any) {
 // returns new-binding bytes; no stale-L2 window.
 func (rw *RBACWatcher) purgeUserCacheData(ctx context.Context, username string) int {
 	total := 0
+
+	// Q-OOM-FIX — drop EvaluateRBAC entries for this user. Key shape is
+	// "username|verb|group|resource|namespace" so a HasPrefix match on
+	// "username|" cleanly scopes the eviction. Concurrent EvaluateRBAC
+	// after this returns will just miss the cache and re-populate.
+	if rw.evalCache != nil {
+		rw.evalCache.RemoveWithPrefix(username + "|")
+	}
 
 	// Phase 1: snapshot identities (no cache mutation yet).
 	//
@@ -615,6 +662,40 @@ func (rw *RBACWatcher) EvaluateRBAC(username string, groups []string, verb strin
 		return false
 	}
 
+	// Q-OOM-FIX cache short-circuit. Key shape:
+	//   "username|verb|group|resource|namespace"
+	//
+	// Groups are intentionally NOT part of the key. The K8s authorizer's
+	// allow decision is the union of all matching subjects (User + Group),
+	// so a per-(user,verb,gr,ns) decision changes only when a binding
+	// affecting this user changes — and our two invalidation hooks
+	// (invalidate / purgeUserCacheData) cover exactly that. Including
+	// groups would explode key cardinality (cyberjoker JWT + cert paths
+	// pass disjoint group sets for the same user) and hurt hit rate.
+	cacheKey := evalCacheKey(username, verb, gr, namespace)
+	if rw.evalCache != nil {
+		if v, ok := rw.evalCache.Get(cacheKey); ok {
+			return v
+		}
+	}
+
+	allowed := rw.evaluateRBACUncached(username, groups, verb, gr, namespace)
+	if rw.evalCache != nil {
+		rw.evalCache.Add(cacheKey, allowed)
+	}
+	return allowed
+}
+
+// evalCacheKey derives the lookup key for evalCache. Kept package-private
+// and inlined-friendly so unit tests can exercise the same key shape.
+func evalCacheKey(username, verb string, gr schema.GroupResource, namespace string) string {
+	return username + "|" + verb + "|" + gr.Group + "|" + gr.Resource + "|" + namespace
+}
+
+// evaluateRBACUncached runs the actual lister scan. Extracted so the hot
+// path in EvaluateRBAC stays small (compiler can keep the cache lookup
+// inline-able).
+func (rw *RBACWatcher) evaluateRBACUncached(username string, groups []string, verb string, gr schema.GroupResource, namespace string) bool {
 	// Build subject identity set for matching.
 	subjects := make(map[string]bool, 1+len(groups))
 	subjects["User:"+username] = true
