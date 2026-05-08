@@ -83,7 +83,9 @@ func prewarmFetchCR(ctx context.Context, c cache.Cache, dynClient k8sdynamic.Int
 	if err != nil {
 		return nil, false
 	}
-	cache.StripAnnotationsFromUnstructured(uns)
+	// Q-OOM-COMPLETION (v0.25.315) Patch 3 — universal annotation strip
+	// + narrow per-GVR strip for composition CRs.
+	cache.StripBulkyFieldsForGVR(uns, gvr)
 	if c != nil {
 		_ = c.SetForGVR(ctx, gvr, cache.GetKey(gvr, ns, name), uns)
 	}

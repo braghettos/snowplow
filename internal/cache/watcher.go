@@ -1098,7 +1098,11 @@ func (rw *ResourceWatcher) registerInformer(gvr schema.GroupVersionResource) boo
 	// consumes ~3.5GB instead of ~2GB (confirmed via pprof heap-223810).
 	if err := informer.SetTransform(func(obj any) (any, error) {
 		if uns, ok := obj.(*unstructured.Unstructured); ok {
-			StripAnnotationsFromUnstructured(uns)
+			// Q-OOM-COMPLETION (v0.25.315) Patch 3 — also applies the
+			// narrow per-GVR strip for composition CRs (resourceVersion,
+			// generation, observedGeneration). Universal annotation strip
+			// is still applied for non-composition GVRs.
+			StripBulkyFieldsForGVR(uns, gvr)
 		}
 		return obj, nil
 	}); err != nil {
