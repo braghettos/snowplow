@@ -598,20 +598,84 @@ func (c *MemCache) SMembers(_ context.Context, key string) ([]string, error) {
 
 // ── List assembly ────────────────────────────────────────────────────────────
 
-// AssembleListFromIndex reads a list-index SET and fetches all referenced GET
-// keys, returning the assembled raw JSON as an UnstructuredList. Returns
-// (nil, false, nil) if the index does not exist or all items have expired.
+// AssembleListFromIndex returns the assembled raw JSON of an UnstructuredList
+// for the given (gvr, namespace).
+//
+// Q-MIRROR-REMOVAL (0.25.316): the implementation now reads from the
+// informer's in-memory store via cache.InformerReaderFromContext(ctx) instead
+// of MGET-ing snowplow:get:* mirror keys. The informer already holds every
+// watched object byte-for-byte (transform-stripped on entry); the mirror was
+// pure redundancy and accounted for ~567K cache_keys at bench scale.
+//
+// Returns (nil, false, nil) if no InformerReader is in ctx (e.g. unit tests
+// constructing a bare MemCache without a ResourceWatcher) or the GVR has no
+// registered informer yet. Existing list-index SETs in MemCache (populated
+// at warmup) are intentionally ignored — they are append-only and would
+// drift forever otherwise.
 func (c *MemCache) AssembleListFromIndex(ctx context.Context, gvr schema.GroupVersionResource, namespace string) ([]byte, bool, error) {
 	if c == nil {
 		return nil, false, nil
 	}
+
+	ir := InformerReaderFromContext(ctx)
+	if ir == nil {
+		// No informer wired — fall back to the legacy mirror-based path
+		// for backward compatibility with tests that seed snowplow:get:*
+		// keys directly. Production always installs WithInformerReader in
+		// the request middleware (see main.go withCache) and in the
+		// background L1 refresh ctx.
+		return c.assembleListFromMirror(ctx, gvr, namespace)
+	}
+
+	objs, ok := ir.ListObjects(gvr, namespace)
+	if !ok {
+		return nil, false, nil
+	}
+
+	// Assemble into an UnstructuredList JSON. Identical wire format to the
+	// legacy mirror path so callers see no shape change.
+	var buf bytes.Buffer
+	buf.WriteString(`{"apiVersion":"`)
+	if gvr.Group == "" {
+		buf.WriteString(gvr.Version)
+	} else {
+		buf.WriteString(gvr.Group)
+		buf.WriteByte('/')
+		buf.WriteString(gvr.Version)
+	}
+	buf.WriteString(`","kind":"List","metadata":{"resourceVersion":""},"items":[`)
+
+	first := true
+	for _, uns := range objs {
+		if uns == nil {
+			continue
+		}
+		raw, err := json.Marshal(uns.Object)
+		if err != nil {
+			continue
+		}
+		if !first {
+			buf.WriteByte(',')
+		}
+		buf.Write(raw)
+		first = false
+	}
+	buf.WriteString(`]}`)
+
+	return buf.Bytes(), true, nil
+}
+
+// assembleListFromMirror is the pre-Q-MIRROR-REMOVAL fallback path. Kept
+// only to support unit tests that seed snowplow:get:* keys directly without
+// constructing a full ResourceWatcher. Production never reaches this branch
+// because the request middleware always installs an InformerReader.
+func (c *MemCache) assembleListFromMirror(ctx context.Context, gvr schema.GroupVersionResource, namespace string) ([]byte, bool, error) {
 	idxKey := ListIndexKey(gvr, namespace)
 	members, err := c.SMembers(ctx, idxKey)
 	if err != nil || len(members) == 0 {
 		return nil, false, err
 	}
 
-	// Build GET keys from member names.
 	getKeys := make([]string, len(members))
 	for i, member := range members {
 		if namespace == "" {
@@ -631,14 +695,12 @@ func (c *MemCache) AssembleListFromIndex(ctx context.Context, gvr schema.GroupVe
 		return nil, false, nil
 	}
 
-	// Assemble into an UnstructuredList JSON.
 	var buf bytes.Buffer
 	buf.WriteString(`{"apiVersion":"`)
-	g := gvr.Group
-	if g == "" {
+	if gvr.Group == "" {
 		buf.WriteString(gvr.Version)
 	} else {
-		buf.WriteString(g)
+		buf.WriteString(gvr.Group)
 		buf.WriteByte('/')
 		buf.WriteString(gvr.Version)
 	}
