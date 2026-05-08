@@ -60,18 +60,22 @@ func NewUnthrottledDynClientForPrewarm(rc *rest.Config) (k8sdynamic.Interface, e
 }
 
 // prewarmFetchCR returns the unstructured.Unstructured for (gvr, ns, name).
-// Fast path: Redis L2 cache (populated by warmer.warmGVR at startup).
-// Slow path: a single GET via the shared unthrottled dynamic client, with
-// the result written back to L2 so subsequent prewarm passes skip the GET.
 //
-// Returns (nil, false) if neither L2 nor the k8s GET yields a CR (eg the
-// resource does not exist, RBAC denies, or the fallback client was nil).
+// Q-MIRROR-REMOVAL (0.25.316):
+//   - Fast path: the informer's in-memory store (cache.InformerReader from
+//     ctx). Zero I/O, zero copy — the informer already holds every watched
+//     object via WATCH and applies the strip-transform on entry.
+//   - Slow path: a single GET via the shared unthrottled dynamic client.
+//     No mirror writeback — the informer will pick up the object on the
+//     next watch event, and the next prewarm pass reads it for free.
+//
+// Returns (nil, false) if neither the informer nor the k8s GET yields a CR
+// (eg the resource does not exist, RBAC denies, or the fallback client was
+// nil).
 func prewarmFetchCR(ctx context.Context, c cache.Cache, dynClient k8sdynamic.Interface, gvr schema.GroupVersionResource, ns, name string) (*unstructured.Unstructured, bool) {
-	if c != nil {
-		var cached unstructured.Unstructured
-		l2Key := cache.GetKey(gvr, ns, name)
-		if hit, cerr := c.Get(ctx, l2Key, &cached); hit && cerr == nil {
-			return &cached, true
+	if ir := cache.InformerReaderFromContext(ctx); ir != nil {
+		if uns, ok := ir.GetObject(gvr, ns, name); ok && uns != nil {
+			return uns, true
 		}
 	}
 	if dynClient == nil {
@@ -82,9 +86,10 @@ func prewarmFetchCR(ctx context.Context, c cache.Cache, dynClient k8sdynamic.Int
 		return nil, false
 	}
 	cache.StripAnnotationsFromUnstructured(uns)
-	if c != nil {
-		_ = c.SetForGVR(ctx, gvr, cache.GetKey(gvr, ns, name), uns)
-	}
+	// Note: no SetForGVR mirror write. The informer's watch will populate
+	// its in-memory store on the next event for this object; subsequent
+	// prewarm reads hit the fast path above without any cache duplication.
+	_ = c // unused — kept for caller signature stability
 	return uns, true
 }
 
