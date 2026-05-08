@@ -228,6 +228,10 @@ func (w *Warmer) warmGVR(ctx context.Context, dynClient k8sdynamic.Interface, gv
 	// Count for observability only — no caching side effects.
 	byNamespace := make(map[string]int)
 	for i := range list.Items {
+		// Q-MIRROR-REMOVAL: warmup no longer writes to cache (informer is the
+		// source of truth). Strip-at-write is performed by watcher.go at
+		// informer event time via StripBulkyFieldsForGVR — see
+		// internal/cache/strip.go (Q-OOM-COMPLETION Patch 3).
 		byNamespace[list.Items[i].GetNamespace()]++
 	}
 

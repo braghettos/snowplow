@@ -87,10 +87,13 @@ func prewarmFetchCR(ctx context.Context, c cache.Cache, dynClient k8sdynamic.Int
 	if err != nil {
 		return nil, false
 	}
-	cache.StripAnnotationsFromUnstructured(uns)
-	// Note: no SetForGVR mirror write. The informer's watch will populate
-	// its in-memory store on the next event for this object; subsequent
-	// prewarm reads hit the fast path above without any cache duplication.
+	// Q-OOM-COMPLETION (v0.25.315) Patch 3 — universal annotation strip
+	// + narrow per-GVR strip for composition CRs. We strip in-place so the
+	// caller (and the calling test) sees the lighter object, but we do NOT
+	// write to the cache: per Q-MIRROR-REMOVAL the informer's watch is the
+	// source of truth. Subsequent prewarm reads hit the InformerReader fast
+	// path above without any cache duplication.
+	cache.StripBulkyFieldsForGVR(uns, gvr)
 	_ = c // unused — kept for caller signature stability
 	return uns, true
 }
