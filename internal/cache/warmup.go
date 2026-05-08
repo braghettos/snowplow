@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +19,38 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+// warmGVRPageSize bounds the per-page LIST response so a single GVR
+// LIST never materialises 50K Unstructured objects in heap simultaneously
+// (architect Q-OOM-WARMER 0.25.320).
+const warmGVRPageSize int64 = 500
+
+// warmFanout bounds Warmer.Run concurrent in-flight LISTs. Default 2 caps
+// peak heap during the startup burst; environment override lets ops widen
+// it on small clusters or narrow it further on memory-pressed pods.
+// Clamped to [1, GOMAXPROCS] so misconfiguration cannot exceed the
+// historical (pre-fix) ceiling.
+func warmFanout() int {
+	max := runtime.GOMAXPROCS(0)
+	if max < 1 {
+		max = 1
+	}
+	def := 2
+	if def > max {
+		def = max
+	}
+	raw := os.Getenv("SNOWPLOW_WARM_FANOUT")
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || n < 1 {
+		return def
+	}
+	if n > max {
+		return max
+	}
+	return n
+}
 
 type WarmupGVR struct {
 	Group    string `yaml:"group"`
@@ -185,7 +218,9 @@ func (w *Warmer) Run(ctx context.Context) {
 		return
 	}
 
-	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
+	// Cap concurrent in-flight Warmer LISTs to bound peak heap during the
+	// startup burst (architect Q-OOM-WARMER 0.25.320).
+	sem := make(chan struct{}, warmFanout())
 	var wg sync.WaitGroup
 	for _, gvr := range w.gvrs {
 		wg.Add(1)
@@ -219,24 +254,54 @@ func (w *Warmer) warmGVR(ctx context.Context, dynClient k8sdynamic.Interface, gv
 	// emitting events, surfacing misconfiguration in startup logs rather
 	// than as a silent first-request 403/timeout. The objects themselves
 	// are immediately discarded; the data lives only in the informer store.
-	list, err := dynClient.Resource(gvr).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		log.Warn("warmup: failed to list GVR", slog.String("gvr", gvr.String()), slog.Any("err", err))
-		return
-	}
-
-	// Count for observability only — no caching side effects.
+	//
+	// Q-OOM-WARMER (0.25.320): the LIST is now paginated via Limit/Continue
+	// so each round-trip materialises ~500 Unstructured items rather than
+	// the entire GVR. With ~50K compositions × 4 concurrent in-flight LISTs
+	// the unpaginated form held 7.15 GiB of decoded JSON + Unstructured in
+	// heap simultaneously (architect peek-walked 2026-05-08); per-page
+	// pagination caps that to a few hundred MiB, GC'd between pages. No
+	// state is carried across pages — each page is decoded for its
+	// observability counts and dropped before the next round-trip.
+	var totalItems int
+	var totalPages int
 	byNamespace := make(map[string]int)
-	for i := range list.Items {
-		// Q-MIRROR-REMOVAL: warmup no longer writes to cache (informer is the
-		// source of truth). Strip-at-write is performed by watcher.go at
-		// informer event time via StripBulkyFieldsForGVR — see
-		// internal/cache/strip.go (Q-OOM-COMPLETION Patch 3).
-		byNamespace[list.Items[i].GetNamespace()]++
+
+	cont := ""
+	for {
+		opts := metav1.ListOptions{Limit: warmGVRPageSize, Continue: cont}
+		list, err := dynClient.Resource(gvr).List(ctx, opts)
+		if err != nil {
+			log.Warn("warmup: failed to list GVR",
+				slog.String("gvr", gvr.String()),
+				slog.String("continue", cont),
+				slog.Int("page", totalPages),
+				slog.Any("err", err))
+			return
+		}
+		totalPages++
+
+		for i := range list.Items {
+			byNamespace[list.Items[i].GetNamespace()]++
+		}
+		totalItems += len(list.Items)
+
+		cont = list.GetContinue()
+		// Drop the page slice so GC can reclaim the decoded Unstructured
+		// objects + raw JSON before the next round-trip allocates another
+		// page. Without this the local `list` would stay live until the
+		// loop iteration returns, doubling peak resident memory.
+		list.Items = nil
+		if cont == "" {
+			break
+		}
 	}
 
-	log.Info("warmup: GVR health check ok", slog.String("gvr", gvr.String()),
-		slog.Int("count", len(list.Items)), slog.Int("namespaces", len(byNamespace)))
+	log.Info("warmup: GVR health check ok",
+		slog.String("gvr", gvr.String()),
+		slog.Int("count", totalItems),
+		slog.Int("namespaces", len(byNamespace)),
+		slog.Int("pages", totalPages))
 }
 
 func (w *Warmer) warmDiscovery(ctx context.Context, log *slog.Logger) {
