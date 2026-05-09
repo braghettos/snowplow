@@ -182,6 +182,22 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 	log := xcontext.Logger(ctx)
 	log.Debug("pagination options", slog.Int("page", opts.Page), slog.Int("perPage", opts.PerPage))
 
+	// Q-CAUSAL-COST (0.25.323) — DEBUG log at exit when ctx is cancelled.
+	// Distinguishes parent-cancel propagation from an internal-deadline trip
+	// (none today; would be a regression marker). Cheap probe, no allocs on
+	// the success path.
+	defer func() {
+		if cerr := ctx.Err(); cerr != nil {
+			var causeStr string
+			if cause := context.Cause(ctx); cause != nil && cause != cerr {
+				causeStr = cause.Error()
+			}
+			log.Debug("resolve.exit_with_ctx_err",
+				slog.String("ctx_err", cerr.Error()),
+				slog.String("cause", causeStr))
+		}
+	}()
+
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
 		log.Error("unable to fetch user info from context", slog.Any("err", err))

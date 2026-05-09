@@ -94,6 +94,15 @@ type Metrics struct {
 	L2EvictionsIdentity  atomic.Int64
 	L2EvictionsRA        atomic.Int64
 	L2EvictionsTotal     atomic.Int64
+
+	// ── Causal-cost /call exit-edge counters (Q-CAUSAL-COST, 0.25.323) ──
+	// Surface at /metrics/runtime under call_events. ClientGone bumps when
+	// req.Context().Err() != nil at handler exit; the AfterWriteHeader
+	// subset bumps when a status had already been sent. WriteError bumps
+	// on any wri.Write returning a non-nil error.
+	CallClientGone                 atomic.Int64
+	CallClientGoneAfterWriteHeader atomic.Int64
+	CallWriteError                 atomic.Int64
 }
 
 // Inc atomically increments the given counter and updates the OTel metric.
@@ -175,6 +184,12 @@ type MetricsSnapshot struct {
 	L2HitRate           float64 `json:"l2_hit_rate"`
 	L2ResidentBytes     int64   `json:"l2_resident_bytes"`
 	L2ResidentCount     int64   `json:"l2_resident_count"`
+
+	// Causal-cost /call exit-edge counters (Q-CAUSAL-COST, 0.25.323).
+	// Mirrored at /metrics/runtime under the call_events block.
+	CallClientGone                 int64 `json:"call_client_gone"`
+	CallClientGoneAfterWriteHeader int64 `json:"call_client_gone_after_write_header"`
+	CallWriteError                 int64 `json:"call_write_error"`
 }
 
 var GlobalMetrics = &Metrics{}
@@ -290,6 +305,10 @@ func (m *Metrics) snapshotFromAtomics() MetricsSnapshot {
 		L1EvictionsTTL: m.L1EvictionsTTL.Load(),
 		L1MaxBytes:     l1MaxBytes(),
 		L1MaxEntries:   int64(l1MaxEntries()),
+
+		CallClientGone:                 m.CallClientGone.Load(),
+		CallClientGoneAfterWriteHeader: m.CallClientGoneAfterWriteHeader.Load(),
+		CallWriteError:                 m.CallWriteError.Load(),
 	}
 	s.L1ResidentBytes, s.L1Entries = sampleL1()
 	s.GetHitRate = hitRate(s.GetHits, s.GetMisses)

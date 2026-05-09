@@ -63,6 +63,15 @@ type callHandler struct {
 // @Router /call [patch]
 // @Router /call [delete]
 func (r *callHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
+	// Q-CAUSAL-COST (0.25.323) — wrap wri so the deferred block can classify
+	// status=0 reports as client-gone-before-WriteHeader vs after vs Write
+	// error. Sits above gzip middleware so bytesWritten is the uncompressed
+	// payload the handler emitted. No behavior change.
+	rec := newStatusRecorder(wri)
+	wri = rec
+	handlerStart := time.Now()
+	defer logCallDone(req, rec, handlerStart)
+
 	opts, err := r.validateRequest(req)
 	if err != nil {
 		response.BadRequest(wri, err)
@@ -413,6 +422,76 @@ func has(s []string, e string) bool {
 		}
 	}
 	return false
+}
+
+// logCallDone is the deferred Q-CAUSAL-COST exit hook for callHandler. It
+// reads ctx.Err / context.Cause once, increments the three call_events
+// counters on the matching edges, and emits the per-call audit line at INFO.
+func logCallDone(req *http.Request, rec *statusRecorder, start time.Time) {
+	ctx := req.Context()
+	ctxErr := ctx.Err()
+	var causeStr, ctxErrStr, writeErrStr string
+	if ctxErr != nil {
+		ctxErrStr = ctxErr.Error()
+		if cause := context.Cause(ctx); cause != nil && cause != ctxErr {
+			causeStr = cause.Error()
+		}
+		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.CallClientGone, "call_client_gone")
+		if rec.headerStatus != 0 {
+			cache.GlobalMetrics.Inc(&cache.GlobalMetrics.CallClientGoneAfterWriteHeader, "call_client_gone_after_write_header")
+		}
+	}
+	if rec.writeErr != nil {
+		writeErrStr = rec.writeErr.Error()
+		cache.GlobalMetrics.Inc(&cache.GlobalMetrics.CallWriteError, "call_write_error")
+	}
+	slog.Info("call.done",
+		slog.String("url", req.URL.String()),
+		slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+		slog.Int("status", rec.headerStatus),
+		slog.Int64("bytes", rec.bytesWritten),
+		slog.String("write_err", writeErrStr),
+		slog.String("ctx_err", ctxErrStr),
+		slog.String("cause", causeStr),
+	)
+}
+
+// statusRecorder is a transparent http.ResponseWriter wrapper. Captures
+// status code, cumulative bytes written, and the first non-nil Write error.
+// Pass-through only — no behavior change. On implicit-WriteHeader (Write
+// without prior WriteHeader) sets headerStatus=200 to mirror net/http.
+type statusRecorder struct {
+	http.ResponseWriter
+	headerStatus int
+	bytesWritten int64
+	writeErr     error
+	wroteHeader  bool
+}
+
+func newStatusRecorder(w http.ResponseWriter) *statusRecorder {
+	return &statusRecorder{ResponseWriter: w}
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if !s.wroteHeader {
+		s.headerStatus = code
+		s.wroteHeader = true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if !s.wroteHeader {
+		// Mirror net/http's implicit 200-on-first-Write contract.
+		s.headerStatus = http.StatusOK
+		s.wroteHeader = true
+	}
+	n, err := s.ResponseWriter.Write(b)
+	s.bytesWritten += int64(n)
+	if err != nil && s.writeErr == nil {
+		s.writeErr = err
+	}
+	return n, err
 }
 
 func callResponseHandler(out map[string]any) func(io.ReadCloser) error {

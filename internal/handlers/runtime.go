@@ -23,6 +23,18 @@ type RuntimeMetrics struct {
 	L2             L2Info          `json:"l2"`
 	Prewarm        PrewarmInfo     `json:"prewarm"`
 	Diag           DiagInfo        `json:"diag"`
+	CallEvents     CallEventsInfo  `json:"call_events"`
+}
+
+// CallEventsInfo exposes Q-CAUSAL-COST (0.25.323) /call exit-edge counters.
+// ClientGone: ctx.Err() != nil at handler exit (client closed or deadline);
+// ClientGoneAfterWriteHeader: subset where a status was already sent (200
+// then client bailed mid-body); WriteError: Write returned non-nil (broken
+// pipe, TCP reset, gzip flush). All monotonic; sample successively for rates.
+type CallEventsInfo struct {
+	ClientGone                 int64 `json:"client_gone"`
+	ClientGoneAfterWriteHeader int64 `json:"client_gone_after_write_header"`
+	WriteError                 int64 `json:"write_error"`
 }
 
 // DiagInfo exposes Q-DIAG-PPROF (0.25.321) heap-shift diagnostic gauges:
@@ -259,6 +271,13 @@ func RuntimeMetricsHandler(c cache.Cache, queues WorkQueueLens, prewarm PrewarmL
 		// zero values when no sampler registered (unit tests, cache-off).
 		ds := cache.SampleDiag()
 		m.Diag = DiagInfo(ds)
+
+		// Q-CAUSAL-COST (0.25.323) — /call exit-edge counters.
+		m.CallEvents = CallEventsInfo{
+			ClientGone:                 snap.CallClientGone,
+			ClientGoneAfterWriteHeader: snap.CallClientGoneAfterWriteHeader,
+			WriteError:                 snap.CallWriteError,
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
