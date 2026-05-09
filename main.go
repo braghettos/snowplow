@@ -40,6 +40,19 @@ const (
 	serviceName = "snowplow"
 )
 
+// corsAllowedHeaders is the canonical CORS-preflight header allowlist.
+// Extracted to a package-level slice so unit tests can pin the contract:
+// any browser-readable header the backend reads MUST appear here or the
+// preflight strips it (Q-5XX-DIAG: X-Reload-Idx, Q-CAUSAL-COST: future).
+var corsAllowedHeaders = []string{
+	"Accept",
+	"Authorization",
+	"Content-Type",
+	"X-Auth-Code",
+	"X-Krateo-TraceId",
+	"X-Reload-Idx",
+}
+
 var (
 	build string
 
@@ -452,13 +465,7 @@ func main() {
 	httpHandler := otelhttp.NewHandler(recoveryMiddleware(handlers.Gzip(use.CORS(cors.Options{
 		AllowedOrigins: []string{"*"},
 		AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowedHeaders: []string{
-			"Accept",
-			"Authorization",
-			"Content-Type",
-			"X-Auth-Code",
-			"X-Krateo-TraceId",
-		},
+		AllowedHeaders: corsAllowedHeaders,
 		ExposedHeaders:   []string{"Link"},
 		AllowCredentials: true,
 		MaxAge:           300,

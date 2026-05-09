@@ -76,12 +76,16 @@ func TestRuntimeMetrics_WidgetsBlockShape(t *testing.T) {
 	if !ok {
 		t.Fatalf("widgets block missing or wrong shape: %T", raw["widgets"])
 	}
+	// Canary contract: JSON keys MUST match the architect's Q-5XX-DIAG
+	// spec names. Past dev-shortened variants (`responses_by_resource`,
+	// `uaf_skipped`) drifted from the tester's grep targets and produced
+	// false-positive "metric missing" defects (Q-5XX-DIAG-FIXES, 0.25.325).
 	for _, k := range []string{
 		"uaf_touching_count",
 		"uaf_non_touching_count",
-		"responses_by_resource",
+		"responses_5xx_by_resource",
 		"error_by_class",
-		"uaf_skipped",
+		"user_access_filter_skipped",
 		"uaf_touching_by_resource",
 	} {
 		if _, present := w[k]; !present {
@@ -110,14 +114,14 @@ func TestRuntimeMetrics_WidgetsBlockEmpty(t *testing.T) {
 	var raw map[string]any
 	_ = json.Unmarshal(rec.Body.Bytes(), &raw)
 	w, _ := raw["widgets"].(map[string]any)
-	if _, present := w["responses_by_resource"]; present {
-		t.Errorf("responses_by_resource must be omitted when empty (got %v)", w)
+	if _, present := w["responses_5xx_by_resource"]; present {
+		t.Errorf("responses_5xx_by_resource must be omitted when empty (got %v)", w)
 	}
 	if _, present := w["error_by_class"]; present {
 		t.Errorf("error_by_class must be omitted when empty (got %v)", w)
 	}
-	if _, present := w["uaf_skipped"]; present {
-		t.Errorf("uaf_skipped must be omitted when empty (got %v)", w)
+	if _, present := w["user_access_filter_skipped"]; present {
+		t.Errorf("user_access_filter_skipped must be omitted when empty (got %v)", w)
 	}
 	if _, present := w["uaf_touching_by_resource"]; present {
 		t.Errorf("uaf_touching_by_resource must be omitted when empty (got %v)", w)

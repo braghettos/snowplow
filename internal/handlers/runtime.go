@@ -42,12 +42,16 @@ type RuntimeMetrics struct {
 // All maps surface only non-empty buckets to keep the /metrics/runtime
 // payload bounded under cold cache.
 type WidgetsInfo struct {
-	ResponsesByResource map[string]int64 `json:"responses_by_resource,omitempty"`
-	ErrorByClass        map[string]int64 `json:"error_by_class,omitempty"`
-	UAFSkipped          map[string]int64 `json:"uaf_skipped,omitempty"`
+	// JSON tags pin the architect's Q-5XX-DIAG canonical contract names.
+	// `responses_5xx_by_resource` carries 2xx/4xx/5xx labels via key suffix
+	// (the per-class dimension lives inside the key, not the metric name);
+	// `user_access_filter_skipped` mirrors the slog audit channel.
+	ResponsesByResource   map[string]int64 `json:"responses_5xx_by_resource,omitempty"`
+	ErrorByClass          map[string]int64 `json:"error_by_class,omitempty"`
+	UAFSkipped            map[string]int64 `json:"user_access_filter_skipped,omitempty"`
 	UAFTouchingByResource map[string]int64 `json:"uaf_touching_by_resource,omitempty"`
-	UAFTouchingCount    int64            `json:"uaf_touching_count"`
-	UAFNonTouchingCount int64            `json:"uaf_non_touching_count"`
+	UAFTouchingCount      int64            `json:"uaf_touching_count"`
+	UAFNonTouchingCount   int64            `json:"uaf_non_touching_count"`
 }
 
 // CallEventsInfo exposes Q-CAUSAL-COST (0.25.323) /call exit-edge counters.
