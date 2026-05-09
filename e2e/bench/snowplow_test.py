@@ -1892,6 +1892,44 @@ def _self_test_destructive_clean_guard():
     log(f"self-test OK: {len(cases)} case(s) passed")
 
 
+def _self_test_phase5_runs_both_users():
+    """Verify Phase 5 covers both admin AND cyberjoker.
+
+    Inspects _browser_run_navigations + run_phase_browser_comparison
+    source. Asserts:
+      - _browser_run_navigations accepts a `username` parameter
+      - run_phase_browser_comparison iterates users (loop over
+        _ensure_users().keys() or equivalent)
+      - run_phase_browser_comparison passes username=... to each
+        _browser_run_navigations call
+    Locks the customer-shape mix coverage in code so a future regression
+    cannot silently revert to admin-only.
+    """
+    import inspect
+    failed = 0
+    sig = inspect.signature(_browser_run_navigations).parameters
+    if "username" not in sig:
+        log("  [FAIL] _browser_run_navigations has no username parameter")
+        failed += 1
+    else:
+        log("  [OK ] _browser_run_navigations accepts username")
+    src = inspect.getsource(run_phase_browser_comparison)
+    if "_ensure_users" not in src:
+        log("  [FAIL] run_phase_browser_comparison does not iterate users")
+        failed += 1
+    else:
+        log("  [OK ] run_phase_browser_comparison iterates _ensure_users")
+    if "username=" not in src:
+        log("  [FAIL] run_phase_browser_comparison does not forward username=")
+        failed += 1
+    else:
+        log("  [OK ] run_phase_browser_comparison forwards username=")
+    if failed:
+        log(f"phase5-both-users FAILED: {failed} case(s)")
+        sys.exit(1)
+    log("phase5-both-users OK")
+
+
 def _self_test_cache_toggle_uses_helm():
     """Verify enable_cache / disable_cache route through helm upgrade.
 
@@ -3096,24 +3134,38 @@ def _browser_measure_navigation(page, page_path, label, min_calls=0):
     }
 
 
-def _browser_run_navigations(browser, scenario_name, num_navigations=2):
-    """Run navigations for a scenario, return list of measurements."""
-    username, password = "admin", _ensure_users()["admin"]
+def _browser_run_navigations(browser, scenario_name, num_navigations=2,
+                             username="admin"):
+    """Run navigations for a scenario as `username`, return measurements.
+
+    Phase 5 historically pinned this function to admin only, so the
+    customer-shape mix-weighted picture (0.95·cyberjoker + 0.05·admin
+    per feedback_north_star_is_frontend_ux.md) was missing the
+    dominant subject. Phase 4 already runs both subjects; Phase 5 now
+    matches.
+    """
+    users = _ensure_users()
+    if username not in users:
+        log(f"  Unknown username {username!r}; available: "
+            f"{sorted(users.keys())}")
+        return []
+    password = users[username]
     ctx = browser.new_context(viewport={"width": 1280, "height": 900},
                               ignore_https_errors=True)
     page = ctx.new_page()
 
     if not _browser_login(page, username, password):
-        log(f"  Login failed for {scenario_name}")
+        log(f"  Login failed for {username} / {scenario_name}")
         ctx.close()
         return []
 
     measurements = []
     for nav_num in range(1, num_navigations + 1):
         for page_name, page_path in BROWSER_NAV_PAGES:
-            label = f"{scenario_name} nav#{nav_num} {page_name}"
+            label = f"{username} {scenario_name} nav#{nav_num} {page_name}"
             log(f"  {label} ...")
             m = _browser_measure_navigation(page, page_path, label)
+            m["user"] = username
             measurements.append(m)
             log(f"    /call requests: {m['callCount']}  "
                 f"waterfall: {m['waterfallMs']}ms  "
@@ -3139,27 +3191,44 @@ def run_phase_browser_comparison():
         log("Install: pip install playwright && python -m playwright install chromium")
         return
 
+    # Both subjects per the customer-shape mix (0.95·cyberjoker + 0.05·admin
+    # per feedback_north_star_is_frontend_ux.md). Phase 4 already covers
+    # both; Phase 5 now matches so the mix-weighted ledger row gets
+    # cyberjoker page-load p99 from the same harness.
+    USERS_TO_RUN = list(_ensure_users().keys())  # admin + cyberjoker
+
     results = {}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
 
         # ── Scenario 1: Cache OFF ──
-        section("Phase 5 — Cache OFF (2 navigations)")
+        section("Phase 5 — Cache OFF (2 navigations × users)")
         disable_cache()
-        results["cache_off"] = _browser_run_navigations(browser, "Cache OFF")
+        results["cache_off"] = []
+        for user in USERS_TO_RUN:
+            results["cache_off"].extend(
+                _browser_run_navigations(browser, "Cache OFF", username=user))
 
         # ── Scenario 2: Cache ON (cold start) ──
-        section("Phase 5 — Cache ON cold (2 navigations)")
+        section("Phase 5 — Cache ON cold (2 navigations × users)")
         enable_cache()
         # Don't wait for L1 warmup — measure cold cache
         time.sleep(5)
-        results["cache_on_cold"] = _browser_run_navigations(browser, "Cache ON (cold)")
+        results["cache_on_cold"] = []
+        for user in USERS_TO_RUN:
+            results["cache_on_cold"].extend(
+                _browser_run_navigations(browser, "Cache ON (cold)",
+                                         username=user))
 
         # ── Scenario 3: Cache ON (fully warmed) ──
-        section("Phase 5 — Cache ON warmed (2 navigations)")
+        section("Phase 5 — Cache ON warmed (2 navigations × users)")
         wait_for_l1_warmup(timeout=120)
-        results["cache_on_warmed"] = _browser_run_navigations(browser, "Cache ON (warmed)")
+        results["cache_on_warmed"] = []
+        for user in USERS_TO_RUN:
+            results["cache_on_warmed"].extend(
+                _browser_run_navigations(browser, "Cache ON (warmed)",
+                                         username=user))
 
         browser.close()
 
@@ -4707,6 +4776,7 @@ def main():
         _self_test_destructive_clean_guard()
         _self_test_assert_clean_guard_wiring()
         _self_test_cache_toggle_uses_helm()
+        _self_test_phase5_runs_both_users()
         _self_test_password_from_secret()
         sys.exit(0)
 
