@@ -52,6 +52,18 @@ type WidgetsInfo struct {
 	UAFTouchingByResource map[string]int64 `json:"uaf_touching_by_resource,omitempty"`
 	UAFTouchingCount      int64            `json:"uaf_touching_count"`
 	UAFNonTouchingCount   int64            `json:"uaf_non_touching_count"`
+	PanelProbe            PanelProbeInfo   `json:"panel_probe"`
+}
+
+// PanelProbeInfo exposes Q-PANEL-PROBE (0.25.326) counters: when the OUTER
+// JQ filter at restactions.go:118 trips, the probe inspects the unfiltered
+// dict's .status.managed shape and bumps one of these. Falsification gate
+// for H_status_managed_empty: managed_empty / (managed_empty + managed_populated)
+// is the overlap ratio with failing-CR set.
+type PanelProbeInfo struct {
+	ManagedEmpty     int64 `json:"managed_empty"`
+	ManagedPopulated int64 `json:"managed_populated"`
+	PathMalformed    int64 `json:"path_malformed"`
 }
 
 // CallEventsInfo exposes Q-CAUSAL-COST (0.25.323) /call exit-edge counters.
@@ -308,6 +320,7 @@ func RuntimeMetricsHandler(c cache.Cache, queues WorkQueueLens, prewarm PrewarmL
 		}
 
 		// Q-5XX-DIAG (0.25.324) — widget handler 5xx attribution.
+		// Q-PANEL-PROBE (0.25.326) — panel-probe nested under widgets.
 		m.Widgets = WidgetsInfo{
 			ResponsesByResource:   snap.WidgetResponsesByResource,
 			ErrorByClass:          snap.WidgetErrorByClass,
@@ -315,6 +328,11 @@ func RuntimeMetricsHandler(c cache.Cache, queues WorkQueueLens, prewarm PrewarmL
 			UAFTouchingByResource: snap.UAFTouchingByResource,
 			UAFTouchingCount:      snap.UAFTouchingCount,
 			UAFNonTouchingCount:   snap.UAFNonTouchingCount,
+			PanelProbe: PanelProbeInfo{
+				ManagedEmpty:     snap.PanelProbeManagedEmpty,
+				ManagedPopulated: snap.PanelProbeManagedPopulated,
+				PathMalformed:    snap.PanelProbePathMalformed,
+			},
 		}
 
 		w.Header().Set("Content-Type", "application/json")

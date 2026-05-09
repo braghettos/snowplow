@@ -126,6 +126,20 @@ type Metrics struct {
 	UAFTouchingByResource     sync.Map // string -> *atomic.Int64
 	UAFTouchingCount          atomic.Int64
 	UAFNonTouchingCount       atomic.Int64
+
+	// ── Panel-probe counters (Q-PANEL-PROBE, 0.25.326) ─────────────────
+	// Falsification gate for H_status_managed_empty: when the OUTER JQ
+	// filter trips at restactions.go:118 with "unable to resolve filter",
+	// the probe inspects the unfiltered dict for any value v whose
+	// .status.managed shape predicts the failure. ManagedEmpty bumps
+	// when an entry's .status.managed is nil/missing/empty-array;
+	// ManagedPopulated bumps when it's a non-empty array (so the JQ trip
+	// is NOT explained by managed-empty); PathMalformed bumps when
+	// .status.managed is a non-array, non-nil value (string/object/etc).
+	// All increments are observe-only — no behavior change.
+	PanelProbeManagedEmpty     atomic.Int64
+	PanelProbeManagedPopulated atomic.Int64
+	PanelProbePathMalformed    atomic.Int64
 }
 
 // IncMapKey atomically increments the counter at key inside m, allocating
@@ -254,6 +268,11 @@ type MetricsSnapshot struct {
 	UAFTouchingByResource     map[string]int64 `json:"uaf_touching_by_resource,omitempty"`
 	UAFTouchingCount          int64            `json:"uaf_touching_count"`
 	UAFNonTouchingCount       int64            `json:"uaf_non_touching_count"`
+
+	// Panel-probe counters (Q-PANEL-PROBE, 0.25.326).
+	PanelProbeManagedEmpty     int64 `json:"panel_probe_managed_empty"`
+	PanelProbeManagedPopulated int64 `json:"panel_probe_managed_populated"`
+	PanelProbePathMalformed    int64 `json:"panel_probe_path_malformed"`
 }
 
 var GlobalMetrics = &Metrics{}
@@ -380,6 +399,10 @@ func (m *Metrics) snapshotFromAtomics() MetricsSnapshot {
 		UAFTouchingByResource:     SnapshotMap(&m.UAFTouchingByResource),
 		UAFTouchingCount:          m.UAFTouchingCount.Load(),
 		UAFNonTouchingCount:       m.UAFNonTouchingCount.Load(),
+
+		PanelProbeManagedEmpty:     m.PanelProbeManagedEmpty.Load(),
+		PanelProbeManagedPopulated: m.PanelProbeManagedPopulated.Load(),
+		PanelProbePathMalformed:    m.PanelProbePathMalformed.Load(),
 	}
 	s.L1ResidentBytes, s.L1Entries = sampleL1()
 	s.GetHitRate = hitRate(s.GetHits, s.GetMisses)

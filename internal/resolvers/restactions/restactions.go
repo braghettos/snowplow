@@ -115,6 +115,7 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, m
 		}
 		jqSpan.End()
 		if err != nil {
+			panelProbeOnFilterError(ctx, opts.In.GetName(), dict, err)
 			return opts.In, dict, fmt.Errorf("unable to resolve filter: %w", err)
 		}
 
@@ -145,4 +146,47 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, m
 // annotation set to `true`.
 func isVerbose(o metav1.Object) bool {
 	return o.GetAnnotations()[annotationKeyVerboseAPI] == "true"
+}
+
+// panelProbeOnFilterError is the Q-PANEL-PROBE (0.25.326) diagnostic site.
+// On OUTER-JQ "unable to resolve filter", scan dict for entries whose
+// .status.managed shape predicts the failure. Observe-only: bumps
+// cache.GlobalMetrics counters + emits one slog line per match; no
+// behavior change. Falsification gate for H_status_managed_empty:
+// failing-CR set ≡ managed_empty-CR set.
+func panelProbeOnFilterError(ctx context.Context, raName string, dict map[string]any, jqErr error) {
+	msg := jqErr.Error()
+	if len(msg) > 200 {
+		msg = msg[:200]
+	}
+	for k, v := range dict {
+		obj, _ := v.(map[string]any)
+		status, _ := obj["status"].(map[string]any)
+		managed, present := status["managed"]
+		if !present {
+			continue
+		}
+		md, _ := obj["metadata"].(map[string]any)
+		ns, _ := md["namespace"].(string)
+		name, _ := md["name"].(string)
+		n, malformed := 0, false
+		if arr, ok := managed.([]any); ok {
+			n = len(arr)
+		} else if managed != nil {
+			malformed = true
+		}
+		switch {
+		case malformed:
+			cache.GlobalMetrics.PanelProbePathMalformed.Add(1)
+		case n == 0:
+			cache.GlobalMetrics.PanelProbeManagedEmpty.Add(1)
+		default:
+			cache.GlobalMetrics.PanelProbeManagedPopulated.Add(1)
+		}
+		xcontext.Logger(ctx).Info("panel.probe",
+			slog.String("ra_name", raName), slog.String("dict_key", k),
+			slog.String("composition_ns", ns), slog.String("composition_name", name),
+			slog.Int("managed_len", n), slog.Bool("path_malformed", malformed),
+			slog.String("filter_error", msg))
+	}
 }
