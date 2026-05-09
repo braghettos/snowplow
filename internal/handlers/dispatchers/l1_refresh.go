@@ -181,7 +181,12 @@ func MakeL1Refresher(c cache.Cache, rc *rest.Config, authnNS, signKey string, rb
 			}
 
 			for _, k := range keys {
-				ok, cascade := refreshSingleL1(ctx, c, uc.user, uc.endpoint, uc.accessToken, k.info, k.raw, authnNS, snowplowEndpointFn, snowplowK8sClient)
+				// Q-REFRESH-COALESCE (0.25.328) — singleflight wrapper
+				// keyed by raw L1 key. Concurrent callers for the same
+				// (binding-identity, gvr, ns, name, page) share ONE
+				// inner refresh. See refresh_coalesce.go for the full
+				// design rationale.
+				ok, cascade := refreshSingleL1Coalesced(ctx, c, uc.user, uc.endpoint, uc.accessToken, k.info, k.raw, authnNS, snowplowEndpointFn, snowplowK8sClient)
 				if ok {
 					totalRefreshed++
 					allCascade = append(allCascade, cascade...)

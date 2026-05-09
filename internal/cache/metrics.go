@@ -86,6 +86,17 @@ type Metrics struct {
 	L1SyncSweepCount  atomic.Int64
 	L1AsyncSweepCount atomic.Int64
 
+	// ── L1 refresher singleflight coalesce (Q-REFRESH-COALESCE, 0.25.328) ─
+	// RefresherInflightCoalesced increments once per FOLLOWER (not leader)
+	// when concurrent refreshSingleL1 calls share the same L1-key
+	// singleflight slot — i.e. the same logical key is already being
+	// refreshed and the new caller piggybacks on the in-flight execution.
+	// Surfaces at /metrics/runtime under cache.refresher_inflight_coalesced.
+	// A non-zero counter is the falsifiable signal that the coalesce
+	// window is collapsing duplicate work; zero means refresher fan-out
+	// already had no duplicates to dedup.
+	RefresherInflightCoalesced atomic.Int64
+
 	// ── L2 post-refilter cache (Q-RBACC-L2-1) ────────────────────────────
 	// Counters surface at /metrics/runtime under l2_* keys. Hit-rate is
 	// computed by the snapshot consumer.
@@ -247,6 +258,11 @@ type MetricsSnapshot struct {
 	L1SyncSweepCount  int64 `json:"l1_sync_sweep_count"`
 	L1AsyncSweepCount int64 `json:"l1_async_sweep_count"`
 
+	// L1 refresher singleflight coalesce (Q-REFRESH-COALESCE, 0.25.328).
+	// Mirrors the atomic counter at /metrics/runtime under
+	// cache.refresher_inflight_coalesced.
+	RefresherInflightCoalesced int64 `json:"refresher_inflight_coalesced"`
+
 	// L2 post-refilter cache (Q-RBACC-L2-1). HitRate is computed in the
 	// snapshot for parity with L1. ResidentBytes/Count are sampled once
 	// per snapshot from the live counters.
@@ -398,6 +414,8 @@ func (m *Metrics) snapshotFromAtomics() MetricsSnapshot {
 		L1EvictionsTTL:    m.L1EvictionsTTL.Load(),
 		L1SyncSweepCount:  m.L1SyncSweepCount.Load(),
 		L1AsyncSweepCount: m.L1AsyncSweepCount.Load(),
+
+		RefresherInflightCoalesced: m.RefresherInflightCoalesced.Load(),
 		L1MaxBytes:        l1MaxBytes(),
 		L1MaxEntries:      int64(l1MaxEntries()),
 
