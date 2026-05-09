@@ -62,10 +62,64 @@ SCREENSHOTS = os.environ.get("SCREENSHOTS", "0") == "1"
 SCALE = int(os.environ.get("SCALE", "5000"))
 NS = "krateo-system"
 
-USERS = {
-    "admin": "zKQAMSGJ3S4S",
-    "cyberjoker": "fUjGILkvvizF",
-}
+def _read_password_from_secret(secret_name, ns=NS):
+    """Read a password from a Kubernetes Secret's `password` data key.
+
+    Replaces the prior hardcoded constants. Hardcoded values drift the
+    moment chart helpers regenerate the secrets at install time, then
+    every login() returns 401 and the bench produces structurally
+    identical numbers that have nothing to do with cache state.
+
+    Returns the decoded password string. Raises RuntimeError if the
+    secret is missing or malformed -- the bench MUST not silently fall
+    back to a stale literal.
+    """
+    proc = subprocess.run(
+        ["kubectl", "get", "secret", secret_name, "-n", ns,
+         "-o", "jsonpath={.data.password}"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"could not read secret {secret_name} in namespace {ns}: "
+            f"{proc.stderr.strip()}")
+    encoded = (proc.stdout or "").strip()
+    if not encoded:
+        raise RuntimeError(
+            f"secret {secret_name} in namespace {ns} has empty data.password")
+    try:
+        return base64.b64decode(encoded).decode("utf-8").rstrip("\n")
+    except Exception as e:
+        raise RuntimeError(
+            f"could not base64-decode data.password from secret "
+            f"{secret_name}: {type(e).__name__}: {e}")
+
+
+def _build_users_dict():
+    """Build USERS from in-cluster secrets at process start.
+
+    Lazy-evaluated so --self-test and --help do not require kubectl
+    access. Real test runs always need kubectl, so the cost is paid
+    exactly once per invocation.
+    """
+    return {
+        "admin": _read_password_from_secret("admin-password"),
+        "cyberjoker": _read_password_from_secret("cyberjoker-password"),
+    }
+
+
+# USERS is populated lazily by _ensure_users() the first time a caller
+# needs credentials. Tests that never log in (--self-test, --help) skip
+# the kubectl secret read entirely.
+USERS = {}
+
+
+def _ensure_users():
+    """Populate USERS on first credential read."""
+    global USERS
+    if not USERS:
+        USERS = _build_users_dict()
+    return USERS
 
 COMPDEF_NAME = "github-scaffolding-with-composition-page"
 COMP_GVR = "composition.krateo.io"
@@ -264,7 +318,7 @@ def login(username, password):
 
 def login_all():
     tokens = {}
-    for username, password in USERS.items():
+    for username, password in _ensure_users().items():
         for attempt in range(5):
             try:
                 tokens[username] = login(username, password)
@@ -1783,6 +1837,45 @@ def _self_test_destructive_clean_guard():
     log(f"self-test OK: {len(cases)} case(s) passed")
 
 
+def _self_test_password_from_secret():
+    """Functional check for the secret-derived USERS dict.
+
+    Runs `kubectl get secret admin-password -n krateo-system` and
+    `kubectl get secret cyberjoker-password -n krateo-system`,
+    verifies both return non-empty base64-decoded strings, and
+    asserts the previously-hardcoded literals are NOT what comes
+    back (so the bench cannot silently drift to stale credentials).
+    Cluster contact required; called only via --self-test on a
+    cluster operator opts in to.
+    """
+    log("Self-test: password-from-secret ...")
+    try:
+        admin_pw = _read_password_from_secret("admin-password")
+        cj_pw = _read_password_from_secret("cyberjoker-password")
+    except Exception as e:
+        log(f"  [SKIP] secret read failed (expected on no-cluster runs): "
+            f"{type(e).__name__}: {e}")
+        return
+    failed = 0
+    if not admin_pw or len(admin_pw) < 4:
+        log(f"  [FAIL] admin password too short: len={len(admin_pw)}")
+        failed += 1
+    else:
+        log(f"  [OK ] admin password decoded len={len(admin_pw)}")
+    if not cj_pw or len(cj_pw) < 4:
+        log(f"  [FAIL] cyberjoker password too short: len={len(cj_pw)}")
+        failed += 1
+    else:
+        log(f"  [OK ] cyberjoker password decoded len={len(cj_pw)}")
+    if admin_pw == cj_pw:
+        log(f"  [FAIL] admin == cyberjoker password (same secret read?)")
+        failed += 1
+    if failed:
+        log(f"password-from-secret FAILED: {failed} case(s)")
+        sys.exit(1)
+    log("password-from-secret OK")
+
+
 def assert_clean(retry_with_cleanup=True):
     """Assert cluster has no bench leftovers. If dirty and retry_with_cleanup,
     invoke clean_environment() once and re-check; raise if still dirty.
@@ -2202,7 +2295,7 @@ def run_phase_latency(tokens):
 
     section("Disabling cache for baseline ...")
     disable_cache()
-    token = login("admin", USERS["admin"])
+    token = login("admin", _ensure_users()["admin"])
 
     # Port-forward to the cache-OFF pod for proof metrics
     pf_off = _start_port_forward()
@@ -2312,7 +2405,7 @@ def run_phase_latency(tokens):
     _stop_port_forward()
 
     disable_cache()
-    token_off = login("admin", USERS["admin"])
+    token_off = login("admin", _ensure_users()["admin"])
     pf_render_off = _start_port_forward()
     pf_render_off_url = pf_render_off or SNOWPLOW
     # Warmup (no L1, but primes HTTP connections + K8s API server caches)
@@ -2857,7 +2950,7 @@ def _browser_measure_navigation(page, page_path, label, min_calls=0):
 
 def _browser_run_navigations(browser, scenario_name, num_navigations=2):
     """Run navigations for a scenario, return list of measurements."""
-    username, password = "admin", USERS["admin"]
+    username, password = "admin", _ensure_users()["admin"]
     ctx = browser.new_context(viewport={"width": 1280, "height": 900},
                               ignore_https_errors=True)
     page = ctx.new_page()
@@ -3347,7 +3440,7 @@ def run_phase_browser_scaling(tokens):
                 wait_for_l1_warmup()
 
             # Login once, reuse page for all stages in this cache mode
-            username, password = "admin", USERS["admin"]
+            username, password = "admin", _ensure_users()["admin"]
             ctx = browser.new_context(viewport={"width": 1280, "height": 900},
                                       ignore_https_errors=True)
             page = ctx.new_page()
@@ -4464,6 +4557,7 @@ def main():
 
     if args.self_test:
         _self_test_destructive_clean_guard()
+        _self_test_password_from_secret()
         sys.exit(0)
 
     if args.scenario == "crb-delete":
