@@ -77,6 +77,14 @@ type Metrics struct {
 	// evicted by the existing TTL pass (was untracked before 0.25.319).
 	L1EvictionsLRU atomic.Int64
 	L1EvictionsTTL atomic.Int64
+	// ── Synchronous L1 admission (0.25.327) ──────────────────────────────
+	// L1SyncSweepCount bumps when a writer in kvStore trips the budget and
+	// runs the LRU sweep inline. L1AsyncSweepCount bumps each time the
+	// 30-s StartEviction tick runs the sweep. Together they reveal whether
+	// admission control or the ticker is doing the work — pre-0.25.327 the
+	// only path was the ticker, so SyncSweepCount must be 0 there.
+	L1SyncSweepCount  atomic.Int64
+	L1AsyncSweepCount atomic.Int64
 
 	// ── L2 post-refilter cache (Q-RBACC-L2-1) ────────────────────────────
 	// Counters surface at /metrics/runtime under l2_* keys. Hit-rate is
@@ -236,6 +244,8 @@ type MetricsSnapshot struct {
 	L1Entries       int64 `json:"l1_entries"`
 	L1MaxBytes      int64 `json:"l1_max_bytes"`
 	L1MaxEntries    int64 `json:"l1_max_entries"`
+	L1SyncSweepCount  int64 `json:"l1_sync_sweep_count"`
+	L1AsyncSweepCount int64 `json:"l1_async_sweep_count"`
 
 	// L2 post-refilter cache (Q-RBACC-L2-1). HitRate is computed in the
 	// snapshot for parity with L1. ResidentBytes/Count are sampled once
@@ -384,10 +394,12 @@ func (m *Metrics) snapshotFromAtomics() MetricsSnapshot {
 		L2ResidentBytes:     L2ResidentBytes(),
 		L2ResidentCount:     L2ResidentCount(),
 
-		L1EvictionsLRU: m.L1EvictionsLRU.Load(),
-		L1EvictionsTTL: m.L1EvictionsTTL.Load(),
-		L1MaxBytes:     l1MaxBytes(),
-		L1MaxEntries:   int64(l1MaxEntries()),
+		L1EvictionsLRU:    m.L1EvictionsLRU.Load(),
+		L1EvictionsTTL:    m.L1EvictionsTTL.Load(),
+		L1SyncSweepCount:  m.L1SyncSweepCount.Load(),
+		L1AsyncSweepCount: m.L1AsyncSweepCount.Load(),
+		L1MaxBytes:        l1MaxBytes(),
+		L1MaxEntries:      int64(l1MaxEntries()),
 
 		CallClientGone:                 m.CallClientGone.Load(),
 		CallClientGoneAfterWriteHeader: m.CallClientGoneAfterWriteHeader.Load(),

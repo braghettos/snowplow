@@ -113,6 +113,13 @@ type MemCache struct {
 	// means). entryCount mirrors len(c.kv) without Range.
 	residentBytes atomic.Int64
 	entryCount    atomic.Int64
+
+	// Synchronous L1 admission (0.25.327) — try-lock so only one writer at
+	// a time runs the inline LRU sweep. Concurrent writers that find the
+	// flag set skip the sweep and let the in-progress one (or the next
+	// writer / 30-s ticker) catch up. Avoids unbounded latency when many
+	// writers simultaneously trip the budget.
+	lruSweeping atomic.Bool
 }
 
 // NewMem creates a new in-process cache with the given default resource TTL.
@@ -190,6 +197,10 @@ func (c *MemCache) StartEviction(ctx context.Context) {
 
 				// LRU budget sweep — runs after TTL pass so we evict only
 				// what's still alive (TTL-expired entries are already gone).
+				// 0.25.327: count this path as the async (ticker-driven) sweep
+				// to distinguish it from the synchronous-admission path in
+				// kvStore.
+				GlobalMetrics.L1AsyncSweepCount.Add(1)
 				c.sweepLRUIfOverBudget()
 			}
 		}
@@ -198,14 +209,25 @@ func (c *MemCache) StartEviction(ctx context.Context) {
 
 // sweepLRUIfOverBudget evicts least-recently-accessed kv entries until both
 // residentBytes <= 0.9 × cap and entryCount <= 0.9 × cap. The 10% slack
-// matches L2's strategy and avoids thrash on bursty writers. Single goroutine
-// (the StartEviction tick) so no internal locking is required beyond the
-// counter atomics.
+// matches L2's strategy and avoids thrash on bursty writers.
 //
 // Concurrent writers may push residentBytes up while we sort; that's fine —
-// the next tick will catch up. Race-free because every counter delta is
-// applied via atomic ops in kvStore/kvDelete.
+// the next tick (or the next sync-admission writer) will catch up. Race-free
+// because every counter delta is applied via atomic ops in kvStore/kvDelete.
+//
+// Unbounded — runs to completion. Used by the 30-s ticker (StartEviction)
+// and by tests that want deterministic post-state. Synchronous-admission
+// callers in kvStore use sweepLRUIfOverBudgetUntil with a deadline.
 func (c *MemCache) sweepLRUIfOverBudget() {
+	c.sweepLRUIfOverBudgetUntil(time.Time{})
+}
+
+// sweepLRUIfOverBudgetUntil is the deadline-aware sweeper. A zero deadline
+// disables the budget (used by the ticker). A non-zero deadline aborts the
+// eviction loop early once exceeded so writer-path latency stays bounded;
+// any remaining over-budget entries roll forward to the next sync-admission
+// writer or the 30-s ticker.
+func (c *MemCache) sweepLRUIfOverBudgetUntil(deadline time.Time) {
 	maxBytes := l1MaxBytes()
 	maxEntries := l1MaxEntries()
 	curBytes := c.residentBytes.Load()
@@ -236,8 +258,13 @@ func (c *MemCache) sweepLRUIfOverBudget() {
 	targetCount := int64(float64(maxEntries) * 0.9)
 
 	evicted := int64(0)
-	for _, it := range items {
+	for i, it := range items {
 		if c.residentBytes.Load() <= targetBytes && c.entryCount.Load() <= targetCount {
+			break
+		}
+		// Bound the writer-path sweep: check the deadline every 64 entries
+		// (cheap; time.Now is ~10ns). Any remaining work rolls forward.
+		if !deadline.IsZero() && i&63 == 0 && time.Now().After(deadline) {
 			break
 		}
 		if c.kvDelete(it.key) != nil {
@@ -247,6 +274,27 @@ func (c *MemCache) sweepLRUIfOverBudget() {
 	if evicted > 0 {
 		GlobalMetrics.L1EvictionsLRU.Add(evicted)
 	}
+}
+
+// maybeSweepInline is the synchronous-admission entry point. Called from
+// kvStore after every write that actually changes counters. Fast path: if
+// the budget is not exceeded, return immediately (no allocation, no Range).
+//
+// Slow path: try-lock c.lruSweeping so only one writer at a time runs the
+// sweep — concurrent writers see the flag set and skip (the in-progress
+// sweep will catch their excess on the same pass, or the next caller/ticker
+// will). The sweep itself is bounded by a 10 ms wallclock deadline so
+// writer-path latency is capped even when the kv map has 200K entries.
+func (c *MemCache) maybeSweepInline() {
+	if c.residentBytes.Load() <= l1MaxBytes() && c.entryCount.Load() <= int64(l1MaxEntries()) {
+		return
+	}
+	if !c.lruSweeping.CompareAndSwap(false, true) {
+		return
+	}
+	defer c.lruSweeping.Store(false)
+	GlobalMetrics.L1SyncSweepCount.Add(1)
+	c.sweepLRUIfOverBudgetUntil(time.Now().Add(10 * time.Millisecond))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -286,6 +334,13 @@ func cloneBytes(b []byte) []byte {
 // kvStore inserts or replaces an entry, updating residentBytes/entryCount and
 // stamping lastAccess. Returns nothing — the caller does not need to know
 // whether a replace happened.
+//
+// 0.25.327: after the counters are updated, maybeSweepInline runs the LRU
+// sweep synchronously when residentBytes > maxBytes or entryCount >
+// maxEntries. The sweep is try-locked + deadline-bounded so concurrent
+// writers don't pile up and a single writer's worst-case latency stays
+// inside the 10 ms budget. Pre-0.25.327 the only sweep was the 30-s ticker,
+// which left a window where resident_bytes could balloon past the cap.
 func (c *MemCache) kvStore(key string, e *memEntry) {
 	now := time.Now().UnixNano()
 	e.lastAccess.Store(now)
@@ -293,11 +348,13 @@ func (c *MemCache) kvStore(key string, e *memEntry) {
 	if loaded {
 		if pe, ok := prev.(*memEntry); ok && pe != nil {
 			c.residentBytes.Add(int64(len(e.data)) - int64(len(pe.data)))
+			c.maybeSweepInline()
 			return
 		}
 	}
 	c.residentBytes.Add(int64(len(e.data)))
 	c.entryCount.Add(1)
+	c.maybeSweepInline()
 }
 
 // kvDelete removes an entry, decrementing the counters. Returns the deleted

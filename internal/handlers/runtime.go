@@ -99,15 +99,17 @@ type DiagInfo struct {
 // Hits/Misses/HitRate (Q-DIAG-PPROF, 0.25.321) folded in from /metrics/cache
 // so canary observers can read L1 attribution without two endpoints.
 type L1Info struct {
-	ResidentBytes int64   `json:"resident_bytes"`
-	Entries       int64   `json:"entries"`
-	MaxBytes      int64   `json:"max_bytes"`
-	MaxEntries    int64   `json:"max_entries"`
-	EvictionsLRU  int64   `json:"evictions_lru"`
-	EvictionsTTL  int64   `json:"evictions_ttl"`
-	Hits          int64   `json:"hits"`
-	Misses        int64   `json:"misses"`
-	HitRate       float64 `json:"hit_rate"`
+	ResidentBytes   int64   `json:"resident_bytes"`
+	Entries         int64   `json:"entries"`
+	MaxBytes        int64   `json:"max_bytes"`
+	MaxEntries      int64   `json:"max_entries"`
+	EvictionsLRU    int64   `json:"evictions_lru"`
+	EvictionsTTL    int64   `json:"evictions_ttl"`
+	Hits            int64   `json:"hits"`
+	Misses          int64   `json:"misses"`
+	HitRate         float64 `json:"hit_rate"`
+	SyncSweepCount  int64   `json:"sync_sweep_count"`
+	AsyncSweepCount int64   `json:"async_sweep_count"`
 }
 
 // WorkQueueLens is the read-side observability surface of the priority
@@ -280,15 +282,17 @@ func RuntimeMetricsHandler(c cache.Cache, queues WorkQueueLens, prewarm PrewarmL
 			},
 			WorkQueues: wqInfo,
 			L1: L1Info{
-				ResidentBytes: snap.L1ResidentBytes,
-				Entries:       snap.L1Entries,
-				MaxBytes:      snap.L1MaxBytes,
-				MaxEntries:    snap.L1MaxEntries,
-				EvictionsLRU:  snap.L1EvictionsLRU,
-				EvictionsTTL:  snap.L1EvictionsTTL,
-				Hits:          snap.L1Hits,
-				Misses:        snap.L1Misses,
-				HitRate:       snap.L1HitRate,
+				ResidentBytes:   snap.L1ResidentBytes,
+				Entries:         snap.L1Entries,
+				MaxBytes:        snap.L1MaxBytes,
+				MaxEntries:      snap.L1MaxEntries,
+				EvictionsLRU:    snap.L1EvictionsLRU,
+				EvictionsTTL:    snap.L1EvictionsTTL,
+				Hits:            snap.L1Hits,
+				Misses:          snap.L1Misses,
+				HitRate:         snap.L1HitRate,
+				SyncSweepCount:  snap.L1SyncSweepCount,
+				AsyncSweepCount: snap.L1AsyncSweepCount,
 			},
 			L2: L2Info{
 				Hits:              snap.L2Hits,
