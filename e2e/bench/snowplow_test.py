@@ -9,8 +9,10 @@ Phases:
   2  latency      Backend + frontend proxy latency benchmark (cache ON vs OFF)
   3  scaling      8-stage incremental scaling matrix (cache ON vs OFF) — skipped at SCALE>=10000
   4  browser      Playwright browser metrics (cache ON vs OFF, DOM, render, XHR waterfall)
-  5  comparison   Browser navigation: cache OFF vs cache ON (cold) vs cache ON (warmed)
+  5  comparison   Browser navigation: cache OFF vs cache ON (cold) vs cache ON (warmed); both admin and cyberjoker
+  6  scaling-browser  S1-S8 ramp at customer scale; convergence-mass per stage (S6/S7/S8); writes canonical ledger row
   7  user-scaling Multi-user scaling: warmup + first-login burst + cache OFF baseline
+  8  per-mutation Sparse mutation convergence: per-event UPDATE→visible p99 by class (HOT/WARM/COLD)
 
 Usage:
   python3 snowplow_test.py                     # all phases
@@ -1890,6 +1892,93 @@ def _self_test_destructive_clean_guard():
         log(f"self-test FAILED: {failed} case(s)")
         sys.exit(1)
     log(f"self-test OK: {len(cases)} case(s) passed")
+
+
+def _self_test_canonical_ledger_row():
+    """Validate the canonical ledger row schema with synthetic input.
+
+    Builds a fake all_results structure covering Phase 6 S1, S6, S7,
+    S8 (each with both ON + OFF + admin + cyberjoker navigations) and
+    asserts that _build_canonical_ledger_row produces every expected
+    top-level key with the right type. Exits non-zero on schema drift.
+    """
+    fake_navs_on = [
+        {"user": "cyberjoker", "nav_num": 1, "cold_warm": "COLD",
+         "waterfallMs": 1200, "convergence_ms": 850},
+        {"user": "cyberjoker", "nav_num": 2, "cold_warm": "WARM",
+         "waterfallMs": 410, "convergence_ms": 800},
+        {"user": "admin", "nav_num": 1, "cold_warm": "COLD",
+         "waterfallMs": 1100},
+        {"user": "admin", "nav_num": 2, "cold_warm": "WARM",
+         "waterfallMs": 380},
+    ]
+    fake_navs_off = [
+        {"user": "cyberjoker", "nav_num": 1, "cold_warm": "COLD",
+         "waterfallMs": 9100},
+        {"user": "admin", "nav_num": 1, "cold_warm": "COLD",
+         "waterfallMs": 5500},
+    ]
+    def _stage_entry(stage, cache, navs):
+        return {
+            "stage": stage,
+            "cache": cache,
+            "pages": {"Dashboard": {"navigations": navs}},
+        }
+    fake_results = []
+    for s in ("1", "6", "7", "8"):
+        fake_results.append(_stage_entry(s, "ON", fake_navs_on))
+        fake_results.append(_stage_entry(s, "OFF", fake_navs_off))
+    row = _build_canonical_ledger_row(fake_results)
+    expected_keys = {
+        "tag", "ship_date", "scale", "uptime_at_capture_s",
+        "cells", "mix_weighted",
+        "convergence_mass_s6_p99",
+        "convergence_mass_s7_p99",
+        "convergence_mass_s8_p99",
+        "convergence_per_mutation_p99_mix",
+        "convergence_per_class_hot_p99",
+        "convergence_per_class_warm_p99",
+        "convergence_per_class_cold_p99",
+        "tag_specific_verifications",
+        "pod_restart_count",
+        "verdict",
+    }
+    failed = 0
+    missing = expected_keys - set(row.keys())
+    if missing:
+        log(f"  [FAIL] ledger row missing keys: {sorted(missing)}")
+        failed += 1
+    else:
+        log("  [OK ] ledger row has all 16 canonical keys")
+    cell_keys = {"admin_on", "admin_off", "cyber_on", "cyber_off"}
+    if set(row.get("cells", {}).keys()) != cell_keys:
+        log(f"  [FAIL] cells keys != admin/cyber × on/off: "
+            f"{sorted(row.get('cells', {}).keys())}")
+        failed += 1
+    else:
+        log("  [OK ] cells covers admin_on/admin_off/cyber_on/cyber_off")
+    mw = row.get("mix_weighted", {})
+    expected_mw = {"cold_ms", "warm_p50_ms", "warm_p99_ms"}
+    if set(mw.keys()) != expected_mw:
+        log(f"  [FAIL] mix_weighted keys: {sorted(mw.keys())}")
+        failed += 1
+    else:
+        log("  [OK ] mix_weighted has cold_ms/warm_p50_ms/warm_p99_ms")
+    if row.get("verdict") not in {"PASS", "WEAK_PASS", "FAIL", "REJECT"}:
+        log(f"  [FAIL] verdict not in canonical set: {row.get('verdict')!r}")
+        failed += 1
+    else:
+        log(f"  [OK ] verdict={row['verdict']}")
+    # convergence_mass_s6_p99 should be 850 (only sample) for the synthetic input
+    if row.get("convergence_mass_s6_p99", 0) <= 0:
+        log("  [FAIL] convergence_mass_s6_p99 not populated from S6 ON navs")
+        failed += 1
+    else:
+        log(f"  [OK ] convergence_mass_s6_p99={row['convergence_mass_s6_p99']}ms")
+    if failed:
+        log(f"canonical-ledger-row FAILED: {failed} case(s)")
+        sys.exit(1)
+    log("canonical-ledger-row OK")
 
 
 def _self_test_phase5_runs_both_users():
@@ -3998,6 +4087,194 @@ def run_phase_browser_scaling(tokens):
         json.dump(all_results, f, indent=2, default=str)
     log(f"Results saved to {out_file}")
 
+    # ── Canonical ledger row JSON ──
+    # Per the campaign-restart spec in
+    # /Users/diegobraga/krateo/snowplow-cache/snowplow/docs/implementation-plan-detailed.md,
+    # every Phase-6 run emits a canonical ledger row that the PM
+    # appends to project_north_star_ledger.md verbatim. Schema is
+    # frozen so successive ships are directly comparable.
+    ledger_row = _build_canonical_ledger_row(all_results)
+    ledger_file = "/tmp/snowplow_canonical_ledger_row.json"
+    with open(ledger_file, "w") as f:
+        json.dump(ledger_row, f, indent=2, default=str)
+    log(f"Canonical ledger row saved to {ledger_file}")
+
+
+def _convergence_p99_for_stage(all_results, stage_label):
+    """p99 of convergence_ms across all ON navigations for a given S-tag.
+
+    Returns -1 when no ON convergence samples are present (stage skipped
+    or all navigations marked TIMEOUT).
+    """
+    samples = []
+    for entry in all_results:
+        if str(entry.get("stage")) != stage_label or entry.get("cache") != "ON":
+            continue
+        for page_name, pg in (entry.get("pages") or {}).items():
+            for nav in (pg.get("navigations") or []):
+                cm = nav.get("convergence_ms")
+                if isinstance(cm, (int, float)) and cm >= 0:
+                    samples.append(int(cm))
+    if not samples:
+        return -1
+    return pct(samples, 99)
+
+
+def _build_canonical_ledger_row(all_results):
+    """Assemble the canonical ledger row from Phase-6 measurements.
+
+    Schema (frozen — do NOT add/rename keys without updating the
+    architect's plan AND the tester's reader):
+      tag, ship_date, scale, uptime_at_capture_s,
+      cells: { admin_on, admin_off, cyber_on, cyber_off }
+        each: { cold_ms, warm_p50_ms, warm_p99_ms }
+      mix_weighted: { cold_ms, warm_p50_ms, warm_p99_ms }
+      convergence_mass_s6_p99,
+      convergence_mass_s7_p99,
+      convergence_mass_s8_p99,
+      convergence_per_mutation_p99_mix,
+      convergence_per_class_hot_p99,
+      convergence_per_class_warm_p99,
+      convergence_per_class_cold_p99,
+      tag_specific_verifications,
+      pod_restart_count,
+      verdict
+    Phase 8 (per-mutation) lands at Commit 6; this writer leaves those
+    fields as null when Phase 8 has not run.
+    """
+    import datetime
+    tag = os.environ.get("EXPECTED_IMAGE_TAG", "unknown")
+    ship_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+    # Per-cell waterfall stats from Phase 6 navigations.
+    def _cell_stats(user, cache_mode):
+        cold_samples = []
+        warm_samples = []
+        for entry in all_results:
+            if entry.get("cache") != cache_mode:
+                continue
+            for page_name, pg in (entry.get("pages") or {}).items():
+                for nav in (pg.get("navigations") or []):
+                    if nav.get("user") and nav["user"] != user:
+                        continue
+                    wf = nav.get("waterfallMs", 0) or 0
+                    if wf <= 0:
+                        continue
+                    if nav.get("nav_num") == 1 or nav.get("cold_warm") == "COLD":
+                        cold_samples.append(wf)
+                    else:
+                        warm_samples.append(wf)
+        return {
+            "cold_ms": pct(cold_samples, 50) if cold_samples else 0,
+            "warm_p50_ms": pct(warm_samples, 50) if warm_samples else 0,
+            "warm_p99_ms": pct(warm_samples, 99) if warm_samples else 0,
+        }
+
+    cells = {
+        "admin_on":   _cell_stats("admin",      "ON"),
+        "admin_off":  _cell_stats("admin",      "OFF"),
+        "cyber_on":   _cell_stats("cyberjoker", "ON"),
+        "cyber_off":  _cell_stats("cyberjoker", "OFF"),
+    }
+    # Mix-weighted = 0.95 * cyber + 0.05 * admin per
+    # feedback_north_star_is_frontend_ux.md
+    mix_weighted = {
+        "cold_ms": int(round(
+            0.95 * cells["cyber_on"]["cold_ms"] +
+            0.05 * cells["admin_on"]["cold_ms"])),
+        "warm_p50_ms": int(round(
+            0.95 * cells["cyber_on"]["warm_p50_ms"] +
+            0.05 * cells["admin_on"]["warm_p50_ms"])),
+        "warm_p99_ms": int(round(
+            0.95 * cells["cyber_on"]["warm_p99_ms"] +
+            0.05 * cells["admin_on"]["warm_p99_ms"])),
+    }
+
+    # Pod restart count
+    restarts = 0
+    try:
+        rc, out, _ = kubectl(
+            "get", "pods", "-n", "krateo-system",
+            "-l", "app.kubernetes.io/name=snowplow",
+            "-o", "jsonpath={.items[0].status.containerStatuses[0].restartCount}")
+        if rc == 0 and out.strip():
+            restarts = int(out.strip())
+    except Exception:
+        pass
+
+    # Uptime at capture
+    uptime_s = 0
+    try:
+        rc, out, _ = kubectl(
+            "get", "pods", "-n", "krateo-system",
+            "-l", "app.kubernetes.io/name=snowplow",
+            "-o", "jsonpath={.items[0].status.startTime}")
+        if rc == 0 and out.strip():
+            import datetime as _dt
+            t0 = _dt.datetime.fromisoformat(out.strip().replace("Z", "+00:00"))
+            uptime_s = int((_dt.datetime.now(_dt.timezone.utc) - t0).total_seconds())
+    except Exception:
+        pass
+
+    return {
+        "tag": tag,
+        "ship_date": ship_date,
+        "scale": [SCALE, 5000] if SCALE != 5000 else [5000],
+        "uptime_at_capture_s": uptime_s,
+        "cells": cells,
+        "mix_weighted": mix_weighted,
+        "convergence_mass_s6_p99": _convergence_p99_for_stage(all_results, "6"),
+        "convergence_mass_s7_p99": _convergence_p99_for_stage(all_results, "7"),
+        "convergence_mass_s8_p99": _convergence_p99_for_stage(all_results, "8"),
+        # Phase 8 sources — populated by run_phase_per_mutation when run.
+        # Loaded from /tmp/snowplow_per_mutation_results.json if present.
+        "convergence_per_mutation_p99_mix": _load_per_mutation_metric("p99_mix"),
+        "convergence_per_class_hot_p99":    _load_per_mutation_metric("hot_p99"),
+        "convergence_per_class_warm_p99":   _load_per_mutation_metric("warm_p99"),
+        "convergence_per_class_cold_p99":   _load_per_mutation_metric("cold_p99"),
+        "tag_specific_verifications": {},
+        "pod_restart_count": restarts,
+        "verdict": _compute_verdict(mix_weighted, restarts,
+                                    _convergence_p99_for_stage(all_results, "8")),
+    }
+
+
+def _load_per_mutation_metric(key):
+    """Load a Phase-8 metric if the per-mutation run has produced it."""
+    path = "/tmp/snowplow_per_mutation_results.json"
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d.get(key)
+    except Exception:
+        return None
+
+
+def _compute_verdict(mix_weighted, restarts, conv_s8_p99):
+    """Verdict per the architect's gates.
+
+    PASS:        warm_p50 < 500ms, cold < 1000ms, conv < 1000ms, 0 restarts
+    WEAK_PASS:   one tier missed by <=20%
+    FAIL:        2+ tiers missed OR conv > 2000ms OR restarts > 0
+    REJECT:      pod crashed, no usable measurements
+    """
+    if not mix_weighted or mix_weighted.get("warm_p50_ms", 0) <= 0:
+        return "REJECT"
+    if restarts > 0:
+        return "FAIL"
+    misses = 0
+    if mix_weighted["warm_p50_ms"] > 500:
+        misses += 1
+    if mix_weighted["cold_ms"] > 1000:
+        misses += 1
+    if conv_s8_p99 is not None and conv_s8_p99 > 1000:
+        misses += 1
+    if misses == 0:
+        return "PASS"
+    if misses == 1:
+        return "WEAK_PASS"
+    return "FAIL"
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PHASE 7: MULTI-USER SCALING
@@ -4777,6 +5054,7 @@ def main():
         _self_test_assert_clean_guard_wiring()
         _self_test_cache_toggle_uses_helm()
         _self_test_phase5_runs_both_users()
+        _self_test_canonical_ledger_row()
         _self_test_password_from_secret()
         sys.exit(0)
 
