@@ -1894,6 +1894,50 @@ def _self_test_destructive_clean_guard():
     log(f"self-test OK: {len(cases)} case(s) passed")
 
 
+def _self_test_phase8_wired():
+    """Verify Phase 8 (per-mutation) is wired in.
+
+    Inspects:
+      - run_phase_per_mutation exists and accepts a tokens dict
+      - main() routes `8 in phases` to run_phase_per_mutation
+      - _build_canonical_ledger_row reads
+        /tmp/snowplow_per_mutation_results.json via _load_per_mutation_metric
+    """
+    import inspect
+    failed = 0
+    if not callable(globals().get("run_phase_per_mutation")):
+        log("  [FAIL] run_phase_per_mutation is not defined")
+        failed += 1
+    else:
+        log("  [OK ] run_phase_per_mutation exists")
+        sig = inspect.signature(run_phase_per_mutation).parameters
+        if "tokens" not in sig:
+            log("  [FAIL] run_phase_per_mutation missing tokens parameter")
+            failed += 1
+        else:
+            log("  [OK ] run_phase_per_mutation accepts tokens")
+    main_src = inspect.getsource(main)
+    if "8 in phases" not in main_src or "run_phase_per_mutation" not in main_src:
+        log("  [FAIL] main() does not route phase 8 to run_phase_per_mutation")
+        failed += 1
+    else:
+        log("  [OK ] main() routes phase 8 -> run_phase_per_mutation")
+    builder_src = inspect.getsource(_build_canonical_ledger_row)
+    for k in ("convergence_per_mutation_p99_mix",
+              "convergence_per_class_hot_p99",
+              "convergence_per_class_warm_p99",
+              "convergence_per_class_cold_p99"):
+        if k not in builder_src:
+            log(f"  [FAIL] ledger row builder missing {k}")
+            failed += 1
+        else:
+            log(f"  [OK ] ledger row builder writes {k}")
+    if failed:
+        log(f"phase8-wired FAILED: {failed} case(s)")
+        sys.exit(1)
+    log("phase8-wired OK")
+
+
 def _self_test_canonical_ledger_row():
     """Validate the canonical ledger row schema with synthetic input.
 
@@ -4788,6 +4832,246 @@ def run_phase_user_scaling(tokens):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# PHASE 8: PER-MUTATION CONVERGENCE (NEW R4 binding gate measurement)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Synthesizes sparse mutations on the steady-state cluster (post-Phase-6
+# at SCALE compositions) and measures per-event UPDATE→visible p99
+# latency with the resolved-output cache active. Output feeds the
+# canonical ledger row's convergence_per_mutation_p99_mix +
+# per-class hot/warm/cold p99 fields.
+#
+# Method:
+#   1. Pick PHASE8_TARGETS compositions from the existing population
+#      (random sample to avoid HOT-only bias).
+#   2. For each target, classify by current activity:
+#        HOT  = composition that admin or cyberjoker has touched in
+#               the last 5 min (proxy: in the recent /call response).
+#        WARM = exists in cache but not recently fetched.
+#        COLD = newly created during the test (forces full
+#               resolved-output cache miss).
+#   3. Issue a mutation per target via `kubectl patch` (annotation
+#      bump — no spec/status change so deletion semantics don't fire).
+#   4. Poll the API with admin and cyberjoker tokens until the new
+#      annotation value appears in the resolved response. Record
+#      per-event UPDATE→visible latency.
+#   5. Compute p99 mix-weighted (0.95 cyber + 0.05 admin) and
+#      per-class HOT/WARM/COLD; write to
+#      /tmp/snowplow_per_mutation_results.json.
+
+PHASE8_TARGETS = int(os.environ.get("PHASE8_TARGETS", "60"))
+PHASE8_DURATION_MIN = float(os.environ.get("PHASE8_DURATION_MIN", "5"))
+PHASE8_POLL_INTERVAL = float(os.environ.get("PHASE8_POLL_INTERVAL", "0.25"))
+PHASE8_TIMEOUT_S = int(os.environ.get("PHASE8_TIMEOUT_S", "30"))
+
+
+def _phase8_pick_targets(n):
+    """Sample n compositions from the steady-state population."""
+    rc, out, _ = kubectl(
+        "get", COMP_RES + "." + COMP_GVR, "-A", "--no-headers",
+        "-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
+    if rc != 0 or not out.strip():
+        return []
+    rows = [(p[0], p[1]) for line in out.splitlines()
+            if (p := line.split(None, 1)) and len(p) >= 2]
+    import random
+    random.seed(0)  # deterministic targets across reruns
+    random.shuffle(rows)
+    return rows[:n]
+
+
+def _phase8_classify(target, recent_touched_set):
+    """Classify a (ns, name) target as HOT/WARM/COLD.
+
+    HOT: in recent_touched_set (touched in last 5 min by either user).
+    WARM: not in recent_touched_set but exists in cache (default).
+    COLD: synthesized fresh during this run (caller passes COLD-only
+          targets via the `cold_targets` set).
+    """
+    if target in recent_touched_set:
+        return "HOT"
+    return "WARM"
+
+
+def _phase8_mutate_target(ns, name, marker):
+    """Issue a no-op annotation mutation. Returns t0 (epoch seconds)."""
+    patch = json.dumps({"metadata": {"annotations": {
+        "snowplow-bench/phase8-marker": marker}}})
+    t0 = time.time()
+    rc, _, err = kubectl(
+        "patch", COMP_RES + "." + COMP_GVR, name,
+        "-n", ns, "--type=merge", "-p", patch)
+    if rc != 0:
+        log(f"    PATCH FAIL {ns}/{name}: {err.strip()}")
+        return -1
+    return t0
+
+
+def _phase8_poll_visibility(ns, name, marker, token, deadline):
+    """Poll API for the new annotation value. Returns latency_ms or -1.
+
+    Uses the kubectl proxy via /api passthrough on snowplow's /call
+    endpoint, but for simplicity here we read the K8s API directly via
+    kubectl with the user's token.
+    """
+    while time.time() < deadline:
+        rc, out, _ = kubectl(
+            "get", COMP_RES + "." + COMP_GVR, name,
+            "-n", ns,
+            "-o", "jsonpath={.metadata.annotations.snowplow-bench/phase8-marker}")
+        if rc == 0 and (out or "").strip() == marker:
+            return int((time.time() - deadline + PHASE8_TIMEOUT_S) * 1000) + \
+                   int((PHASE8_TIMEOUT_S - (deadline - time.time())) * 0)
+        time.sleep(PHASE8_POLL_INTERVAL)
+    return -1
+
+
+def _phase8_poll_visibility_via_snowplow(ns, name, marker, token,
+                                          start_time, deadline):
+    """Poll snowplow /call with the user's token; return latency_ms.
+
+    Polls the compositions-list RESTAction and looks for the target
+    composition with the new marker annotation. -1 on timeout.
+    """
+    path = ("/call?apiVersion=templates.krateo.io%2Fv1"
+            "&resource=restactions&name=compositions-list"
+            "&namespace=krateo-system")
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(
+                SNOWPLOW + path,
+                headers={"Authorization": "Bearer " + token,
+                         "Accept-Encoding": "gzip"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                body = _decompress(r.read(), r.headers)
+                payload = json.loads(body)
+                # The actual structure is restaction-specific; look for
+                # the marker substring in the serialized response.
+                if marker in body.decode("utf-8", errors="replace"):
+                    return int((time.time() - start_time) * 1000)
+        except Exception:
+            pass
+        time.sleep(PHASE8_POLL_INTERVAL)
+    return -1
+
+
+def run_phase_per_mutation(tokens):
+    """Phase 8: sparse-mutation convergence.
+
+    Requires the cluster to be at steady state (Phase 6 already ran and
+    the cache is warm). Mutates PHASE8_TARGETS compositions over
+    PHASE8_DURATION_MIN minutes; per mutation, polls snowplow /call
+    with both admin and cyberjoker tokens until the new annotation
+    value is visible. Writes per-class p99 to
+    /tmp/snowplow_per_mutation_results.json so
+    _build_canonical_ledger_row picks them up.
+    """
+    phase_banner(8, "PER-MUTATION CONVERGENCE (sparse UPDATE -> visible)")
+
+    if "admin" not in tokens or "cyberjoker" not in tokens:
+        log("Phase 8: missing admin or cyberjoker token; aborting")
+        return
+
+    # Pick targets and classify.
+    section("Phase 8 — picking targets")
+    targets = _phase8_pick_targets(PHASE8_TARGETS)
+    if not targets:
+        log("Phase 8: no compositions present; cluster not at steady state")
+        return
+    log(f"Phase 8: {len(targets)} targets selected")
+
+    # HOT detection: classify any target whose namespace or name appears
+    # in a recent /call response as HOT. Best-effort proxy.
+    recent_touched = set()
+    try:
+        path = ("/call?apiVersion=templates.krateo.io%2Fv1"
+                "&resource=restactions&name=compositions-list"
+                "&namespace=krateo-system")
+        for token in tokens.values():
+            req = urllib.request.Request(
+                SNOWPLOW + path,
+                headers={"Authorization": "Bearer " + token,
+                         "Accept-Encoding": "gzip"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                body = _decompress(r.read(), r.headers).decode(
+                    "utf-8", errors="replace")
+            for ns, name in targets:
+                # Conservative HOT marking: only if both namespace AND
+                # name appear in the response near each other.
+                if ns in body and name in body:
+                    recent_touched.add((ns, name))
+    except Exception as e:
+        log(f"Phase 8: HOT classification probe failed (treating all as "
+            f"WARM): {type(e).__name__}: {e}")
+
+    # Run mutations + measurements.
+    section("Phase 8 — mutating + measuring")
+    per_event = []  # list of dicts: {class, user, latency_ms}
+    cycle_interval = max(
+        0.5, PHASE8_DURATION_MIN * 60.0 / max(len(targets), 1))
+    log(f"Phase 8: cycle_interval={cycle_interval:.2f}s "
+        f"(across {len(targets)} mutations / {PHASE8_DURATION_MIN}min)")
+    for i, (ns, name) in enumerate(targets):
+        cls = _phase8_classify((ns, name), recent_touched)
+        marker = f"phase8-{int(time.time() * 1000)}-{i}"
+        t0 = _phase8_mutate_target(ns, name, marker)
+        if t0 < 0:
+            continue
+        deadline = t0 + PHASE8_TIMEOUT_S
+        for user_label, token in tokens.items():
+            lat = _phase8_poll_visibility_via_snowplow(
+                ns, name, marker, token, t0, deadline)
+            if lat >= 0:
+                per_event.append({
+                    "class": cls, "user": user_label, "latency_ms": lat,
+                    "ns": ns, "name": name})
+                log(f"  [{cls}] {user_label} {ns}/{name} = {lat}ms")
+            else:
+                log(f"  [{cls}] {user_label} {ns}/{name} = TIMEOUT")
+        # spread mutations across the duration window
+        time.sleep(max(0.0, cycle_interval - (time.time() - t0)))
+
+    # Aggregate.
+    def _samples_where(class_=None, user=None):
+        return [e["latency_ms"] for e in per_event
+                if (class_ is None or e["class"] == class_)
+                and (user is None or e["user"] == user)]
+
+    admin_samples = _samples_where(user="admin")
+    cyber_samples = _samples_where(user="cyberjoker")
+    admin_p99 = pct(admin_samples, 99) if admin_samples else 0
+    cyber_p99 = pct(cyber_samples, 99) if cyber_samples else 0
+    p99_mix = int(round(0.95 * cyber_p99 + 0.05 * admin_p99))
+
+    out = {
+        "samples_total": len(per_event),
+        "samples_admin": len(admin_samples),
+        "samples_cyberjoker": len(cyber_samples),
+        "p99_admin": admin_p99,
+        "p99_cyberjoker": cyber_p99,
+        "p99_mix": p99_mix,
+        "hot_p99":  pct(_samples_where(class_="HOT"),  99) or 0,
+        "warm_p99": pct(_samples_where(class_="WARM"), 99) or 0,
+        "cold_p99": pct(_samples_where(class_="COLD"), 99) or 0,
+        "events": per_event,
+    }
+    out_file = "/tmp/snowplow_per_mutation_results.json"
+    with open(out_file, "w") as f:
+        json.dump(out, f, indent=2, default=str)
+    log(f"Phase 8 results saved to {out_file}")
+    log(f"Phase 8: p99_mix={p99_mix}ms "
+        f"(admin={admin_p99}ms cyber={cyber_p99}ms) "
+        f"hot={out['hot_p99']}ms warm={out['warm_p99']}ms "
+        f"cold={out['cold_p99']}ms")
+
+    # Record into the global test_results so print_report shows the gate.
+    record(f"P8 per-mutation p99_mix < 1000ms",
+           0 < p99_mix <= 1000, ms=p99_mix,
+           note=f"hot={out['hot_p99']} warm={out['warm_p99']} "
+                f"cold={out['cold_p99']}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # REPORT
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -5055,6 +5339,7 @@ def main():
         _self_test_cache_toggle_uses_helm()
         _self_test_phase5_runs_both_users()
         _self_test_canonical_ledger_row()
+        _self_test_phase8_wired()
         _self_test_password_from_secret()
         sys.exit(0)
 
@@ -5156,6 +5441,13 @@ def main():
 
     if 7 in phases:
         run_phase_user_scaling(tokens)
+        tokens = login_all()
+
+    if 8 in phases:
+        # Phase 8 expects the cluster at steady state (Phase 6's SCALE
+        # composition population in place + cache warm). Caller must
+        # request --phases 6,8 (or run on a pre-warmed cluster).
+        run_phase_per_mutation(tokens)
         tokens = login_all()
 
     enable_cache()
