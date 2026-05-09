@@ -652,25 +652,80 @@ def _wait_old_pods_gone(old_pods_str):
             time.sleep(2)
 
 
+HELM_RELEASE = os.environ.get("HELM_RELEASE", "snowplow")
+CACHE_ENABLED_VALUES_KEY = os.environ.get(
+    "CACHE_ENABLED_VALUES_KEY", "env.CACHE_ENABLED")
+
+
+def _set_cache_via_helm(value):
+    """Toggle CACHE_ENABLED through `helm upgrade --reuse-values`.
+
+    Per `feedback_chart_only_for_snowplow.md`: all snowplow deployment
+    config flows through the chart values + ConfigMap, never via
+    `kubectl set env deployment/snowplow`. The previous implementation
+    used `kubectl set env`, which created drift between the live
+    Deployment and the chart values: the next `helm upgrade --install`
+    would silently revert the toggle. Production clusters never use
+    `kubectl set env` for snowplow, so the bench shouldn't either.
+
+    Uses --reuse-values so the toggle does not require knowing every
+    other override the operator applied; --set targets only the
+    CACHE_ENABLED key. The values key path is configurable via env
+    (default `env.CACHE_ENABLED`) so this same code path adapts to
+    the stripped chart at clean-slate-0.30.0 where the key is absent
+    and the cache subsystem itself doesn't exist.
+    """
+    str_value = "true" if value else "false"
+    args = [
+        "helm", "upgrade", HELM_RELEASE, HELM_RELEASE,
+        "-n", NS,
+        "--repo", os.environ.get(
+            "SNOWPLOW_HELM_REPO",
+            "oci://ghcr.io/braghettos"),
+        "--reuse-values",
+        "--set", f"{CACHE_ENABLED_VALUES_KEY}={str_value}",
+    ]
+    # The `helm upgrade <release> <chart>` form requires the OCI repo
+    # context. If the operator already has the chart pulled locally
+    # they can override via SNOWPLOW_HELM_CHART_PATH (path to local
+    # chart dir) which takes precedence.
+    chart_path = os.environ.get("SNOWPLOW_HELM_CHART_PATH")
+    if chart_path:
+        args = [
+            "helm", "upgrade", HELM_RELEASE, chart_path,
+            "-n", NS,
+            "--reuse-values",
+            "--set", f"{CACHE_ENABLED_VALUES_KEY}={str_value}",
+        ]
+    proc = subprocess.run(args, capture_output=True, text=True, timeout=300)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"helm upgrade failed (rc={proc.returncode}): "
+            f"stdout={proc.stdout.strip()} stderr={proc.stderr.strip()}")
+    log(f"helm upgrade OK: {CACHE_ENABLED_VALUES_KEY}={str_value}")
+
+
 def enable_cache():
-    log("Enabling cache (CACHE_ENABLED=true) ...")
-    _, old_pods, _ = kubectl("get", "pods", "-n", NS, "-l", "app.kubernetes.io/name=snowplow",
-                              "-o", "jsonpath={.items[*].metadata.name}")
-    kubectl("set", "env", "deployment/snowplow", "-n", NS,
-            "-c", "snowplow", "CACHE_ENABLED=true")
-    kubectl("rollout", "status", "deployment/snowplow", "-n", NS, "--timeout=300s")
+    log("Enabling cache (CACHE_ENABLED=true) via helm ...")
+    _, old_pods, _ = kubectl("get", "pods", "-n", NS,
+                             "-l", "app.kubernetes.io/name=snowplow",
+                             "-o", "jsonpath={.items[*].metadata.name}")
+    _set_cache_via_helm(True)
+    kubectl("rollout", "status", "deployment/snowplow",
+            "-n", NS, "--timeout=300s")
     _wait_old_pods_gone(old_pods)
     wait_for_snowplow()
     log("Cache enabled")
 
 
 def disable_cache():
-    log("Disabling cache (CACHE_ENABLED=false) ...")
-    _, old_pods, _ = kubectl("get", "pods", "-n", NS, "-l", "app.kubernetes.io/name=snowplow",
-                              "-o", "jsonpath={.items[*].metadata.name}")
-    kubectl("set", "env", "deployment/snowplow", "-n", NS,
-            "-c", "snowplow", "CACHE_ENABLED=false")
-    kubectl("rollout", "status", "deployment/snowplow", "-n", NS, "--timeout=300s")
+    log("Disabling cache (CACHE_ENABLED=false) via helm ...")
+    _, old_pods, _ = kubectl("get", "pods", "-n", NS,
+                             "-l", "app.kubernetes.io/name=snowplow",
+                             "-o", "jsonpath={.items[*].metadata.name}")
+    _set_cache_via_helm(False)
+    kubectl("rollout", "status", "deployment/snowplow",
+            "-n", NS, "--timeout=300s")
     _wait_old_pods_gone(old_pods)
     wait_for_snowplow()
     log("Cache disabled")
@@ -1835,6 +1890,47 @@ def _self_test_destructive_clean_guard():
         log(f"self-test FAILED: {failed} case(s)")
         sys.exit(1)
     log(f"self-test OK: {len(cases)} case(s) passed")
+
+
+def _self_test_cache_toggle_uses_helm():
+    """Verify enable_cache / disable_cache route through helm upgrade.
+
+    Per feedback_chart_only_for_snowplow.md the bench MUST NOT use
+    `kubectl set env` to toggle CACHE_ENABLED. This test inspects
+    enable_cache and disable_cache source and asserts both call
+    `_set_cache_via_helm` and neither contains the literal
+    `kubectl set env` pattern (case-insensitive).
+    """
+    import inspect
+    failed = 0
+    for fn in (enable_cache, disable_cache):
+        src = inspect.getsource(fn)
+        if "_set_cache_via_helm" not in src:
+            log(f"  [FAIL] {fn.__name__} does not call _set_cache_via_helm")
+            failed += 1
+        else:
+            log(f"  [OK ] {fn.__name__} calls _set_cache_via_helm")
+        # No "kubectl(\"set\", \"env\", ..." invocation.
+        if 'kubectl("set", "env"' in src or "kubectl('set', 'env'" in src:
+            log(f"  [FAIL] {fn.__name__} still uses kubectl set env")
+            failed += 1
+        else:
+            log(f"  [OK ] {fn.__name__} no kubectl set env usage")
+    helm_src = inspect.getsource(_set_cache_via_helm)
+    if "--reuse-values" not in helm_src:
+        log("  [FAIL] _set_cache_via_helm does not pass --reuse-values")
+        failed += 1
+    else:
+        log("  [OK ] _set_cache_via_helm uses --reuse-values")
+    if "helm" not in helm_src or "upgrade" not in helm_src:
+        log("  [FAIL] _set_cache_via_helm does not invoke helm upgrade")
+        failed += 1
+    else:
+        log("  [OK ] _set_cache_via_helm invokes helm upgrade")
+    if failed:
+        log(f"cache-toggle-helm FAILED: {failed} case(s)")
+        sys.exit(1)
+    log("cache-toggle-helm OK")
 
 
 def _self_test_assert_clean_guard_wiring():
@@ -4610,6 +4706,7 @@ def main():
     if args.self_test:
         _self_test_destructive_clean_guard()
         _self_test_assert_clean_guard_wiring()
+        _self_test_cache_toggle_uses_helm()
         _self_test_password_from_secret()
         sys.exit(0)
 
