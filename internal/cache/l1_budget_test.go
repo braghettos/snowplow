@@ -38,8 +38,13 @@ func resetL1Counters() {
 }
 
 // TestL1_ByteBudget_EvictsOldestWhenOverCap fills the cache past the byte
-// cap and verifies the oldest (first-written) entries are evicted first
-// until residentBytes <= 0.9 × cap.
+// cap and verifies the oldest (first-written) entries are evicted first.
+//
+// 0.25.327: synchronous admission inside kvStore drives most evictions
+// during the fill loop itself (no >30-s window where bytes balloon). The
+// invariant is the same — oldest evicted, newest survives, residentBytes
+// at-or-below maxBytes — but post-loop bytes settle near the cap rather
+// than 2× past it.
 func TestL1_ByteBudget_EvictsOldestWhenOverCap(t *testing.T) {
 	resetL1Counters()
 	// 10 KB cap with 1 KB-each entries → should hold ~9 after sweep.
@@ -61,25 +66,28 @@ func TestL1_ByteBudget_EvictsOldestWhenOverCap(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	// Pre-sweep: residentBytes ≈ numEntries × entrySize. SetRaw stores
-	// cloneBytes(val) so each entry's data is exactly entrySize.
-	if got := c.L1ResidentBytes(); got < int64(numEntries*entrySize) {
-		t.Errorf("pre-sweep residentBytes: got %d, want >= %d", got, numEntries*entrySize)
-	}
-
+	// Belt-and-braces: an explicit sweep is still allowed and must be
+	// idempotent under sync-admission (no-ops if already under cap).
 	c.sweepLRUIfOverBudget()
 
-	// Post-sweep: under target = 0.9 × cap = 9216 bytes.
-	target := int64(float64(l1MaxBytes()) * 0.9)
-	if got := c.L1ResidentBytes(); got > target {
-		t.Errorf("post-sweep residentBytes: got %d, want <= %d", got, target)
+	// Post-write: residentBytes <= cap (sync admission pins it).
+	maxBytes := l1MaxBytes()
+	if got := c.L1ResidentBytes(); got > maxBytes {
+		t.Errorf("residentBytes: got %d, want <= %d (sync admission failed)", got, maxBytes)
 	}
 
-	// LRU evictions counter: should be > 0 (at least 11 evictions to bring
-	// 20 KB down to <= 9 KB).
+	// LRU evictions counter: should be > 0 (at least 10 evictions across
+	// the 20 writes that overshot the 10 KB cap; 0.25.327 sync admission
+	// drives them incrementally rather than in one terminal pass).
 	evictedLRU := GlobalMetrics.L1EvictionsLRU.Load()
-	if evictedLRU < 11 {
-		t.Errorf("L1EvictionsLRU: got %d, want >= 11", evictedLRU)
+	if evictedLRU < 10 {
+		t.Errorf("L1EvictionsLRU: got %d, want >= 10", evictedLRU)
+	}
+
+	// Sync admission MUST have driven the sweep — async ticker is not
+	// running in this test. Pre-0.25.327 this was always 0.
+	if got := GlobalMetrics.L1SyncSweepCount.Load(); got == 0 {
+		t.Errorf("L1SyncSweepCount: got 0, want >= 1 (sync-admission did not fire)")
 	}
 
 	// The newest entries (key-19, key-18, ...) MUST survive. The oldest
@@ -95,6 +103,10 @@ func TestL1_ByteBudget_EvictsOldestWhenOverCap(t *testing.T) {
 // TestL1_EntryBudget_EvictsOldestAt200K simulates the entry-count cap
 // trigger by setting a small entry cap and confirming that excess entries
 // are LRU-evicted when residentBytes is well under the byte cap.
+//
+// 0.25.327: synchronous admission keeps entryCount <= maxEntries during
+// the fill loop. Post-loop count settles near the cap (not 15), and the
+// LRU ordering invariant — oldest evicted, newest survives — still holds.
 func TestL1_EntryBudget_EvictsOldestAt200K(t *testing.T) {
 	resetL1Counters()
 	t.Setenv(envL1MaxBytes, "10737418240") // 10 GiB — never trigger
@@ -113,18 +125,18 @@ func TestL1_EntryBudget_EvictsOldestAt200K(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	if got := c.L1EntryCount(); got != 15 {
-		t.Errorf("pre-sweep entryCount: got %d, want 15", got)
-	}
-
+	// Belt-and-braces: explicit sweep is idempotent.
 	c.sweepLRUIfOverBudget()
 
-	// Target = 0.9 × 10 = 9 entries.
-	if got := c.L1EntryCount(); got > 9 {
-		t.Errorf("post-sweep entryCount: got %d, want <= 9", got)
+	// Sync admission keeps entryCount at-or-below the cap.
+	if got := c.L1EntryCount(); got > int64(l1MaxEntries()) {
+		t.Errorf("entryCount: got %d, want <= %d (sync admission failed)", got, l1MaxEntries())
 	}
 	if got := GlobalMetrics.L1EvictionsLRU.Load(); got < 6 {
 		t.Errorf("L1EvictionsLRU: got %d, want >= 6", got)
+	}
+	if got := GlobalMetrics.L1SyncSweepCount.Load(); got == 0 {
+		t.Errorf("L1SyncSweepCount: got 0, want >= 1")
 	}
 
 	// k-14 (newest) survives; k-0 (oldest) evicted.
@@ -136,15 +148,19 @@ func TestL1_EntryBudget_EvictsOldestAt200K(t *testing.T) {
 	}
 }
 
-// TestL1_LRUOrdering_GetRefreshesAccess writes 10 entries, then GetRaw on
-// the OLDEST (which would normally be evicted first), then triggers a
-// sweep. The previously-touched entry must survive while a non-touched
-// older entry is evicted instead.
+// TestL1_LRUOrdering_GetRefreshesAccess writes N entries that fit, touches
+// the OLDEST to refresh its lastAccess, then writes more entries to trip
+// the budget. The touched entry must survive while a non-touched older
+// entry is evicted instead.
+//
+// 0.25.327: with sync admission, eviction can happen mid-write-loop. We
+// use a cap that comfortably holds the initial 10 entries, then append
+// extras after the touch so the trigger lands at a deterministic point.
 func TestL1_LRUOrdering_GetRefreshesAccess(t *testing.T) {
 	resetL1Counters()
-	// 1024 byte cap, 128-byte entries → 8 fit. Write 10, touch the
-	// oldest, sweep.
-	t.Setenv(envL1MaxBytes, "1024")
+	// 2048 byte cap, 128-byte entries → 16 fit. Write 10 (under cap),
+	// touch k-0, then write 8 more so 10+8=18 trips eviction.
+	t.Setenv(envL1MaxBytes, "2048")
 	t.Setenv(envL1MaxEntries, "100000")
 
 	c := NewMem(time.Hour)
@@ -163,6 +179,14 @@ func TestL1_LRUOrdering_GetRefreshesAccess(t *testing.T) {
 		t.Fatalf("k-0 missing pre-touch")
 	}
 
+	// Push past the cap so eviction fires (sync admission, then explicit
+	// belt-and-braces).
+	for i := 10; i < 18; i++ {
+		if err := c.SetRaw(ctx, "k-"+strconv.Itoa(i), fillBytes(128)); err != nil {
+			t.Fatalf("SetRaw: %v", err)
+		}
+		time.Sleep(time.Millisecond)
+	}
 	c.sweepLRUIfOverBudget()
 
 	// k-0 was just touched → must survive. k-1 should be the new oldest
