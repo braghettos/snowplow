@@ -18,10 +18,14 @@ import (
 	"github.com/krateoplatformops/plumbing/server/use/cors"
 	"github.com/krateoplatformops/plumbing/slogs/pretty"
 	_ "github.com/krateoplatformops/snowplow/docs"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers"
 	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
 	httpSwagger "github.com/swaggo/http-swagger"
+
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
 )
 
 const (
@@ -90,6 +94,51 @@ func main() {
 		use.TraceId(),
 		use.Logger(log),
 	)
+
+	// Cache plumbing — present at 0.30.1, dormant by default.
+	//
+	// When CACHE_ENABLED is unset / false / 0 / no, cache.Disabled()
+	// returns true and cache.NewResourceWatcher returns (nil, nil)
+	// without instantiating the dynamicinformer factory. No goroutines
+	// spawn. Every consumer (objects.Get, dynamic.ListObjects,
+	// api.Resolve) checks cache.Disabled() at the top and falls back
+	// to apiserver.
+	//
+	// When CACHE_ENABLED=true the factory is constructed but
+	// factory.Start() is NOT called here — that's deferred to 0.30.2
+	// which lands consumer routing.
+	cacheCtx, cacheCancel := context.WithCancel(context.Background())
+	defer cacheCancel()
+
+	var cacheWatcher *cache.ResourceWatcher
+	if !cache.Disabled() {
+		rc, rcErr := rest.InClusterConfig()
+		if rcErr != nil {
+			log.Warn("cache: rest.InClusterConfig failed; staying on apiserver branch",
+				slog.Any("err", rcErr))
+		} else {
+			dynCli, dynErr := dynamic.NewForConfig(rc)
+			if dynErr != nil {
+				log.Warn("cache: dynamic.NewForConfig failed; staying on apiserver branch",
+					slog.Any("err", dynErr))
+			} else {
+				w, wErr := cache.NewResourceWatcher(cacheCtx, dynCli)
+				if wErr != nil {
+					log.Warn("cache: NewResourceWatcher failed; staying on apiserver branch",
+						slog.Any("err", wErr))
+				} else {
+					cacheWatcher = w
+				}
+			}
+		}
+	} else {
+		// Disabled() emits the canonical "cache.disabled=true" log line
+		// from inside NewResourceWatcher — call it for the side-effect
+		// even when we know it returns nil. This is the falsifier the
+		// PM gate verifies via `kubectl logs`.
+		_, _ = cache.NewResourceWatcher(cacheCtx, nil)
+	}
+	_ = cacheWatcher // wired to dispatchers at 0.30.2
 
 	mux := http.NewServeMux()
 

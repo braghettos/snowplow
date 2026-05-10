@@ -83,7 +83,7 @@ func List() http.HandlerFunc {
 				GVR:       gvr,
 			}
 
-			obj, err := cli.List(context.Background(), opts)
+			obj, err := dynamic.ListObjects(req.Context(), cli, opts)
 			if err != nil {
 				log.Error("cannot list resources",
 					slog.String("gvr", gvr.String()), slog.Any("err", err))

@@ -9,6 +9,7 @@ import (
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/kubeconfig"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/dynamic"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -26,6 +27,24 @@ type Result struct {
 }
 
 func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
+	log := xcontext.Logger(ctx)
+
+	// Cache routing gate. At 0.30.1 cache.Disabled() defaults to true
+	// and we always fall through to the apiserver branch below. The
+	// 0.30.2 ship lands the cache-served branch above this fall-through.
+	if cache.Disabled() {
+		return getFromAPIServer(ctx, ref)
+	}
+
+	// Routed branch — placeholder for 0.30.2 wiring. Falls through to
+	// the apiserver branch at 0.30.1 because no consumer registered a
+	// ResourceWatcher with the relevant GVR yet.
+	log.Debug("objects.Get: cache routed but no watcher injected; falling back to apiserver",
+		slog.String("gvr", ref.APIVersion+"/"+ref.Resource))
+	return getFromAPIServer(ctx, ref)
+}
+
+func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 	log := xcontext.Logger(ctx)
 
 	gv, err := schema.ParseGroupVersion(ref.APIVersion)

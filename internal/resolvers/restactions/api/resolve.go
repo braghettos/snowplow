@@ -11,6 +11,7 @@ import (
 	"github.com/krateoplatformops/plumbing/maps"
 	"github.com/krateoplatformops/plumbing/ptr"
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"k8s.io/client-go/rest"
 )
 
@@ -27,6 +28,12 @@ type ResolveOptions struct {
 	PerPage int
 	Page    int
 	Extras  map[string]any
+
+	// Watcher is the cluster-wide informer cache. When nil (the
+	// default at 0.30.1, since CACHE_ENABLED defaults to false),
+	// every API call takes the apiserver branch via httpcall.Do.
+	// Routing for K8s-served endpoints flips on at 0.30.2.
+	Watcher *cache.ResourceWatcher
 }
 
 func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
@@ -44,6 +51,15 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 
 	log := xcontext.Logger(ctx)
 	log.Info("pagination options", slog.Int("page", opts.Page), slog.Int("perPage", opts.PerPage))
+
+	// Cache routing gate. At 0.30.1 cache.Disabled() defaults to true
+	// and Watcher is nil — every API call takes the apiserver branch.
+	// The 0.30.2 ship lands the cache-served branch keyed off Watcher.
+	if cache.Disabled() || opts.Watcher == nil {
+		log.Debug("api.Resolve: cache disabled or watcher unset; using apiserver branch",
+			slog.Bool("cache_disabled", cache.Disabled()),
+			slog.Bool("watcher_nil", opts.Watcher == nil))
+	}
 
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
