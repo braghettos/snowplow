@@ -927,60 +927,90 @@ def wait_for_compositions(expected, timeout=300, tolerance=5):
 
 
 def delete_all_compositions():
-    """Delete all bench compositions normally (let controllers reconcile finalizers)."""
-    rc, out, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "--all-namespaces", "--no-headers",
-                         "-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
+    """Delete all bench compositions via namespace-cascade.
+
+    Cascade-delete bench-ns-NN namespaces in parallel; K8s GC reaps every
+    child object (compositions, secrets, configmaps, Argo apps) automatically.
+    Falls back to finalizer-patch on any composition that blocks namespace
+    termination.
+
+    Replaces per-composition kubectl delete + 300s controller-wait. At 49K
+    compositions the controller workqueue cannot drain in 300s and the
+    finalizer-patch fallback always fired anyway (~17min end-to-end).
+    Namespace-cascade is ~49 deletes (one per bench-ns-NN) and typically
+    completes in ~30s.
+    """
+    rc, out, _ = kubectl("get", "ns", "--no-headers")
     if rc != 0 or not out.strip():
-        log("No compositions to delete")
+        log("No namespaces visible; skipping composition cleanup")
         return
-    items = [(p[0], p[1]) for line in out.strip().split("\n")
-             if (p := line.split(None, 1)) and len(p) >= 2 and p[0].startswith("bench-")]
-    if not items:
-        log("No bench compositions to delete")
+    bench_namespaces = [
+        line.split()[0] for line in out.strip().split("\n")
+        if line.startswith("bench-ns-")
+    ]
+    if not bench_namespaces:
+        log("No bench namespaces present")
         return
 
-    # Delete in parallel
-    def delete_comp(item):
-        kubectl("delete", f"{COMP_RES}.{COMP_GVR}", item[1], "-n", item[0],
-                "--ignore-not-found", "--wait=false")
+    log(f"Cascade-deleting {len(bench_namespaces)} bench namespaces ...")
+
+    # Step 1: parallel namespace delete (--wait=false; we poll instead)
+    def delete_ns(ns):
+        kubectl("delete", "ns", ns, "--ignore-not-found", "--wait=false")
     with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
-        list(ex.map(delete_comp, items))
-    log(f"Triggered deletion of {len(items)} compositions")
+        list(ex.map(delete_ns, bench_namespaces))
 
-    # Wait for all compositions to disappear (give controllers 300s to reconcile)
-    deadline = time.time() + 300
+    # Step 2: poll until namespaces fully terminated OR finalizer-stuck.
+    # 2 min is generous; well-behaved GC completes in ~30s. If we exit on
+    # timeout, step 3 patches composition finalizers (the typical blocker).
+    deadline = time.time() + 120
     while time.time() < deadline:
-        remaining = count_compositions()
-        if remaining == 0:
-            log("All compositions deleted")
+        rc, out, _ = kubectl("get", "ns", "--no-headers")
+        terminating = []
+        if rc == 0:
+            for line in (out or "").strip().split("\n"):
+                parts = line.split()
+                if not parts or not parts[0].startswith("bench-ns-"):
+                    continue
+                terminating.append(parts[0])
+        if not terminating:
+            log(f"All {len(bench_namespaces)} bench namespaces deleted")
             return
-        log(f"  {remaining} compositions remaining ...")
-        time.sleep(10)
+        log(f"  {len(terminating)} bench namespaces still Terminating ...")
+        time.sleep(5)
 
-    # Force-remove finalizers on any stuck compositions so namespaces can terminate
-    remaining = count_compositions()
-    if remaining > 0:
-        log(f"Patching finalizers off {remaining} stuck compositions ...")
-        rc, out, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "--all-namespaces",
-                             "--no-headers",
-                             "-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
-        stuck = [(p[0], p[1]) for line in (out or "").strip().split("\n")
-                 if (p := line.split(None, 1)) and len(p) >= 2]
-
+    # Step 3: finalizer-patch fallback. Stuck namespaces typically have
+    # compositions whose finalizers block GC. Patch finalizers across ALL
+    # remaining bench compositions in parallel, then re-poll namespaces.
+    log("Some namespaces stuck; patching composition finalizers ...")
+    rc, out, _ = kubectl("get", f"{COMP_RES}.{COMP_GVR}", "--all-namespaces",
+                         "--no-headers",
+                         "-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name")
+    stuck = [(p[0], p[1]) for line in (out or "").strip().split("\n")
+             if (p := line.split(None, 1)) and len(p) >= 2
+             and p[0].startswith("bench-")]
+    if stuck:
         def patch_finalizer(item):
             kubectl("patch", f"{COMP_RES}.{COMP_GVR}", item[1], "-n", item[0],
                     "--type=merge", f"-p={FINALIZER_PATCH}")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
             list(ex.map(patch_finalizer, stuck))
-        log(f"Finalizers patched on {len(stuck)} compositions")
+        log(f"Finalizers patched on {len(stuck)} stuck compositions")
 
-        # Brief wait for deletion to propagate
-        time.sleep(10)
-        remaining = count_compositions()
-        if remaining == 0:
-            log("All compositions deleted (after finalizer patch)")
-        else:
-            log(f"WARNING: {remaining} compositions still remaining")
+    # Brief wait for cascade to complete after patch
+    time.sleep(10)
+    rc, out, _ = kubectl("get", "ns", "--no-headers")
+    final_stuck = []
+    if rc == 0:
+        for line in (out or "").strip().split("\n"):
+            parts = line.split()
+            if parts and parts[0].startswith("bench-ns-"):
+                final_stuck.append(parts[0])
+    if final_stuck:
+        log(f"WARNING: {len(final_stuck)} bench namespaces still present "
+            f"after finalizer-patch")
+    else:
+        log("All bench namespaces cleared")
 
 
 def delete_all_compositiondefinitions():
@@ -2178,6 +2208,155 @@ def _self_test_password_from_secret():
         log(f"password-from-secret FAILED: {failed} case(s)")
         sys.exit(1)
     log("password-from-secret OK")
+
+
+def _self_test_namespace_cascade_delete():
+    """Verify delete_all_compositions uses namespace-cascade, not per-comp.
+
+    Runs delete_all_compositions() with kubectl monkey-patched to a
+    recorder. Two scenarios:
+
+      A. Healthy cascade — kubectl get ns lists 3 bench-ns-XX namespaces;
+         second poll returns no bench-ns-XX. Expect: 3 delete-ns calls,
+         zero per-composition delete calls, no finalizer patches.
+
+      B. Stuck cascade — kubectl get ns keeps returning 1 stuck namespace
+         past the timeout. Expect: delete-ns calls AND finalizer-patch
+         fallback fires across stuck compositions.
+
+    No cluster contact: every kubectl invocation is intercepted.
+    """
+    log("Self-test: namespace-cascade-delete ...")
+    import inspect
+    failed = 0
+
+    # Structural: the function MUST get ns first and call delete on ns
+    # (not on compositions) for the happy path.
+    src = inspect.getsource(delete_all_compositions)
+    structural_checks = [
+        ('"get", "ns"', "fetches namespaces, not compositions, on entry"),
+        ('"delete", "ns"', "issues namespace delete (cascade) calls"),
+        ("bench-ns-", "filters to bench-ns- prefix"),
+        ("ThreadPoolExecutor", "deletes namespaces in parallel"),
+        ("FINALIZER_PATCH", "retains finalizer-patch fallback"),
+    ]
+    for needle, desc in structural_checks:
+        if needle not in src:
+            log(f"  [FAIL] delete_all_compositions missing: {desc}")
+            failed += 1
+        else:
+            log(f"  [OK ] delete_all_compositions {desc}")
+    # Anti-regression: NO per-composition kubectl delete loop. Per-comp
+    # delete at 49K scale was the ~17min path the cascade replaces.
+    if 'kubectl("delete", f"{COMP_RES}.{COMP_GVR}"' in src:
+        log("  [FAIL] delete_all_compositions still per-composition delete")
+        failed += 1
+    else:
+        log("  [OK ] delete_all_compositions no per-composition delete loop")
+
+    # Behavioural: monkey-patch kubectl + time.sleep, exercise both paths.
+    real_kubectl = globals()["kubectl"]
+    real_sleep = time.sleep
+    real_time = time.time
+    try:
+        # ---- Scenario A: healthy cascade ----
+        calls_a = []
+        ns_listings = iter([
+            # 1st: list bench namespaces
+            (0, "bench-ns-01   Active   1m\n"
+                "bench-ns-02   Active   1m\n"
+                "bench-ns-03   Active   1m\n"
+                "krateo-system Active   1m\n", ""),
+            # poll #1: still terminating
+            (0, "bench-ns-01   Terminating 1m\n"
+                "bench-ns-02   Terminating 1m\n"
+                "krateo-system Active      1m\n", ""),
+            # poll #2: all gone
+            (0, "krateo-system Active 1m\n", ""),
+        ])
+
+        def fake_kubectl_a(*args, **kwargs):
+            calls_a.append(args)
+            if args[:2] == ("get", "ns"):
+                try:
+                    return next(ns_listings)
+                except StopIteration:
+                    return (0, "krateo-system Active 1m\n", "")
+            return (0, "", "")
+
+        globals()["kubectl"] = fake_kubectl_a
+        time.sleep = lambda s: None
+        delete_all_compositions()
+        delete_ns_calls_a = [c for c in calls_a
+                             if len(c) >= 2 and c[0] == "delete" and c[1] == "ns"]
+        delete_comp_calls_a = [c for c in calls_a if len(c) >= 2
+                               and c[0] == "delete"
+                               and isinstance(c[1], str)
+                               and c[1].startswith(COMP_RES)]
+        patch_calls_a = [c for c in calls_a if c and c[0] == "patch"]
+        if len(delete_ns_calls_a) == 3:
+            log(f"  [OK ] healthy: 3 namespace deletes issued")
+        else:
+            log(f"  [FAIL] healthy: expected 3 ns deletes, got "
+                f"{len(delete_ns_calls_a)}")
+            failed += 1
+        if not delete_comp_calls_a:
+            log("  [OK ] healthy: zero per-composition delete calls")
+        else:
+            log(f"  [FAIL] healthy: per-composition deletes leaked: "
+                f"{len(delete_comp_calls_a)}")
+            failed += 1
+        if not patch_calls_a:
+            log("  [OK ] healthy: no finalizer-patch fallback fired")
+        else:
+            log(f"  [FAIL] healthy: unexpected patch calls: "
+                f"{len(patch_calls_a)}")
+            failed += 1
+
+        # ---- Scenario B: stuck cascade triggers finalizer fallback ----
+        calls_b = []
+        # Force the polling loop to time out by overriding time.time to
+        # return values past the 120s deadline on the 3rd call.
+        time_returns = iter([1000.0, 1000.0, 1000.0, 9999.0, 9999.0,
+                             9999.0, 9999.0, 9999.0])
+
+        def fake_time():
+            try:
+                return next(time_returns)
+            except StopIteration:
+                return 9999.0
+        time.time = fake_time
+
+        def fake_kubectl_b(*args, **kwargs):
+            calls_b.append(args)
+            if args[:2] == ("get", "ns"):
+                # Always return a stuck bench-ns-99 to force fallback
+                return (0, "bench-ns-99 Terminating 1m\n", "")
+            if args[0] == "get" and len(args) >= 2 \
+                    and args[1].startswith(COMP_RES):
+                # 2 stuck compositions to patch
+                return (0, "bench-ns-99 stuck-c1\nbench-ns-99 stuck-c2\n", "")
+            return (0, "", "")
+
+        globals()["kubectl"] = fake_kubectl_b
+        delete_all_compositions()
+        patch_calls_b = [c for c in calls_b if c and c[0] == "patch"
+                         and len(c) >= 2 and c[1].startswith(COMP_RES)]
+        if len(patch_calls_b) == 2:
+            log(f"  [OK ] stuck: finalizer-patch fired on 2 compositions")
+        else:
+            log(f"  [FAIL] stuck: expected 2 finalizer patches, got "
+                f"{len(patch_calls_b)}")
+            failed += 1
+    finally:
+        globals()["kubectl"] = real_kubectl
+        time.sleep = real_sleep
+        time.time = real_time
+
+    if failed:
+        log(f"namespace-cascade-delete FAILED: {failed} case(s)")
+        sys.exit(1)
+    log("namespace-cascade-delete OK")
 
 
 def assert_clean(retry_with_cleanup=True, allow_destructive=False):
@@ -5341,6 +5520,7 @@ def main():
         _self_test_canonical_ledger_row()
         _self_test_phase8_wired()
         _self_test_password_from_secret()
+        _self_test_namespace_cascade_delete()
         sys.exit(0)
 
     if args.scenario == "crb-delete":
