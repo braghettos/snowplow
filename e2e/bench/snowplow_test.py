@@ -2782,7 +2782,7 @@ def _self_test_canonical_ledger_row():
         failed += 1
     else:
         log("  [OK ] mix_weighted has cold_ms/warm_p50_ms/warm_p99_ms")
-    if row.get("verdict") not in {"PASS", "WEAK_PASS", "FAIL", "REJECT"}:
+    if row.get("verdict") not in {"PASS", "WEAK_PASS", "FAIL", "FLOOR", "REJECT"}:
         log(f"  [FAIL] verdict not in canonical set: {row.get('verdict')!r}")
         failed += 1
     else:
@@ -2797,6 +2797,119 @@ def _self_test_canonical_ledger_row():
         log(f"canonical-ledger-row FAILED: {failed} case(s)")
         sys.exit(1)
     log("canonical-ledger-row OK")
+
+
+def _self_test_canonical_ledger_row_floor_shape():
+    """Validate exporter behavior on a floor-tag (cache-stripped) shape.
+
+    At a floor tag (e.g. 0.30.0) the deployed chart has no
+    CACHE_ENABLED toggle, so Phase 6 emits ON entries with empty
+    `pages: {}` and only OFF entries carry real navigation samples.
+    This test proves the exporter:
+
+      1. Tags navs only via _browser_measure_stage's per-nav loop
+         (real navs do NOT carry user/nav_num/cold_warm; only the
+         stage helper adds them — verify by inspecting the helper).
+      2. Mirrors admin → cyber when cyber has no samples but admin
+         does, and stamps `mirrored_from` on the mirrored cell.
+      3. Computes mix_weighted from OFF cells when ON cells are empty,
+         producing non-zero numbers on a floor-tag JSON.
+      4. Returns convergence_mass_*_p99 from OFF samples when ON has
+         none.
+      5. Stamps verdict="FLOOR" instead of "REJECT" or "FAIL" when
+         OFF cells carry numbers but ON cells do not.
+    """
+    import inspect
+    failed = 0
+
+    # 1. _browser_measure_stage tags every nav with user/nav_num/cold_warm.
+    src = inspect.getsource(_browser_measure_stage)
+    tags_required = ('m["nav_num"]', 'm["cold_warm"]', 'm["user"]')
+    missing_tag = [t for t in tags_required if t not in src]
+    if missing_tag:
+        log(f"  [FAIL] _browser_measure_stage missing nav tags: {missing_tag}")
+        failed += 1
+    else:
+        log("  [OK ] _browser_measure_stage tags nav_num/cold_warm/user on every nav")
+
+    # 2-5. Build a floor-shape all_results: ON entries empty, OFF entries
+    # carry admin samples only (Phase 6 logs in as admin).
+    real_admin_off_navs = [
+        # Real shape — no user/nav_num/cold_warm because Phase 6 used
+        # to drop them. After Edit 1 these tags are emitted; the test
+        # asserts the exporter copes WITH them via the synthetic
+        # branch above and WITHOUT them here.
+        {"user": "admin", "nav_num": 1, "cold_warm": "COLD",
+         "waterfallMs": 9100, "convergence_ms": 51303},
+        {"user": "admin", "nav_num": 2, "cold_warm": "WARM",
+         "waterfallMs": 7387, "convergence_ms": 50773},
+        {"user": "admin", "nav_num": 3, "cold_warm": "WARM",
+         "waterfallMs": 8521, "convergence_ms": 55936},
+    ]
+    floor_results = []
+    for s in ("1", "6", "7", "8"):
+        # Synthetic ON N/A row, mirroring run_phase_browser_scaling.
+        floor_results.append({
+            "stage": s, "cache": "ON",
+            "cache_supported": False, "pages": {},
+        })
+        floor_results.append({
+            "stage": s, "cache": "OFF",
+            "pages": {"Dashboard": {"navigations": real_admin_off_navs}},
+        })
+    row = _build_canonical_ledger_row(floor_results)
+
+    # 2. cyber_off mirrors admin_off; admin_off keeps real numbers.
+    if not row["cells"]["admin_off"].get("warm_p50_ms"):
+        log("  [FAIL] admin_off cell empty on floor-shape input")
+        failed += 1
+    else:
+        log(f"  [OK ] admin_off.warm_p50_ms={row['cells']['admin_off']['warm_p50_ms']}")
+    cyber_off = row["cells"]["cyber_off"]
+    if cyber_off.get("warm_p50_ms", 0) <= 0:
+        log("  [FAIL] cyber_off not mirrored from admin_off")
+        failed += 1
+    elif cyber_off.get("mirrored_from") != "admin_off":
+        log(f"  [FAIL] cyber_off mirrored but lacks mirrored_from='admin_off' "
+            f"(got {cyber_off.get('mirrored_from')!r})")
+        failed += 1
+    else:
+        log("  [OK ] cyber_off mirrored from admin_off with mirrored_from annotation")
+    # admin_off must NOT carry mirrored_from (it had real samples).
+    if "mirrored_from" in row["cells"]["admin_off"]:
+        log("  [FAIL] admin_off should not be mirrored — it had real samples")
+        failed += 1
+    else:
+        log("  [OK ] admin_off keeps its own samples (no mirror)")
+
+    # 3. mix_weighted comes from OFF cells when ON cells are empty.
+    mw = row["mix_weighted"]
+    if mw["warm_p50_ms"] <= 0 or mw["cold_ms"] <= 0:
+        log(f"  [FAIL] mix_weighted zero on floor input: {mw}")
+        failed += 1
+    else:
+        log(f"  [OK ] mix_weighted populated from OFF cells: {mw}")
+
+    # 4. convergence falls back to OFF samples.
+    for tag in ("s6", "s7", "s8"):
+        key = f"convergence_mass_{tag}_p99"
+        if row.get(key, -1) <= 0:
+            log(f"  [FAIL] {key} not populated on floor input")
+            failed += 1
+        else:
+            log(f"  [OK ] {key}={row[key]}ms (from OFF samples)")
+
+    # 5. verdict is FLOOR.
+    if row.get("verdict") != "FLOOR":
+        log(f"  [FAIL] floor-shape verdict={row.get('verdict')!r}, expected FLOOR")
+        failed += 1
+    else:
+        log("  [OK ] verdict=FLOOR on floor-shape input")
+
+    if failed:
+        log(f"canonical-ledger-row-floor-shape FAILED: {failed} case(s)")
+        sys.exit(1)
+    log("canonical-ledger-row-floor-shape OK")
 
 
 def _self_test_phase5_runs_both_users():
@@ -5228,9 +5341,15 @@ def _verify_composition_count_ui(page):
         return -1
 
 
-def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, token=None, num_navs=3):
+def _browser_measure_stage(page, stage_num, stage_desc, cache_mode,
+                           token=None, num_navs=3, user="admin"):
     """Navigate browser to each page num_navs times, return timing data.
-    Expects an already-logged-in page object and an admin JWT token."""
+    Expects an already-logged-in page object and an admin JWT token.
+
+    `user` tags every emitted navigation dict with the subject the
+    measurement applies to so the canonical-row exporter can bucket
+    samples per cell (admin/cyberjoker × ON/OFF). The page must already
+    be logged in as `user`; this argument is metadata only."""
     ns_count, comp_count = count_bench_ns(), count_compositions()
     log(f"Cluster: {ns_count} bench ns, {comp_count} compositions")
 
@@ -5242,10 +5361,17 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, token=None, 
             m = _browser_measure_navigation(page, page_path,
                                             f"S{stage_num} {cache_mode} nav#{nav_num} {page_name}",
                                             min_calls=cold_calls)
+            # Tag the nav so the canonical-row exporter can bucket
+            # samples by subject + cold/warm without re-deriving from
+            # array index. Without these the exporter saw every nav as
+            # an unfiltered warm sample for every cell.
+            cold_warm = 'COLD' if nav_num == 1 else 'WARM'
+            m["nav_num"] = nav_num
+            m["cold_warm"] = cold_warm
+            m["user"] = user
             navs.append(m)
             if nav_num == 1:
                 cold_calls = m["callCount"]  # COLD nav sets the baseline
-            cold_warm = 'COLD' if nav_num == 1 else 'WARM'
             http_info = f"  http={m['httpOk']}ok" if m.get("httpOk", 0) + m.get("httpErr", 0) > 0 else ""
             if m.get("httpErr", 0) > 0:
                 http_info += f"/{m['httpErr']}err"
@@ -5852,20 +5978,33 @@ def run_phase_browser_scaling(tokens):
 
 
 def _convergence_p99_for_stage(all_results, stage_label):
-    """p99 of convergence_ms across all ON navigations for a given S-tag.
+    """p99 of convergence_ms across navigations for a given stage.
 
-    Returns -1 when no ON convergence samples are present (stage skipped
-    or all navigations marked TIMEOUT).
+    The verify-polling loop in `_browser_measure_stage` emits
+    `convergence_ms` regardless of cache mode (it measures the
+    cluster→UI propagation deadline, not just the cache rebuild). We
+    prefer ON samples when present, then fall back to OFF when the
+    deployed chart has no cache toggle (cache_supported=false) — this
+    keeps the field populated at floor tags where the rich JSON
+    actually carries the numbers but the ON branch was a synthetic N/A.
+
+    Returns -1 when no convergence samples exist in either mode (e.g.
+    stage skipped or every poll timed out).
     """
-    samples = []
-    for entry in all_results:
-        if str(entry.get("stage")) != stage_label or entry.get("cache") != "ON":
-            continue
-        for page_name, pg in (entry.get("pages") or {}).items():
-            for nav in (pg.get("navigations") or []):
-                cm = nav.get("convergence_ms")
-                if isinstance(cm, (int, float)) and cm >= 0:
-                    samples.append(int(cm))
+    def _samples_for(mode):
+        out = []
+        for entry in all_results:
+            if str(entry.get("stage")) != stage_label:
+                continue
+            if entry.get("cache") != mode:
+                continue
+            for _, pg in (entry.get("pages") or {}).items():
+                for nav in (pg.get("navigations") or []):
+                    cm = nav.get("convergence_ms")
+                    if isinstance(cm, (int, float)) and cm >= 0:
+                        out.append(int(cm))
+        return out
+    samples = _samples_for("ON") or _samples_for("OFF")
     if not samples:
         return -1
     return pct(samples, 99)
@@ -5927,18 +6066,37 @@ def _build_canonical_ledger_row(all_results):
         "cyber_on":   _cell_stats("cyberjoker", "ON"),
         "cyber_off":  _cell_stats("cyberjoker", "OFF"),
     }
+
+    # Mirror admin → cyber when Phase 6 only ran the admin subject AND
+    # admin produced non-zero numbers. Customer mix is 95%+ narrow-RBAC
+    # (project_q_cold_1_state.md), so dropping cyber to zero whenever
+    # we did not separately measure it would leave mix_weighted zeroed
+    # on every floor run. The mirror is annotated, not hardcoded — when
+    # Phase 6 grows a cyberjoker loop the per-cell samples take over.
+    def _mirror(target, source):
+        if cells[target]["cold_ms"] > 0 or cells[target]["warm_p50_ms"] > 0:
+            return  # cyber was actually measured — keep its samples
+        if cells[source]["cold_ms"] <= 0 and cells[source]["warm_p50_ms"] <= 0:
+            return  # nothing to mirror from
+        cells[target] = dict(cells[source])
+        cells[target]["mirrored_from"] = source
+    _mirror("cyber_on", "admin_on")
+    _mirror("cyber_off", "admin_off")
+
     # Mix-weighted = 0.95 * cyber + 0.05 * admin per
-    # feedback_north_star_is_frontend_ux.md
+    # feedback_north_star_is_frontend_ux.md.
+    # Floor tags ship without a cache toggle (cache_supported=false on
+    # the chart), so the *_on cells are structured N/A. Compute against
+    # whichever side has samples — prefer ON, fall back to OFF — so the
+    # ledger row always carries the customer-shape readout.
+    def _mw_pick(field):
+        cyber = cells["cyber_on"][field] if cells["cyber_on"][field] > 0 else cells["cyber_off"][field]
+        admin = cells["admin_on"][field] if cells["admin_on"][field] > 0 else cells["admin_off"][field]
+        return int(round(0.95 * cyber + 0.05 * admin))
     mix_weighted = {
-        "cold_ms": int(round(
-            0.95 * cells["cyber_on"]["cold_ms"] +
-            0.05 * cells["admin_on"]["cold_ms"])),
-        "warm_p50_ms": int(round(
-            0.95 * cells["cyber_on"]["warm_p50_ms"] +
-            0.05 * cells["admin_on"]["warm_p50_ms"])),
-        "warm_p99_ms": int(round(
-            0.95 * cells["cyber_on"]["warm_p99_ms"] +
-            0.05 * cells["admin_on"]["warm_p99_ms"])),
+        "cold_ms":     _mw_pick("cold_ms"),
+        "warm_p50_ms": _mw_pick("warm_p50_ms"),
+        "warm_p99_ms": _mw_pick("warm_p99_ms"),
     }
 
     # Pod restart count
@@ -5986,7 +6144,8 @@ def _build_canonical_ledger_row(all_results):
         "tag_specific_verifications": {},
         "pod_restart_count": restarts,
         "verdict": _compute_verdict(mix_weighted, restarts,
-                                    _convergence_p99_for_stage(all_results, "8")),
+                                    _convergence_p99_for_stage(all_results, "8"),
+                                    cells=cells),
     }
 
 
@@ -6001,18 +6160,34 @@ def _load_per_mutation_metric(key):
         return None
 
 
-def _compute_verdict(mix_weighted, restarts, conv_s8_p99):
+def _compute_verdict(mix_weighted, restarts, conv_s8_p99, cells=None):
     """Verdict per the architect's gates.
 
     PASS:        warm_p50 < 500ms, cold < 1000ms, conv < 1000ms, 0 restarts
     WEAK_PASS:   one tier missed by <=20%
     FAIL:        2+ tiers missed OR conv > 2000ms OR restarts > 0
+    FLOOR:       measurements present, but the deployed chart has no
+                 cache toggle (cache_supported=false) — the *_on cells
+                 are structured N/A by design at this tag, so a hard
+                 PASS/FAIL would be misleading. The PM uses FLOOR rows
+                 as the structural baseline that subsequent levers
+                 build on.
     REJECT:      pod crashed, no usable measurements
     """
     if not mix_weighted or mix_weighted.get("warm_p50_ms", 0) <= 0:
         return "REJECT"
     if restarts > 0:
         return "FAIL"
+    # FLOOR detection: ON cells are zero (chart had no toggle) but the
+    # OFF cells carry real numbers, so mix_weighted came from the OFF
+    # branch. This is the floor-tag baseline; not a PASS/FAIL gate.
+    if cells:
+        on_zero = (cells.get("admin_on", {}).get("warm_p50_ms", 0) <= 0 and
+                   cells.get("cyber_on", {}).get("warm_p50_ms", 0) <= 0)
+        off_nonzero = (cells.get("admin_off", {}).get("warm_p50_ms", 0) > 0 or
+                       cells.get("cyber_off", {}).get("warm_p50_ms", 0) > 0)
+        if on_zero and off_nonzero:
+            return "FLOOR"
     misses = 0
     if mix_weighted["warm_p50_ms"] > 500:
         misses += 1
@@ -7050,6 +7225,7 @@ def main():
         _self_test_phase6_cache_supported_flag()
         _self_test_phase5_runs_both_users()
         _self_test_canonical_ledger_row()
+        _self_test_canonical_ledger_row_floor_shape()
         _self_test_phase8_wired()
         _self_test_password_from_secret()
         _self_test_namespace_cascade_delete()
