@@ -1053,6 +1053,32 @@ CACHE_ENABLED_VALUES_KEY = os.environ.get(
     "CACHE_ENABLED_VALUES_KEY", "env.CACHE_ENABLED")
 
 
+def _chart_supports_cache_toggle():
+    """Return True iff the deployed chart wires a CACHE_ENABLED env var.
+
+    At clean-slate-0.30.0 the stripped chart removes the cache subsystem
+    entirely — no CACHE_ENABLED env, no L1, no warmer. Toggling is
+    meaningless on that chart variant, so the bench must detect the
+    absence and short-circuit (rather than dispatch a helm upgrade that
+    either fails on an unknown value or silently no-ops).
+
+    Detection: jsonpath into the live Deployment's container env list.
+    Returns True only if container[0] has an env entry named
+    CACHE_ENABLED. False on any error / missing pod / missing env.
+
+    NOTE: this is intentionally chart-agnostic — it inspects the
+    deployed manifest, not chart values — so it correctly classifies
+    both the rich 0.20.5-style chart and the stripped 0.30.0 chart.
+    """
+    rc, out, _ = kubectl(
+        "get", "deploy", HELM_RELEASE, "-n", NS,
+        "-o",
+        "jsonpath={.spec.template.spec.containers[0]"
+        ".env[?(@.name=='CACHE_ENABLED')].name}",
+    )
+    return rc == 0 and out.strip() == "CACHE_ENABLED"
+
+
 def _set_cache_via_helm(value):
     """Toggle CACHE_ENABLED through `helm upgrade --reuse-values`.
 
@@ -1067,64 +1093,115 @@ def _set_cache_via_helm(value):
     Uses --reuse-values so the toggle does not require knowing every
     other override the operator applied; --set targets only the
     CACHE_ENABLED key. The values key path is configurable via env
-    (default `env.CACHE_ENABLED`) so this same code path adapts to
-    the stripped chart at clean-slate-0.30.0 where the key is absent
-    and the cache subsystem itself doesn't exist.
+    (default `env.CACHE_ENABLED`).
+
+    Chart-source dispatch — three forms (helm 3.x):
+
+      OCI registry  (oci://...)  → chart-ref IS the URL itself; no --repo flag.
+      HTTP registry (http[s]://...) → release name as chart, --repo URL.
+      Local path     (anything else) → chart-ref IS the path; no --repo flag.
+
+    Misuse of `--repo` against an OCI URL fails because helm's --repo
+    flag invokes the repo-index.yaml protocol which does not exist on
+    OCI registries. That bug crashed Pass 1 of the 0.30.0 campaign on
+    2026-05-09 14:52 CEST.
+
+    Graceful no-op when the deployed chart has no CACHE_ENABLED env
+    (stripped chart-0.30.0): callers see a logged skip and should treat
+    cache-on cells as N/A. See `_chart_supports_cache_toggle`.
     """
+    if not _chart_supports_cache_toggle():
+        log("Cache toggle skipped: deployed chart has no CACHE_ENABLED env "
+            "(cache subsystem absent at this image)")
+        return False
+
     str_value = "true" if value else "false"
-    args = [
-        "helm", "upgrade", HELM_RELEASE, HELM_RELEASE,
-        "-n", NS,
-        "--repo", os.environ.get(
-            "SNOWPLOW_HELM_REPO",
-            "oci://ghcr.io/braghettos"),
-        "--reuse-values",
-        "--set", f"{CACHE_ENABLED_VALUES_KEY}={str_value}",
-    ]
-    # The `helm upgrade <release> <chart>` form requires the OCI repo
-    # context. If the operator already has the chart pulled locally
-    # they can override via SNOWPLOW_HELM_CHART_PATH (path to local
-    # chart dir) which takes precedence.
+    helm_repo = os.environ.get(
+        "SNOWPLOW_HELM_REPO", "oci://ghcr.io/braghettos/charts/snowplow")
+    helm_version = os.environ.get("SNOWPLOW_HELM_VERSION")  # optional
     chart_path = os.environ.get("SNOWPLOW_HELM_CHART_PATH")
+
     if chart_path:
+        # Operator-pulled local chart wins — explicit override.
         args = [
             "helm", "upgrade", HELM_RELEASE, chart_path,
             "-n", NS,
             "--reuse-values",
             "--set", f"{CACHE_ENABLED_VALUES_KEY}={str_value}",
         ]
+    elif helm_repo.startswith("oci://"):
+        # OCI form: chart reference is the URL itself, no --repo flag.
+        args = [
+            "helm", "upgrade", HELM_RELEASE, helm_repo,
+            "-n", NS,
+            "--reuse-values",
+            "--set", f"{CACHE_ENABLED_VALUES_KEY}={str_value}",
+        ]
+        if helm_version:
+            args.extend(["--version", helm_version])
+    elif helm_repo.startswith("http://") or helm_repo.startswith("https://"):
+        # HTTP repo form: chart name is release name, --repo points at index.
+        args = [
+            "helm", "upgrade", HELM_RELEASE, HELM_RELEASE,
+            "-n", NS,
+            "--repo", helm_repo,
+            "--reuse-values",
+            "--set", f"{CACHE_ENABLED_VALUES_KEY}={str_value}",
+        ]
+        if helm_version:
+            args.extend(["--version", helm_version])
+    else:
+        # Local chart path (relative or absolute filesystem dir).
+        args = [
+            "helm", "upgrade", HELM_RELEASE, helm_repo,
+            "-n", NS,
+            "--reuse-values",
+            "--set", f"{CACHE_ENABLED_VALUES_KEY}={str_value}",
+        ]
+
     proc = subprocess.run(args, capture_output=True, text=True, timeout=300)
     if proc.returncode != 0:
         raise RuntimeError(
             f"helm upgrade failed (rc={proc.returncode}): "
             f"stdout={proc.stdout.strip()} stderr={proc.stderr.strip()}")
     log(f"helm upgrade OK: {CACHE_ENABLED_VALUES_KEY}={str_value}")
+    return True
 
 
 def enable_cache():
     log("Enabling cache (CACHE_ENABLED=true) via helm ...")
+    if not _chart_supports_cache_toggle():
+        log("  (no-op: chart has no cache toggle; cache=on cells will be N/A)")
+        return False
     _, old_pods, _ = kubectl("get", "pods", "-n", NS,
                              "-l", "app.kubernetes.io/name=snowplow",
                              "-o", "jsonpath={.items[*].metadata.name}")
-    _set_cache_via_helm(True)
+    if not _set_cache_via_helm(True):
+        return False
     kubectl("rollout", "status", "deployment/snowplow",
             "-n", NS, "--timeout=300s")
     _wait_old_pods_gone(old_pods)
     wait_for_snowplow()
     log("Cache enabled")
+    return True
 
 
 def disable_cache():
     log("Disabling cache (CACHE_ENABLED=false) via helm ...")
+    if not _chart_supports_cache_toggle():
+        log("  (no-op: chart has no cache toggle; cache=off is the only mode)")
+        return False
     _, old_pods, _ = kubectl("get", "pods", "-n", NS,
                              "-l", "app.kubernetes.io/name=snowplow",
                              "-o", "jsonpath={.items[*].metadata.name}")
-    _set_cache_via_helm(False)
+    if not _set_cache_via_helm(False):
+        return False
     kubectl("rollout", "status", "deployment/snowplow",
             "-n", NS, "--timeout=300s")
     _wait_old_pods_gone(old_pods)
     wait_for_snowplow()
     log("Cache disabled")
+    return True
 
 
 # ── Resource management ──────────────────────────────────────────────────────
@@ -2799,6 +2876,392 @@ def _self_test_cache_toggle_uses_helm():
         log(f"cache-toggle-helm FAILED: {failed} case(s)")
         sys.exit(1)
     log("cache-toggle-helm OK")
+
+
+def _self_test_cache_toggle_chart_source_dispatch():
+    """Verify _set_cache_via_helm dispatches the correct helm-upgrade
+    syntax for OCI / HTTP / local-path chart sources.
+
+    Background: Pass 1 of the 0.30.0 campaign crashed 2026-05-09 14:52
+    CEST because the OCI default was passed via `--repo`, which helm 3
+    does not support for OCI registries. The fix dispatches by URL
+    scheme — this test pins the dispatch table.
+
+    Strategy: monkey-patch _chart_supports_cache_toggle (so the test
+    doesn't touch a cluster), monkey-patch subprocess.run to capture
+    the args list, exercise each scheme, and assert the captured
+    argv matches the expected form.
+    """
+    log("Self-test: cache-toggle-chart-source-dispatch ...")
+    import inspect
+
+    # Source-level guard: dispatch table must mention each URL scheme.
+    src = inspect.getsource(_set_cache_via_helm)
+    failed = 0
+    for marker in ('startswith("oci://")',
+                   'startswith("http://")',
+                   'startswith("https://")'):
+        if marker not in src:
+            log(f"  [FAIL] _set_cache_via_helm missing scheme branch: {marker}")
+            failed += 1
+        else:
+            log(f"  [OK ] _set_cache_via_helm has branch for {marker}")
+
+    # Structural OCI-bug guard: the OCI dispatch block must NOT contain
+    # "--repo" in its args list. Slice from the elif statement (skipping
+    # docstring mentions) to the next elif/else.
+    oci_idx = src.find('elif helm_repo.startswith("oci://")')
+    next_branch = src.find("elif helm_repo.startswith", oci_idx + 1)
+    if next_branch == -1:
+        next_branch = src.find("    else:", oci_idx + 1)
+    if oci_idx == -1 or next_branch == -1:
+        log("  [FAIL] could not locate OCI dispatch block to validate")
+        failed += 1
+    else:
+        oci_block = src[oci_idx:next_branch]
+        # Strip line comments before checking — the dispatch block
+        # legitimately mentions "--repo" in a clarifying comment, but
+        # the args list (the only thing that matters for helm) must
+        # not contain it.
+        oci_code_only = "\n".join(
+            line.split("#", 1)[0]
+            for line in oci_block.splitlines()
+        )
+        if '"--repo"' in oci_code_only or "'--repo'" in oci_code_only:
+            log("  [FAIL] OCI dispatch block contains --repo "
+                "(OCI form must NOT pass --repo)")
+            failed += 1
+        else:
+            log("  [OK ] OCI dispatch block has no --repo flag")
+
+    # Capture-and-replay: drive each scheme through the real function
+    # with subprocess.run + _chart_supports_cache_toggle stubbed.
+    captured = {}
+
+    def _fake_run(args, **kwargs):
+        captured["args"] = list(args)
+
+        class _Done:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return _Done()
+
+    real_run = subprocess.run
+    real_supports = globals().get("_chart_supports_cache_toggle")
+    real_log = globals().get("log")
+    real_env = dict(os.environ)
+    try:
+        subprocess.run = _fake_run
+        globals()["_chart_supports_cache_toggle"] = lambda: True
+        # Silence log inside the dispatch tests
+        globals()["log"] = lambda *a, **k: None
+        # Drop chart-path override so URL scheme is exercised
+        os.environ.pop("SNOWPLOW_HELM_CHART_PATH", None)
+        os.environ.pop("SNOWPLOW_HELM_VERSION", None)
+
+        cases = [
+            # (env_repo, expected substrings present, forbidden substrings)
+            (
+                "oci://ghcr.io/braghettos/charts/snowplow",
+                ["helm", "upgrade", HELM_RELEASE,
+                 "oci://ghcr.io/braghettos/charts/snowplow",
+                 "--reuse-values"],
+                ["--repo"],  # OCI form MUST NOT use --repo
+            ),
+            (
+                "https://example.com/charts",
+                ["helm", "upgrade", HELM_RELEASE, HELM_RELEASE,
+                 "--repo", "https://example.com/charts",
+                 "--reuse-values"],
+                [],
+            ),
+            (
+                "http://example.com/charts",
+                ["helm", "upgrade", HELM_RELEASE, HELM_RELEASE,
+                 "--repo", "http://example.com/charts",
+                 "--reuse-values"],
+                [],
+            ),
+            (
+                "/tmp/local-chart-dir",
+                ["helm", "upgrade", HELM_RELEASE, "/tmp/local-chart-dir",
+                 "--reuse-values"],
+                ["--repo"],
+            ),
+        ]
+        # restore real log inside the test by aliasing for status output
+        for repo, must_have, must_not_have in cases:
+            os.environ["SNOWPLOW_HELM_REPO"] = repo
+            captured.clear()
+            _set_cache_via_helm(True)
+            args = captured.get("args", [])
+            argv_str = " ".join(args)
+
+            ok = True
+            for substr in must_have:
+                if substr not in args:
+                    ok = False
+                    real_log(f"  [FAIL] repo={repo!r} expected {substr!r} "
+                             f"in args; got {argv_str}")
+                    failed += 1
+            for substr in must_not_have:
+                if substr in args:
+                    ok = False
+                    real_log(f"  [FAIL] repo={repo!r} forbidden {substr!r} "
+                             f"present in args; got {argv_str}")
+                    failed += 1
+            if ok:
+                real_log(f"  [OK ] repo={repo!r} dispatch: {argv_str}")
+
+        # OCI + version
+        os.environ["SNOWPLOW_HELM_REPO"] = "oci://ghcr.io/braghettos/charts/snowplow"
+        os.environ["SNOWPLOW_HELM_VERSION"] = "0.30.0"
+        captured.clear()
+        _set_cache_via_helm(True)
+        args = captured.get("args", [])
+        if "--version" in args and "0.30.0" in args:
+            real_log("  [OK ] OCI form honours SNOWPLOW_HELM_VERSION")
+        else:
+            real_log(f"  [FAIL] OCI form did not append --version; args={args}")
+            failed += 1
+    finally:
+        subprocess.run = real_run
+        globals()["_chart_supports_cache_toggle"] = real_supports
+        globals()["log"] = real_log
+        # Restore env exactly
+        for k in ("SNOWPLOW_HELM_REPO", "SNOWPLOW_HELM_VERSION",
+                  "SNOWPLOW_HELM_CHART_PATH"):
+            os.environ.pop(k, None)
+        os.environ.update({k: v for k, v in real_env.items()
+                           if k.startswith("SNOWPLOW_HELM_")})
+
+    if failed:
+        log(f"cache-toggle-chart-source-dispatch FAILED: {failed} case(s)")
+        sys.exit(1)
+    log("cache-toggle-chart-source-dispatch OK")
+
+
+def _self_test_cache_toggle_graceful_skip():
+    """Verify enable_cache / disable_cache / _set_cache_via_helm
+    short-circuit (no helm upgrade fires) when the deployed chart
+    has no CACHE_ENABLED env.
+
+    Stripped chart-0.30.0 omits the cache subsystem entirely. Trying
+    to toggle would either fail loudly (helm rejects unknown values
+    in --strict mode) or silently no-op (default). The bench needs
+    EXPLICIT skip so cache-on cells render as N/A.
+    """
+    log("Self-test: cache-toggle-graceful-skip ...")
+    failed = 0
+
+    real_supports = globals().get("_chart_supports_cache_toggle")
+    real_run = subprocess.run
+    real_kubectl = globals().get("kubectl")
+    real_rollout = None
+    real_log = globals().get("log")
+
+    helm_calls = []
+
+    def _fake_run(args, **kwargs):
+        # Anything that isn't helm we accept; helm calls are recorded.
+        if args and args[0] == "helm":
+            helm_calls.append(list(args))
+
+        class _Done:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return _Done()
+
+    def _fake_kubectl(*args, **kwargs):
+        # Pretend any kubectl probe (rollout, get pods) succeeds
+        # without effects. The cache-toggle code paths that we want
+        # to verify never actually hit the cluster in this test.
+        return 0, "", ""
+
+    try:
+        subprocess.run = _fake_run
+        globals()["kubectl"] = _fake_kubectl
+        globals()["_chart_supports_cache_toggle"] = lambda: False
+        globals()["log"] = lambda *a, **k: None
+
+        # _set_cache_via_helm directly: must return False, no helm fired.
+        helm_calls.clear()
+        result = _set_cache_via_helm(True)
+        if result is not False:
+            real_log(f"  [FAIL] _set_cache_via_helm returned {result!r}; "
+                     "expected False on unsupported chart")
+            failed += 1
+        elif helm_calls:
+            real_log(f"  [FAIL] _set_cache_via_helm fired helm: {helm_calls}")
+            failed += 1
+        else:
+            real_log("  [OK ] _set_cache_via_helm short-circuits (no helm)")
+
+        # enable_cache: must return False, no helm fired.
+        helm_calls.clear()
+        result = enable_cache()
+        if result is not False:
+            real_log(f"  [FAIL] enable_cache returned {result!r}; "
+                     "expected False on unsupported chart")
+            failed += 1
+        elif helm_calls:
+            real_log(f"  [FAIL] enable_cache fired helm: {helm_calls}")
+            failed += 1
+        else:
+            real_log("  [OK ] enable_cache short-circuits (no helm)")
+
+        # disable_cache: must return False, no helm fired.
+        helm_calls.clear()
+        result = disable_cache()
+        if result is not False:
+            real_log(f"  [FAIL] disable_cache returned {result!r}; "
+                     "expected False on unsupported chart")
+            failed += 1
+        elif helm_calls:
+            real_log(f"  [FAIL] disable_cache fired helm: {helm_calls}")
+            failed += 1
+        else:
+            real_log("  [OK ] disable_cache short-circuits (no helm)")
+
+        # Now flip the chart-supports flag back ON and verify a
+        # helm upgrade IS fired. This is the inverse-control test.
+        globals()["_chart_supports_cache_toggle"] = lambda: True
+        os.environ["SNOWPLOW_HELM_REPO"] = "oci://ghcr.io/braghettos/charts/snowplow"
+        helm_calls.clear()
+        result = _set_cache_via_helm(True)
+        if result is not True:
+            real_log(f"  [FAIL] _set_cache_via_helm(supported=True) returned "
+                     f"{result!r}; expected True")
+            failed += 1
+        elif not helm_calls or helm_calls[0][0] != "helm":
+            real_log(f"  [FAIL] _set_cache_via_helm(supported=True) did not "
+                     f"fire helm; calls={helm_calls}")
+            failed += 1
+        else:
+            real_log(f"  [OK ] _set_cache_via_helm(supported=True) fires helm: "
+                     f"{' '.join(helm_calls[0])}")
+    finally:
+        subprocess.run = real_run
+        globals()["kubectl"] = real_kubectl
+        globals()["_chart_supports_cache_toggle"] = real_supports
+        globals()["log"] = real_log
+        os.environ.pop("SNOWPLOW_HELM_REPO", None)
+
+    if failed:
+        log(f"cache-toggle-graceful-skip FAILED: {failed} case(s)")
+        sys.exit(1)
+    log("cache-toggle-graceful-skip OK")
+
+
+def _self_test_chart_supports_cache_toggle():
+    """Verify _chart_supports_cache_toggle returns True iff kubectl
+    reports a CACHE_ENABLED env var on the deployment.
+
+    Stubs kubectl to simulate (a) chart with CACHE_ENABLED env present,
+    (b) chart with the env absent, (c) kubectl error. Each scenario
+    must produce the documented return value.
+    """
+    log("Self-test: chart-supports-cache-toggle ...")
+    failed = 0
+
+    real_kubectl = globals().get("kubectl")
+    real_log = globals().get("log")
+    last_args = []
+
+    def _make_kubectl(rc, out):
+        def _fake(*args, **kwargs):
+            last_args.append(list(args))
+            return rc, out, ""
+        return _fake
+
+    try:
+        globals()["log"] = lambda *a, **k: None
+
+        # Case A: chart wires CACHE_ENABLED — kubectl returns the name.
+        last_args.clear()
+        globals()["kubectl"] = _make_kubectl(0, "CACHE_ENABLED")
+        if not _chart_supports_cache_toggle():
+            real_log("  [FAIL] supports=True case returned False")
+            failed += 1
+        else:
+            real_log("  [OK ] CACHE_ENABLED present -> True")
+
+        # The kubectl probe must be jsonpath-based and target the
+        # deployment env list. Source-level marker check.
+        if not last_args or "jsonpath=" not in " ".join(last_args[0]):
+            real_log("  [FAIL] kubectl probe did not use jsonpath")
+            failed += 1
+        elif "CACHE_ENABLED" not in " ".join(last_args[0]):
+            real_log("  [FAIL] kubectl probe did not filter on CACHE_ENABLED")
+            failed += 1
+        else:
+            real_log("  [OK ] kubectl probe uses jsonpath + CACHE_ENABLED filter")
+
+        # Case B: chart strips CACHE_ENABLED — kubectl returns empty.
+        globals()["kubectl"] = _make_kubectl(0, "")
+        if _chart_supports_cache_toggle():
+            real_log("  [FAIL] supports=False case returned True")
+            failed += 1
+        else:
+            real_log("  [OK ] CACHE_ENABLED absent -> False")
+
+        # Case C: kubectl error (rc != 0) — must return False, never crash.
+        globals()["kubectl"] = _make_kubectl(1, "")
+        try:
+            r = _chart_supports_cache_toggle()
+        except Exception as e:
+            real_log(f"  [FAIL] kubectl-error case raised: {e!r}")
+            failed += 1
+            r = None
+        if r is not False:
+            real_log(f"  [FAIL] kubectl-error case returned {r!r}")
+            failed += 1
+        else:
+            real_log("  [OK ] kubectl error -> False (no crash)")
+    finally:
+        globals()["kubectl"] = real_kubectl
+        globals()["log"] = real_log
+
+    if failed:
+        log(f"chart-supports-cache-toggle FAILED: {failed} case(s)")
+        sys.exit(1)
+    log("chart-supports-cache-toggle OK")
+
+
+def _self_test_phase6_cache_supported_flag():
+    """Verify run_phase_browser_scaling honours cache_supported flag.
+
+    Source-level inspection: phase 6 must (a) consult
+    _chart_supports_cache_toggle once, and (b) emit a synthetic
+    `cache_supported: False` row when the chart strips cache.
+    """
+    log("Self-test: phase6-cache-supported-flag ...")
+    import inspect
+
+    src = inspect.getsource(run_phase_browser_scaling)
+    failed = 0
+    for marker in ("_chart_supports_cache_toggle",
+                   "cache_supported"):
+        if marker not in src:
+            log(f"  [FAIL] run_phase_browser_scaling missing {marker!r}")
+            failed += 1
+        else:
+            log(f"  [OK ] run_phase_browser_scaling references {marker}")
+
+    # _browser_measure_stage results must always carry cache_supported.
+    bm_src = inspect.getsource(_browser_measure_stage)
+    if "cache_supported" not in bm_src:
+        log("  [FAIL] _browser_measure_stage does not tag cache_supported")
+        failed += 1
+    else:
+        log("  [OK ] _browser_measure_stage tags cache_supported on rows")
+
+    if failed:
+        log(f"phase6-cache-supported-flag FAILED: {failed} case(s)")
+        sys.exit(1)
+    log("phase6-cache-supported-flag OK")
 
 
 def _self_test_assert_clean_guard_wiring():
@@ -4966,6 +5429,10 @@ def _browser_measure_stage(page, stage_num, stage_desc, cache_mode, token=None, 
         "stage": stage_num, "desc": stage_desc, "cache": cache_mode,
         "bench_ns": ns_count, "compositions": comp_count,
         "pages": pages_data,
+        # cache_supported defaults True for any actually-measured cell.
+        # The Phase-6 caller overrides this to False for synthetic N/A
+        # rows on stripped charts (see run_phase_browser_scaling).
+        "cache_supported": True,
     }
 
 
@@ -4990,8 +5457,32 @@ def run_phase_browser_scaling(tokens):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
 
+        # Detect chart capability ONCE per phase invocation. The deployed
+        # chart cannot change mid-phase, and toggling on a stripped chart
+        # is a logical no-op that should produce structured N/A rows.
+        cache_supported = _chart_supports_cache_toggle()
+        if not cache_supported:
+            log("Phase 6: deployed chart has no CACHE_ENABLED env — "
+                "cache=ON cells will be tagged cache_supported=false and "
+                "the cache-ON branch will be skipped.")
+
         for cache_mode in ("ON", "OFF"):
             section(f"BROWSER MATRIX: cache={cache_mode}")
+
+            if cache_mode == "ON" and not cache_supported:
+                # Emit a structured N/A marker so the summary table can
+                # show "—" for the entire cache-ON column instead of
+                # silently dropping the cell.
+                all_results.append({
+                    "stage": "ALL",
+                    "desc": "cache=ON unsupported (stripped chart)",
+                    "cache": "ON",
+                    "cache_supported": False,
+                    "pages": {},
+                })
+                log("  (skipped: chart has no cache toggle)")
+                continue
+
             clean_environment()
             if cache_mode == "ON":
                 enable_cache()
@@ -6553,6 +7044,10 @@ def main():
         _self_test_destructive_clean_guard()
         _self_test_assert_clean_guard_wiring()
         _self_test_cache_toggle_uses_helm()
+        _self_test_cache_toggle_chart_source_dispatch()
+        _self_test_cache_toggle_graceful_skip()
+        _self_test_chart_supports_cache_toggle()
+        _self_test_phase6_cache_supported_flag()
         _self_test_phase5_runs_both_users()
         _self_test_canonical_ledger_row()
         _self_test_phase8_wired()
