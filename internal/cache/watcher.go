@@ -115,6 +115,27 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 	for _, gvr := range RBACResourceTypes {
 		rw.addResourceTypeLocked(gvr)
 	}
+
+	// 0.30.5: install the SetTransform strip BEFORE factory.Start
+	// (primer §4.7). The TransformFunc drops managedFields and the
+	// last-applied-configuration annotation from every object before
+	// it lands in the indexer. SetTransform returns an error only when
+	// the informer has already started — at this point we have not
+	// called Start yet, so the error path is unreachable. We log a
+	// WARN if it ever happens to surface the regression rather than
+	// failing the boot.
+	for gvr, gi := range rw.informers {
+		resourceType := gvrResourceTypeString(gvr)
+		tf := StripBulkyFieldsForResourceType(resourceType, gvr)
+		if err := gi.Informer().SetTransform(tf); err != nil {
+			slog.Warn("cache.strip.set_transform_failed",
+				slog.String("subsystem", "cache"),
+				slog.String("resource_type", resourceType),
+				slog.String("error", err.Error()),
+			)
+		}
+	}
+
 	rw.factory.Start(rw.stopCh)
 	rw.started = true
 
@@ -145,6 +166,13 @@ func (rw *ResourceWatcher) AddResourceType(gvr schema.GroupVersionResource) {
 
 // addResourceTypeLocked is the lock-held implementation of
 // AddResourceType. Callers MUST hold rw.mu.Lock().
+//
+// 0.30.5: every newly-added informer also has the SetTransform strip
+// installed — including informers added lazily after Start(). For
+// post-Start registration SetTransform returns an error (cannot mutate
+// a running informer); we log it as a WARN so the regression is
+// observable but do NOT fail the registration (the cache still works,
+// just at higher memory cost for that GVR).
 func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource) {
 	if _, exists := rw.informers[gvr]; exists {
 		return
@@ -153,10 +181,33 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	gi := rw.factory.ForResource(gvr)
 	rw.informers[gvr] = gi
 
+	resourceType := gvrResourceTypeString(gvr)
+	tf := StripBulkyFieldsForResourceType(resourceType, gvr)
+	if err := gi.Informer().SetTransform(tf); err != nil {
+		slog.Warn("cache.strip.set_transform_failed",
+			slog.String("subsystem", "cache"),
+			slog.String("resource_type", resourceType),
+			slog.String("error", err.Error()),
+			slog.Bool("post_start", rw.started),
+		)
+	}
+
 	if rw.started {
 		// Late registration after Start(): kick the new informer.
 		go gi.Informer().Run(rw.stopCh)
 	}
+}
+
+// gvrResourceTypeString renders gvr as "group/version/Resource" for the
+// strip.applied falsifier log line. The core group renders as
+// "core/v1/Resource" (rather than "/v1/Resource") so log readers don't
+// need to special-case the empty-group case.
+func gvrResourceTypeString(gvr schema.GroupVersionResource) string {
+	group := gvr.Group
+	if group == "" {
+		group = "core"
+	}
+	return group + "/" + gvr.Version + "/" + gvr.Resource
 }
 
 // Start launches every registered informer and begins serving from the
