@@ -42,7 +42,8 @@ var RBACResourceTypes = []schema.GroupVersionResource{
 // ResourceWatcher is the cluster-wide informer cache. At 0.30.4 the
 // factory is instantiated AND started by NewResourceWatcher when
 // CACHE_ENABLED=true; the four Role-Based Access Control GVRs are
-// eagerly registered.
+// eagerly registered. At 0.30.6 the RestAction-derived inventory is
+// also eager-registered post-construction via EagerRegisterAll.
 //
 // All methods are safe for concurrent use. AddResourceType registers an
 // informer for a GVR; Start launches them; Get/List read from the
@@ -58,6 +59,17 @@ type ResourceWatcher struct {
 	mu        sync.RWMutex
 	informers map[schema.GroupVersionResource]informers.GenericInformer
 	started   bool
+
+	// eagerSet is the set of GVRs the caller passed to MarkEagerSet —
+	// the post-startup expectation is that NO AddResourceType call
+	// fires for a GVR in this set (because eager already registered
+	// it). When one does, addResourceTypeLocked emits the WARN
+	// "lazy-AddResourceType-unexpected" so the regression is visible.
+	// nil eagerSet = "eager registration not yet completed" — no
+	// WARNs fire (the constructor's own RBAC registrations are not
+	// "lazy").
+	eagerSet     map[schema.GroupVersionResource]struct{}
+	eagerDone    bool
 
 	stopCh chan struct{}
 }
@@ -173,6 +185,14 @@ func (rw *ResourceWatcher) AddResourceType(gvr schema.GroupVersionResource) {
 // a running informer); we log it as a WARN so the regression is
 // observable but do NOT fail the registration (the cache still works,
 // just at higher memory cost for that GVR).
+//
+// 0.30.6: post-eager-registration calls into AddResourceType are
+// expected to be rare — the inventory walker is supposed to cover the
+// full RestAction-derived GVR set. When a lazy registration fires AND
+// eager registration has completed AND the GVR was in the eager
+// inventory set, we emit `lazy-AddResourceType-unexpected` so the
+// regression is loud. Lazy registration for a GVR NOT in the eager
+// inventory is normal (e.g. customer-added RestAction post-startup).
 func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource) {
 	if _, exists := rw.informers[gvr]; exists {
 		return
@@ -195,7 +215,55 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	if rw.started {
 		// Late registration after Start(): kick the new informer.
 		go gi.Informer().Run(rw.stopCh)
+
+		// 0.30.6 falsifier (plan §"Code-path falsifier"). If eager
+		// registration has already completed AND this GVR was in
+		// the eager set, the inventory walker missed it OR an
+		// upstream caller is double-registering — either way the
+		// SRE wants to see it.
+		if rw.eagerDone {
+			if _, wasInEager := rw.eagerSet[gvr]; wasInEager {
+				slog.Warn("lazy-AddResourceType-unexpected",
+					slog.String("subsystem", "cache"),
+					slog.String("resource_type", resourceType),
+					slog.String("hint", "was in eager inventory but registered lazily"),
+				)
+			} else {
+				slog.Info("lazy-AddResourceType",
+					slog.String("subsystem", "cache"),
+					slog.String("resource_type", resourceType),
+					slog.String("hint", "not in eager inventory — likely post-startup RestAction"),
+				)
+			}
+		}
 	}
+}
+
+// MarkEagerSet records the set of GVRs that were registered via the
+// eager-registration pathway (Tag 0.30.6). After this call, lazy
+// AddResourceType for any GVR in `eagerSet` emits the
+// `lazy-AddResourceType-unexpected` WARN — the gap is a falsifier the
+// PM gate verifies via `kubectl logs`.
+//
+// Calling MarkEagerSet with a nil slice is permitted (resets the
+// eager-done flag back to false — used by tests).
+//
+// Safe for concurrent use.
+func (rw *ResourceWatcher) MarkEagerSet(eagerSet []schema.GroupVersionResource) {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+
+	if eagerSet == nil {
+		rw.eagerSet = nil
+		rw.eagerDone = false
+		return
+	}
+	m := make(map[schema.GroupVersionResource]struct{}, len(eagerSet))
+	for _, gvr := range eagerSet {
+		m[gvr] = struct{}{}
+	}
+	rw.eagerSet = m
+	rw.eagerDone = true
 }
 
 // gvrResourceTypeString renders gvr as "group/version/Resource" for the

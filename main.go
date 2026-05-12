@@ -25,6 +25,7 @@ import (
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
 	httpSwagger "github.com/swaggo/http-swagger"
 
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 )
@@ -148,6 +149,35 @@ func main() {
 						log.Info("cache: RBAC informers fully synced")
 					}
 					syncCancel()
+
+					// Tag 0.30.6 binding: walk every RestAction in the
+					// cluster, derive the GVR set referenced by
+					// spec.api[*].path, and eager-register the lot.
+					// Bound by STARTUP_TIMEOUT_SECONDS (default 120);
+					// fan-in by STARTUP_INFORMER_FANIN (default 8).
+					// Soft failure: log + continue; the lazy fallback
+					// in AddResourceType handles the gap.
+					fanin := env.Int("STARTUP_INFORMER_FANIN", 8)
+					startupTimeout := time.Duration(env.Int("STARTUP_TIMEOUT_SECONDS", 120)) * time.Second
+					invCtx, invCancel := context.WithTimeout(cacheCtx, startupTimeout)
+					inv, invErr := cache.CollectResourceTypesFromRestActions(invCtx, dynCli)
+					if invErr != nil {
+						log.Warn("cache: RestAction inventory walk failed; falling through to lazy registration",
+							slog.Any("err", invErr))
+						// Mark eager-done with an empty set so any
+						// post-startup AddResourceType is treated as
+						// expected-lazy (no WARN spam).
+						w.MarkEagerSet([]schema.GroupVersionResource{})
+					} else {
+						n, regErr := cache.EagerRegisterAll(invCtx, w, inv, fanin, startupTimeout)
+						if regErr != nil {
+							log.Warn("cache: eager registration WaitForCacheSync incomplete",
+								slog.Int("resource_types", n),
+								slog.Any("err", regErr))
+						}
+						w.MarkEagerSet(inv)
+					}
+					invCancel()
 				}
 			}
 		}
