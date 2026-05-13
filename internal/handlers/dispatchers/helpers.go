@@ -1,7 +1,9 @@
 package dispatchers
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -9,6 +11,7 @@ import (
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/http/response"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
@@ -110,4 +113,94 @@ func checkDispatchRBAC(ctx context.Context, gvr schema.GroupVersionResource, nam
 		return false
 	}
 	return allowed
+}
+
+// dispatchCacheLookupKey builds the L1 resolved-output cache key and
+// returns the live cache handle, if the L1 layer is enabled. Returns
+// (key, nil) when L1 is disabled — callers MUST treat handle==nil as
+// "skip cache lookup, take the 0.30.6 path".
+//
+// User identity is read from the request context; on error (missing
+// or unparseable UserInfo) we treat the request as uncacheable —
+// returning a nil handle — so the request still resolves correctly but
+// never reads or writes the L1 cache. A keyless request would risk
+// cross-user leaks, which is unacceptable.
+func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, resource, namespace, name string, perPage, page int, extras map[string]any) (string, cacheHandle) {
+	c := cache.ResolvedCache()
+	if c == nil {
+		return "", nil
+	}
+	ui, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		// Defence in depth — without an identity we cannot key
+		// safely. Skip the cache for this request.
+		return "", nil
+	}
+	key := cache.ComputeKey(cache.ResolvedKeyInputs{
+		HandlerKind: handlerKind,
+		Group:       group,
+		Version:     version,
+		Resource:    resource,
+		Namespace:   namespace,
+		Name:        name,
+		Username:    ui.Username,
+		Groups:      ui.Groups,
+		PerPage:     perPage,
+		Page:        page,
+		Extras:      extras,
+	})
+	return key, c
+}
+
+// cacheHandle is the narrow interface the dispatchers depend on. The
+// real implementation is *cache.resolvedCache; tests can substitute
+// stubs without dragging in the whole singleton. Kept package-private
+// so it never leaks beyond dispatchers.
+type cacheHandle interface {
+	Get(key string) (*cache.ResolvedEntry, bool)
+	Put(key string, entry *cache.ResolvedEntry)
+}
+
+// emitResolvedCacheLookup writes the per-request falsifier line per
+// plan §"Code-path falsifier":
+//
+//	resolved_cache.lookup hit=true|false key_hash=... resident_bytes=N
+//
+// We log at INFO so a casual grep on production logs proves whether
+// L1 is firing.
+func emitResolvedCacheLookup(log *slog.Logger, handlerKind, key string, hit bool, residentBytes int) {
+	if log == nil {
+		return
+	}
+	log.Info("resolved_cache.lookup",
+		slog.String("subsystem", "cache"),
+		slog.String("handler", handlerKind),
+		slog.String("key_hash", key),
+		slog.Bool("hit", hit),
+		slog.Int("resident_bytes", residentBytes),
+	)
+}
+
+// encodeResolvedJSON marshals res with the same json.Encoder settings
+// the dispatchers used before 0.30.7 (SetIndent("", "  ")). Centralising
+// the encode here ensures the cache-hit path returns byte-identical
+// output to the cache-miss path; any divergence would break the
+// "cache=on warm response equals cache=off response" contract.
+func encodeResolvedJSON(res any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(res); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// writeResolvedJSON writes the canonical Content-Type + 200 + payload.
+// We deliberately do NOT log here on errors writing to the wire — a
+// client disconnect mid-write is normal and not actionable.
+func writeResolvedJSON(wri http.ResponseWriter, payload []byte) {
+	wri.Header().Set("Content-Type", "application/json")
+	wri.WriteHeader(http.StatusOK)
+	_, _ = wri.Write(payload)
 }

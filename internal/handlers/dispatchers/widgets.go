@@ -1,7 +1,6 @@
 package dispatchers
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -74,6 +73,25 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 
 	perPage, page := paginationInfo(log, req)
 
+	// Tag 0.30.7: L1 resolved-output cache lookup. Same gating
+	// semantics as restactions.go — strictly after EvaluateRBAC.
+	cacheKey, cacheHandle := dispatchCacheLookupKey(req.Context(), "widgets",
+		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
+		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
+		perPage, page, extras)
+	if cacheHandle != nil {
+		if entry, ok := cacheHandle.Get(cacheKey); ok {
+			emitResolvedCacheLookup(log, "widgets", cacheKey, true, len(entry.RawJSON))
+			writeResolvedJSON(wri, entry.RawJSON)
+			log.Info("Widget successfully resolved",
+				slog.String("duration", util.ETA(start)),
+				slog.String("l1", "hit"),
+			)
+			return
+		}
+		emitResolvedCacheLookup(log, "widgets", cacheKey, false, 0)
+	}
+
 	ctx := xcontext.BuildContext(req.Context())
 
 	res, err := widgets.Resolve(ctx, widgets.ResolveOptions{
@@ -104,13 +122,20 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	encoded, err := encodeResolvedJSON(res)
+	if err != nil {
+		log.Error("unable to encode widget response", slog.Any("err", err))
+		response.InternalError(wri, err)
+		return
+	}
+	if cacheHandle != nil && cacheKey != "" {
+		cacheHandle.Put(cacheKey, &cache.ResolvedEntry{RawJSON: encoded})
+	}
+
 	log.Info("Widget successfully resolved",
 		slog.String("duration", util.ETA(start)),
+		slog.String("l1", "miss"),
 	)
 
-	wri.Header().Set("Content-Type", "application/json")
-	wri.WriteHeader(http.StatusOK)
-	enc := json.NewEncoder(wri)
-	enc.SetIndent("", "  ")
-	enc.Encode(res)
+	writeResolvedJSON(wri, encoded)
 }

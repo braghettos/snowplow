@@ -1,7 +1,6 @@
 package dispatchers
 
 import (
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -67,6 +66,37 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		}
 	}
 
+	perPage, page := paginationInfo(log, req)
+
+	// Tag 0.30.7: L1 resolved-output cache lookup. Runs strictly
+	// AFTER the EvaluateRBAC gate above (Revision 2 binding) so the
+	// permission check is never short-circuited by a cache hit. Cache
+	// hits short-circuit the resolver + JSON re-encode; misses fall
+	// through to the 0.30.6-equivalent resolve-and-encode path.
+	//
+	// Per feedback_l1_invalidation_delete_only.md: this sub-ship
+	// (0.30.7) uses TTL-only invalidation; DELETE-driven eviction
+	// lands at 0.30.8. UPDATE/PATCH use stale-while-revalidate by
+	// rule.
+	cacheKey, cacheHandle := dispatchCacheLookupKey(req.Context(), "restactions",
+		got.GVR.Group, got.GVR.Version, got.GVR.Resource,
+		got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
+		perPage, page, extras)
+	if cacheHandle != nil {
+		if entry, ok := cacheHandle.Get(cacheKey); ok {
+			emitResolvedCacheLookup(log, "restactions", cacheKey, true, len(entry.RawJSON))
+			writeResolvedJSON(wri, entry.RawJSON)
+			log.Info("RESTAction successfully resolved",
+				slog.String("name", got.Unstructured.GetName()),
+				slog.String("namespace", got.Unstructured.GetNamespace()),
+				slog.String("duration", util.ETA(start)),
+				slog.String("l1", "hit"),
+			)
+			return
+		}
+		emitResolvedCacheLookup(log, "restactions", cacheKey, false, 0)
+	}
+
 	scheme := runtime.NewScheme()
 	if err := apis.AddToScheme(scheme); err != nil {
 		log.Error("unable to add apis to scheme",
@@ -86,8 +116,6 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		return
 	}
 
-	perPage, page := paginationInfo(log, req)
-
 	ctx := xcontext.BuildContext(req.Context())
 	res, err := restactions.Resolve(ctx, restactions.ResolveOptions{
 		In:      &cr,
@@ -105,15 +133,29 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		return
 	}
 
+	// Encode once, write once, and (if L1 is live) store the encoded
+	// bytes for the next lookup. Sharing the same []byte between the
+	// http.ResponseWriter write path and the cache entry is safe
+	// because the cache treats RawJSON as immutable once put.
+	encoded, err := encodeResolvedJSON(res)
+	if err != nil {
+		log.Error("unable to encode rest action response",
+			slog.String("name", cr.Name),
+			slog.String("namespace", cr.Namespace),
+			slog.Any("err", err))
+		response.InternalError(wri, err)
+		return
+	}
+	if cacheHandle != nil && cacheKey != "" {
+		cacheHandle.Put(cacheKey, &cache.ResolvedEntry{RawJSON: encoded})
+	}
+
 	log.Info("RESTAction successfully resolved",
 		slog.String("name", cr.Name),
 		slog.String("namespace", cr.Namespace),
 		slog.String("duration", util.ETA(start)),
+		slog.String("l1", "miss"),
 	)
 
-	wri.Header().Set("Content-Type", "application/json")
-	wri.WriteHeader(http.StatusOK)
-	enc := json.NewEncoder(wri)
-	enc.SetIndent("", "  ")
-	enc.Encode(res)
+	writeResolvedJSON(wri, encoded)
 }
