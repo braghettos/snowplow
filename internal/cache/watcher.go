@@ -10,6 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
@@ -147,6 +148,15 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 			)
 		}
 	}
+
+	// 0.30.6 plan §Risks bullet 1 — startup assertion. The typed
+	// RBAC overrides MUST be registered BEFORE factory.Start so
+	// every Add/Update event fires through the typed transform.
+	// Registration happens at package init() in strip.go; if it
+	// regressed (someone deletes the init or renames the GVR), this
+	// panics with the missing GVR so the regression cannot ship
+	// silently.
+	AssertRBACTypedOverridesRegistered()
 
 	rw.factory.Start(rw.stopCh)
 	rw.started = true
@@ -389,6 +399,100 @@ func filterByNamespace(items []interface{}, ns string) []interface{} {
 			continue
 		}
 		if uns.GetNamespace() == ns {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
+// GetTypedObject returns the cached object for (gvr, namespace, name)
+// as a runtime.Object — without the *unstructured.Unstructured
+// type-assert that GetObject performs. Used by callers that opt into
+// the 0.30.6 typed-converting transform: the indexer entry is a typed
+// pointer (e.g. *rbacv1.ClusterRoleBinding) and the caller does the
+// final type-assert at the call-site.
+//
+// Returns (nil, false) when the GVR is not registered, the key is
+// missing, or the underlying object is nil. NEVER falls back to
+// apiserver. ZERO conversion cost — this is the read-path mate to
+// stripAndType* in strip.go.
+//
+// For non-RBAC callers that still want the Unstructured (e.g.
+// resolver-side reads), GetObject is preserved unchanged.
+func (rw *ResourceWatcher) GetTypedObject(gvr schema.GroupVersionResource, namespace, name string) (runtime.Object, bool) {
+	rw.mu.RLock()
+	gi, ok := rw.informers[gvr]
+	rw.mu.RUnlock()
+
+	if !ok {
+		return nil, false
+	}
+
+	key := name
+	if namespace != "" {
+		key = namespace + "/" + name
+	}
+
+	obj, exists, err := gi.Informer().GetIndexer().GetByKey(key)
+	if err != nil || !exists {
+		return nil, false
+	}
+
+	robj, ok := obj.(runtime.Object)
+	if !ok {
+		return nil, false
+	}
+	return robj, true
+}
+
+// ListTypedObjects returns every cached object for gvr scoped to
+// namespace as []runtime.Object — without the *unstructured.Unstructured
+// type-assert that ListObjects performs. Caller does the final type
+// assert at the call-site.
+//
+// Pass empty namespace for cluster-wide listing. NEVER falls back to
+// apiserver. ZERO conversion cost.
+func (rw *ResourceWatcher) ListTypedObjects(gvr schema.GroupVersionResource, namespace string) []runtime.Object {
+	rw.mu.RLock()
+	gi, ok := rw.informers[gvr]
+	rw.mu.RUnlock()
+
+	if !ok {
+		return nil
+	}
+
+	store := gi.Informer().GetIndexer()
+	var items []interface{}
+	if namespace == "" {
+		items = store.List()
+	} else {
+		idx, err := store.ByIndex(clientcache.NamespaceIndex, namespace)
+		if err != nil {
+			items = filterRuntimeByNamespace(store.List(), namespace)
+		} else {
+			items = idx
+		}
+	}
+
+	out := make([]runtime.Object, 0, len(items))
+	for _, it := range items {
+		if robj, ok := it.(runtime.Object); ok {
+			out = append(out, robj)
+		}
+	}
+	return out
+}
+
+// filterRuntimeByNamespace is the runtime.Object analogue of
+// filterByNamespace. Used by ListTypedObjects only when the indexer
+// is missing the NamespaceIndex (rare; defensive).
+func filterRuntimeByNamespace(items []interface{}, ns string) []interface{} {
+	out := make([]interface{}, 0, len(items))
+	for _, it := range items {
+		// metav1.Object interface gives us GetNamespace without type
+		// assertion against either Unstructured or typed kinds.
+		type nsAccessor interface{ GetNamespace() string }
+		if a, ok := it.(nsAccessor); ok && a.GetNamespace() == ns {
 			out = append(out, it)
 		}
 	}

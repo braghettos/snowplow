@@ -135,21 +135,39 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, error) {
 // Subject that matches opts.Username / opts.Groups / "system:authenticated".
 // For every match the bound Role / ClusterRole is resolved and its
 // rules walked. First permitting rule wins (RBAC semantics).
+//
+// 0.30.6 — reads typed *rbacv1.{ClusterRole,Role}Binding directly from
+// the indexer (typed transform fires once at Add/Update event time per
+// strip.go stripAndType*). Per-call FromUnstructured cost is zero.
+// Defensive Unstructured fallback is retained for safety: if for any
+// reason an indexer entry is still an Unstructured (e.g. test seeding
+// path, transform conversion failure logged WARN at write time), the
+// per-call conversion runs and logs WARN at read time so the regression
+// is loud (plan §"Code-path falsifier" — fallback=true rate MUST stay
+// below 1%).
+//
+// 0.30.6 also reorders subject-prefilter to run BEFORE the typed read
+// in the inner loop where the typed object is already in hand. The
+// outer ListTypedObjects walk picks subjects from the typed object
+// directly; the prefilter still short-circuits the rule-walk (the
+// expensive part) when no subject matches.
 func evaluateAgainstInformer(ctx context.Context, rw *cache.ResourceWatcher, opts EvaluateOptions) (bool, error) {
-	_ = ctx // reserved for future cancellation / tracing hooks
+	log := xcontext.Logger(ctx)
 
 	// 1) ClusterRoleBindings — apply cluster-wide. Cluster-wide
 	//    permits override namespace scope.
-	crbs := rw.ListObjects(clusterRoleBindingsGVR, "")
-	for _, uns := range crbs {
-		crb, err := toClusterRoleBinding(uns)
+	crbs := rw.ListTypedObjects(clusterRoleBindingsGVR, "")
+	for _, obj := range crbs {
+		crb, err := asClusterRoleBinding(obj, log)
 		if err != nil {
 			return false, err
 		}
+		// Subject prefilter FIRST — skip the entire roleRefPermits
+		// walk when no subject matches. Cheaper than the rule-walk.
 		if !anySubjectMatches(crb.Subjects, opts) {
 			continue
 		}
-		permits, err := roleRefPermits(rw, "", crb.RoleRef, opts)
+		permits, err := roleRefPermits(rw, "", crb.RoleRef, opts, log)
 		if err != nil {
 			return false, err
 		}
@@ -163,16 +181,16 @@ func evaluateAgainstInformer(ctx context.Context, rw *cache.ResourceWatcher, opt
 	//    RoleRef can point at a Role (same namespace) or a ClusterRole
 	//    (cluster-wide) but the binding's effect is the namespace.
 	if opts.Namespace != "" {
-		rbs := rw.ListObjects(roleBindingsGVR, opts.Namespace)
-		for _, uns := range rbs {
-			rb, err := toRoleBinding(uns)
+		rbs := rw.ListTypedObjects(roleBindingsGVR, opts.Namespace)
+		for _, obj := range rbs {
+			rb, err := asRoleBinding(obj, log)
 			if err != nil {
 				return false, err
 			}
 			if !anySubjectMatches(rb.Subjects, opts) {
 				continue
 			}
-			permits, err := roleRefPermits(rw, opts.Namespace, rb.RoleRef, opts)
+			permits, err := roleRefPermits(rw, opts.Namespace, rb.RoleRef, opts, log)
 			if err != nil {
 				return false, err
 			}
@@ -188,14 +206,17 @@ func evaluateAgainstInformer(ctx context.Context, rw *cache.ResourceWatcher, opt
 // roleRefPermits resolves ref (Role or ClusterRole) and walks its
 // rules. namespace is the RoleBinding's namespace (used to resolve
 // kind=Role); empty when ref came from a ClusterRoleBinding.
-func roleRefPermits(rw *cache.ResourceWatcher, namespace string, ref rbacv1.RoleRef, opts EvaluateOptions) (bool, error) {
+//
+// 0.30.6 — reads typed *rbacv1.{ClusterRole,Role} directly via
+// GetTypedObject; defensive Unstructured fallback logs WARN.
+func roleRefPermits(rw *cache.ResourceWatcher, namespace string, ref rbacv1.RoleRef, opts EvaluateOptions, log *slog.Logger) (bool, error) {
 	switch ref.Kind {
 	case "ClusterRole":
-		uns, ok := rw.GetObject(clusterRolesGVR, "", ref.Name)
+		obj, ok := rw.GetTypedObject(clusterRolesGVR, "", ref.Name)
 		if !ok {
 			return false, nil
 		}
-		cr, err := toClusterRole(uns)
+		cr, err := asClusterRole(obj, log)
 		if err != nil {
 			return false, err
 		}
@@ -207,11 +228,11 @@ func roleRefPermits(rw *cache.ResourceWatcher, namespace string, ref rbacv1.Role
 			// Kubernetes — treat as deny.
 			return false, nil
 		}
-		uns, ok := rw.GetObject(rolesGVR, namespace, ref.Name)
+		obj, ok := rw.GetTypedObject(rolesGVR, namespace, ref.Name)
 		if !ok {
 			return false, nil
 		}
-		r, err := toRole(uns)
+		r, err := asRole(obj, log)
 		if err != nil {
 			return false, err
 		}
@@ -301,6 +322,99 @@ func parseServiceAccountUsername(u string) (string, string, bool) {
 	}
 	return parts[0], parts[1], true
 }
+
+// asClusterRoleBinding extracts a *rbacv1.ClusterRoleBinding from an
+// indexer object. Happy path: the indexer already holds a typed
+// pointer (cache/strip.go stripAndTypeClusterRoleBinding ran at the
+// Add/Update event), the type assertion succeeds, and per-call
+// FromUnstructured cost is zero. This is the 0.30.6 headline win.
+//
+// Defensive fallback path: the indexer entry is still
+// *unstructured.Unstructured (e.g. transform missed it, test seeded
+// without the transform pipeline, or a future code regression). In
+// that case we convert once with the existing toClusterRoleBinding
+// helper and log WARN with fallback=true so the regression is loud
+// (plan §"Code-path falsifier"). Allow/deny result is bit-exact equal
+// either way — the test suite asserts equivalence.
+//
+// Returns error only when the indexer object is neither typed nor
+// convertible (the fallback FromUnstructured failed).
+func asClusterRoleBinding(obj interface{}, log *slog.Logger) (*rbacv1.ClusterRoleBinding, error) {
+	if crb, ok := obj.(*rbacv1.ClusterRoleBinding); ok {
+		return crb, nil
+	}
+	uns, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return nil, fmt.Errorf("rbac.asClusterRoleBinding: indexer object is neither *rbacv1.ClusterRoleBinding nor *unstructured.Unstructured (%T)", obj)
+	}
+	log.Warn("rbac.indexer.read fallback=true",
+		slog.String("subsystem", "rbac"),
+		slog.String("kind", "ClusterRoleBinding"),
+		slog.String("name", uns.GetName()),
+		slog.String("hint", "indexer entry was Unstructured — typed transform did not fire on this object"),
+	)
+	return toClusterRoleBinding(uns)
+}
+
+// asRoleBinding is the RoleBinding analogue of asClusterRoleBinding.
+func asRoleBinding(obj interface{}, log *slog.Logger) (*rbacv1.RoleBinding, error) {
+	if rb, ok := obj.(*rbacv1.RoleBinding); ok {
+		return rb, nil
+	}
+	uns, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return nil, fmt.Errorf("rbac.asRoleBinding: indexer object is neither *rbacv1.RoleBinding nor *unstructured.Unstructured (%T)", obj)
+	}
+	log.Warn("rbac.indexer.read fallback=true",
+		slog.String("subsystem", "rbac"),
+		slog.String("kind", "RoleBinding"),
+		slog.String("name", uns.GetName()),
+		slog.String("namespace", uns.GetNamespace()),
+		slog.String("hint", "indexer entry was Unstructured — typed transform did not fire on this object"),
+	)
+	return toRoleBinding(uns)
+}
+
+// asClusterRole is the ClusterRole analogue of asClusterRoleBinding.
+func asClusterRole(obj interface{}, log *slog.Logger) (*rbacv1.ClusterRole, error) {
+	if cr, ok := obj.(*rbacv1.ClusterRole); ok {
+		return cr, nil
+	}
+	uns, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return nil, fmt.Errorf("rbac.asClusterRole: indexer object is neither *rbacv1.ClusterRole nor *unstructured.Unstructured (%T)", obj)
+	}
+	log.Warn("rbac.indexer.read fallback=true",
+		slog.String("subsystem", "rbac"),
+		slog.String("kind", "ClusterRole"),
+		slog.String("name", uns.GetName()),
+		slog.String("hint", "indexer entry was Unstructured — typed transform did not fire on this object"),
+	)
+	return toClusterRole(uns)
+}
+
+// asRole is the Role analogue of asClusterRoleBinding.
+func asRole(obj interface{}, log *slog.Logger) (*rbacv1.Role, error) {
+	if r, ok := obj.(*rbacv1.Role); ok {
+		return r, nil
+	}
+	uns, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return nil, fmt.Errorf("rbac.asRole: indexer object is neither *rbacv1.Role nor *unstructured.Unstructured (%T)", obj)
+	}
+	log.Warn("rbac.indexer.read fallback=true",
+		slog.String("subsystem", "rbac"),
+		slog.String("kind", "Role"),
+		slog.String("name", uns.GetName()),
+		slog.String("namespace", uns.GetNamespace()),
+		slog.String("hint", "indexer entry was Unstructured — typed transform did not fire on this object"),
+	)
+	return toRole(uns)
+}
+
+// to{Kind} helpers (below) remain for the defensive Unstructured
+// fallback path only. The cache=on happy path uses the as{Kind}
+// helpers above with zero per-call conversion.
 
 func toRoleBinding(uns *unstructured.Unstructured) (*rbacv1.RoleBinding, error) {
 	out := &rbacv1.RoleBinding{}

@@ -16,6 +16,7 @@ import (
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
@@ -429,3 +430,170 @@ func TestEvaluateRBAC_CacheOnWithoutGlobalDenies(t *testing.T) {
 		t.Fatalf("unexpected error message: %v", err)
 	}
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// 0.30.6 typed-RBAC indexer tests
+// ──────────────────────────────────────────────────────────────────────
+
+// TestEvaluateRBAC_IndexerStoresTypedPointers is the load-bearing
+// 0.30.6 contract test: after newTestWatcher seeds RBAC objects, the
+// indexer entries are typed pointers (not Unstructured), proving the
+// typed-converting transform fired at Add event time. This is the
+// mechanism behind the FromUnstructured CPU win (4760 ms → < 500 ms
+// per cold nav projected).
+func TestEvaluateRBAC_IndexerStoresTypedPointers(t *testing.T) {
+	newTestWatcher(t,
+		clusterRole("admin", rule([]string{"*"}, []string{"*"}, []string{"*"})),
+		clusterRoleBinding("admin-bind", "admin", userSubject("alice")),
+		role("ns-a", "viewer", rule([]string{""}, []string{"configmaps"}, []string{"get"})),
+		roleBinding("ns-a", "viewer-bind", "Role", "viewer", userSubject("bob")),
+	)
+
+	rw := cache.Global()
+	if rw == nil {
+		t.Fatalf("expected non-nil global watcher")
+	}
+
+	crbGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}
+	crGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}
+	rbGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}
+	rGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}
+
+	// ClusterRoleBinding indexer entry must be typed.
+	crbs := rw.ListTypedObjects(crbGVR, "")
+	if len(crbs) != 1 {
+		t.Fatalf("ClusterRoleBindings: want 1, got %d", len(crbs))
+	}
+	if _, ok := crbs[0].(*rbacv1.ClusterRoleBinding); !ok {
+		t.Fatalf("ClusterRoleBinding indexer entry not typed: %T", crbs[0])
+	}
+
+	// ClusterRole indexer entry must be typed.
+	crObj, ok := rw.GetTypedObject(crGVR, "", "admin")
+	if !ok {
+		t.Fatalf("ClusterRole admin missing from indexer")
+	}
+	if _, ok := crObj.(*rbacv1.ClusterRole); !ok {
+		t.Fatalf("ClusterRole indexer entry not typed: %T", crObj)
+	}
+
+	// RoleBinding (in namespace) indexer entry must be typed.
+	rbs := rw.ListTypedObjects(rbGVR, "ns-a")
+	if len(rbs) != 1 {
+		t.Fatalf("RoleBindings in ns-a: want 1, got %d", len(rbs))
+	}
+	if _, ok := rbs[0].(*rbacv1.RoleBinding); !ok {
+		t.Fatalf("RoleBinding indexer entry not typed: %T", rbs[0])
+	}
+
+	// Role indexer entry must be typed.
+	rObj, ok := rw.GetTypedObject(rGVR, "ns-a", "viewer")
+	if !ok {
+		t.Fatalf("Role viewer missing from indexer")
+	}
+	if _, ok := rObj.(*rbacv1.Role); !ok {
+		t.Fatalf("Role indexer entry not typed: %T", rObj)
+	}
+}
+
+// TestEvaluateRBAC_TypedHappyPath is a behavioural smoke test on the
+// 0.30.6 typed-read path. The previous allow-by-CRB test exercises the
+// same path, but this one asserts the fast-path explicitly via mixed
+// resources + a non-matching subject to ensure the prefilter ordering
+// (subject FIRST, role-walk SECOND) doesn't regress correctness.
+func TestEvaluateRBAC_TypedHappyPath(t *testing.T) {
+	newTestWatcher(t,
+		clusterRole("admin", rule([]string{"*"}, []string{"*"}, []string{"*"})),
+		clusterRole("viewer", rule([]string{""}, []string{"pods"}, []string{"get"})),
+		clusterRoleBinding("admin-bind", "admin", userSubject("alice")),
+		clusterRoleBinding("viewer-bind", "viewer", userSubject("bob")),
+		clusterRoleBinding("noise-bind", "admin", userSubject("decoy")),
+	)
+
+	cases := []struct {
+		user, verb, resource string
+		want                 bool
+	}{
+		{"alice", "delete", "secrets", true},  // admin
+		{"bob", "get", "pods", true},          // viewer
+		{"bob", "delete", "secrets", false},   // viewer rule doesn't match
+		{"eve", "get", "anything", false},     // no binding
+	}
+	for _, c := range cases {
+		ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+			Username: c.user, Verb: c.verb, Group: "", Resource: c.resource, Namespace: "default",
+		})
+		if err != nil {
+			t.Fatalf("EvaluateRBAC(%s,%s,%s): %v", c.user, c.verb, c.resource, err)
+		}
+		if ok != c.want {
+			t.Fatalf("EvaluateRBAC(%s,%s,%s) = %v, want %v", c.user, c.verb, c.resource, ok, c.want)
+		}
+	}
+}
+
+// TestEvaluateRBAC_UnstructuredFallbackEquivalence — defensive
+// fallback contract (plan §Risks bullet 2). When the indexer entry
+// for an RBAC GVR is still *unstructured.Unstructured (because the
+// typed override didn't fire on it — e.g. a future regression),
+// EvaluateRBAC MUST still produce the correct allow/deny result.
+//
+// Mechanism: disable the typed-converting override for the
+// clusterrolebindings GVR for this test, seed via the dynamic fake
+// (the default strip-only transform now applies, so the indexer
+// stores *Unstructured), and verify allow/deny matches what the
+// typed path would produce.
+func TestEvaluateRBAC_UnstructuredFallbackEquivalence(t *testing.T) {
+	crbGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}
+	crGVR := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}
+
+	// Disable typed overrides for both CRB and CR so the indexer
+	// stores Unstructured for both — exercises the full fallback
+	// path (asClusterRoleBinding + asClusterRole). Restore the
+	// overrides at test exit so other subtests are unaffected.
+	restoreCRB := cache.DisableTypedOverrideForTest(crbGVR)
+	t.Cleanup(restoreCRB)
+	restoreCR := cache.DisableTypedOverrideForTest(crGVR)
+	t.Cleanup(restoreCR)
+
+	newTestWatcher(t,
+		clusterRole("admin", rule([]string{"*"}, []string{"*"}, []string{"*"})),
+		clusterRoleBinding("admin-bind", "admin", userSubject("alice")),
+	)
+
+	// Sanity-check: the indexer holds Unstructured for CRB now.
+	rw := cache.Global()
+	crbs := rw.ListTypedObjects(crbGVR, "")
+	if len(crbs) != 1 {
+		t.Fatalf("CRB indexer count: want 1, got %d", len(crbs))
+	}
+	if _, isUns := crbs[0].(*unstructured.Unstructured); !isUns {
+		t.Fatalf("expected Unstructured in indexer after disabling typed override, got %T", crbs[0])
+	}
+
+	// EvaluateRBAC MUST still produce a correct allow.
+	ok, err := rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+		Username: "alice", Verb: "get", Group: "", Resource: "secrets", Namespace: "default",
+	})
+	if err != nil {
+		t.Fatalf("EvaluateRBAC on Unstructured-fallback path: %v", err)
+	}
+	if !ok {
+		t.Fatalf("Unstructured-fallback equivalence broken: alice should be admin")
+	}
+
+	// Negative: deny case must also be correct.
+	ok, err = rbac.EvaluateRBAC(context.Background(), rbac.EvaluateOptions{
+		Username: "eve", Verb: "get", Group: "", Resource: "secrets", Namespace: "default",
+	})
+	if err != nil {
+		t.Fatalf("EvaluateRBAC(eve): %v", err)
+	}
+	if ok {
+		t.Fatalf("Unstructured-fallback equivalence broken: eve should be denied")
+	}
+}
+
+// silence the unstructured import even when the test that uses it is
+// the only consumer.
+var _ = unstructured.Unstructured{}

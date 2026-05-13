@@ -3,6 +3,7 @@ package cache
 import (
 	"testing"
 
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -202,6 +203,254 @@ func TestStrip_ErrorPathDoesNotPanic(t *testing.T) {
 			// nil-in, nil-out). The contract is: no panic, no error.
 			_ = out
 		})
+	}
+}
+
+// TestStrip_TypedRBACOverridesRegistered confirms init() populated
+// typedResourceOverrides for all four RBAC GVRs. 0.30.6 plan §Risks
+// bullet 1 startup assertion is built on this; a regression here
+// would panic NewResourceWatcher rather than ship silently.
+func TestStrip_TypedRBACOverridesRegistered(t *testing.T) {
+	for _, gvr := range rbacTypedGVRs {
+		if _, ok := typedResourceOverrides[gvr]; !ok {
+			t.Fatalf("typedResourceOverrides missing entry for %s", gvr)
+		}
+	}
+	// AssertRBACTypedOverridesRegistered must NOT panic.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("AssertRBACTypedOverridesRegistered panicked: %v", r)
+		}
+	}()
+	AssertRBACTypedOverridesRegistered()
+}
+
+// TestStrip_AssertRBACPanicsOnMissingOverride confirms the startup
+// assertion DOES panic when an RBAC GVR is missing its override.
+// Saves/restores the override map so other tests are unaffected.
+func TestStrip_AssertRBACPanicsOnMissingOverride(t *testing.T) {
+	gvr := rbacTypedGVRs[0]
+	saved := typedResourceOverrides[gvr]
+	delete(typedResourceOverrides, gvr)
+	defer func() {
+		typedResourceOverrides[gvr] = saved
+		if r := recover(); r == nil {
+			t.Fatalf("expected panic, got none")
+		}
+	}()
+	AssertRBACTypedOverridesRegistered()
+	t.Fatalf("AssertRBACTypedOverridesRegistered did not panic (unreachable)")
+}
+
+// TestStrip_TypedTransform_ProducesTypedPointer is the load-bearing
+// 0.30.6 assertion: when the typed-converting transform fires on an
+// RBAC GVR, the indexer-bound output is a typed pointer (e.g.
+// *rbacv1.ClusterRoleBinding), NOT *unstructured.Unstructured. This
+// is the contract internal/rbac/evaluate.go relies on for zero
+// per-call FromUnstructured cost.
+func TestStrip_TypedTransform_ProducesTypedPointer(t *testing.T) {
+	resetStripLoggingForTest()
+	cases := []struct {
+		name     string
+		gvr      schema.GroupVersionResource
+		uns      *unstructured.Unstructured
+		wantType string
+	}{
+		{
+			name: "ClusterRoleBinding",
+			gvr:  rbacTypedGVRs[3], // clusterrolebindings
+			uns: &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rbac.authorization.k8s.io/v1",
+				"kind":       "ClusterRoleBinding",
+				"metadata":   map[string]interface{}{"name": "demo-crb"},
+				"subjects": []interface{}{
+					map[string]interface{}{"kind": "User", "name": "alice", "apiGroup": "rbac.authorization.k8s.io"},
+				},
+				"roleRef": map[string]interface{}{
+					"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "admin",
+				},
+			}},
+			wantType: "*v1.ClusterRoleBinding",
+		},
+		{
+			name: "RoleBinding",
+			gvr:  rbacTypedGVRs[1], // rolebindings
+			uns: &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rbac.authorization.k8s.io/v1",
+				"kind":       "RoleBinding",
+				"metadata":   map[string]interface{}{"name": "demo-rb", "namespace": "ns-a"},
+				"subjects": []interface{}{
+					map[string]interface{}{"kind": "Group", "name": "devs", "apiGroup": "rbac.authorization.k8s.io"},
+				},
+				"roleRef": map[string]interface{}{
+					"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "viewer",
+				},
+			}},
+			wantType: "*v1.RoleBinding",
+		},
+		{
+			name: "ClusterRole",
+			gvr:  rbacTypedGVRs[2], // clusterroles
+			uns: &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rbac.authorization.k8s.io/v1",
+				"kind":       "ClusterRole",
+				"metadata":   map[string]interface{}{"name": "admin"},
+				"rules": []interface{}{
+					map[string]interface{}{
+						"apiGroups": []interface{}{"*"},
+						"resources": []interface{}{"*"},
+						"verbs":     []interface{}{"*"},
+					},
+				},
+			}},
+			wantType: "*v1.ClusterRole",
+		},
+		{
+			name: "Role",
+			gvr:  rbacTypedGVRs[0], // roles
+			uns: &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "rbac.authorization.k8s.io/v1",
+				"kind":       "Role",
+				"metadata":   map[string]interface{}{"name": "viewer", "namespace": "ns-a"},
+				"rules": []interface{}{
+					map[string]interface{}{
+						"apiGroups": []interface{}{""},
+						"resources": []interface{}{"secrets"},
+						"verbs":     []interface{}{"get"},
+					},
+				},
+			}},
+			wantType: "*v1.Role",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			resetStripLoggingForTest()
+			tf := StripBulkyFieldsForResourceType(gvrResourceTypeString(c.gvr), c.gvr)
+			out, err := tf(c.uns)
+			if err != nil {
+				t.Fatalf("transform error: %v", err)
+			}
+			// Must be typed pointer, NOT Unstructured.
+			if _, isUns := out.(*unstructured.Unstructured); isUns {
+				t.Fatalf("transform returned *unstructured.Unstructured; want typed pointer (%s)", c.wantType)
+			}
+			// Type-specific assertion.
+			switch c.gvr.Resource {
+			case "clusterrolebindings":
+				crb, ok := out.(*rbacv1.ClusterRoleBinding)
+				if !ok {
+					t.Fatalf("want *rbacv1.ClusterRoleBinding, got %T", out)
+				}
+				if len(crb.Subjects) != 1 || crb.Subjects[0].Name != "alice" {
+					t.Fatalf("subject lost in conversion: %+v", crb.Subjects)
+				}
+				if crb.RoleRef.Name != "admin" {
+					t.Fatalf("roleRef lost: %+v", crb.RoleRef)
+				}
+			case "rolebindings":
+				rb, ok := out.(*rbacv1.RoleBinding)
+				if !ok {
+					t.Fatalf("want *rbacv1.RoleBinding, got %T", out)
+				}
+				if len(rb.Subjects) != 1 || rb.Subjects[0].Name != "devs" {
+					t.Fatalf("subject lost: %+v", rb.Subjects)
+				}
+			case "clusterroles":
+				cr, ok := out.(*rbacv1.ClusterRole)
+				if !ok {
+					t.Fatalf("want *rbacv1.ClusterRole, got %T", out)
+				}
+				if len(cr.Rules) != 1 || cr.Rules[0].Verbs[0] != "*" {
+					t.Fatalf("rules lost: %+v", cr.Rules)
+				}
+			case "roles":
+				r, ok := out.(*rbacv1.Role)
+				if !ok {
+					t.Fatalf("want *rbacv1.Role, got %T", out)
+				}
+				if len(r.Rules) != 1 || r.Rules[0].Resources[0] != "secrets" {
+					t.Fatalf("rules lost: %+v", r.Rules)
+				}
+			}
+		})
+	}
+}
+
+// TestStrip_TypedTransform_MalformedFallsBack confirms that a
+// malformed RBAC Unstructured (broken roleRef type) cannot panic and
+// returns the original Unstructured for the downstream evaluate.go
+// fallback path. The informer never sees an error. Plan §Risks bullet
+// 2.
+func TestStrip_TypedTransform_MalformedFallsBack(t *testing.T) {
+	resetStripLoggingForTest()
+	gvr := rbacTypedGVRs[3] // clusterrolebindings
+	tf := StripBulkyFieldsForResourceType(gvrResourceTypeString(gvr), gvr)
+
+	// roleRef has wrong type — FromUnstructured will fail.
+	uns := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "rbac.authorization.k8s.io/v1",
+		"kind":       "ClusterRoleBinding",
+		"metadata":   map[string]interface{}{"name": "broken"},
+		"roleRef":    "this-should-be-a-map-not-a-string",
+	}}
+
+	out, err := tf(uns)
+	if err != nil {
+		t.Fatalf("transform must never propagate error to informer: %v", err)
+	}
+	// Fallback contract: returns Unstructured (not nil, not typed).
+	if _, isUns := out.(*unstructured.Unstructured); !isUns {
+		t.Fatalf("malformed fallback expected *unstructured.Unstructured, got %T", out)
+	}
+}
+
+// TestStrip_TypedTransform_StripsBeforeConverting confirms that the
+// typed transform applies the default strip (managedFields +
+// last-applied) BEFORE conversion — the typed object inherits the
+// strip. This matters because the typed pointer in the indexer is the
+// only copy; if strip didn't run, the typed object would carry the
+// bulk fields forward.
+func TestStrip_TypedTransform_StripsBeforeConverting(t *testing.T) {
+	resetStripLoggingForTest()
+	gvr := rbacTypedGVRs[3] // clusterrolebindings
+	tf := StripBulkyFieldsForResourceType(gvrResourceTypeString(gvr), gvr)
+
+	uns := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "rbac.authorization.k8s.io/v1",
+		"kind":       "ClusterRoleBinding",
+		"metadata": map[string]interface{}{
+			"name": "demo-crb",
+			"annotations": map[string]interface{}{
+				"kubectl.kubernetes.io/last-applied-configuration": "should-be-dropped",
+				"keep-me": "yes",
+			},
+			"managedFields": []interface{}{
+				map[string]interface{}{"manager": "kubectl"},
+			},
+		},
+		"roleRef": map[string]interface{}{
+			"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "admin",
+		},
+	}}
+
+	out, err := tf(uns)
+	if err != nil {
+		t.Fatalf("transform error: %v", err)
+	}
+	crb, ok := out.(*rbacv1.ClusterRoleBinding)
+	if !ok {
+		t.Fatalf("want *rbacv1.ClusterRoleBinding, got %T", out)
+	}
+	if _, present := crb.Annotations["kubectl.kubernetes.io/last-applied-configuration"]; present {
+		t.Fatalf("last-applied not dropped on typed path: %v", crb.Annotations)
+	}
+	if crb.Annotations["keep-me"] != "yes" {
+		t.Fatalf("non-target annotation lost on typed path: %v", crb.Annotations)
+	}
+	if len(crb.ManagedFields) != 0 {
+		t.Fatalf("managedFields not dropped on typed path: %v", crb.ManagedFields)
 	}
 }
 
