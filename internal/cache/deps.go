@@ -44,6 +44,7 @@
 package cache
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"strconv"
@@ -52,6 +53,45 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
+
+// ctxKeyL1RecordType is the typed empty-struct context key used by
+// WithL1KeyContext / L1KeyFromContext. Distinct unexported type so
+// external packages cannot collide via raw string keys.
+type ctxKeyL1RecordType struct{}
+
+var ctxKeyL1Record = ctxKeyL1RecordType{}
+
+// WithL1KeyContext returns a child context that carries l1Key as the
+// resolved-output cache entry currently being populated. The resolver
+// reads this via L1KeyFromContext during inner-call dispatch and records
+// dep edges so DELETE events on the touched (gvr, ns, name) tuples evict
+// the entry from L1.
+//
+// Empty l1Key is treated as "do not record" — the parent context is
+// returned unchanged (saves an allocation and keeps the no-record
+// invariant explicit at the call site).
+//
+// Per plan §0.30.94 / Revision 19 "Resolver-side dep recording threaded
+// via context.Context". Threading via context.Value avoids adding a
+// *RecordingDeps parameter to every signature in the resolver call
+// chain (api.Resolve → restactions.Resolve → httpcall.Do).
+func WithL1KeyContext(ctx context.Context, l1Key string) context.Context {
+	if ctx == nil || l1Key == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxKeyL1Record, l1Key)
+}
+
+// L1KeyFromContext returns the L1 key attached to ctx by
+// WithL1KeyContext. Returns "" when no key was attached (the resolver
+// must treat empty as "do not record").
+func L1KeyFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(ctxKeyL1Record).(string)
+	return v
+}
 
 // Dependency env knobs.
 const (

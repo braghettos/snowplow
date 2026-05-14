@@ -223,6 +223,115 @@ func ParseAPIServerPathToGVR(path string) (schema.GroupVersionResource, bool) {
 	return schema.GroupVersionResource{}, false
 }
 
+// ParseAPIServerPathToDep extracts (gvr, namespace, name) from a fully-
+// resolved apiserver path. Returns name="" when the path is a LIST form
+// (caller must use cache.Deps().RecordList). Returns ok=false for
+// non-apiserver paths, unresolved JQ fragments, or malformed shapes.
+//
+// Path shapes recognised (after query-string + trailing-slash stripping):
+//
+//	/api/v1/<resource>                              -> {core/v1, ns="",  name=""}
+//	/api/v1/<resource>/<name>                       -> {core/v1, ns="",  name=<name>}
+//	/api/v1/namespaces/<ns>/<resource>              -> {core/v1, ns=<ns>,name=""}
+//	/api/v1/namespaces/<ns>/<resource>/<name>       -> {core/v1, ns=<ns>,name=<name>}
+//	/apis/<g>/<v>/<resource>                        -> {g/v,     ns="",  name=""}
+//	/apis/<g>/<v>/<resource>/<name>                 -> {g/v,     ns="",  name=<name>}
+//	/apis/<g>/<v>/namespaces/<ns>/<resource>        -> {g/v,     ns=<ns>,name=""}
+//	/apis/<g>/<v>/namespaces/<ns>/<resource>/<name> -> {g/v,     ns=<ns>,name=<name>}
+//
+// Subresource suffixes (e.g. ".../status", ".../scale") are accepted
+// and recorded against the parent resource — subresource changes are
+// indistinguishable from parent-object UPDATEs from a dep-tracking
+// standpoint, and over-recording on the parent GVR is the conservative
+// safe direction (extra dep, not missing dep).
+//
+// Per plan §0.30.94 "Concrete file:line changes — internal/cache/inventory.go".
+// Sibling of ParseAPIServerPathToGVR; shares the ${...}-rejection +
+// trailing-slash logic.
+func ParseAPIServerPathToDep(path string) (gvr schema.GroupVersionResource, namespace, name string, ok bool) {
+	// Strip query string.
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	// Strip trailing slash.
+	path = strings.TrimRight(path, "/")
+
+	// Reject paths with unresolved JQ template fragments.
+	if strings.Contains(path, "${") {
+		return schema.GroupVersionResource{}, "", "", false
+	}
+
+	switch {
+	case strings.HasPrefix(path, "/api/"):
+		// /api/<version>/<resource>[/...]
+		rest := strings.TrimPrefix(path, "/api/")
+		parts := strings.Split(rest, "/")
+		if len(parts) < 2 {
+			return schema.GroupVersionResource{}, "", "", false
+		}
+		version := parts[0]
+		// Namespaced form: /api/v1/namespaces/<ns>/<resource>[/<name>[/<subresource>...]]
+		if parts[1] == "namespaces" && len(parts) >= 4 {
+			ns := parts[2]
+			resource := parts[3]
+			objName := ""
+			if len(parts) >= 5 {
+				objName = parts[4]
+			}
+			return schema.GroupVersionResource{
+				Version:  version,
+				Resource: resource,
+			}, ns, objName, true
+		}
+		// Cluster-scoped form: /api/v1/<resource>[/<name>[/<subresource>...]]
+		resource := parts[1]
+		objName := ""
+		if len(parts) >= 3 {
+			objName = parts[2]
+		}
+		return schema.GroupVersionResource{
+			Version:  version,
+			Resource: resource,
+		}, "", objName, true
+
+	case strings.HasPrefix(path, "/apis/"):
+		// /apis/<group>/<version>/<resource>[/...]
+		// or:  /apis/<group>/<version>/namespaces/<ns>/<resource>[/...]
+		rest := strings.TrimPrefix(path, "/apis/")
+		parts := strings.Split(rest, "/")
+		if len(parts) < 3 {
+			return schema.GroupVersionResource{}, "", "", false
+		}
+		group := parts[0]
+		version := parts[1]
+		if parts[2] == "namespaces" && len(parts) >= 5 {
+			ns := parts[3]
+			resource := parts[4]
+			objName := ""
+			if len(parts) >= 6 {
+				objName = parts[5]
+			}
+			return schema.GroupVersionResource{
+				Group:    group,
+				Version:  version,
+				Resource: resource,
+			}, ns, objName, true
+		}
+		resource := parts[2]
+		objName := ""
+		if len(parts) >= 4 {
+			objName = parts[3]
+		}
+		return schema.GroupVersionResource{
+			Group:    group,
+			Version:  version,
+			Resource: resource,
+		}, "", objName, true
+	}
+
+	return schema.GroupVersionResource{}, "", "", false
+}
+
 // unstructuredSliceField pulls obj[fields...] as []any. Returns
 // (nil, false, nil) when the path is missing or the leaf is not a
 // slice. An error is returned only when an intermediate node has the

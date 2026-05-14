@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
@@ -228,6 +229,51 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			call.ResponseHandler = jsonHandler(ctx, jsonHandlerOptions{
 				key: id, out: dict, filter: apiCall.Filter,
 			})
+
+			// 0.30.94 Edge type 3: record a resolver-side dep edge so a
+			// future DELETE/UPDATE on the K8s object this inner call
+			// reads from will evict / refresh the L1 entry currently
+			// being populated.
+			//
+			// The dispatcher attached the L1 key via cache.WithL1KeyContext
+			// before calling restactions.Resolve. Empty L1 key means
+			// either L1 is disabled or the current request is a cache
+			// hit (which doesn't take this path anyway) — in both cases
+			// we skip recording.
+			//
+			// Verb filter: GET-only at this tag. PUT/POST/PATCH/DELETE
+			// are mutations and the response should not establish a dep
+			// edge against the mutation target (the edge would be on
+			// the GET response shape, not the mutation target). Per
+			// plan §0.30.94 "Verb filter rationale" — conservative
+			// allowlist; extend if HEAD-shaped reads surface later.
+			//
+			// Parser: ParseAPIServerPathToDep handles 8 canonical apiserver
+			// shapes uniformly (per feedback_no_special_cases.md — no
+			// per-resource carve-outs). name=="" signals list-scope.
+			//
+			// Idempotency: cache.Deps().Record / RecordList are sync.Map
+			// LoadOrStore — repeated edges (iterator pages, retried
+			// stages) are sub-microsecond no-ops.
+			if l1Key := cache.L1KeyFromContext(ctx); l1Key != "" && !cache.Disabled() {
+				if ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet {
+					if gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(call.Path); parseOK {
+						if name == "" {
+							cache.Deps().RecordList(l1Key, gvr, ns)
+						} else {
+							cache.Deps().Record(l1Key, gvr, ns, name)
+						}
+						log.Debug("dep.recorded",
+							slog.String("subsystem", "cache"),
+							slog.String("edge_type", "innerCall"),
+							slog.String("gvr", gvr.String()),
+							slog.String("ns", ns),
+							slog.String("name", name),
+							slog.String("l1_key", l1Key),
+						)
+					}
+				}
+			}
 
 			log.Debug("calling api", slog.String("name", id),
 				slog.String("host", call.Endpoint.ServerURL), slog.String("path", call.Path),

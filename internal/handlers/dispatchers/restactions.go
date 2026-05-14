@@ -118,6 +118,14 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	}
 
 	ctx := xcontext.BuildContext(req.Context())
+	// 0.30.94 Edge type 3: attach the L1 key being populated so the
+	// resolver can record dep edges for each inner K8s call it makes.
+	// Empty cacheKey (L1 disabled, RBAC-skipped) is a no-op inside
+	// WithL1KeyContext — the resolver sees an empty key and skips
+	// recording.
+	if cacheKey != "" {
+		ctx = cache.WithL1KeyContext(ctx, cacheKey)
+	}
 	res, err := restactions.Resolve(ctx, restactions.ResolveOptions{
 		In:      &cr,
 		AuthnNS: r.authnNS,

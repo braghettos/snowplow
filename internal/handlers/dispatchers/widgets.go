@@ -95,6 +95,15 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	}
 
 	ctx := xcontext.BuildContext(req.Context())
+	// 0.30.94 Edge type 3: attach the L1 key being populated so the
+	// underlying restactions resolver (called transitively via apiRef)
+	// records dep edges against each inner K8s call. Widget L1 key
+	// flows through into the inner resolver — Edge type 3 correctly
+	// records against the widget L1 key because the widget cache entry
+	// depends on every K8s object its underlying RestActions touch.
+	if cacheKey != "" {
+		ctx = cache.WithL1KeyContext(ctx, cacheKey)
+	}
 
 	res, err := widgets.Resolve(ctx, widgets.ResolveOptions{
 		In:      got.Unstructured,

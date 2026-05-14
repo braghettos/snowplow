@@ -44,6 +44,16 @@ func All() map[string]http.Handler {
 // the closure body is where future credential-stashing work plugs in.
 func RegisterRefreshHandlers() {
 	cache.RegisterRefreshFunc("restactions", func(ctx context.Context, key string, in cache.ResolvedKeyInputs) error {
+		// 0.30.94 Edge type 3 refresher integration: attach the L1 key
+		// to the refresh ctx so when the no-op handler is flipped to
+		// real re-resolve in a future tag, the resolver's inner-call
+		// recording site sees a non-empty L1 key and re-records updated
+		// dep edges (object set may have changed between original
+		// resolve and refresh). At 0.30.94 the handler stays no-op per
+		// 0.30.8 design — this is a no-cost pre-wire so subsequent
+		// tags need not touch dispatchers.go again.
+		_ = cache.WithL1KeyContext(ctx, key)
+
 		// 0.30.8: no-op. Counter ticks via refresher.completedTotal so
 		// downstream telemetry can verify the queue is draining.
 		slog.Debug("refresh.restactions.noop",
@@ -54,6 +64,7 @@ func RegisterRefreshHandlers() {
 		return nil
 	})
 	cache.RegisterRefreshFunc("widgets", func(ctx context.Context, key string, in cache.ResolvedKeyInputs) error {
+		_ = cache.WithL1KeyContext(ctx, key)
 		slog.Debug("refresh.widgets.noop",
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
