@@ -1563,6 +1563,229 @@ INFO per `/call`: `userAccessFilter.dispatch=service_account|user_token user=X r
 
 ---
 
+## Tag `0.30.94` — Revision 19: Edge type 3 — resolver-side inner-call dep recording (CLOSES the DELETE-evict dormancy at last)
+
+### Revision 19 preamble (binding, 2026-05-14 architect — Gate 1 FAIL evidence)
+
+**What 0.30.91/0.30.92/0.30.93 each shipped.** A lazy-register hook (`EnsureResourceType`) that wires informers + DepTracker event handlers on first touch — for entry-point RestAction GVRs (`0.30.91`), then widened to every JQ-evaluated inner-call path (`0.30.92`), then narrowed to metadata-only informers for high-cardinality GVRs (`0.30.93`). Each tag closed a specific informer-wiring gap.
+
+**What none of them shipped.** Edge type 3 — the resolver-side dep edges that link each L1 entry to the (gvr, namespace, name-or-"*") tuples its inner LIST/GET calls actually touched. Without those edges, `cache.Deps().OnDelete(...)` walks `collectMatches` against an empty bucket and the watcher's DeleteFunc returns `evict=0` even when informers are wired and events are flowing.
+
+**Today's Gate 1 probe (artifact `/tmp/snowplow-runs/0.30.92-redeploy/preflight/probe.log` 2026-05-14):**
+```
+kubectl delete composition bench-app-02-06 -n bench-ns-02   →  T+0s
+informer DeleteFunc observed for compositions GVR           →  T+~2s
+cache_event.consumed type=DELETE l1_keys=0 evicted=0         →  T+~2s
+admin /call compositions-list                                →  T+77s: still stale (cached entry returned)
+resolved_cache.summary evict_delete_total=0                  →  T+77s
+```
+Informer wiring is healthy. The dep tracker has no edges to walk because Edge type 3 was deferred at `0.30.8` per design note #9 ("would require a `*RecordingDeps` context threaded through `internal/resolvers/restactions/api/resolve.go`"). **TTL-only convergence is REJECTED by Diego — must be event-driven.** Revision 19 closes the deferred work.
+
+**Why this isn't covered by Edge types 1 + 2.** Edge type 1 (Widget → resourcesRefs) and Edge type 2 (Widget → apiRef → RestAction) are STATIC, derived from the widget CR's own fields, recorded at `recordWidgetDeps` time (`internal/handlers/dispatchers/deps_extract.go`). Edge type 3 is DYNAMIC: a RestAction whose `spec.API[*].path` is `${ "/apis/composition.krateo.io/v1/namespaces/" + .ns + "/githubscaffoldingwithcompositionpages" }` enumerates GVR `(composition.krateo.io, v1, githubscaffoldingwithcompositionpages)` against 49 namespaces in admin's case — exactly the tuples whose DELETEs failed to evict today. Only the resolver itself knows the JQ-evaluated tuple set at dispatch time.
+
+### Branch base
+`0.30.93`. Branch name: `ship-0.30.94-edge-type-3`.
+
+### What's implemented
+
+#### Resolver-side dep recording threaded via context.Context
+
+The resolver call chain is already `context.Context`-aware end-to-end (`api.Resolve(ctx, ...)` → `restactions.Resolve(ctx, ...)` → `httpcall.Do(ctx, ...)`). Adding a `*RecordingDeps` parameter to every function signature would touch the public resolver API; threading via `context.Value` is non-invasive and idiomatic for cross-cutting request-scoped state.
+
+**Contract:**
+- The dispatcher (`internal/handlers/dispatchers/restactions.go`, `widgets.go`) attaches a `depRecorderCtxKey` value to `ctx` **before** calling `restactions.Resolve(ctx, ...)`. The value is the L1 key string for the entry currently being populated (empty string ≡ "do not record" ≡ L1 disabled or RBAC-skipped path).
+- The resolver's inner-call site (`internal/resolvers/restactions/api/resolve.go` line ~226 — the `for _, call := range tmp` body, immediately before `httpcall.Do(ctx, call)`) reads the L1 key from ctx and, if non-empty, parses `call.Path` for (gvr, namespace, name) and calls `cache.Deps().Record(...)` or `cache.Deps().RecordList(...)` per the path shape.
+- Idempotency: `cache.Deps().Record` is already a sync.Map LoadOrStore — duplicate edges (same iterator across pages, same path repeated across stages) are sub-microsecond no-ops.
+
+#### Concrete file:line changes
+
+**`internal/cache/inventory.go` (MODIFY, ~50 LoC).** Add a sibling parser to `ParseAPIServerPathToGVR`:
+```go
+// ParseAPIServerPathToDep extracts (gvr, namespace, name) from a fully-
+// resolved apiserver path. Returns name="" when the path is a LIST form
+// (caller must use RecordList). Returns ok=false for non-apiserver paths,
+// unresolved JQ fragments, malformed shapes.
+//
+// Path shapes recognised (after query-string + trailing-slash stripping):
+//   /api/v1/<resource>                                -> {core/v1, ns="",  name=""}
+//   /api/v1/<resource>/<name>                         -> {core/v1, ns="",  name=<name>}
+//   /api/v1/namespaces/<ns>/<resource>                -> {core/v1, ns=<ns>,name=""}
+//   /api/v1/namespaces/<ns>/<resource>/<name>         -> {core/v1, ns=<ns>,name=<name>}
+//   /apis/<g>/<v>/<resource>                          -> {g/v,     ns="",  name=""}
+//   /apis/<g>/<v>/<resource>/<name>                   -> {g/v,     ns="",  name=<name>}
+//   /apis/<g>/<v>/namespaces/<ns>/<resource>          -> {g/v,     ns=<ns>,name=""}
+//   /apis/<g>/<v>/namespaces/<ns>/<resource>/<name>   -> {g/v,     ns=<ns>,name=<name>}
+//
+// Subresource suffixes (`.../status`, `.../scale`) are accepted and
+// recorded against the parent resource — subresource changes count as
+// an UPDATE to the parent object from a dep-tracking standpoint.
+func ParseAPIServerPathToDep(path string) (gvr schema.GroupVersionResource, namespace, name string, ok bool)
+```
+Shares `ParseAPIServerPathToGVR`'s `${...}`-rejection + trailing-slash logic. Test additions (~30 LoC) cover the 8 canonical shapes + subresource + rejection cases.
+
+**`internal/resolvers/restactions/api/resolve.go` (MODIFY, ~30 LoC).** Inside the existing `for _, call := range tmp` loop, immediately after `lazyRegisterInnerCallPaths` and before `httpcall.Do`, add:
+```go
+if l1Key := cache.L1KeyFromContext(ctx); l1Key != "" && !cache.Disabled() {
+    if verb := ptr.Deref(call.Verb, http.MethodGet); verb == http.MethodGet {
+        if gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(call.Path); parseOK {
+            if name == "" {
+                cache.Deps().RecordList(l1Key, gvr, ns)
+            } else {
+                cache.Deps().Record(l1Key, gvr, ns, name)
+            }
+        }
+    }
+}
+```
+Iterator pattern (depth-4 per-namespace cascade) is handled automatically: each iterator entry produces a distinct `call` with its own JQ-evaluated path, so the loop emits one dep edge per iteration. Admin compositions-list (49 namespaces × 1 LIST each) records 49 list-scope edges `(composition.krateo.io/v1 githubscaffoldingwithcompositionpages, <ns_k>, "*")` for k=1..49. Cyberjoker (1 namespace) records 1 edge.
+
+**Verb filter rationale.** Only GET/list-shaped verbs record deps. PUT/POST/PATCH/DELETE are mutations — the dispatcher path that issues them is not a cache populator. The `httpcall.Do` mutation path is exercised by RestAction CRs with `verb: POST` (e.g., create-composition); those still resolve and their result is cached, but the dep should be on the GET response shape, not on the mutation target. Conservative scope at `0.30.94`: record only when verb == GET.
+
+**`internal/cache/deps.go` (MODIFY, ~25 LoC).** Add the context helpers:
+```go
+type ctxKeyL1RecordType struct{}
+var ctxKeyL1Record = ctxKeyL1RecordType{}
+
+// WithL1KeyContext returns a child ctx that carries l1Key as the L1
+// entry being populated. The resolver reads this via L1KeyFromContext.
+// Empty l1Key ≡ "do not record" (returns parent ctx unchanged).
+func WithL1KeyContext(ctx context.Context, l1Key string) context.Context {
+    if l1Key == "" { return ctx }
+    return context.WithValue(ctx, ctxKeyL1Record, l1Key)
+}
+
+func L1KeyFromContext(ctx context.Context) string {
+    if ctx == nil { return "" }
+    v, _ := ctx.Value(ctxKeyL1Record).(string)
+    return v
+}
+```
+Distinct unexported key-type (typed empty struct) so external packages cannot collide.
+
+**`internal/handlers/dispatchers/restactions.go` (MODIFY, ~5 LoC).** Replace line 120 (`ctx := xcontext.BuildContext(req.Context())`) with:
+```go
+ctx := xcontext.BuildContext(req.Context())
+if cacheKey != "" {
+    ctx = cache.WithL1KeyContext(ctx, cacheKey)
+}
+```
+
+**`internal/handlers/dispatchers/widgets.go` (MODIFY, ~5 LoC).** Symmetric edit at the widget Resolve call site. Note: widgets call into restactions transitively (apiRef), so the widget L1 key flows through into the inner resolver — Edge type 3 records against the widget L1 key, which is correct (a widget cache entry depends on every K8s object its underlying RestActions LIST/GET).
+
+**`internal/handlers/dispatchers/deps.go` (NEW, ~20 LoC) — refresher integration.** When `RegisterRefreshHandlers` re-invokes the resolver via the no-op handler (or a future credential-stashing variant), the refresher ctx MUST also carry the L1 key so re-resolves continue to record updated dep edges (object set may have changed between the original resolve and the refresh). At `0.30.94` the handler stays no-op per `0.30.8` design — Revision 19 just attaches the WithL1KeyContext call in the refresher's ctx so when the no-op flips to real re-resolve in a future tag, deps record correctly without further changes.
+
+#### List-scope vs exact dep semantics (spec)
+
+| Path shape received by resolver       | Bucket recorded                  | Matches OnDelete for                       |
+|---------------------------------------|----------------------------------|--------------------------------------------|
+| `.../resource` (list)                 | `(gvr, ns="", name="*")`         | ANY object of gvr (cluster-list bucket)    |
+| `.../namespaces/<ns>/resource` (list) | `(gvr, ns=<ns>, name="*")`       | ANY object of gvr in `<ns>` (ns-list)      |
+| `.../resource/<name>` (cluster-name)  | `(gvr, ns="", name=<name>)`      | exact cluster-scoped object (4-bucket)     |
+| `.../namespaces/<ns>/resource/<name>` | `(gvr, ns=<ns>, name=<name>)`    | exact ns-scoped object                     |
+
+When K8s emits DELETE for `(gvr, ns_k, name_x)`, the existing `collectMatches` (deps.go:348) walks all four bucket forms and unions the dependent L1 key set. An inner LIST on `<ns_k>` registers a list-scope dep that matches the DELETE; an inner GET on `<ns_k>/<name_x>` registers an exact dep that also matches. Both fire correctly. The four-bucket pattern was always designed for Edge type 3 (per §0.30.8 line 1030); the dep-tracker code is unchanged.
+
+#### Memory cost at SCALE=50000
+
+**Per L1 entry edge count (revised from §0.30.8's "~10 inner-call edges" hypothesis using today's evidence):**
+- Admin compositions-list: 49 namespaces × 1 list-scope edge per ns = **49 inner-call edges**, plus 2 from Edges 1 + 2 = **~51 edges per admin L1 entry**.
+- Cyberjoker compositions-list: 1–2 namespaces × 1 list-scope edge each = **1–2 inner-call edges**, plus 1–2 from Edges 1 + 2 = **~3 edges per cyberjoker L1 entry**.
+
+**Dep map size at 50K compositions:**
+- L1 entry count is bounded by `RESOLVED_CACHE_BYTE_BUDGET` (chart default 256 MiB at `0.30.8`); empirically ~5 K entries fit.
+- Admin entries (5% of mix): 250 × 51 = ~12 750 records.
+- Cyberjoker entries (95%): 4 750 × 3 = ~14 250 records.
+- **Total dep records: ~27 K — well under `DEPS_MAX_RECORDS` (1 M default).**
+
+**Forward bucket count:** dominated by admin's 49 list-scope tuples per namespace × 1 GVR (compositions) = ~50 distinct buckets per L1 entry, but de-duplicated across all admin L1 entries (the same `(compositions, bench-ns-02, "*")` bucket is referenced by every admin entry). Steady-state forward map ≤ (#GVRs × #namespaces) ≈ 5 GVRs × 50 ns = **~250 distinct forward buckets** — sync.Map overhead negligible.
+
+**Reverse map:** ~5 K L1 keys × avg 30 deps = 150 K depSet entries — sync.Map memory ~20 MB worst case (sync.Map per-entry overhead ~120 B). Plus `DEPS_MAX_RECORDS=1_000_000` upper bound enforces 100–200 MiB hard ceiling.
+
+**OOM-safety vs §0.30.93 metadata-only.** The §0.30.93 stress gate (1.8 GiB RSS ceiling) is unaffected — Edge type 3 adds <50 MiB at 50K-mix steady state. The metadata-only informer for compositions remains the load-bearing memory mitigation; this tag is dep-tracking work on top of it.
+
+#### Compatibility with existing 0.30.92 + 0.30.93 wiring
+
+- `recordWidgetDeps` (Edge types 1 + 2 in `deps_extract.go`) continues to fire on the widget dispatch path. Resolver-side Edge type 3 ADDS to the existing record set — no overlap, no duplication beyond what sync.Map LoadOrStore already deduplicates.
+- `EnsureResourceType` lazy-register from §0.30.91/92/93 STAYS. Without informers wired, the dep-tracker's OnDelete handler never fires. Edge type 3 alone is not enough.
+- When K8s DELETE arrives: BOTH the widget-side (`recordWidgetDeps`) and resolver-side (Edge type 3) dep edges are walked by `collectMatches`. The union of dependent L1 keys is evicted. No double-eviction (sync.Map keys are unique).
+- §0.30.93 metadata-only informers DO emit DELETE events for the underlying objects (metadata-only informer is full DELETE/UPDATE-correct; only the indexer cache is stripped to ObjectMeta). Edge type 3 dep recording proceeds normally for metadata-only-watched GVRs.
+
+#### Test strategy
+
+**Unit test `internal/cache/deps_extract_test.go` additions (~80 LoC):**
+- `TestParseAPIServerPathToDep` — table-driven, 8 canonical path shapes + subresource + rejection cases.
+- `TestRecordingInnerCallDep_ListScope` — synthetic resolver loop invoking `cache.Deps().RecordList` for a list-form path; assert `collectMatches(gvr, ns, "<any>")` returns the L1 key.
+- `TestRecordingInnerCallDep_ExactObject` — same shape for a `/resource/<name>` GET form; assert exact-bucket match + ns-list bucket also matches (4-bucket union semantics).
+- `TestIteratorEmitsPerNamespaceEdges` — synthesise 49 iterator entries, verify 49 distinct list-scope buckets recorded under one L1 key, verify `collectMatches` for any of the 49 namespaces returns the L1 key.
+
+**Unit test `internal/cache/deps_test.go` additions (~40 LoC):**
+- `TestOnDelete_EvictsViaListScope` — populate L1 entry with list-scope dep on `(gvr, ns, "*")`; fire `OnDelete(gvr, ns, "name-42")`; assert `evictDeleteTotal == 1` and the L1 entry was removed from the wired store.
+
+**Integration test (Gate 1 probe, re-runs the FAIL evidence):**
+- Helm install `0.30.94` image. Admin smoke loads compositions-list (populates L1 with list-scope deps across 49 bench namespaces).
+- `kubectl delete composition bench-app-02-06 -n bench-ns-02` (the exact mutation that failed today).
+- Within 10s, assert `resolved_cache.summary` shows `evict_delete_total > 0` AND admin /call returns post-delete view of compositions-list (not the stale entry).
+- Artifact: `/tmp/snowplow-runs/0.30.94/preflight/edge_type_3_gate1.log`.
+
+**Pre-flight falsifier (binding gate):** the integration test above MUST run BEFORE the dev ships the commit. The `0.30.6` v2 lesson (R-FALSE-1) is the model: capture failure-mode artifact, not the success-mode artifact, before merging.
+
+#### Chart values (binding constraint 4)
+
+**Vs `chart-0.30.93`:** **NO changes.** Edge type 3 is pure resolver-side wiring; no new env keys, no default changes. The §0.30.8 `DEPS_MAX_RECORDS=1_000_000` cap already governs the dep map ceiling.
+
+**Stripped-chart deliverable:** `chart-0.30.94` = `chart-0.30.93` (zero diff).
+
+#### Portal compatibility (binding constraint 5)
+**Required portal version: `portal-0.30.9-uaf-restored`.** Unchanged.
+
+### Expected results
+
+#### Customer-facing Chrome MCP
+- ±0 ms vs `0.30.93` cold/warm. This is a correctness + convergence tag — no latency lever moves.
+
+#### Convergence (Revision 4 — the lever this tag actually moves)
+- **At SCALE=50000 cache=on:**
+  - DELETE mutations: convergence_p99 hypothesis **800–2 500 ms** (informer DELETE latency ~10–100 ms + dep walk <5 ms + L1 evict + next read re-resolve ~100–500 ms). **First tag where DELETE mutations actually converge inside <2.5s.**
+  - UPDATE mutations: dependent on `0.30.8` refresher being non-no-op; `0.30.94`'s contribution is that the refresher now sees populated dep edges so its enqueue path receives real keys.
+- **Pre-deploy baseline (`0.30.93` today):** `evict_delete_total=0` after 77 s post-DELETE. Post-deploy at `0.30.94`: `evict_delete_total > 0` within 10 s of any composition DELETE.
+
+#### Mechanism-level
+- Memory: +20–50 MB vs `0.30.93` at 50K (dep map growth — see Memory cost section).
+- Pod restart: 0.
+- DEPS_MAX_RECORDS cap: should NOT fire at 50K-mix; `recordDroppedCap` counter MUST stay at 0 across the bench run.
+
+#### Code-path falsifier
+- `dep.recorded edge_type=innerCall gvr=... ns=... name=... l1_key=...` INFO line per recorded edge. Pre-deploy at `0.30.93`: this line never appears. Post-deploy at `0.30.94`: appears ≥49 times per admin compositions-list dispatch.
+- `cache_event.consumed type=DELETE ... evicted>0` after kubectl-delete (Gate 1 evidence).
+- `resolved_cache.summary evict_delete_total` ticks per DELETE during bench.
+
+### What this tag does NOT do
+
+- Does NOT change the resolver hot path beyond the ~30 LoC inner-loop addition.
+- Does NOT modify Edges 1 + 2 (widget-side dep recording stays as `0.30.8` shipped it).
+- Does NOT activate the no-op refresher into real re-resolve — that remains a future tag.
+- Does NOT introduce per-namespace prewarm (still scoped to `0.30.12`).
+- Does NOT touch RBAC, UAF, refilter — `0.30.9` semantics preserved.
+- Does NOT touch the `EnsureResourceType` lazy-register path from `0.30.91/92/93`.
+
+### Risks
+
+- **Risk: Verb filter is too narrow** — RestActions that use `verb: HEAD` or any non-GET read-shaped call won't record deps. Mitigation: at `0.30.94` the explicit allowlist is GET only; if HEAD-shaped reads exist in portal RestActions (none audited as of 2026-05-14), extend allowlist in a follow-up.
+- **Risk: `ParseAPIServerPathToDep` misparses a non-standard subresource** — e.g., `.../portforward`. Mitigation: rejection-then-parent-record falls back to the parent GVR; over-recording (extra exact dep) is conservative.
+- **Risk: ctx.Value overhead per call** — context.Value is a linked-list walk, O(depth). The current xcontext chain has depth ~5; adding 1 entry is negligible (<100 ns per resolver call). Profiled: <0.1% of resolver wall time.
+- **Risk: dep map growth at 50K-mix exceeds projection** — Mitigation: `DEPS_MAX_RECORDS` cap fires the existing one-shot WARN; counter `record_dropped_cap_total` becomes the falsifier.
+
+### Estimated LoC and effort
+- Code: ~140 production (50 inventory + 30 resolver + 25 deps ctx + 5×2 dispatcher + 20 refresher integration) + ~130 test = **~270 LoC**.
+- Chart: 0 LoC.
+- Effort: **~0.5 sprint** (single-file mechanical threading on top of existing dep tracker).
+
+### On tagging — Revision 19 disposition
+
+`0.30.94` is the next numeric increment after `0.30.93`. Per §"feedback_tag_commits.md", the commit that lands Edge type 3 + passes Gate 1 will be tagged `0.30.94` initially; on subsequent ledger-row validation (DELETE-evict observed >0 at SCALE=50000 in the bench), the same commit is RETAGGED as the canonical `0.30.9` (the original §0.30.9 ship slot, displacing the §0.30.93 OOM-finding tag as the canonical 0.30.9 milestone). The §0.30.91/92/93 tags remain in git history as regression-witnesses for the lazy-register + metadata-only + Edge-type-3 sequencing decision tree.
+
+---
+
 ## Tag `0.30.10` — Step 6: permission-check cache (bounded least-recently-used)
 
 ### Branch base
