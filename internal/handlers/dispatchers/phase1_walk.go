@@ -18,11 +18,11 @@
 //   2. Recursively resolve the navigation widget tree under the snowplow
 //      service-account identity through the STANDARD widget resolver.
 //      Each resolved widget returns `status.resourcesRefs.items[]`; every
-//      item whose `verb == "GET"` (and `allowed == true`) is itself a
-//      `/call?...` widget endpoint — the walker fetches that child widget
-//      CR and recurses into it. Recursion proceeds Root -> Route -> Page
-//      -> Row/Column -> DataGrid/Table leaf. A visited-set keyed on the
-//      child widget endpoint dedupes shared subtrees and prevents cycles.
+//      item whose `verb == "GET"` is itself a `/call?...` widget endpoint
+//      — the walker fetches that child widget CR and recurses into it.
+//      Recursion proceeds Root -> Route -> Page -> Row/Column ->
+//      DataGrid/Table leaf. A visited-set keyed on the child widget
+//      endpoint dedupes shared subtrees and prevents cycles.
 //
 //      WHY verb == "GET" ONLY (load-bearing — correctness AND safety):
 //      a non-GET resourcesRefs item is a mutation/action endpoint
@@ -31,6 +31,15 @@
 //      edge that is not navigation and (b) — the SA walk runs with
 //      privileged service-account credentials — issue a DESTRUCTIVE
 //      apiserver mutation. The walk MUST stay strictly read-only.
+//
+//      WHY the `allowed` flag is NOT a recursion gate: it is rbac.UserCan
+//      for the CURRENT identity, and the Phase 1 SA holds no `get` grant
+//      on the navigation widget CRs — so under the SA every child is
+//      allowed=false. Gating on it prunes the whole tree at the first
+//      Route and the composition informer never registers. Phase 1 is
+//      identity-independent informer DISCOVERY, not per-user rendering;
+//      the `allowed` render gate belongs at real request time. See
+//      walkShouldRecurse for the full rationale.
 //   3. As the RESTAction resolver processes inner-call paths (fired when
 //      the recursion reaches an apiRef-bearing leaf such as the
 //      Compositions Page DataGrid), the flag-independent
@@ -513,9 +522,11 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		// SAFETY + CORRECTNESS gate: recurse ONLY into GET refs that are
-		// allowed and carry a path. walkShouldRecurse is the single
-		// auditable predicate (see its doc).
+		// SAFETY + CORRECTNESS gate: recurse ONLY into verb=="GET" refs
+		// that carry a path. walkShouldRecurse is the single auditable
+		// predicate — see its doc for why verb=="GET" is the load-bearing
+		// read-only invariant and why `allowed` is deliberately NOT a
+		// gate here (the SA walk is RBAC-denied on every nav widget).
 		if !walkShouldRecurse(child) {
 			continue
 		}
@@ -566,22 +577,48 @@ type navChildRef struct {
 }
 
 // walkShouldRecurse is the single, auditable predicate the recursive
-// walk applies before descending into a resourcesRefs child. It is
-// load-bearing on BOTH correctness and safety:
+// walk applies before descending into a resourcesRefs child.
 //
-//   - verb == "GET" (case-insensitive): a non-GET resourcesRefs item is
-//     a mutation/action endpoint (POST/PUT/PATCH/DELETE) bound to a
-//     widget's `actions`, never part of the navigation/render tree.
-//     Recursing into it is wrong navigation — AND, because the Phase 1
-//     walk runs with the snowplow service account's PRIVILEGED
-//     credentials, following such a ref would issue a DESTRUCTIVE
-//     apiserver mutation. The walk MUST stay strictly read-only.
-//   - allowed == true: mirrors the frontend WidgetRenderer's
-//     items.filter(({allowed})=>allowed) — a not-allowed child is not
-//     rendered, so it is not part of the navigation surface to warm.
-//   - a non-empty path: nothing to fetch/recurse into otherwise.
+// THE LOAD-BEARING GATE — verb == "GET" (case-insensitive):
+//
+//	A non-GET resourcesRefs item is a mutation/action endpoint
+//	(POST/PUT/PATCH/DELETE) bound to a widget's `actions`, never part of
+//	the navigation/render tree. Recursing into it is wrong navigation —
+//	AND, because the Phase 1 walk runs with the snowplow service
+//	account's PRIVILEGED credentials, following such a ref would issue a
+//	DESTRUCTIVE apiserver mutation. verb == "GET" alone fully guarantees
+//	the walk stays strictly read-only: a GET is non-destructive
+//	regardless of any RBAC verdict.
+//
+// WHY `allowed` is DELIBERATELY NOT a recursion gate (0.30.105
+// on-cluster finding):
+//
+//	The `allowed` flag a resolved resourcesRefs item carries is
+//	rbac.UserCan evaluated for the CURRENT context identity. The Phase 1
+//	walk's identity is the snowplow SERVICE ACCOUNT, which holds no
+//	RoleBinding granting `get` on the navigation widget CRs — so under
+//	the SA every navigation child resolves allowed=false. Gating the
+//	recursion on allowed==true therefore prunes the ENTIRE tree at the
+//	first Route level: the walk never reaches the Compositions Page
+//	DataGrid and the composition.krateo.io informer is never registered
+//	(exactly the 0.30.104 failure this release exists to fix; the first
+//	0.30.105 on-cluster bench reproduced it when this gate was applied).
+//
+//	The frontend WidgetRenderer applies items.filter(({allowed})=>allowed)
+//	because a denied widget must not RENDER for that logged-in user. But
+//	Phase 1 is informer DISCOVERY, not rendering — informer registration
+//	is identity-independent: the composition informer the Compositions
+//	Page needs is the same object set no matter which user can see it.
+//	The walk must discover the full GET-navigation STRUCTURE; the
+//	per-user `allowed` render gate is correctly applied later, at real
+//	request time, not during startup warmup. Dropping `allowed` here
+//	does NOT weaken the read-only guarantee — verb == "GET" is the sole
+//	safety invariant and it is independent of RBAC.
+//
+// Also requires a non-empty path — nothing to fetch/recurse into
+// otherwise.
 func walkShouldRecurse(child navChildRef) bool {
-	return strings.EqualFold(child.Verb, "GET") && child.Allowed && child.Path != ""
+	return strings.EqualFold(child.Verb, "GET") && child.Path != ""
 }
 
 // extractResourcesRefsItems reads status.resourcesRefs.items[] from a

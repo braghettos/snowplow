@@ -138,10 +138,20 @@ func TestExtractResourcesRefsItems(t *testing.T) {
 // would issue a DESTRUCTIVE apiserver mutation. This test asserts the
 // exact predicate the walk applies before recursing into a child:
 //
-//	recurse  IFF  verb == "GET" (case-insensitive)  AND  allowed == true
+//	recurse  IFF  verb == "GET" (case-insensitive)  AND  path != ""
 //
-// A regression that drops the verb filter — letting the SA walk follow a
+// verb == "GET" is the SOLE load-bearing read-only invariant. A
+// regression that drops the verb filter — letting the SA walk follow a
 // POST/PUT/PATCH/DELETE action ref — fails here.
+//
+// `allowed` is DELIBERATELY NOT a gate: it is rbac.UserCan for the walk's
+// identity, and the Phase 1 SA holds no `get` grant on navigation widget
+// CRs — so under the SA every child resolves allowed=false. Gating on it
+// would prune the whole tree at the first Route and the composition
+// informer would never register (the 0.30.104 failure 0.30.105 fixes).
+// A GET ref with allowed=false MUST still be recursed: see
+// walkShouldRecurse. A regression that re-adds the allowed gate fails the
+// `{"GET", false, true}` case here.
 func TestWalkFilter_GETOnly(t *testing.T) {
 	cases := []struct {
 		verb        string
@@ -149,9 +159,10 @@ func TestWalkFilter_GETOnly(t *testing.T) {
 		wantRecurse bool
 	}{
 		{"GET", true, true},
-		{"get", true, true}, // case-insensitive
-		{"GET", false, false},
+		{"get", true, true},  // case-insensitive
+		{"GET", false, true}, // allowed=false GET MUST still recurse (SA walk is RBAC-denied)
 		{"POST", true, false},
+		{"POST", false, false},
 		{"PUT", true, false},
 		{"PATCH", true, false},
 		{"DELETE", true, false},
@@ -162,8 +173,12 @@ func TestWalkFilter_GETOnly(t *testing.T) {
 		got := walkShouldRecurse(ref)
 		if got != tc.wantRecurse {
 			t.Errorf("verb=%q allowed=%v: shouldRecurse=%v, want %v "+
-				"(non-GET refs are mutation/action endpoints — the SA walk MUST NOT follow them)",
+				"(verb==GET is the sole read-only invariant; allowed is NOT a gate)",
 				tc.verb, tc.allowed, got, tc.wantRecurse)
 		}
+	}
+	// An empty path is never recursable regardless of verb.
+	if walkShouldRecurse(navChildRef{Verb: "GET", Path: ""}) {
+		t.Error("a GET ref with empty path must NOT be recursed — nothing to fetch")
 	}
 }
