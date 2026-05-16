@@ -108,58 +108,55 @@ var customResourceDefinitionGVR = schema.GroupVersionResource{
 	Resource: "customresourcedefinitions",
 }
 
-// routesLoadersGVR is the GVR of the `routesloaders` widget CR — one of
-// the two navigation roots. Phase 1 LISTs every routesloaders CR
-// cluster-wide and resolves each; the resolution discovers all
-// downstream business GVRs.
+// routesLoadersGVR is the GVR of the `routesloaders` widget CR.
 //
-// Per feedback_no_special_cases.md: the routesloaders GVR is the bare
-// navigation-root anchor, not a per-resource carve-out. It is hardcoded
-// because the navigation surface HAS to start somewhere — the frontend's
-// route loader is that fixed entry point. Every GVR reached FROM it is
-// discovered, never named.
+// 0.30.107 — this is NO LONGER a root-SELECTION driver. The navigation
+// roots Phase 1 walks are read from the frontend ConfigMap at runtime
+// (config.json .api.INIT / .api.ROUTES_LOADER — see
+// dispatchers/phase1_roots.go); the resource name `routesloaders` is
+// never a Go literal in that selection path. This GVR remains ONLY as a
+// meta-query INFORMER-ANCHOR seed: the watcher pre-registers an informer
+// for this resource type so that a `/call` to a routesloaders CR can be
+// served from cache rather than the apiserver. It is the informer-warming
+// anchor, not "where navigation starts".
+//
+// Per feedback_no_special_cases.md: a bare informer-anchor seed for a
+// well-known navigation resource type, not a per-resource carve-out and
+// not a root-selection special-case.
 var routesLoadersGVR = schema.GroupVersionResource{
 	Group:    "widgets.templates.krateo.io",
 	Version:  "v1beta1",
 	Resource: "routesloaders",
 }
 
-// navMenusGVR is the GVR of the `navmenus` widget CR — the SECOND
-// navigation root (0.30.105). The portal frontend `/call`s exactly two
-// entry-point widget CRs on login:
+// navMenusGVR is the GVR of the `navmenus` widget CR.
 //
-//	INIT          = navmenus/sidebar-nav-menu   (the sidebar nav tree)
-//	ROUTES_LOADER = routesloaders/routes-loader (the route tree)
+// 0.30.107 — like routesLoadersGVR, this is NO LONGER a root-SELECTION
+// driver: the navigation roots come from the frontend ConfigMap's
+// config.json (.api.INIT). This GVR remains ONLY as a meta-query
+// INFORMER-ANCHOR seed so a `/call` to a navmenus CR can be served from
+// the informer cache. The resource name `navmenus` is never a Go literal
+// in the root-selection path.
 //
-// (see frontend src/components/Sidebar/Sidebar.tsx + src/widgets/NavMenu/
-// NavMenu.tsx.) Phase 1's pre-0.30.105 walk seeded ONLY routesLoadersGVR
-// and resolved just the navigation ROOT — it never recursed route→page→
-// widget→apiRef, so the heavy `composition.krateo.io` informer behind the
-// Compositions Page DataGrid was never registered. 0.30.105 adds this
-// second root AND a recursive widget-tree walker.
-//
-// Per feedback_no_special_cases.md: navmenus is an ENTRY-POINT GVR in the
-// `widgets.templates.krateo.io` group derived from the frontend config
-// contract — NOT a business GVR. It is the bare anchor for the other
-// half of the navigation surface, exactly as routesLoadersGVR is for the
-// first. Every GVR reached FROM either root is discovered, never named.
+// Per feedback_no_special_cases.md: a bare informer-anchor seed, not a
+// per-resource carve-out.
 var navMenusGVR = schema.GroupVersionResource{
 	Group:    "widgets.templates.krateo.io",
 	Version:  "v1beta1",
 	Resource: "navmenus",
 }
 
-// RoutesLoadersGVR exposes the routesloaders navigation-root GVR to the
-// Phase 1 walk driver (which lives in the dispatchers package — widget
-// resolution is there). Read-only accessor; the value is a hardcoded
-// meta-query seed.
+// RoutesLoadersGVR exposes the routesloaders meta-query informer-anchor
+// seed. Read-only accessor. 0.30.107: no longer consumed by the Phase 1
+// root-selection path (roots come from the frontend ConfigMap) — retained
+// for the seed-set and its falsifier test.
 func RoutesLoadersGVR() schema.GroupVersionResource {
 	return routesLoadersGVR
 }
 
-// NavMenusGVR exposes the navmenus navigation-root GVR to the Phase 1
-// walk driver. Read-only accessor; the value is a hardcoded meta-query
-// seed (the second entry-point root, 0.30.105).
+// NavMenusGVR exposes the navmenus meta-query informer-anchor seed.
+// Read-only accessor. 0.30.107: no longer consumed by the Phase 1
+// root-selection path.
 func NavMenusGVR() schema.GroupVersionResource {
 	return navMenusGVR
 }
@@ -171,13 +168,17 @@ func CustomResourceDefinitionGVR() schema.GroupVersionResource {
 
 // MetaQuerySeeds returns the COMPLETE hardcoded seed budget for Tag B —
 // EXACTLY these 8 GVRs, nothing else (feedback_no_special_cases.md is a
-// hard requirement here):
+// hard requirement here). Every entry is a meta-query INFORMER-ANCHOR
+// seed: the watcher pre-registers an informer for the resource type so a
+// `/call` to one of these can be served from cache. None of them is a
+// root-SELECTION driver — the navigation roots come from the frontend
+// ConfigMap (config.json .api.INIT / .api.ROUTES_LOADER; see
+// dispatchers/phase1_roots.go).
 //
-//  1. routesloaders            — the first navigation root Phase 1 LISTs.
-//  2. navmenus                 — the second navigation root (0.30.105).
-//     Both are entry-point widget CRs in the widgets.templates.krateo.io
-//     group, derived from the frontend config contract (INIT +
-//     ROUTES_LOADER) — NOT business GVRs.
+//  1. routesloaders            — informer-anchor for the routesloaders
+//     widget type. 0.30.107: no longer a root-selection literal.
+//  2. navmenus                 — informer-anchor for the navmenus widget
+//     type. 0.30.107: no longer a root-selection literal.
 //  3. restactions              — the restActionGVR anchor (already cited
 //     by inventory.go; the resolver's apiRef edges target it).
 //  4. customresourcedefinitions — the CRD-watch root (Part 2).
@@ -187,10 +188,10 @@ func CustomResourceDefinitionGVR() schema.GroupVersionResource {
 //     auditable source of truth).
 //
 // Every BUSINESS GVR — widgets, panels, compositions — is ABSENT from
-// this set by construction. Those are discovered by RESOLVING the two
-// navigation roots, never named in code. A test asserts this slice has
-// exactly 8 entries and that none of them is a composition/widget/panel
-// business GVR.
+// this set by construction. Those are discovered by RESOLVING the
+// ConfigMap-derived navigation roots, never named in code. A test
+// asserts this slice has exactly 8 entries and that none of them is a
+// composition/widget/panel business GVR.
 func MetaQuerySeeds() []schema.GroupVersionResource {
 	seeds := []schema.GroupVersionResource{
 		routesLoadersGVR,
@@ -488,4 +489,35 @@ func InternalRESTConfigFromContext(ctx context.Context) (any, bool) {
 		return nil, false
 	}
 	return v, true
+}
+
+// IsInternalDispatch reports whether ctx is driven by an internal/startup
+// driver — today, Phase 1's SA-credentialed resolution walk. It is true
+// iff WithInternalRESTConfig attached an internal-dispatch *rest.Config
+// (the SINGLE marker the walk sets on every resolution context it builds;
+// see resolveNavigationRoot in dispatchers/phase1_walk.go).
+//
+// WHY a dedicated predicate: the resolver pivot's per-user RBAC narrowing
+// (filterListByRBAC / filterGetByRBAC) is keyed on the REQUEST USER
+// identity against the Krateo Role/RoleBinding CRs. Phase 1 resolves
+// under the snowplow service account, which carries NO Krateo RBAC CRs,
+// so that narrowing default-denies and silently empties every
+// informer-served LIST inside an apiRef RESTAction — the navmenu's
+// `navmenuitems` LIST returns zero items and the navigation descent dies
+// before it reaches the Compositions DataGrid. Phase 1 is identity-
+// independent informer DISCOVERY, not per-user rendering: the pivot's
+// RBAC filter must NOT narrow an internal-dispatch read. The per-user
+// `allowed` render gate is correctly applied later, at real request time.
+//
+// SECURITY — this can NEVER widen a real user's view: an ordinary
+// per-user request never calls WithInternalRESTConfig, so
+// IsInternalDispatch is false on every request path. Only Phase 1's
+// startup walk sets the marker, and Phase 1 DISCARDS its resolution
+// output (it populates no L1, persists no status) — the unfiltered
+// bytes never reach a user. The bypass is uniform over every GVR
+// (feedback_no_special_cases.md): one context-state predicate, no
+// per-resource carve-out.
+func IsInternalDispatch(ctx context.Context) bool {
+	_, ok := InternalRESTConfigFromContext(ctx)
+	return ok
 }

@@ -9,12 +9,18 @@
 // meta-query seed budget, and the CRD-watch (Part 2); main.go owns the
 // startup wiring.
 //
-// THE WALK (Part 1, recursive as of 0.30.105):
-//   1. LIST every navigation-root widget CR cluster-wide (SA dyn client).
-//      There are TWO roots — `routesloaders` and `navmenus` — both
-//      entry-point widget CRs in the widgets.templates.krateo.io group.
-//      They are the frontend's two `/call` login entry points
-//      (ROUTES_LOADER + INIT).
+// THE WALK (Part 1, recursive as of 0.30.105; ConfigMap-derived roots as
+// of 0.30.107):
+//   1. READ the navigation roots from the frontend ConfigMap (NOT a
+//      hardcoded GVR LIST). The frontend ConfigMap's `config.json`
+//      declares the two `/call` entry points the frontend itself
+//      dispatches on login — `.api.INIT` and `.api.ROUTES_LOADER`. Phase
+//      1 parses each `/call?resource=...&apiVersion=...&name=...&
+//      namespace=...` URL into an ObjectReference and fetches those EXACT
+//      two widget CRs as the navigation roots. The resource names
+//      (`navmenus`, `routesloaders`) appear NOWHERE as Go literals — they
+//      arrive at runtime from config.json. If the frontend changes its
+//      INIT widget, Phase 1 follows automatically. See phase1_roots.go.
 //   2. Recursively resolve the navigation widget tree under the snowplow
 //      service-account identity through the STANDARD widget resolver.
 //      Each resolved widget returns `status.resourcesRefs.items[]`; every
@@ -58,10 +64,13 @@
 // CRITICAL — feedback_no_special_cases.md: Phase 1 seeds ONLY from the
 // two resolved navigation roots. There is NO configured widget-GVR list
 // and NO configured RESTAction list. RESTActions + downstream GVRs are
-// discovered purely by recursively resolving the routesloaders / navmenus
-// roots — an orphan RESTAction wired to no navigation page is never
-// reached and never registers an informer. The ONLY named GVRs are the
-// two entry-point roots; they ARE the frontend config contract.
+// discovered purely by recursively resolving the navigation roots — an
+// orphan RESTAction wired to no navigation page is never reached and
+// never registers an informer. The two roots themselves are NOT Go
+// literals either: they are read from the frontend ConfigMap's
+// config.json (.api.INIT / .api.ROUTES_LOADER) — the navigation contract.
+// The ConfigMap pointer is config too (FRONTEND_CONFIG_CONFIGMAP env var
+// + AUTHN_NAMESPACE). See phase1_roots.go.
 //
 // BEHAVIOR-NEUTRAL — the whole walk runs only when cache.PrewarmEnabled()
 // (PREWARM_ENABLED=true). main.go does not call Phase1Warmup otherwise.
@@ -78,15 +87,13 @@ import (
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/plumbing/jwtutil"
+	"github.com/krateoplatformops/plumbing/maps"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	idynamic "github.com/krateoplatformops/snowplow/internal/dynamic"
 	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
-	"github.com/krateoplatformops/plumbing/maps"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8sdynamic "k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 )
@@ -124,9 +131,10 @@ type rootResolver func(ctx context.Context, root *unstructured.Unstructured) err
 //     restactions / customresourcedefinitions + the 4 RBAC GVRs);
 //   - start the CRD-watch (Part 2) so composition informers spawn as
 //     their CRDs are observed for navigation-discovered groups;
-//   - LIST every routesloaders AND navmenus CR and recursively resolve
-//     each navigation tree under SA identity — the resolution
-//     auto-registers an informer per touched GVR;
+//   - READ the navigation roots from the frontend ConfigMap (config.json
+//     .api.INIT / .api.ROUTES_LOADER) and recursively resolve each
+//     navigation tree under SA identity — the resolution auto-registers
+//     an informer per touched GVR;
 //   - let the registered set settle (the CRD-watch may still be adding
 //     composition informers after the walk's last resolve);
 //   - WaitAllInformersSynced — block until every registered informer
@@ -171,8 +179,20 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 		return dynErr
 	}
 
+	// The navigation-config namespace: snowplow's control-plane namespace
+	// — the same authn-namespace it already runs in / authenticates
+	// against. It is NOT a Go constant: it flows from the AUTHN_NAMESPACE
+	// chart value via main.go's --authn-namespace flag.
+	cfgNamespace := authnNS
+
+	// listNavigationRootsFromConfigMap fetches the frontend ConfigMap and
+	// the two named root CRs via objects.Get, which honours the
+	// internal-dispatch context. So the lister runs under the same
+	// SA-credentialed context the per-root resolver uses — built here
+	// once via withPhase1SAContext.
 	lister := func(lctx context.Context) ([]*unstructured.Unstructured, error) {
-		return listNavigationRoots(lctx, dynCli)
+		return listNavigationRootsFromConfigMap(
+			withPhase1SAContext(lctx, *saEP, rc), dynCli, cfgNamespace)
 	}
 	resolver := func(rctx context.Context, root *unstructured.Unstructured) error {
 		return resolveNavigationRoot(rctx, root, *saEP, rc, authnNS)
@@ -208,7 +228,9 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 	// for groups Phase 1's walk has fed into the auto-discover set.
 	rw.StartCRDWatch(ctx)
 
-	// Step 3 — LIST the navigation roots (routesloaders + navmenus).
+	// Step 3 — READ the navigation roots from the frontend ConfigMap
+	// (config.json .api.INIT / .api.ROUTES_LOADER → the two named root
+	// widget CRs). No hardcoded GVR LIST.
 	roots, listErr := lister(ctx)
 	if listErr != nil {
 		log.Warn("phase1.warmup.roots_list_failed",
@@ -347,73 +369,6 @@ func rootKey(root *unstructured.Unstructured) string {
 	return ns + "/" + root.GetName()
 }
 
-// navigationRootListPageLimit bounds each page of a navigation-root LIST
-// so the apiserver does not stream an unbounded response — mirrors the
-// listPageLimit policy the informer factory uses.
-const navigationRootListPageLimit int64 = 500
-
-// listNavigationRoots LISTs every navigation-root CR cluster-wide via the
-// SA dynamic client: BOTH the routesloaders GVR and the navmenus GVR
-// (0.30.105). A LIST error on one root GVR does not suppress the other —
-// the per-GVR error is returned only if BOTH fail; a partial result is
-// still walkable.
-func listNavigationRoots(ctx context.Context, dynCli k8sdynamic.Interface) ([]*unstructured.Unstructured, error) {
-	gvrs := []schema.GroupVersionResource{
-		cache.RoutesLoadersGVR(),
-		cache.NavMenusGVR(),
-	}
-	var (
-		out     []*unstructured.Unstructured
-		lastErr error
-		okAny   bool
-	)
-	for _, gvr := range gvrs {
-		items, err := listAllOfGVR(ctx, dynCli, gvr)
-		if err != nil {
-			slog.Warn("phase1.warmup.root_gvr_list_failed",
-				slog.String("subsystem", "cache"),
-				slog.String("gvr", gvr.String()),
-				slog.Any("err", err),
-			)
-			lastErr = err
-			continue
-		}
-		okAny = true
-		out = append(out, items...)
-	}
-	if !okAny && lastErr != nil {
-		return nil, lastErr
-	}
-	return out, nil
-}
-
-// listAllOfGVR LISTs every CR of one GVR cluster-wide via the SA dynamic
-// client, paging with a bounded limit.
-func listAllOfGVR(ctx context.Context, dynCli k8sdynamic.Interface, gvr schema.GroupVersionResource) ([]*unstructured.Unstructured, error) {
-	var (
-		out           []*unstructured.Unstructured
-		continueToken string
-	)
-	for {
-		list, err := dynCli.Resource(gvr).Namespace(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
-			Limit:    navigationRootListPageLimit,
-			Continue: continueToken,
-		})
-		if err != nil {
-			return nil, err
-		}
-		for i := range list.Items {
-			item := list.Items[i]
-			out = append(out, &item)
-		}
-		continueToken = list.GetContinue()
-		if continueToken == "" {
-			break
-		}
-	}
-	return out, nil
-}
-
 // phase1MaxWalkDepth bounds the recursive widget-tree descent. The portal
 // navigation tree is shallow (Root -> Route -> Page -> Row/Column ->
 // DataGrid/Table is ~5 levels); this cap is a defensive guard against a
@@ -444,7 +399,24 @@ const phase1MaxWalkDepth = 32
 //     (objects.Get, resourcesrefs.Resolve) use it verbatim via
 //     cache.ClientConfigFor instead of rebuilding a client from saEP
 //     through kubeconfig.NewClientConfig.
-func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured, saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) error {
+// withPhase1SAContext builds the SA-credentialed context Phase 1
+// resolution runs under. It is the SINGLE place the SA identity +
+// internal-dispatch markers are installed, shared by the navigation-root
+// lister (the ConfigMap read + root-CR fetch) and resolveNavigationRoot
+// (the per-root recursive walk) so both run under exactly one identity.
+//
+// The internal-dispatch markers it installs:
+//   - xcontext.WithUserConfig(saEP)   — the endpoint shape the resolver
+//     expects on the context.
+//   - xcontext.WithUserInfo({snowplow SA}) — the identity label.
+//   - cache.WithInternalEndpoint(&saEP) — the RESTAction resolver's
+//     non-UAF inner-call endpoint resolution.
+//   - cache.WithInternalRESTConfig(saRC) — the SA *rest.Config used
+//     verbatim by the object-fetch sites; ALSO the marker
+//     cache.IsInternalDispatch keys on, so the pivot's per-user RBAC
+//     narrowing is bypassed for Phase 1 discovery (0.30.107 — see
+//     cache.IsInternalDispatch).
+func withPhase1SAContext(ctx context.Context, saEP endpoints.Endpoint, saRC *rest.Config) context.Context {
 	rctx := xcontext.BuildContext(ctx,
 		xcontext.WithUserConfig(saEP),
 		xcontext.WithUserInfo(jwtutil.UserInfo{Username: snowplowSAUsername}),
@@ -452,6 +424,11 @@ func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured,
 	)
 	rctx = cache.WithInternalEndpoint(rctx, &saEP)
 	rctx = cache.WithInternalRESTConfig(rctx, saRC)
+	return rctx
+}
+
+func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured, saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) error {
+	rctx := withPhase1SAContext(ctx, saEP, saRC)
 
 	w := &phase1Walker{
 		authnNS:    authnNS,

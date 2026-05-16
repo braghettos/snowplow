@@ -66,6 +66,7 @@ import (
 	"log/slog"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -96,6 +97,24 @@ func filterListByRBAC(
 	items []*unstructured.Unstructured,
 ) ([]*unstructured.Unstructured, bool) {
 	log := xcontext.Logger(ctx)
+
+	// INTERNAL-DISPATCH BYPASS (0.30.107): Phase 1's SA-credentialed
+	// startup walk resolves the navigation tree for informer DISCOVERY,
+	// not per-user rendering. It runs under the snowplow service account,
+	// which carries NO Krateo Role/RoleBinding CRs — so the per-item
+	// EvaluateRBAC below would default-deny every item and silently empty
+	// the LIST (the navmenu's `navmenuitems` apiRef LIST returned zero
+	// items, killing the navmenu→navmenuitem→page→datagrid descent before
+	// it reached the Compositions DataGrid; 0.30.106 boot log
+	// rbac_dropped=3). Phase 1 discovery is identity-independent. This
+	// bypass can never widen a real user's view: cache.IsInternalDispatch
+	// is true ONLY when WithInternalRESTConfig is on the context, which
+	// only Phase 1's walk sets — never a per-user request. Phase 1
+	// discards its resolution output, so the unfiltered bytes reach no
+	// user. Uniform over every GVR (feedback_no_special_cases.md).
+	if cache.IsInternalDispatch(ctx) {
+		return items, true
+	}
 
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
@@ -202,6 +221,17 @@ func filterGetByRBAC(
 		// only reaches here on an indexer HIT (obj non-nil), but the
 		// helper must not trust that invariant blindly — fail closed.
 		return false
+	}
+
+	// INTERNAL-DISPATCH BYPASS (0.30.107): the GET-by-name sibling of the
+	// filterListByRBAC bypass above. Phase 1's SA-credentialed walk
+	// fetches navigation widget CRs by name (objects.Get → the pivot's
+	// GET-by-name branch); the SA carries no Krateo RBAC, so the per-user
+	// EvaluateRBAC below would default-deny every fetch and the walk
+	// could not descend. Phase 1 discovery is identity-independent and
+	// cannot leak — see the filterListByRBAC bypass rationale.
+	if cache.IsInternalDispatch(ctx) {
+		return true
 	}
 
 	user, err := xcontext.UserInfo(ctx)
