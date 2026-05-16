@@ -196,28 +196,9 @@ func (rw *ResourceWatcher) StartCRDWatch(ctx context.Context) {
 		return
 	}
 
-	register := func(obj interface{}) {
-		gvr, gvrOK := compositionGVRFromCRDObject(obj)
-		if !gvrOK {
-			return
-		}
-		if !matchesAutoDiscoverGroup(gvr.Group) {
-			// CRD whose group is not navigation-discovered — ignored.
-			return
-		}
-		added, _ := rw.EnsureResourceType(gvr)
-		if added {
-			slog.Info("cache.crdwatch.registered",
-				slog.String("subsystem", "cache"),
-				slog.String("gvr", gvr.String()),
-				slog.String("note", "composition informer spawned on CRD event — group is navigation-discovered"),
-			)
-		}
-	}
-
 	if _, err := gi.Informer().AddEventHandler(clientcache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj interface{}) { register(obj) },
-		UpdateFunc: func(_, newObj interface{}) { register(newObj) },
+		AddFunc:    func(obj interface{}) { rw.registerCRDObject(obj, "crd-event") },
+		UpdateFunc: func(_, newObj interface{}) { rw.registerCRDObject(newObj, "crd-event") },
 		// DeleteFunc intentionally omitted: a CRD deletion is rare and
 		// the informer for its GVR going stale is harmless — the pivot's
 		// servable() gate falls through on an unconfirmed resource type.
@@ -234,6 +215,81 @@ func (rw *ResourceWatcher) StartCRDWatch(ctx context.Context) {
 		slog.String("note", "CRD informer event handler installed — composition GVRs auto-register on CRD-add for navigation-discovered groups"),
 	)
 	_ = ctx // ctx reserved: the informer lifecycle is bound by rw.stopCh.
+}
+
+// registerCRDObject is the single per-CRD-object registration step:
+// derive the CRD's served-version GVR and, IFF its group is in the
+// navigation-derived auto-discover set, register a per-GVR informer for
+// it. Idempotent — EnsureResourceType observes added=false for an
+// already-registered GVR. Shared by the CRD informer's event handler
+// (AddFunc/UpdateFunc) and the post-walk ReconcileAutoDiscoverCRDs scan.
+//
+// `via` is a log-only tag distinguishing the trigger (crd-event vs
+// post-walk-reconcile).
+func (rw *ResourceWatcher) registerCRDObject(obj interface{}, via string) {
+	gvr, gvrOK := compositionGVRFromCRDObject(obj)
+	if !gvrOK {
+		return
+	}
+	if !matchesAutoDiscoverGroup(gvr.Group) {
+		// CRD whose group is not navigation-discovered — ignored.
+		return
+	}
+	added, _ := rw.EnsureResourceType(gvr)
+	if added {
+		slog.Info("cache.crdwatch.registered",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("via", via),
+			slog.String("note", "composition informer spawned — group is navigation-discovered"),
+		)
+	}
+}
+
+// ReconcileAutoDiscoverCRDs re-scans the CRD informer's local store and
+// re-applies registerCRDObject to every CRD currently present. It exists
+// to close a boot ORDERING race:
+//
+//	StartCRDWatch installs the CRD informer's event handler, and the
+//	informer's initial LIST replays every existing CRD through AddFunc
+//	ONCE. The Phase 1 walk runs AFTER StartCRDWatch — so when the walk
+//	discovers a composition group (AddAutoDiscoverGroup) the CRD informer
+//	has very likely ALREADY replayed that group's CRD with
+//	matchesAutoDiscoverGroup==false, dropping it permanently. AddFunc
+//	never re-fires for a CRD that merely sat in etcd unchanged, so the
+//	composition informer would never register.
+//
+// Calling this AFTER the Phase 1 walk has finished discovering all
+// navigation groups deterministically closes the race: the
+// auto-discover set is now complete, and a single store re-scan
+// registers every composition informer whose CRD was replayed too
+// early. EnsureResourceType is idempotent, so CRDs already registered by
+// the live event handler are no-ops.
+//
+// Nil-receiver / passthrough / CRD-watch-not-started are no-ops.
+func (rw *ResourceWatcher) ReconcileAutoDiscoverCRDs() int {
+	if rw == nil || rw.mode == modePassthrough {
+		return 0
+	}
+	rw.mu.RLock()
+	gi, ok := rw.informers[customResourceDefinitionGVR]
+	rw.mu.RUnlock()
+	if !ok || gi == nil {
+		return 0
+	}
+
+	before := rw.RegisteredCount()
+	for _, obj := range gi.Informer().GetStore().List() {
+		rw.registerCRDObject(obj, "post-walk-reconcile")
+	}
+	registered := rw.RegisteredCount() - before
+	slog.Info("cache.crdwatch.reconcile_complete",
+		slog.String("subsystem", "cache"),
+		slog.Int("newly_registered", registered),
+		slog.Any("auto_discover_groups", AutoDiscoverGroupsSnapshot()),
+		slog.String("note", "post-walk CRD store re-scan — closes the boot replay-vs-discover ordering race"),
+	)
+	return registered
 }
 
 // compositionGVRFromCRDObject derives the GVR of a CRD's served (storage)

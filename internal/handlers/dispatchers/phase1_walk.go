@@ -32,9 +32,11 @@
 //      privileged service-account credentials — issue a DESTRUCTIVE
 //      apiserver mutation. The walk MUST stay strictly read-only.
 //
-//      WHY the `allowed` flag is NOT a recursion gate: it is rbac.UserCan
-//      for the CURRENT identity, and the Phase 1 SA holds no `get` grant
-//      on the navigation widget CRs — so under the SA every child is
+//      WHY the `allowed` flag is NOT a recursion gate: it is snowplow's
+//      typed-RBAC evaluator (EvaluateRBAC) keyed on the REQUEST USER
+//      identity against the Krateo Role/RoleBinding CRs — NOT the
+//      apiserver's RBAC. The Phase 1 SA-walk context carries no Krateo
+//      RBAC CRs, so EvaluateRBAC default-denies and every child resolves
 //      allowed=false. Gating on it prunes the whole tree at the first
 //      Route and the composition informer never registers. Phase 1 is
 //      identity-independent informer DISCOVERY, not per-user rendering;
@@ -253,19 +255,35 @@ func phase1WarmupWith(ctx context.Context, rw *cache.ResourceWatcher, lister roo
 		resolved++
 	}
 
-	// Step 5 — let the registered set settle. The CRD-watch may still be
-	// adding composition informers after the last resolve returned (its
-	// informer's initial LIST + the per-GVR EnsureResourceType run
+	// Step 5 — reconcile the CRD-watch against the now-complete
+	// auto-discover set. The walk discovers composition groups (e.g.
+	// composition.krateo.io) AFTER StartCRDWatch's CRD informer has
+	// already replayed every existing CRD — so the composition CRD was
+	// seen with matchesAutoDiscoverGroup==false and dropped. Now that the
+	// walk has finished, the auto-discover set is complete; a single CRD
+	// store re-scan registers every composition informer whose CRD was
+	// replayed too early. Idempotent for CRDs already registered live.
+	reconciled := rw.ReconcileAutoDiscoverCRDs()
+	if reconciled > 0 {
+		log.Info("phase1.warmup.crd_reconcile",
+			slog.String("subsystem", "cache"),
+			slog.Int("newly_registered", reconciled),
+		)
+	}
+
+	// Step 6 — let the registered set settle. The CRD-watch may still be
+	// adding composition informers after the reconcile (the per-GVR
+	// EnsureResourceType + the informer's initial LIST run
 	// asynchronously). Poll RegisteredGVRs until it stops growing for one
 	// settle window, bounded by ctx.
 	settleRegisteredSet(ctx, rw)
 
-	// Step 6 — the Phase 1 sync barrier. Block until every registered
+	// Step 7 — the Phase 1 sync barrier. Block until every registered
 	// informer (meta-query seeds + resolution-discovered + CRD-watch-
 	// spawned) reaches HasSynced, bounded by ctx.
 	syncErr := rw.WaitAllInformersSynced(ctx)
 
-	// Step 7 — signal Phase1Done. /readyz flips to 200.
+	// Step 8 — signal Phase1Done. /readyz flips to 200.
 	cache.MarkPhase1Done()
 
 	log.Info("phase1.warmup.completed",
@@ -436,14 +454,37 @@ func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured,
 	rctx = cache.WithInternalRESTConfig(rctx, saRC)
 
 	w := &phase1Walker{
-		authnNS: authnNS,
-		visited: map[string]struct{}{},
+		authnNS:    authnNS,
+		visited:    map[string]struct{}{},
+		gvrSamples: map[string]int{},
 	}
 	return w.walk(rctx, root, 0)
 }
 
+// phase1PerGVRSampleLimit caps how many widget CRs of the SAME GVR the
+// walk resolves+recurses into across the whole walk. It is the key
+// 0.30.105 data-fan-out bound.
+//
+// WHY (the on-cluster finding): a Compositions Page DataGrid yields one
+// resourcesRefs child PER COMPOSITION ROW — at production scale that is
+// ~49K children, every one a `githubscaffoldingwithcompositionpage`
+// widget of the SAME GVR. Recursing into all of them turns the startup
+// walk into a 49K-deep per-composition resolution storm that blows the
+// PHASE1_TIMEOUT_SECONDS budget (the first on-cluster 0.30.105 bench
+// CrashLooped the pod). But for INFORMER DISCOVERY every row-widget of a
+// given GVR is identical — resolving one fires the exact same
+// lazyRegisterInnerCallPaths apiRef chain as resolving the 49000th. So
+// the walk samples a SMALL bounded number per distinct child GVR: enough
+// to traverse genuine navigation structure (each distinct widget GVR is
+// still visited) while skipping the per-row data fan-out.
+//
+// The limit is >1 so a parent that legitimately has a couple of
+// different-purpose children sharing a GVR is not under-covered; it is
+// small because additional same-GVR widgets discover no new informer.
+const phase1PerGVRSampleLimit = 4
+
 // phase1Walker carries the per-root recursive-walk state. A fresh walker
-// is created per navigation root so the visited-set never crosses roots
+// is created per navigation root so the dedupe state never crosses roots
 // — but because the two roots can share Page subtrees, dedupe WITHIN a
 // root is what matters for cycle-safety; cross-root re-resolves are
 // harmless (idempotent informer registration) and rare.
@@ -453,6 +494,11 @@ type phase1Walker struct {
 	// namespace+name) so a shared subtree is resolved once and a cyclic
 	// reference cannot loop forever.
 	visited map[string]struct{}
+	// gvrSamples counts how many widget CRs of each GVR (resource+
+	// apiVersion) the walk has already resolved. Once a GVR hits
+	// phase1PerGVRSampleLimit, further siblings of that GVR are skipped —
+	// the data-fan-out bound (see phase1PerGVRSampleLimit).
+	gvrSamples map[string]int
 }
 
 // walk resolves widget `in` through the standard widget resolver under
@@ -541,7 +587,23 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		if _, seen := w.visited[key]; seen {
 			continue
 		}
+
+		// DATA-FAN-OUT BOUND: skip this child once its GVR has already
+		// been sampled phase1PerGVRSampleLimit times. A Compositions Page
+		// DataGrid yields one child per composition row — ~49K children
+		// of the same GVR — and resolving every one would blow the
+		// PHASE1_TIMEOUT budget. Every same-GVR row-widget fires the
+		// identical lazyRegisterInnerCallPaths apiRef chain, so a small
+		// sample saturates informer discovery for that GVR. Distinct
+		// navigation-structure GVRs are each still visited up to the
+		// limit. See phase1PerGVRSampleLimit.
+		gvrKey := ref.APIVersion + "|" + ref.Resource
+		if w.gvrSamples[gvrKey] >= phase1PerGVRSampleLimit {
+			continue
+		}
+
 		w.visited[key] = struct{}{}
+		w.gvrSamples[gvrKey]++
 
 		// Fetch the child widget CR under the SA-credentialed ctx. The
 		// resolver mutates the object in place, so a fresh fetch per
@@ -593,16 +655,23 @@ type navChildRef struct {
 // WHY `allowed` is DELIBERATELY NOT a recursion gate (0.30.105
 // on-cluster finding):
 //
-//	The `allowed` flag a resolved resourcesRefs item carries is
-//	rbac.UserCan evaluated for the CURRENT context identity. The Phase 1
-//	walk's identity is the snowplow SERVICE ACCOUNT, which holds no
-//	RoleBinding granting `get` on the navigation widget CRs — so under
-//	the SA every navigation child resolves allowed=false. Gating the
-//	recursion on allowed==true therefore prunes the ENTIRE tree at the
-//	first Route level: the walk never reaches the Compositions Page
-//	DataGrid and the composition.krateo.io informer is never registered
-//	(exactly the 0.30.104 failure this release exists to fix; the first
-//	0.30.105 on-cluster bench reproduced it when this gate was applied).
+//	The `allowed` flag a resolved resourcesRefs item carries is set by
+//	resourcesrefs.resolveOne via rbac.UserCan -> EvaluateRBAC — snowplow's
+//	OWN typed-RBAC evaluator, keyed on the REQUEST USER IDENTITY
+//	(username + groups extracted from the context) against the
+//	informer-cached Krateo Role/RoleBinding CRs. It is NOT the apiserver's
+//	RBAC and NOT the walk identity's apiserver permissions.
+//
+//	The Phase 1 walk's context identity is the snowplow service account.
+//	That identity HAS broad apiserver get/list/watch (so objects.Get
+//	below succeeds) — but it carries no Krateo Role/RoleBinding CRs, so
+//	EvaluateRBAC evaluates an effectively-empty subject and default-denies:
+//	every navigation child resolves allowed=false. Gating the recursion on
+//	allowed==true therefore prunes the ENTIRE tree at the first Route
+//	level: the walk never reaches the Compositions Page DataGrid and the
+//	composition.krateo.io informer is never registered (exactly the
+//	0.30.104 failure this release exists to fix; the first 0.30.105
+//	on-cluster bench reproduced it when this gate was applied).
 //
 //	The frontend WidgetRenderer applies items.filter(({allowed})=>allowed)
 //	because a denied widget must not RENDER for that logged-in user. But

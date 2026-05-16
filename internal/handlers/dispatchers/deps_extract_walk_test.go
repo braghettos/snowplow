@@ -144,14 +144,15 @@ func TestExtractResourcesRefsItems(t *testing.T) {
 // regression that drops the verb filter — letting the SA walk follow a
 // POST/PUT/PATCH/DELETE action ref — fails here.
 //
-// `allowed` is DELIBERATELY NOT a gate: it is rbac.UserCan for the walk's
-// identity, and the Phase 1 SA holds no `get` grant on navigation widget
-// CRs — so under the SA every child resolves allowed=false. Gating on it
-// would prune the whole tree at the first Route and the composition
-// informer would never register (the 0.30.104 failure 0.30.105 fixes).
-// A GET ref with allowed=false MUST still be recursed: see
-// walkShouldRecurse. A regression that re-adds the allowed gate fails the
-// `{"GET", false, true}` case here.
+// `allowed` is DELIBERATELY NOT a gate: it is snowplow's typed-RBAC
+// evaluator (EvaluateRBAC) keyed on the REQUEST USER identity against the
+// Krateo Role/RoleBinding CRs. The Phase 1 SA-walk context carries no
+// Krateo RBAC CRs, so EvaluateRBAC default-denies and every child
+// resolves allowed=false. Gating on it would prune the whole tree at the
+// first Route and the composition informer would never register (the
+// 0.30.104 failure 0.30.105 fixes). A GET ref with allowed=false MUST
+// still be recursed: see walkShouldRecurse. A regression that re-adds the
+// allowed gate fails the `{"GET", false, true}` case here.
 func TestWalkFilter_GETOnly(t *testing.T) {
 	cases := []struct {
 		verb        string
