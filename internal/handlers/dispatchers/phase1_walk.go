@@ -481,6 +481,20 @@ func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured,
 // The limit is >1 so a parent that legitimately has a couple of
 // different-purpose children sharing a GVR is not under-covered; it is
 // small because additional same-GVR widgets discover no new informer.
+//
+// STRUCTURAL ASSUMPTION (architect follow-up note): this bound's safety
+// rests on no single parent widget having more than
+// phase1PerGVRSampleLimit distinct same-GVR DataGrid/Table siblings. The
+// gvrSamples counter is keyed on GVR alone, so siblings that share a GVR
+// share one budget. Today the navigation tree never crosses that count,
+// so every distinct-purpose widget is sampled. If a future navigation
+// tree adds same-GVR sibling widgets beyond this count, an
+// earlier-iterated sibling could exhaust the budget and a later
+// distinct-purpose sibling (e.g. the Compositions DataGrid) could be
+// skipped before its informer chain is discovered — at which point this
+// limit MUST rise (or the counter must key on a finer identity than the
+// bare GVR). Until then, 4 is a deliberate, navigation-shape-validated
+// constant, not an arbitrary one.
 const phase1PerGVRSampleLimit = 4
 
 // phase1Walker carries the per-root recursive-walk state. A fresh walker
@@ -572,7 +586,10 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		// that carry a path. walkShouldRecurse is the single auditable
 		// predicate — see its doc for why verb=="GET" is the load-bearing
 		// read-only invariant and why `allowed` is deliberately NOT a
-		// gate here (the SA walk is RBAC-denied on every nav widget).
+		// gate here. (`allowed` is set by snowplow's OWN typed-RBAC
+		// evaluator keyed on the REQUEST USER identity; the SA walk
+		// carries no such identity, so it default-denies — the SA's
+		// broad apiserver permissions are not the cause.)
 		if !walkShouldRecurse(child) {
 			continue
 		}

@@ -161,7 +161,7 @@ func TestWalkFilter_GETOnly(t *testing.T) {
 	}{
 		{"GET", true, true},
 		{"get", true, true},  // case-insensitive
-		{"GET", false, true}, // allowed=false GET MUST still recurse (SA walk is RBAC-denied)
+		{"GET", false, true}, // allowed=false GET MUST still recurse (SA walk carries no request-user identity; typed-RBAC default-denies)
 		{"POST", true, false},
 		{"POST", false, false},
 		{"PUT", true, false},
