@@ -32,6 +32,7 @@ package api
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -50,11 +51,26 @@ import (
 // auto-generated certificate is signed by a CA that is NOT in the system
 // root store — the same trust posture as a real cluster's self-signed
 // apiserver CA. Returns the server and its CA PEM bytes.
+//
+// The LIST body carries TWO real items. This is load-bearing for the
+// fix-path test: client-go parses the response into an
+// *unstructured.UnstructuredList whose item objects live in the typed
+// `Items` field — `list.Object` does NOT carry an `items` key. A fix
+// that marshals `list.Object` would emit an items-less envelope; the
+// fix-path test asserts the served bytes contain BOTH item names so an
+// items-less envelope FAILS the test (the bug found on the first
+// 0.30.104 on-cluster smoke check, where `.namespaces.items` was null
+// and Phase 1 discovered no composition GVR).
+const fixtureNS1 = "krateo-system"
+const fixtureNS2 = "demo-system"
+
 func newTLSAPIServer(t *testing.T) (*httptest.Server, []byte) {
 	t.Helper()
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"apiVersion":"v1","kind":"NamespaceList","items":[]}`)
+		_, _ = io.WriteString(w, `{"apiVersion":"v1","kind":"NamespaceList","metadata":{"resourceVersion":"1"},"items":[`+
+			`{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"`+fixtureNS1+`"}},`+
+			`{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"`+fixtureNS2+`"}}]}`)
 	}))
 	t.Cleanup(srv.Close)
 
@@ -177,6 +193,18 @@ func TestPlumbingHttpcall_TokenAuthEndpoint_DropsCA(t *testing.T) {
 // returns) dispatches the same /api/v1/namespaces LIST and SUCCEEDS — the
 // client-go transport installs the CA into RootCAs correctly.
 //
+// It ALSO guards the LIST-envelope-shape bug found on the first 0.30.104
+// on-cluster smoke check: the served bytes MUST carry an `items` array
+// containing every namespace. client-go parses the apiserver response
+// into an *unstructured.UnstructuredList whose item objects live in the
+// typed `Items` field — `list.Object` has NO `items` key. Marshalling
+// `list.Object` (the original 0.30.104 code) yields an items-less
+// envelope; the walk's iterator filter `[.namespaces.items[] | ...]`
+// then evaluates against a null `items` and Phase 1 discovers no
+// composition GVR. The fix marshals `list.UnstructuredContent()`, which
+// folds Items back into an `items` array. This test FAILS against the
+// items-less marshal.
+//
 // This exercises dispatchViaInternalRESTConfig — the api-stage sibling of
 // dispatchViaInformer — which the 0.30.104 fix wires ahead of
 // httpcall.Do whenever cache.WithInternalRESTConfig is on the context.
@@ -209,8 +237,41 @@ func TestInternalRESTConfigDispatch_TrustsClusterCA(t *testing.T) {
 		t.Fatalf("FIX BROKEN: served body is not the apiserver LIST envelope: %q",
 			string(raw))
 	}
+
+	// The LIST-envelope-shape guard: the served bytes MUST contain a
+	// non-null `items` array with every namespace. An items-less
+	// envelope (json.Marshal(list.Object)) fails here.
+	var envelope struct {
+		Kind  string `json:"kind"`
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	if uErr := json.Unmarshal(raw, &envelope); uErr != nil {
+		t.Fatalf("FIX BROKEN: served bytes are not valid JSON: %v", uErr)
+	}
+	if len(envelope.Items) != 2 {
+		t.Fatalf("LIST-ENVELOPE BUG: served LIST envelope must carry the 2 "+
+			"namespace items in an `items` array — got %d. The 0.30.104 "+
+			"first-smoke-check bug: marshalling list.Object drops items "+
+			"(items live in UnstructuredList.Items, not list.Object); the "+
+			"walk's `.namespaces.items[]` iterator then sees null and "+
+			"Phase 1 discovers no composition GVR. served bytes: %q",
+			len(envelope.Items), string(raw))
+	}
+	got := map[string]bool{}
+	for _, it := range envelope.Items {
+		got[it.Metadata.Name] = true
+	}
+	if !got[fixtureNS1] || !got[fixtureNS2] {
+		t.Fatalf("LIST-ENVELOPE BUG: served `items` is missing a namespace — "+
+			"want %q + %q, got %v", fixtureNS1, fixtureNS2, got)
+	}
 	t.Logf("fix confirmed — client-go transport from rest.Config{CAData} "+
-		"trusts the cluster CA: %d bytes served", len(raw))
+		"trusts the cluster CA AND the served LIST envelope carries all "+
+		"%d items: %d bytes served", len(envelope.Items), len(raw))
 }
 
 // TestInternalRESTConfigDispatch_NoConfigFallsThrough confirms the

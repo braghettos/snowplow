@@ -245,13 +245,24 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 	if listErr != nil {
 		return nil, false, listErr
 	}
-	// list.Object already carries the apiserver LIST envelope
-	// (apiVersion / kind / items / metadata) — client-go's dynamic List
-	// returns the apiserver response verbatim as an UnstructuredList.
-	// Marshalling list.Object reproduces the exact apiserver bytes the
-	// JQ pipeline expects; no synthesized envelope needed (unlike the
-	// informer pivot, which has only the item slice).
-	raw, mErr := json.Marshal(list.Object)
+	// CRITICAL — marshal list.UnstructuredContent(), NOT list.Object.
+	// client-go's *unstructured.UnstructuredList keeps the item objects
+	// in the separate typed `Items []Unstructured` field; `list.Object`
+	// carries ONLY the envelope scalars (apiVersion / kind / metadata)
+	// and does NOT contain an `items` key. Marshalling list.Object
+	// therefore yields a LIST envelope with NO items — the resolver's
+	// iterator filter `[.<id>.items[] | ...]` then evaluates against a
+	// null `items` and the walk discovers nothing (0.30.104 first
+	// on-cluster smoke check: the namespace LIST succeeded but
+	// `.namespaces.items` was null, so Phase 1 registered only the 8
+	// infra informers — no composition informer).
+	//
+	// UnstructuredContent() shallow-copies the envelope scalars AND
+	// folds the typed Items slice back into an `items` array — the exact
+	// apiserver LIST shape (apiVersion / kind / metadata / items) the JQ
+	// pipeline expects, byte-equivalent to the httpcall.Do path
+	// (feedback_cache_must_not_constrain_jq.md).
+	raw, mErr := json.Marshal(list.UnstructuredContent())
 	if mErr != nil {
 		return nil, false, mErr
 	}
