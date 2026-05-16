@@ -81,13 +81,56 @@ func dispatchTestScheme() *runtime.Scheme {
 	return s
 }
 
+// dispatchAdminUser is the identity dispatchCtx() carries. The
+// dispatch serve-mechanics tests (verb gate, subresource, LIST/GET
+// served, counters, parallelism) are NOT RBAC tests — they assert the
+// pivot's cache-serving plumbing. Tag 0.30.100 added a post-LIST
+// per-item RBAC filter to dispatchViaInformer; for those tests to keep
+// exercising the served path the context must carry an identity that
+// is authorized for everything. dispatchAdminRBACSeed() grants exactly
+// that. The RBAC-narrowing behaviour itself is covered by the dedicated
+// falsifier in informer_dispatch_rbac_narrow_test.go.
+const dispatchAdminUser = "dispatch-admin"
+
+// dispatchAdminRBACSeed returns RBAC objects granting dispatchAdminUser
+// a cluster-wide wildcard — so the Tag-0.30.100 per-item RBAC filter is
+// a transparent pass-through for the serve-mechanics tests.
+func dispatchAdminRBACSeed() []runtime.Object {
+	return []runtime.Object{
+		&rbacv1.ClusterRole{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole"},
+			ObjectMeta: metav1.ObjectMeta{Name: "dispatch-admin-role"},
+			Rules: []rbacv1.PolicyRule{
+				{APIGroups: []string{"*"}, Resources: []string{"*"}, Verbs: []string{"*"}},
+			},
+		},
+		&rbacv1.ClusterRoleBinding{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding"},
+			ObjectMeta: metav1.ObjectMeta{Name: "dispatch-admin-binding"},
+			Subjects: []rbacv1.Subject{
+				{Kind: rbacv1.UserKind, APIGroup: "rbac.authorization.k8s.io", Name: dispatchAdminUser},
+			},
+			RoleRef: rbacv1.RoleRef{
+				APIGroup: "rbac.authorization.k8s.io",
+				Kind:     "ClusterRole",
+				Name:     "dispatch-admin-role",
+			},
+		},
+	}
+}
+
 // newDispatchWatcher constructs a synced cache=on watcher with the test
 // GVR's informer registered and at least one seeded object. Returns
 // the watcher (caller does NOT need to stop — t.Cleanup is wired).
+//
+// The watcher is additionally seeded with dispatchAdminRBACSeed() so the
+// Tag-0.30.100 per-item RBAC filter permits dispatchAdminUser (the
+// identity dispatchCtx carries) — see dispatchAdminUser doc.
 func newDispatchWatcher(t *testing.T, seed ...runtime.Object) *cache.ResourceWatcher {
 	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 
+	seed = append(seed, dispatchAdminRBACSeed()...)
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
 		dispatchTestScheme(), dispatchTestListKinds(), seed...)
 
@@ -114,6 +157,16 @@ func newDispatchWatcher(t *testing.T, seed ...runtime.Object) *cache.ResourceWat
 	case <-syncCh:
 	case <-time.After(5 * time.Second):
 		t.Fatalf("EnsureResourceType: informer did not sync within 5s")
+	}
+
+	// Wait for the eagerly-registered RBAC informers to sync — the
+	// Tag-0.30.100 per-item RBAC filter reads them; an unsynced RBAC
+	// store would deny dispatchAdminUser and break the serve-mechanics
+	// assertions.
+	syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := rw.WaitForCacheSync(syncCtx, 5*time.Second); err != nil {
+		t.Fatalf("WaitForCacheSync (RBAC informers): %v", err)
 	}
 
 	cache.SetGlobal(rw)
@@ -146,11 +199,19 @@ func newTestRestActionRuntimeObject(ns, name, marker string) runtime.Object {
 	return newTestRestActionObject(ns, name, marker)
 }
 
-// dispatchCtx builds a context with a no-op logger discovery path —
-// xcontext.Logger falls back to slog.Default() when the context has
-// no logger attached, so the dispatch path's log calls are safe.
+// dispatchCtx builds a context for the serve-mechanics dispatch tests.
+// xcontext.Logger falls back to slog.Default() when the context has no
+// logger attached, so the dispatch path's log calls are safe.
+//
+// Tag 0.30.100: the context carries dispatchAdminUser as the identity.
+// dispatchViaInformer's served-LIST branch now runs a per-item RBAC
+// filter and FAILS CLOSED on a missing identity (served=false). The
+// serve-mechanics tests assert served=true; they pair with watchers
+// built via newDispatchWatcher / newDispatchWatcherWithNamespaces,
+// which seed dispatchAdminRBACSeed() granting this user a cluster-wide
+// wildcard — so the RBAC filter is a transparent pass-through here.
 func dispatchCtx() context.Context {
-	return context.Background()
+	return ctxWithUser(dispatchAdminUser)
 }
 
 // buildCall returns a RequestOptions with verb + path + a no-op
@@ -784,8 +845,11 @@ func newDispatchWatcherWithNamespaces(t *testing.T) *cache.ResourceWatcher {
 	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 
+	// dispatchAdminRBACSeed() so the Tag-0.30.100 per-item RBAC filter
+	// permits dispatchAdminUser (the identity dispatchCtx carries).
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
-		dispatchTestScheme(), dispatchTestListKindsWithNamespaces())
+		dispatchTestScheme(), dispatchTestListKindsWithNamespaces(),
+		dispatchAdminRBACSeed()...)
 
 	rw, err := cache.NewResourceWatcher(context.Background(), dyn)
 	if err != nil {
@@ -804,6 +868,14 @@ func newDispatchWatcherWithNamespaces(t *testing.T) *cache.ResourceWatcher {
 	case <-syncCh:
 	case <-time.After(5 * time.Second):
 		t.Fatalf("EnsureResourceType: informer did not sync within 5s")
+	}
+
+	// Wait for the eagerly-registered RBAC informers to sync (Tag
+	// 0.30.100 per-item RBAC filter reads them).
+	syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := rw.WaitForCacheSync(syncCtx, 5*time.Second); err != nil {
+		t.Fatalf("WaitForCacheSync (RBAC informers): %v", err)
 	}
 
 	cache.SetGlobal(rw)

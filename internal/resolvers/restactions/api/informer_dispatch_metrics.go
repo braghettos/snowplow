@@ -40,6 +40,12 @@ var (
 	// apiserver path, passthrough / cache-off, metadata-only GVR,
 	// not-synced informer, GET-miss, or marshal failure.
 	dispatchInformerFallthrough atomic.Uint64
+	// dispatchInformerRBACDropped counts INDIVIDUAL list items dropped
+	// by the Tag-0.30.100 post-LIST per-item RBAC filter — the user
+	// lacked a `list` grant for the item's namespace. A non-zero value
+	// is the expected steady state for narrow-RBAC users; it is the
+	// falsifier signal that the pivot is no longer over-exposing.
+	dispatchInformerRBACDropped atomic.Uint64
 )
 
 // DispatchInformerStats is an atomic snapshot of the pivot serve-rate
@@ -49,6 +55,7 @@ type DispatchInformerStats struct {
 	ListServed  uint64
 	GetServed   uint64
 	Fallthrough uint64
+	RBACDropped uint64
 }
 
 // DispatchInformerStatsSnapshot returns the current counter values.
@@ -57,6 +64,7 @@ func DispatchInformerStatsSnapshot() DispatchInformerStats {
 		ListServed:  dispatchInformerListServed.Load(),
 		GetServed:   dispatchInformerGetServed.Load(),
 		Fallthrough: dispatchInformerFallthrough.Load(),
+		RBACDropped: dispatchInformerRBACDropped.Load(),
 	}
 }
 
@@ -93,6 +101,7 @@ func startDispatchSummary() {
 					slog.Uint64("list_served", s.ListServed),
 					slog.Uint64("get_served", s.GetServed),
 					slog.Uint64("apiserver_fallthrough", s.Fallthrough),
+					slog.Uint64("rbac_dropped", s.RBACDropped),
 				)
 			}
 		}()

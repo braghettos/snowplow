@@ -218,6 +218,15 @@ func marshalAsList(apiVersion, listKind string, items []*unstructured.Unstructur
 // envelope via marshalAsList; GET-by-name output is the bare object
 // (apiserver shape — single Unstructured serialised as-is).
 //
+// Tag 0.30.100: the served LIST branch additionally runs every item
+// through filterListByRBAC — a post-LIST per-item RBAC check against
+// the in-process typed-RBAC indexer — before marshalling. The pivot
+// bypasses the per-user `<username>-clientconfig` token, so without
+// this filter an apiserver-routed LIST with no userAccessFilter stanza
+// over-exposes every object to a narrow-RBAC user. A LIST request with
+// no identity on the context fails closed (served=false → apiserver
+// fallthrough).
+//
 // Per `feedback_cache_must_not_constrain_jq.md`: the envelope bytes
 // MUST be byte-equivalent to apiserver for the JQ pipeline to remain
 // invariant. The shape we produce is the canonical Unstructured shape
@@ -335,6 +344,25 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 			dispatchInformerFallthrough.Add(1)
 			return nil, false
 		}
+
+		// Tag 0.30.100: post-LIST per-item RBAC filter. The informer
+		// partition is RBAC-blind — dispatchViaInformer never reads
+		// call.Endpoint, so it bypasses the per-user `<username>-
+		// clientconfig` bearer token that narrows the apiserver path.
+		// For an apiserver-routed LIST with no userAccessFilter stanza
+		// (e.g. compositions-list) that token was the ONLY RBAC gate;
+		// without this filter a narrow-RBAC user sees every object
+		// (0.30.99 Phase-6 "Finding 1"). filterListByRBAC drops items
+		// the user has no `list` grant for. FAIL-CLOSED: a missing
+		// identity returns served=false → apiserver fallthrough (the
+		// apiserver's per-user token narrows correctly); a per-item
+		// EvaluateRBAC error drops that item.
+		items, identityOK := filterListByRBAC(ctx, gvr, items)
+		if !identityOK {
+			dispatchInformerFallthrough.Add(1)
+			return nil, false
+		}
+
 		raw, err := marshalAsList(apiVersion, listKindForResource(gvr.Resource), items)
 		if err != nil {
 			log.Warn("informer_dispatch.list_marshal_failed",
