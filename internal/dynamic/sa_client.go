@@ -34,8 +34,16 @@ import (
 
 // Standard in-cluster ServiceAccount projected paths (see
 // https://kubernetes.io/docs/tasks/run-application/access-api-from-pod/).
-// These constants mirror the locations rest.InClusterConfig reads.
-const (
+// These mirror the locations rest.InClusterConfig reads.
+//
+// They are package vars (not consts) ONLY so the credential-real
+// falsifier test can point ServiceAccountEndpoint at a temp dir holding
+// real-shaped credentials (a raw JWT token + a raw PEM CA) — the 0.30.102
+// unit tests shipped the "illegal base64 data" bug precisely because they
+// only exercised the no-files error path, never a real SA credential.
+// Production NEVER reassigns these; the values are the fixed projected
+// SA volume paths.
+var (
 	saTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 	saCAPath    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 )

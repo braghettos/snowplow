@@ -380,3 +380,68 @@ func InternalEndpointFromContext(ctx context.Context) (any, bool) {
 	}
 	return v, true
 }
+
+// ctxKeyInternalRESTConfigType is the typed empty-struct context key for
+// WithInternalRESTConfig / InternalRESTConfigFromContext.
+type ctxKeyInternalRESTConfigType struct{}
+
+var ctxKeyInternalRESTConfig = ctxKeyInternalRESTConfigType{}
+
+// WithInternalRESTConfig attaches a ready-built apiserver *rest.Config to
+// ctx. The snowplow object/resourceRef client-construction sites consult
+// this when an internal/startup driver (Phase 1's SA-credentialed
+// resolution walk) is in flight, and use it directly instead of rebuilding
+// a client from the context endpoint via kubeconfig.NewClientConfig.
+//
+// 0.30.103 bug fix — WHY a *rest.Config and not just the endpoint:
+// kubeconfig.NewClientConfig(ctx, ep) marshals the endpoint into a
+// kubeconfig document and hands it to client-go's clientcmd loader. That
+// path is CERT-AUTH-ONLY and base64-aware:
+//   - it has NO token field — a token-bearing endpoint loses its only
+//     credential (the SA client would then be unauthenticated);
+//   - clientcmd base64-DECODES certificate-authority-data, so it requires
+//     the CA to be base64-encoded. The per-user `<user>-clientconfig`
+//     Secret stores credentials base64-encoded (the authn signup flow
+//     base64-encodes them), so the per-user path works. But the snowplow
+//     service account's in-cluster credentials — the projected
+//     /var/run/secrets/.../token (a raw JWT) and ca.crt (raw PEM) — are
+//     NOT base64-encoded. Feeding the raw-PEM SA CA through that path
+//     fails with "illegal base64 data at input byte 0".
+//
+// So the SA cannot be expressed as a kubeconfig-loadable endpoint at all.
+// The SA *rest.Config must be built directly from the raw in-cluster
+// credentials (rest.InClusterConfig), then carried here so the resolver's
+// client-construction sites use it verbatim — bypassing the
+// base64/cert-only kubeconfig path entirely.
+//
+// This is a GENERAL mechanism, not a per-resource carve-out
+// (feedback_no_special_cases.md): any internal driver can hand the
+// resolver a pre-built *rest.Config; only the client SOURCE is
+// parameterised, the resolver stays one code path. Ordinary per-user
+// requests never set it and fall through to the unchanged
+// kubeconfig.NewClientConfig path.
+//
+// rc is carried as `any` so the cache package does not couple to the
+// k8s.io/client-go/rest type; the consuming site type-asserts to
+// *rest.Config. nil rc returns the parent context unchanged.
+func WithInternalRESTConfig(ctx context.Context, rc any) context.Context {
+	if ctx == nil || rc == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxKeyInternalRESTConfig, rc)
+}
+
+// InternalRESTConfigFromContext returns the internal-dispatch *rest.Config
+// attached by WithInternalRESTConfig, or (nil, false) when none was set
+// (the ordinary per-user request path — the caller then builds a client
+// from the context endpoint via kubeconfig.NewClientConfig).
+func InternalRESTConfigFromContext(ctx context.Context) (any, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	v := ctx.Value(ctxKeyInternalRESTConfig)
+	if v == nil {
+		return nil, false
+	}
+	return v, true
+}

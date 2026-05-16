@@ -7,7 +7,6 @@ import (
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/http/response"
-	"github.com/krateoplatformops/plumbing/kubeconfig"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/dynamic"
@@ -158,7 +157,14 @@ func getFromAPIServer(ctx context.Context, ref templatesv1.ObjectReference) (res
 		return
 	}
 
-	rc, err := kubeconfig.NewClientConfig(ctx, ep)
+	// 0.30.103: ClientConfigFor returns the context-injected
+	// internal-dispatch *rest.Config when an internal/startup driver
+	// (Phase 1's SA-credentialed walk) is in flight, else delegates to
+	// the unchanged kubeconfig.NewClientConfig per-user path. This is
+	// what makes Phase 1's SA fetch work — the SA's raw-PEM CA + bearer
+	// token cannot survive kubeconfig.NewClientConfig (see
+	// cache.WithInternalRESTConfig).
+	rc, err := cache.ClientConfigFor(ctx, ep)
 	if err != nil {
 		log.Error("unable to create kubernetes client config", slog.Any("err", err))
 		res.Err = response.New(http.StatusInternalServerError, err)

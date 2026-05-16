@@ -9,8 +9,8 @@ import (
 	"strconv"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/kubeconfig"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/dynamic"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -23,7 +23,12 @@ func Resolve(ctx context.Context, items []templatesv1.ResourceRef) ([]templatesv
 		return nil, err
 	}
 
-	rc, err := kubeconfig.NewClientConfig(ctx, ep)
+	// 0.30.103: ClientConfigFor returns the context-injected
+	// internal-dispatch *rest.Config when an internal/startup driver
+	// (Phase 1's SA-credentialed walk) is in flight, else delegates to
+	// the unchanged kubeconfig.NewClientConfig per-user path — see
+	// cache.WithInternalRESTConfig.
+	rc, err := cache.ClientConfigFor(ctx, ep)
 	if err != nil {
 		return nil, err
 	}

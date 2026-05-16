@@ -134,7 +134,7 @@ func Phase1Warmup(ctx context.Context, rc *rest.Config, authnNS string) error {
 		return listRoutesLoaders(lctx, dynCli)
 	}
 	resolver := func(rctx context.Context, root *unstructured.Unstructured) error {
-		return resolveRoutesLoaderRoot(rctx, root, *saEP, authnNS)
+		return resolveRoutesLoaderRoot(rctx, root, *saEP, rc, authnNS)
 	}
 
 	return phase1WarmupWith(ctx, rw, lister, resolver)
@@ -328,22 +328,34 @@ func listRoutesLoaders(ctx context.Context, dynCli k8sdynamic.Interface) ([]*uns
 // effects (informer auto-registration via lazyRegisterInnerCallPaths,
 // CRD-watch group feed) are the whole point.
 //
-// The SA endpoint is injected three ways so the standard resolver runs
-// unchanged under SA identity:
-//   - xcontext.WithUserConfig(saEP): objects.Get fetches child widget
-//     CRs against the SA endpoint.
+// The SA credentials are injected so the standard resolver runs unchanged
+// under SA identity:
+//   - xcontext.WithUserConfig(saEP): the endpoint shape the resolver
+//     expects on the context (it carries the SA apiserver URL).
 //   - xcontext.WithUserInfo({snowplow SA}): the resolver requires an
 //     identity on the context.
 //   - cache.WithInternalEndpoint(&saEP): the RESTAction resolver's
 //     non-UAF inner-call endpoint resolution returns the SA endpoint
 //     instead of looking up a (non-existent) `<sa>-clientconfig` Secret.
-func resolveRoutesLoaderRoot(ctx context.Context, root *unstructured.Unstructured, saEP endpoints.Endpoint, authnNS string) error {
+//   - cache.WithInternalRESTConfig(saRC): the LOAD-BEARING 0.30.103 fix.
+//     saRC is the SA *rest.Config built by main.go from
+//     rest.InClusterConfig — it carries the SA bearer token and CA with
+//     the correct in-cluster semantics. The resolver's object-fetch sites
+//     (objects.Get, resourcesrefs.Resolve) use it verbatim via
+//     cache.ClientConfigFor instead of rebuilding a client from saEP
+//     through kubeconfig.NewClientConfig — which CANNOT carry the SA's
+//     raw-PEM CA (it base64-decodes the CA field) nor the SA's bearer
+//     token (the kubeconfig user block is cert-auth-only). Without saRC
+//     the root fetch fails with "illegal base64 data at input byte 0"
+//     and Phase 1 warms nothing (the 0.30.102 bug).
+func resolveRoutesLoaderRoot(ctx context.Context, root *unstructured.Unstructured, saEP endpoints.Endpoint, saRC *rest.Config, authnNS string) error {
 	rctx := xcontext.BuildContext(ctx,
 		xcontext.WithUserConfig(saEP),
 		xcontext.WithUserInfo(jwtutil.UserInfo{Username: snowplowSAUsername}),
 		xcontext.WithLogger(slog.Default()),
 	)
 	rctx = cache.WithInternalEndpoint(rctx, &saEP)
+	rctx = cache.WithInternalRESTConfig(rctx, saRC)
 
 	// Resolve the routesloaders CR. The widget resolver recursively
 	// reaches every downstream RESTAction + child widget; each inner
