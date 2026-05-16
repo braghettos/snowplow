@@ -83,10 +83,28 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 						slog.String("gvr", gvr.String()),
 						slog.String("ns", ref.Namespace),
 						slog.String("name", ref.Name))
-				} else if obj, hit := rw.GetObject(gvr, ref.Namespace, ref.Name); hit {
-					// Cache hit. DeepCopy so the strip never mutates the
-					// shared informer-store object, then apply the EXACT
-					// same field strips getFromAPIServer performs (see
+				} else if obj, hit := rw.GetObject(gvr, ref.Namespace, ref.Name); hit && filterGetByRBAC(ctx, gvr, obj) {
+					// Cache hit AND the context's user is RBAC-authorized
+					// to `get` this object.
+					//
+					// Tag 0.30.101: filterGetByRBAC is the GET-verb RBAC
+					// check — the GET-path sibling of Tag A (0.30.100,
+					// the resolver pivot's LIST filter). The informer
+					// branch bypasses the per-user `<username>-
+					// clientconfig` bearer token that getFromAPIServer
+					// reads, so without this check a narrow-RBAC user
+					// GETting a known object name in a namespace they
+					// have no `get` grant for would receive it.
+					// FAIL-CLOSED: a denied GET, a missing identity, or
+					// an evaluator error all return false → this branch
+					// is skipped → the call falls through to
+					// getFromAPIServer, which issues the GET under the
+					// user's own token (the apiserver's authoritative
+					// 403). See filterGetByRBAC (informer_serve.go).
+					//
+					// DeepCopy so the strip never mutates the shared
+					// informer-store object, then apply the EXACT same
+					// field strips getFromAPIServer performs (see
 					// stripForServe — byte-equivalence is mandatory per
 					// feedback_cache_must_not_constrain_jq.md).
 					out := obj.DeepCopy()
@@ -100,14 +118,19 @@ func Get(ctx context.Context, ref templatesv1.ObjectReference) (res Result) {
 					res.Unstructured = out
 					return res
 				}
-				// GET-miss (informer synced, object absent): fall
-				// through to the apiserver so the caller sees the
-				// apiserver NotFound envelope shape.
+				// Fall through to the apiserver for either:
+				//   - GET-miss (informer synced, object absent) — the
+				//     caller sees the apiserver NotFound envelope shape;
+				//   - GET-hit but RBAC-denied / no-identity / evaluator
+				//     error (Tag 0.30.101 filterGetByRBAC) — the
+				//     apiserver issues the GET under the user's own
+				//     token and returns the authoritative 403.
 			}
 		}
 		// Any fall-through inside the routed branch — parse failure,
-		// nil/passthrough/metadata-only watcher, not-synced, GET-miss —
-		// is an apiserver-served call under the active pivot.
+		// nil/passthrough/metadata-only watcher, not-synced, GET-miss,
+		// RBAC-denied GET — is an apiserver-served call under the active
+		// pivot.
 		objectsGetApiserverFallthrough.Add(1)
 		return getFromAPIServer(ctx, ref)
 	}

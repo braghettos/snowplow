@@ -213,6 +213,9 @@ func marshalAsList(apiVersion, listKind string, items []*unstructured.Unstructur
 //   - metadata-only routed GVR (PartialObjectMetadata cannot satisfy
 //     resolver reads — only carries metadata, not spec/status)
 //   - GET-by-name 404 (preserves apiserver's error envelope shape)
+//   - GET-by-name RBAC-denied / no-identity / evaluator error
+//     (Tag 0.30.101 filterGetByRBAC — apiserver's per-user token
+//     applies the authoritative 403)
 //
 // On the served path, LIST output is wrapped in the apiserver LIST
 // envelope via marshalAsList; GET-by-name output is the bare object
@@ -226,6 +229,14 @@ func marshalAsList(apiVersion, listKind string, items []*unstructured.Unstructur
 // over-exposes every object to a narrow-RBAC user. A LIST request with
 // no identity on the context fails closed (served=false → apiserver
 // fallthrough).
+//
+// Tag 0.30.101: the served GET-by-name branch runs the hit object
+// through filterGetByRBAC — the GET-verb sibling of the same check.
+// Without it the pivot's GET branch over-exposes a single object the
+// same way: a narrow-RBAC user GETting a known name in a namespace
+// they have no `get` grant for would receive it. A denied GET, a
+// missing identity, or an evaluator error all fail closed
+// (served=false → apiserver fallthrough).
 //
 // Per `feedback_cache_must_not_constrain_jq.md`: the envelope bytes
 // MUST be byte-equivalent to apiserver for the JQ pipeline to remain
@@ -416,6 +427,22 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 		dispatchInformerFallthrough.Add(1)
 		return nil, false
 	}
+
+	// Tag 0.30.101: GET-verb RBAC check — the GET-by-name sibling of the
+	// Tag-0.30.100 post-LIST per-item filter. The pivot bypasses the
+	// per-user `<username>-clientconfig` bearer token (dispatchViaInformer
+	// never reads call.Endpoint), so without this check a narrow-RBAC
+	// user GETting a known object name in a namespace they have no `get`
+	// grant for would receive the raw informer object. filterGetByRBAC
+	// runs the object through a `get`-verb EvaluateRBAC against the
+	// in-process typed-RBAC indexer. FAIL-CLOSED: a denied GET, a missing
+	// identity, or an evaluator error all return false → apiserver
+	// fallthrough (the apiserver's per-user token correctly 403s).
+	if !filterGetByRBAC(ctx, gvr, obj) {
+		dispatchInformerFallthrough.Add(1)
+		return nil, false
+	}
+
 	raw, err := json.Marshal(obj.Object)
 	if err != nil {
 		log.Warn("informer_dispatch.get_marshal_failed",

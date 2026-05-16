@@ -38,6 +38,7 @@
 package objects
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"strconv"
@@ -46,7 +47,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	xcontext "github.com/krateoplatformops/plumbing/context"
+	"github.com/krateoplatformops/snowplow/internal/rbac"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // resolverUseInformerEnv is the env-var key shared with the 0.30.95
@@ -172,4 +176,108 @@ func stripForServe(uns *unstructured.Unstructured) {
 		uns.SetAnnotations(annotations)
 	}
 	uns.SetManagedFields(nil)
+}
+
+// filterGetByRBAC — Tag 0.30.101: GET-verb RBAC check for the
+// objects.Get informer-served branch. The GET-path sibling of Tag A
+// (0.30.100), which fixed the same over-exposure class on the resolver
+// pivot's LIST branch (filterListByRBAC, internal/resolvers/restactions/
+// api/informer_dispatch_rbac.go).
+//
+// THE BUG: objects.Get's informer-served branch returned the raw
+// informer object (rw.GetObject → stripForServe) with ZERO RBAC check.
+// objects.Get's apiserver branch (getFromAPIServer) reads the per-user
+// `<username>-clientconfig` endpoint via xcontext.UserConfig and issues
+// the GET under the user's own bearer token — so the apiserver applies
+// the user's RBAC. The informer branch bypasses that token entirely; a
+// narrow-RBAC user GETting a known object name in a namespace they have
+// no `get` grant for received the object.
+//
+// THE FIX: filterGetByRBAC runs the hit object through a `get`-verb
+// EvaluateRBAC check against the in-process, tokenless typed-RBAC
+// indexer (internal/rbac/evaluate.go) — the same evaluator the
+// userAccessFilter refilter and Tag A's LIST filter use.
+//
+// Return contract:
+//   - true  — identity present AND the user has a `get` grant for the
+//     object's namespace. Caller serves the informer object.
+//   - false — caller MUST NOT serve; fall through to getFromAPIServer
+//     (which issues the GET under the user's own token — a denied GET
+//     becomes the apiserver's authoritative 403). false covers every
+//     fail-closed path: no identity on the context, an EvaluateRBAC
+//     error, or an EvaluateRBAC deny. Under no path does an
+//     unauthorized informer object reach the caller.
+//
+// gvr supplies the API group + resource for the EvaluateRBAC tuple; the
+// verb is fixed "get". namespace is the object's OWN metadata.namespace
+// (cluster-scoped object, namespace=="", evaluates against cluster-wide
+// RBAC — the correct apiserver-equivalent semantics) — mirrors Tag A's
+// filterListByRBAC, which uses each item's own namespace.
+//
+// We deliberately replicate the api package's filterGetByRBAC rather
+// than import it: `objects` must not gain an `objects → restactions/api`
+// import edge (the informer_serve.go package doc spells out the
+// import-cycle risk). `internal/rbac` imports only `internal/cache`, so
+// `objects → rbac` is cycle-free. The helper body is ~10 lines; the
+// duplication is cheaper than the coupling.
+//
+// Per feedback_no_special_cases.md: uniform over every GVR — no
+// per-resource carve-out.
+func filterGetByRBAC(ctx context.Context, gvr schema.GroupVersionResource, obj *unstructured.Unstructured) bool {
+	log := xcontext.Logger(ctx)
+
+	if obj == nil {
+		// Defensive: the caller only reaches here on an indexer HIT
+		// (obj non-nil), but the helper fails closed rather than trust
+		// that invariant blindly.
+		return false
+	}
+
+	user, err := xcontext.UserInfo(ctx)
+	if err != nil {
+		// FAIL-CLOSED: no identity → cannot vouch for the object. Fall
+		// through to the apiserver, whose per-user-token gate is the
+		// authoritative answer.
+		log.Warn("objects.Get.rbac_get_filter.no_identity",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("namespace", obj.GetNamespace()),
+			slog.String("name", obj.GetName()),
+			slog.Any("err", err),
+			slog.String("action", "fallthrough_to_apiserver"),
+		)
+		return false
+	}
+
+	allowed, err := rbac.EvaluateRBAC(ctx, rbac.EvaluateOptions{
+		Username:  user.Username,
+		Groups:    user.Groups,
+		Verb:      "get",
+		Group:     gvr.Group,
+		Resource:  gvr.Resource,
+		Namespace: obj.GetNamespace(),
+	})
+	if err != nil {
+		// FAIL-CLOSED: an evaluator hiccup never permits a serve.
+		log.Warn("objects.Get.rbac_get_filter.evaluate_error",
+			slog.String("subsystem", "cache"),
+			slog.String("user", user.Username),
+			slog.String("gvr", gvr.String()),
+			slog.String("namespace", obj.GetNamespace()),
+			slog.String("name", obj.GetName()),
+			slog.Any("err", err),
+			slog.String("action", "fallthrough_to_apiserver"),
+		)
+		return false
+	}
+
+	log.Debug("objects.Get.rbac_get_filter",
+		slog.String("subsystem", "cache"),
+		slog.String("user", user.Username),
+		slog.String("gvr", gvr.String()),
+		slog.String("namespace", obj.GetNamespace()),
+		slog.String("name", obj.GetName()),
+		slog.Bool("allowed", allowed),
+	)
+	return allowed
 }

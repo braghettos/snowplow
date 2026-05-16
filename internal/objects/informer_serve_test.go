@@ -120,14 +120,69 @@ func resetServeCounters() {
 	objectsGetApiserverFallthrough.Store(0)
 }
 
+// serveAdminUser is the identity serveAdminCtx() carries. The
+// objects.Get serve-mechanics tests (informer-served, strip, DeepCopy)
+// are NOT RBAC tests — they assert the pivot's cache-serving plumbing.
+// Tag 0.30.101 added a GET-verb RBAC check (filterGetByRBAC) to the
+// informer-served branch; for those tests to keep exercising the served
+// path the context must carry an identity authorized for everything.
+// serveAdminRBACSeed() grants exactly that. The GET-path RBAC-narrowing
+// behaviour itself is covered by the dedicated falsifier in
+// informer_serve_rbac_narrow_test.go.
+const serveAdminUser = "serve-admin"
+
+// serveAdminRBACSeed returns RBAC objects granting serveAdminUser a
+// cluster-wide wildcard — so the Tag-0.30.101 GET-verb RBAC filter is a
+// transparent pass-through for the serve-mechanics tests. Mirrors the
+// `api` package's dispatchAdminRBACSeed (Tag 0.30.100).
+func serveAdminRBACSeed() []runtime.Object {
+	return []runtime.Object{
+		&rbacv1.ClusterRole{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole"},
+			ObjectMeta: metav1.ObjectMeta{Name: "serve-admin-role"},
+			Rules: []rbacv1.PolicyRule{
+				{APIGroups: []string{"*"}, Resources: []string{"*"}, Verbs: []string{"*"}},
+			},
+		},
+		&rbacv1.ClusterRoleBinding{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding"},
+			ObjectMeta: metav1.ObjectMeta{Name: "serve-admin-binding"},
+			Subjects: []rbacv1.Subject{
+				{Kind: rbacv1.UserKind, APIGroup: "rbac.authorization.k8s.io", Name: serveAdminUser},
+			},
+			RoleRef: rbacv1.RoleRef{
+				APIGroup: "rbac.authorization.k8s.io",
+				Kind:     "ClusterRole",
+				Name:     "serve-admin-role",
+			},
+		},
+	}
+}
+
+// serveAdminCtx builds a context carrying serveAdminUser as the
+// identity. The Tag-0.30.101 GET-verb RBAC filter FAILS CLOSED on a
+// missing identity (informer branch skipped → apiserver fallthrough).
+// The serve-mechanics tests that assert an informer serve pair this
+// context with a watcher built via newServeWatcher, which seeds
+// serveAdminRBACSeed() granting this user a cluster-wide wildcard — so
+// the RBAC filter is a transparent pass-through there.
+func serveAdminCtx() context.Context {
+	return ctxWithUser(serveAdminUser)
+}
+
 // newServeWatcher constructs a synced cache=on watcher with the test
 // GVR's informer registered + seeded. Mirrors the `api` package's
 // `newDispatchWatcher` helper. Caller does NOT stop the watcher —
 // t.Cleanup is wired.
+//
+// The watcher is additionally seeded with serveAdminRBACSeed() so the
+// Tag-0.30.101 GET-verb RBAC filter permits serveAdminUser (the
+// identity serveAdminCtx carries) — see serveAdminUser doc.
 func newServeWatcher(t *testing.T, seed ...runtime.Object) *cache.ResourceWatcher {
 	t.Helper()
 	t.Setenv("CACHE_ENABLED", "true")
 
+	seed = append(seed, serveAdminRBACSeed()...)
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
 		serveTestScheme(), serveTestListKinds(), seed...)
 
@@ -151,6 +206,16 @@ func newServeWatcher(t *testing.T, seed ...runtime.Object) *cache.ResourceWatche
 	case <-syncCh:
 	case <-time.After(5 * time.Second):
 		t.Fatalf("EnsureResourceType: informer did not sync within 5s")
+	}
+
+	// Wait for the eagerly-registered RBAC informers to sync — the
+	// Tag-0.30.101 GET-verb RBAC filter reads them; an unsynced RBAC
+	// store would deny serveAdminUser and break the serve-mechanics
+	// assertions.
+	syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := rw.WaitForCacheSync(syncCtx, 5*time.Second); err != nil {
+		t.Fatalf("WaitForCacheSync (RBAC informers): %v", err)
 	}
 
 	cache.SetGlobal(rw)
@@ -206,7 +271,9 @@ func TestGet_InformerServed(t *testing.T) {
 	t.Setenv("RESOLVER_USE_INFORMER", "true")
 	newServeWatcher(t, newServeTestObject("default", "alpha", "marker-alpha"))
 
-	res := Get(context.Background(), serveTestRef("default", "alpha"))
+	// serveAdminCtx carries an identity with a cluster-wide RBAC
+	// wildcard — the Tag-0.30.101 GET-verb filter is a pass-through.
+	res := Get(serveAdminCtx(), serveTestRef("default", "alpha"))
 
 	if res.Err != nil {
 		t.Fatalf("informer-served: unexpected Err: %v", res.Err)
@@ -238,7 +305,7 @@ func TestGet_InformerServed_StripsManagedFields(t *testing.T) {
 	t.Setenv("RESOLVER_USE_INFORMER", "true")
 	newServeWatcher(t, newServeTestObject("default", "alpha", "m"))
 
-	res := Get(context.Background(), serveTestRef("default", "alpha"))
+	res := Get(serveAdminCtx(), serveTestRef("default", "alpha"))
 	if res.Unstructured == nil {
 		t.Fatalf("strip test: expected served object; got nil")
 	}
@@ -271,7 +338,7 @@ func TestGet_InformerServed_DoesNotMutateStore(t *testing.T) {
 	t.Setenv("RESOLVER_USE_INFORMER", "true")
 	rw := newServeWatcher(t, newServeTestObject("default", "alpha", "m"))
 
-	res := Get(context.Background(), serveTestRef("default", "alpha"))
+	res := Get(serveAdminCtx(), serveTestRef("default", "alpha"))
 	if res.Unstructured == nil {
 		t.Fatalf("setup: expected served object")
 	}
