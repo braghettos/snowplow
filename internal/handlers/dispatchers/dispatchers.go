@@ -19,10 +19,13 @@ func All() map[string]http.Handler {
 }
 
 // RegisterRefreshHandlers wires the L1 resolved-output cache refresher
-// callbacks for the two dispatcher kinds. MUST be called AFTER
+// callbacks for every refreshable handler kind — "restactions",
+// "widgets", and (Ship 0.30.117) "apistage". MUST be called AFTER
 // ResolvedCache() is built (so the cache singleton exists) and BEFORE
 // cache.StartRefresher (so the worker pool sees populated handlers on
-// first dequeue).
+// first dequeue). A kind missing from this registry is silently
+// TTL-only — the refresher counts skippedNoHandler and never re-resolves
+// it (the 0.30.116 -> 0.30.117 AC-E3 defect).
 //
 // Ship C (0.30.112): the handlers are REAL — each delegates to the
 // shared resolveAndPopulateL1, which re-resolves the entry from its own
@@ -78,4 +81,13 @@ func RegisterRefreshHandlers(saRC *rest.Config) {
 	}
 	cache.RegisterRefreshFunc("restactions", refreshFunc)
 	cache.RegisterRefreshFunc("widgets", refreshFunc)
+	// Ship 0.30.117 — AC-E3 fix. Ship E (0.30.116) added the "apistage"
+	// L1 entry kind but RegisterRefreshHandlers never registered a
+	// handler for it, so an apistage entry off the refresher queue hit a
+	// nil handler -> skippedNoHandler -> silently TTL-only, never
+	// refreshed (the dep-scoped refresh AC-E3 promised). The SAME
+	// refreshFunc closure serves it: the resolve-once seam already routes
+	// HandlerKindApistage (resolve_populate.go re-resolves the owning
+	// RESTAction, whose in-loop key-swap re-Puts the stage entry).
+	cache.RegisterRefreshFunc(cache.HandlerKindApistage, refreshFunc)
 }
