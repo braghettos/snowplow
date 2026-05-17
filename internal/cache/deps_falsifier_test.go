@@ -128,12 +128,12 @@ func TestFalsifierF2_DeleteDirtyMarksDependentGet(t *testing.T) {
 	store.Put(widgetL1, &ResolvedEntry{
 		RawJSON: []byte(`{"kind":"button"}`),
 		Inputs: &ResolvedKeyInputs{
-			HandlerKind: "widgets",
-			Group:       widgetGVR.Group,
-			Version:     widgetGVR.Version,
-			Resource:    widgetGVR.Resource,
-			Namespace:   "app",
-			Name:        "save-btn",
+			CacheEntryClass: "widgets",
+			Group:           widgetGVR.Group,
+			Version:         widgetGVR.Version,
+			Resource:        widgetGVR.Resource,
+			Namespace:       "app",
+			Name:            "save-btn",
 		},
 	})
 	// The widget GET-depends on RESTAction "list-users" — a DIFFERENT

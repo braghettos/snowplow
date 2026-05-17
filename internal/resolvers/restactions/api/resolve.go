@@ -220,20 +220,45 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 				opts.RESTActionNamespace, opts.RESTActionName,
 				user.Username, user.Groups, apiCall, dict, opts.PerPage, opts.Page)
 			stageKey = cache.ComputeKey(stageInputs)
-			if entry, hit := apistageStore.Get(stageKey); hit && entry != nil {
-				if v, decoded := decodeStageValue(entry.RawJSON); decoded {
-					dict[id] = v
-					log.Info("apistage.l1_hit",
-						slog.String("subsystem", "cache"),
-						slog.String("name", id),
-						slog.String("key_hash", stageKey),
-						slog.String("hint", "stage served from api-stage L1 — K8s call skipped"),
-					)
-					continue
+
+			// Ship 0.30.118 — refresh self-hit fix. When this resolve is a
+			// REFRESH-driven re-resolve (WithRefreshBypass set by the
+			// refresher) AND this stage's key is EXACTLY the refresh's
+			// target stage key, SKIP the Get: the whole point of the
+			// refresh is to recompute THIS stage from K8s. Without the
+			// skip the stage would self-hit the dirty-but-resident entry
+			// it is refreshing (Get honors only TTL, not the dirty flag),
+			// the K8s call would be skipped, and no fresh value re-Put.
+			// The skip is scoped to the EXACT target stage key — sibling
+			// stages of the same refresh still Get-hit normally (they are
+			// not being refreshed). Request-path resolves never carry the
+			// marker, so this is byte-identical to 0.30.117 for them.
+			bypassThisStage := cache.RefreshBypassFromContext(ctx) &&
+				stageKey == cache.L1KeyFromContext(ctx)
+
+			if !bypassThisStage {
+				if entry, hit := apistageStore.Get(stageKey); hit && entry != nil {
+					if v, decoded := decodeStageValue(entry.RawJSON); decoded {
+						dict[id] = v
+						log.Info("apistage.l1_hit",
+							slog.String("subsystem", "cache"),
+							slog.String("name", id),
+							slog.String("key_hash", stageKey),
+							slog.String("hint", "stage served from api-stage L1 — K8s call skipped"),
+						)
+						continue
+					}
 				}
+			} else {
+				log.Info("apistage.refresh_bypass",
+					slog.String("subsystem", "cache"),
+					slog.String("name", id),
+					slog.String("key_hash", stageKey),
+					slog.String("hint", "refresh-driven re-resolve of this exact stage — Get skipped, recomputing from K8s"),
+				)
 			}
-			// Miss — resolve the stage under the stage key so the
-			// existing inner-call dep-recording (resolve.go ~line 300)
+			// Miss (or bypass) — resolve the stage under the stage key so
+			// the existing inner-call dep-recording (resolve.go ~line 300)
 			// attributes this stage's K8s LIST/GET to the stage entry.
 			stageCtx = cache.WithL1KeyContext(ctx, stageKey)
 		}

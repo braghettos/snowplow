@@ -143,12 +143,12 @@ func TestEnsureResourceTypeMetadataOnly_DepTrackerFires(t *testing.T) {
 	rc.Put(l1Key, &cache.ResolvedEntry{
 		RawJSON: []byte(`{"items":["before"]}`),
 		Inputs: &cache.ResolvedKeyInputs{
-			HandlerKind: "restactions",
-			Group:       compositionGVR.Group,
-			Version:     compositionGVR.Version,
-			Resource:    compositionGVR.Resource,
-			Namespace:   "bench-ns-01",
-			Name:        "victim",
+			CacheEntryClass: "restactions",
+			Group:           compositionGVR.Group,
+			Version:         compositionGVR.Version,
+			Resource:        compositionGVR.Resource,
+			Namespace:       "bench-ns-01",
+			Name:            "victim",
 		},
 	})
 	cache.Deps().Record(l1Key, compositionGVR, "bench-ns-01", "victim")

@@ -66,7 +66,7 @@ func TestRefresher_HandlerInvokedOnEnqueue(t *testing.T) {
 	defer cleanup()
 
 	c := ResolvedCache()
-	inputs := ResolvedKeyInputs{HandlerKind: "widgets", Username: "u"}
+	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Username: "u"}
 	key := ComputeKey(inputs)
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"x":1}`), Inputs: &inputs})
 
@@ -75,8 +75,8 @@ func TestRefresher_HandlerInvokedOnEnqueue(t *testing.T) {
 		if k != key {
 			t.Errorf("handler got key %q want %q", k, key)
 		}
-		if in.HandlerKind != "widgets" {
-			t.Errorf("handler got HandlerKind %q want widgets", in.HandlerKind)
+		if in.CacheEntryClass != "widgets" {
+			t.Errorf("handler got CacheEntryClass %q want widgets", in.CacheEntryClass)
 		}
 		called.Add(1)
 		return nil
@@ -101,7 +101,7 @@ func TestRefresher_RapidMarksCoalesce(t *testing.T) {
 	defer cleanup()
 
 	c := ResolvedCache()
-	inputs := ResolvedKeyInputs{HandlerKind: "widgets", Name: "coalesce"}
+	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "coalesce"}
 	key := ComputeKey(inputs)
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
@@ -149,7 +149,7 @@ func TestRefresher_ErrorRetriesThenForgets(t *testing.T) {
 	resetRefresherForTest()
 
 	c := ResolvedCache()
-	inputs := ResolvedKeyInputs{HandlerKind: "widgets", Name: "retry"}
+	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "retry"}
 	key := ComputeKey(inputs)
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
@@ -202,7 +202,7 @@ func TestRefresher_PoisonPillDroppedAfterCap(t *testing.T) {
 	resetRefresherForTest()
 
 	c := ResolvedCache()
-	inputs := ResolvedKeyInputs{HandlerKind: "widgets", Name: "poison"}
+	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "poison"}
 	key := ComputeKey(inputs)
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
@@ -265,7 +265,7 @@ func TestRefresher_TransientUnderCapStillSucceeds(t *testing.T) {
 	resetRefresherForTest()
 
 	c := ResolvedCache()
-	inputs := ResolvedKeyInputs{HandlerKind: "widgets", Name: "transient"}
+	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "transient"}
 	key := ComputeKey(inputs)
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
@@ -303,7 +303,7 @@ func TestRefresher_HandlerErrorDoesNotEvict(t *testing.T) {
 	resetRefresherForTest()
 
 	c := ResolvedCache()
-	inputs := ResolvedKeyInputs{HandlerKind: "widgets", Name: "noevict"}
+	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "noevict"}
 	key := ComputeKey(inputs)
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
@@ -332,7 +332,7 @@ func TestRefresher_NilInputsEntrySkips(t *testing.T) {
 
 	c := ResolvedCache()
 	// Synthesise a key + a legacy entry with nil Inputs under it.
-	key := ComputeKey(ResolvedKeyInputs{HandlerKind: "widgets", Name: "legacy"})
+	key := ComputeKey(ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "legacy"})
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: nil})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -353,7 +353,7 @@ func TestRefresher_NoHandlerForKind(t *testing.T) {
 	defer cleanup()
 
 	c := ResolvedCache()
-	inputs := ResolvedKeyInputs{HandlerKind: "unregistered"}
+	inputs := ResolvedKeyInputs{CacheEntryClass: "unregistered"}
 	key := ComputeKey(inputs)
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
@@ -413,7 +413,7 @@ func TestRefresher_ConcurrentEnqueueRaceFree(t *testing.T) {
 	const N = 200
 	var wg sync.WaitGroup
 	for i := 0; i < N; i++ {
-		inputs := ResolvedKeyInputs{HandlerKind: "widgets", Name: "n" + itoa(i)}
+		inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "n" + itoa(i)}
 		key := ComputeKey(inputs)
 		c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 		wg.Add(1)
@@ -442,7 +442,7 @@ func TestRefresher_OnUpdateRefreshesContent(t *testing.T) {
 	defer cleanup()
 
 	c := ResolvedCache()
-	inputs := ResolvedKeyInputs{HandlerKind: "widgets", Name: "content"}
+	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "content"}
 	key := ComputeKey(inputs)
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{"v":"stale"}`), Inputs: &inputs})
 
@@ -476,7 +476,7 @@ func TestRefresher_RefreshAfterEvictDoesNotResurrect(t *testing.T) {
 	defer cleanup()
 
 	c := ResolvedCache()
-	inputs := ResolvedKeyInputs{HandlerKind: "widgets", Name: "evicted"}
+	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "evicted"}
 	key := ComputeKey(inputs)
 	// Entry is NOT in the store — emulate "evicted before the worker
 	// picked up the dirty-mark".
@@ -552,7 +552,7 @@ func TestRefresher_DepTrackerOnUpdateEnqueues(t *testing.T) {
 	defer cleanup()
 
 	c := ResolvedCache()
-	inputs := ResolvedKeyInputs{HandlerKind: "widgets"}
+	inputs := ResolvedKeyInputs{CacheEntryClass: "widgets"}
 	key := ComputeKey(inputs)
 	c.Put(key, &ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 

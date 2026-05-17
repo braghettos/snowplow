@@ -65,10 +65,10 @@ func TestDeps_FourBucketLookup(t *testing.T) {
 	d := newTestDepTracker(t, 1_000)
 	gvr := gvrCompositions()
 
-	d.Record("L1_exact", gvr, "bench-ns-01", "app-1")    // exact
-	d.RecordList("L1_nslist", gvr, "bench-ns-01")        // ns-list
-	d.Record("L1_clustname", gvr, "", "app-1")           // cluster-name (rare)
-	d.RecordList("L1_clustlist", gvr, "")                // cluster-list
+	d.Record("L1_exact", gvr, "bench-ns-01", "app-1") // exact
+	d.RecordList("L1_nslist", gvr, "bench-ns-01")     // ns-list
+	d.Record("L1_clustname", gvr, "", "app-1")        // cluster-name (rare)
+	d.RecordList("L1_clustlist", gvr, "")             // cluster-list
 
 	matched := d.collectMatches(gvr, "bench-ns-01", "app-1")
 	want := []string{"L1_exact", "L1_nslist", "L1_clustname", "L1_clustlist"}
@@ -99,12 +99,12 @@ func TestDeps_FourBucketLookup(t *testing.T) {
 // representation of that object so OnDelete classifies it as evict.
 func inputsFor(gvr schema.GroupVersionResource, ns, name string) *ResolvedKeyInputs {
 	return &ResolvedKeyInputs{
-		HandlerKind: "restactions",
-		Group:       gvr.Group,
-		Version:     gvr.Version,
-		Resource:    gvr.Resource,
-		Namespace:   ns,
-		Name:        name,
+		CacheEntryClass: "restactions",
+		Group:           gvr.Group,
+		Version:         gvr.Version,
+		Resource:        gvr.Resource,
+		Namespace:       ns,
+		Name:            name,
 	}
 }
 
@@ -793,9 +793,9 @@ func TestDeps_OnResourceTypeRemoved_DirtyMarksListAndGetDeps(t *testing.T) {
 		Inputs:  inputsFor(gvr, "ns", "self-obj"),
 	})
 
-	d.RecordList("L1_list", gvr, "ns")          // LIST-dep
-	d.Record("L1_get", gvr, "ns", "thing-1")    // dependent GET-dep
-	d.Record("L1_self", gvr, "ns", "self-obj")  // self-representation GET-dep
+	d.RecordList("L1_list", gvr, "ns")         // LIST-dep
+	d.Record("L1_get", gvr, "ns", "thing-1")   // dependent GET-dep
+	d.Record("L1_self", gvr, "ns", "self-obj") // self-representation GET-dep
 
 	var marked []string
 	var mu sync.Mutex

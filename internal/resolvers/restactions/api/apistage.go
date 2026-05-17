@@ -23,7 +23,7 @@
 // out of Ship E scope.
 //
 // The api-stage entry is just a third granularity of cache.ResolvedKeyInputs
-// (HandlerKind=="apistage", Stage set) on the SAME ResolvedCacheStore —
+// (CacheEntryClass=="apistage", Stage set) on the SAME ResolvedCacheStore —
 // no parallel cache. The live Ship-A dep-tracker + Ship-C refresher
 // handle it with no new code: resolving the stage under
 // WithL1KeyContext(stageKey) makes the existing inner-call dep-recording
@@ -141,17 +141,17 @@ func stageDiscriminator(stage *templates.API, dict map[string]any) string {
 // can re-fetch the RESTAction and re-run the single stage.
 func stageKeyInputs(raNamespace, raName, username string, groups []string, stage *templates.API, dict map[string]any, perPage, page int) cache.ResolvedKeyInputs {
 	return cache.ResolvedKeyInputs{
-		HandlerKind: cache.HandlerKindApistage,
-		Group:       restActionGVR.Group,
-		Version:     restActionGVR.Version,
-		Resource:    restActionGVR.Resource,
-		Namespace:   raNamespace,
-		Name:        raName,
-		Username:    username,
-		Groups:      groups,
-		PerPage:     perPage,
-		Page:        page,
-		Stage:       stageDiscriminator(stage, dict),
+		CacheEntryClass: cache.CacheEntryClassApistage,
+		Group:           restActionGVR.Group,
+		Version:         restActionGVR.Version,
+		Resource:        restActionGVR.Resource,
+		Namespace:       raNamespace,
+		Name:            raName,
+		Username:        username,
+		Groups:          groups,
+		PerPage:         perPage,
+		Page:            page,
+		Stage:           stageDiscriminator(stage, dict),
 	}
 }
 

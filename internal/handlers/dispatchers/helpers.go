@@ -141,17 +141,17 @@ func dispatchCacheLookupKey(ctx context.Context, handlerKind, group, version, re
 		return "", nil, nil
 	}
 	inputs := cache.ResolvedKeyInputs{
-		HandlerKind: handlerKind,
-		Group:       group,
-		Version:     version,
-		Resource:    resource,
-		Namespace:   namespace,
-		Name:        name,
-		Username:    ui.Username,
-		Groups:      ui.Groups,
-		PerPage:     perPage,
-		Page:        page,
-		Extras:      extras,
+		CacheEntryClass: handlerKind,
+		Group:           group,
+		Version:         version,
+		Resource:        resource,
+		Namespace:       namespace,
+		Name:            name,
+		Username:        ui.Username,
+		Groups:          ui.Groups,
+		PerPage:         perPage,
+		Page:            page,
+		Extras:          extras,
 	}
 	return cache.ComputeKey(inputs), c, &inputs
 }

@@ -131,6 +131,50 @@ func L1KeyFromContext(ctx context.Context) string {
 	return v
 }
 
+// ctxKeyRefreshBypassType is the typed empty-struct context key for the
+// Ship 0.30.118 refresh-bypass marker. Distinct unexported type — same
+// collision-safety as ctxKeyL1RecordType.
+type ctxKeyRefreshBypassType struct{}
+
+var ctxKeyRefreshBypass = ctxKeyRefreshBypassType{}
+
+// WithRefreshBypass returns a child context marked as a REFRESH-driven
+// re-resolve (Ship 0.30.118 — the api-stage self-hit fix). The refresher
+// sets it on the re-resolve context for an apistage entry; the api-stage
+// resolver consults it via RefreshBypassFromContext.
+//
+// THE INVARIANT it restores: the resolve that feeds a refresh must not
+// consult the entry being refreshed. The apistage refresh routes through
+// the whole-RESTAction stage loop, whose per-stage Get(stageKey) reads
+// the resolved-output L1 — so without this marker the refresh re-resolve
+// self-hits the dirty-but-resident entry it is refreshing, skips the K8s
+// call, and never re-Puts. With the marker the stage loop SKIPS the Get
+// for exactly the stage key being refreshed (L1KeyFromContext) — that
+// stage recomputes from K8s and the key-swap Put writes the fresh value.
+// Sibling stages still Get-hit normally (they are not being refreshed).
+//
+// Mirrors WithL1KeyContext: a context.Value flag, no parameter threaded
+// through the resolver call chain. A nil ctx is returned unchanged.
+func WithRefreshBypass(ctx context.Context) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxKeyRefreshBypass, true)
+}
+
+// RefreshBypassFromContext reports whether ctx was marked by
+// WithRefreshBypass — i.e. whether this resolve is a refresh-driven
+// re-resolve. The api-stage stage loop combines this with a stage-key
+// equality check (stageKey == L1KeyFromContext(ctx)) so the bypass
+// applies ONLY to the exact stage entry being refreshed.
+func RefreshBypassFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(ctxKeyRefreshBypass).(bool)
+	return v
+}
+
 // Dependency env knobs.
 const (
 	envDepsMaxRecords = "DEPS_MAX_RECORDS"

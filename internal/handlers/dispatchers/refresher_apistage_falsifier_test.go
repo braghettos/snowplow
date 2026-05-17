@@ -15,7 +15,7 @@
 // path. These two falsifiers drive the refresher path:
 //
 //   FA1 (registry) — after RegisterRefreshHandlers, the handler registry
-//        MUST carry an entry for cache.HandlerKindApistage. FAILS pre-fix:
+//        MUST carry an entry for cache.CacheEntryClassApistage. FAILS pre-fix:
 //        RefreshFuncForTest(apistage) returns nil.
 //
 //   FA2 (end-to-end) — a dirty-marked apistage L1 key, drained by the
@@ -39,25 +39,25 @@ import (
 )
 
 // apistageRefreshInputs is the canonical ResolvedKeyInputs for an
-// api-stage L1 entry — HandlerKind=="apistage", Stage set, the owning
+// api-stage L1 entry — CacheEntryClass=="apistage", Stage set, the owning
 // RESTAction's GVR/namespace/name + a per-user identity.
 func apistageRefreshInputs() cache.ResolvedKeyInputs {
 	return cache.ResolvedKeyInputs{
-		HandlerKind: cache.HandlerKindApistage,
-		Group:       "templates.krateo.io",
-		Version:     "v1",
-		Resource:    "restactions",
-		Namespace:   "bench-ns-01",
-		Name:        "shared-compositions-restaction",
-		Username:    "cyberjoker",
-		Groups:      []string{"devs"},
-		Stage:       "stage\x1fcompositions\x1fabc\x1fdef",
+		CacheEntryClass: cache.CacheEntryClassApistage,
+		Group:           "templates.krateo.io",
+		Version:         "v1",
+		Resource:        "restactions",
+		Namespace:       "bench-ns-01",
+		Name:            "shared-compositions-restaction",
+		Username:        "cyberjoker",
+		Groups:          []string{"devs"},
+		Stage:           "stage\x1fcompositions\x1fabc\x1fdef",
 	}
 }
 
 // TestFalsifierFA1_ApistageHandlerRegistered asserts the registry-level
 // defect directly: RegisterRefreshHandlers MUST register a RefreshFunc
-// for cache.HandlerKindApistage alongside "restactions" and "widgets".
+// for cache.CacheEntryClassApistage alongside "restactions" and "widgets".
 //
 // FAILS pre-fix: RegisterRefreshHandlers omits the apistage kind, so
 // RefreshFuncForTest(apistage) returns nil — the refresher would count
@@ -84,10 +84,10 @@ func TestFalsifierFA1_ApistageHandlerRegistered(t *testing.T) {
 		t.Fatalf("FA1: widgets RefreshFunc unregistered — regression")
 	}
 	// THE DEFECT: the apistage kind must be registered.
-	if cache.RefreshFuncForTest(cache.HandlerKindApistage) == nil {
+	if cache.RefreshFuncForTest(cache.CacheEntryClassApistage) == nil {
 		t.Fatalf("FA1: no RefreshFunc registered for kind=%q — an apistage L1 "+
 			"entry off the refresher queue hits a nil handler -> skippedNoHandler "+
-			"-> never refreshed (AC-E3 defect)", cache.HandlerKindApistage)
+			"-> never refreshed (AC-E3 defect)", cache.CacheEntryClassApistage)
 	}
 }
 
@@ -115,8 +115,8 @@ func TestFalsifierFA2_ApistageEntryRefreshedEndToEnd(t *testing.T) {
 	// observable in content.
 	freshBytes := []byte(`{"value":"refreshed-apistage"}`)
 	restoreSeam := setResolveOnceForTest(func(_ context.Context, in cache.ResolvedKeyInputs) ([]byte, error) {
-		if in.HandlerKind != cache.HandlerKindApistage {
-			t.Errorf("FA2: resolve seam invoked for unexpected kind %q", in.HandlerKind)
+		if in.CacheEntryClass != cache.CacheEntryClassApistage {
+			t.Errorf("FA2: resolve seam invoked for unexpected kind %q", in.CacheEntryClass)
 		}
 		return freshBytes, nil
 	})

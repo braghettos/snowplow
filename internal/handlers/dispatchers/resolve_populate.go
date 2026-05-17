@@ -132,10 +132,25 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// recording site re-records dep edges for this refresh.
 	rctx = cache.WithL1KeyContext(rctx, key)
 
+	// Ship 0.30.118 — refresh self-hit fix. An apistage re-resolve routes
+	// through the whole-RESTAction stage loop, whose per-stage
+	// Get(stageKey) reads the resolved-output L1. Without this marker the
+	// loop would self-hit the dirty-but-resident apistage entry it is
+	// refreshing (Get honors only TTL, not the dirty flag), skip the K8s
+	// call, and never re-Put — the entry would converge by TTL only. The
+	// marker makes the stage loop SKIP the Get for exactly this stage key
+	// (key == L1KeyFromContext above), so the target stage recomputes
+	// from K8s and the resolver's key-swap Put writes the fresh value.
+	// Set ONLY for the apistage class — restactions/widgets re-resolves do
+	// not route through the apistage Get and are unaffected.
+	if inputs.CacheEntryClass == cache.CacheEntryClassApistage {
+		rctx = cache.WithRefreshBypass(rctx)
+	}
+
 	encoded, err := resolveOnceFn(rctx, inputs)
 	if err != nil {
 		return fmt.Errorf("resolveAndPopulateL1 %s/%s: %w",
-			inputs.HandlerKind, inputs.Name, err)
+			inputs.CacheEntryClass, inputs.Name, err)
 	}
 	if encoded == nil {
 		// The seam declined to resolve (e.g. unknown handler kind) —
@@ -161,7 +176,7 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	log.Debug("resolveAndPopulateL1: re-resolved + stored",
 		slog.String("subsystem", "cache"),
 		slog.String("key_hash", key),
-		slog.String("handler", inputs.HandlerKind),
+		slog.String("handler", inputs.CacheEntryClass),
 		slog.String("user", inputs.Username),
 	)
 	return nil
@@ -192,29 +207,33 @@ func resolveOnceProd(ctx context.Context, inputs cache.ResolvedKeyInputs) ([]byt
 		return nil, fmt.Errorf("re-fetch %s/%s: nil object", inputs.Resource, inputs.Name)
 	}
 
-	switch inputs.HandlerKind {
+	switch inputs.CacheEntryClass {
 	case "restactions":
 		return resolveRestActionForRefresh(ctx, got, inputs, authnNS)
 	case "widgets":
 		return resolveWidgetForRefresh(ctx, got, inputs, authnNS)
-	case cache.HandlerKindApistage:
-		// Ship E (0.30.116): an api-stage L1 entry. Its Inputs identify
-		// the OWNING RESTAction (Group/Version/Resource/Namespace/Name);
-		// re-resolving that whole RESTAction re-runs every stage, and —
-		// because the refresh ctx carries RESOLVED_CACHE_APISTAGE_ENABLED
-		// the same as the request path — the resolver's in-loop key-swap
-		// re-Puts a fresh entry for THIS stage (and its siblings). The
-		// single dirty-marked stage converges as a side effect of the
-		// parent re-resolve; no predecessor-state reconstruction needed.
+	case cache.CacheEntryClassApistage:
+		// Ship E (0.30.116) + Ship 0.30.118: an api-stage L1 entry. Its
+		// Inputs identify the OWNING RESTAction (Group/Version/Resource/
+		// Namespace/Name); re-resolving that whole RESTAction re-runs
+		// every stage. resolveAndPopulateL1 marked this ctx with
+		// WithRefreshBypass — so the resolver's per-stage Get SKIPS the
+		// dirty-but-resident entry for exactly the target stage key
+		// (Ship 0.30.118 self-hit fix). That stage recomputes from K8s
+		// and the resolver's in-loop key-swap re-Puts a fresh entry for
+		// it. Sibling stages still Get-hit (they are not being refreshed).
 		//
-		// CRITICAL: this returns (nil, nil) on success. The stage entry
+		// CRITICAL: this returns (nil, nil) on success — and that is now
+		// the CORRECT contract, not a workaround. The target stage entry
 		// has ALREADY been re-Put by the resolver's key-swap, under the
-		// stage key, with the correct apistage value shape. If we
-		// returned the RESTAction's encoded bytes, resolveAndPopulateL1
-		// would Put THOSE bytes under the stage key — overwriting the
-		// correct stage entry with whole-RESTAction output. (nil, nil)
-		// makes resolveAndPopulateL1 skip its own Put: the work is done.
-		// A resolve ERROR still propagates so the refresher retries.
+		// stage key, with the correct apistage value shape (the bypass is
+		// what makes that re-Put actually fire — pre-0.30.118 the self-hit
+		// short-circuited it). If we instead returned the RESTAction's
+		// encoded bytes, resolveAndPopulateL1 would Put THOSE bytes under
+		// the stage key — overwriting the correct stage entry with
+		// whole-RESTAction output. (nil, nil) makes resolveAndPopulateL1
+		// skip its own Put: the work is done. A resolve ERROR still
+		// propagates so the refresher retries.
 		if _, err := resolveRestActionForRefresh(ctx, got, inputs, authnNS); err != nil {
 			return nil, err
 		}

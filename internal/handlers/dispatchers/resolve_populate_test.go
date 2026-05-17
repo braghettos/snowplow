@@ -32,14 +32,14 @@ func TestACC7_ReResolveUsesEntryIdentityAndL1KeyContext(t *testing.T) {
 
 	c := cache.ResolvedCache()
 	inputs := cache.ResolvedKeyInputs{
-		HandlerKind: "restactions",
-		Group:       "templates.krateo.io",
-		Version:     "v1",
-		Resource:    "restactions",
-		Namespace:   "team-a",
-		Name:        "list-users",
-		Username:    "cyberjoker",
-		Groups:      []string{"devs", "qa"},
+		CacheEntryClass: "restactions",
+		Group:           "templates.krateo.io",
+		Version:         "v1",
+		Resource:        "restactions",
+		Namespace:       "team-a",
+		Name:            "list-users",
+		Username:        "cyberjoker",
+		Groups:          []string{"devs", "qa"},
 	}
 	key := cache.ComputeKey(inputs)
 	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":1}`), Inputs: &inputs})
@@ -90,7 +90,7 @@ func TestACC5_ResolveSeamDeclineIsCleanSkip(t *testing.T) {
 	t.Cleanup(cache.ResetResolvedCacheForTest)
 
 	c := cache.ResolvedCache()
-	inputs := cache.ResolvedKeyInputs{HandlerKind: "widgets", Name: "skip"}
+	inputs := cache.ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "skip"}
 	key := cache.ComputeKey(inputs)
 	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"orig":1}`), Inputs: &inputs})
 	before := c.Stats().StoreTotal
@@ -120,7 +120,7 @@ func TestResolvePopulate_EvictedDuringResolveNotResurrected(t *testing.T) {
 	t.Cleanup(cache.ResetResolvedCacheForTest)
 
 	c := cache.ResolvedCache()
-	inputs := cache.ResolvedKeyInputs{HandlerKind: "widgets", Name: "racey"}
+	inputs := cache.ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "racey"}
 	key := cache.ComputeKey(inputs)
 	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
@@ -159,14 +159,14 @@ func TestPartB_SATransportOnContext(t *testing.T) {
 
 	c := cache.ResolvedCache()
 	inputs := cache.ResolvedKeyInputs{
-		HandlerKind: "widgets",
-		Group:       "widgets.templates.krateo.io",
-		Version:     "v1beta1",
-		Resource:    "panels",
-		Namespace:   "demo",
-		Name:        "compositions-panel",
-		Username:    "cyberjoker",
-		Groups:      []string{"devs"},
+		CacheEntryClass: "widgets",
+		Group:           "widgets.templates.krateo.io",
+		Version:         "v1beta1",
+		Resource:        "panels",
+		Namespace:       "demo",
+		Name:            "compositions-panel",
+		Username:        "cyberjoker",
+		Groups:          []string{"devs"},
 	}
 	key := cache.ComputeKey(inputs)
 	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{"stale":1}`), Inputs: &inputs})
@@ -175,13 +175,13 @@ func TestPartB_SATransportOnContext(t *testing.T) {
 	saRC := &rest.Config{Host: "https://kubernetes.default.svc"}
 
 	var (
-		gotUser     string
-		gotUserCfg  endpoints.Endpoint
-		userCfgOK   bool
-		gotIntEP    any
-		intEPOK     bool
-		gotIntRC    any
-		intRCOK     bool
+		gotUser    string
+		gotUserCfg endpoints.Endpoint
+		userCfgOK  bool
+		gotIntEP   any
+		intEPOK    bool
+		gotIntRC   any
+		intRCOK    bool
 	)
 	restore := setResolveOnceForTest(func(ctx context.Context, _ cache.ResolvedKeyInputs) ([]byte, error) {
 		if ui, err := xcontext.UserInfo(ctx); err == nil {
@@ -236,7 +236,7 @@ func TestPartB_NilSATransportIsIdentityOnly(t *testing.T) {
 	t.Cleanup(cache.ResetResolvedCacheForTest)
 
 	c := cache.ResolvedCache()
-	inputs := cache.ResolvedKeyInputs{HandlerKind: "widgets", Name: "no-sa", Username: "u"}
+	inputs := cache.ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "no-sa", Username: "u"}
 	key := cache.ComputeKey(inputs)
 	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 
@@ -264,7 +264,7 @@ func TestResolvePopulate_SeamErrorPropagates(t *testing.T) {
 	t.Cleanup(cache.ResetResolvedCacheForTest)
 
 	c := cache.ResolvedCache()
-	inputs := cache.ResolvedKeyInputs{HandlerKind: "widgets", Name: "err"}
+	inputs := cache.ResolvedKeyInputs{CacheEntryClass: "widgets", Name: "err"}
 	key := cache.ComputeKey(inputs)
 	c.Put(key, &cache.ResolvedEntry{RawJSON: []byte(`{}`), Inputs: &inputs})
 

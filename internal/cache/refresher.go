@@ -50,9 +50,9 @@ import (
 // Refresher env knobs. The base/max backoff delays drive the
 // exponential-failure rate limiter; parallelism sizes the worker pool.
 const (
-	envRefresherParallelism  = "RESOLVED_CACHE_REFRESHER_PARALLELISM"
-	envRefresherBaseDelayMS  = "RESOLVED_CACHE_REFRESHER_BASE_DELAY_MS"
-	envRefresherMaxDelayMS   = "RESOLVED_CACHE_REFRESHER_MAX_DELAY_MS"
+	envRefresherParallelism = "RESOLVED_CACHE_REFRESHER_PARALLELISM"
+	envRefresherBaseDelayMS = "RESOLVED_CACHE_REFRESHER_BASE_DELAY_MS"
+	envRefresherMaxDelayMS  = "RESOLVED_CACHE_REFRESHER_MAX_DELAY_MS"
 
 	defaultRefresherParallelism = 4
 	// Exponential-failure backoff: first retry after baseDelay, doubling
@@ -310,7 +310,7 @@ func (r *refresher) processOne(ctx context.Context, key string) error {
 		return nil
 	}
 	r.handlersMu.RLock()
-	fn := r.handlers[entry.Inputs.HandlerKind]
+	fn := r.handlers[entry.Inputs.CacheEntryClass]
 	r.handlersMu.RUnlock()
 	if fn == nil {
 		r.skippedNoHandler.Add(1)
@@ -319,7 +319,7 @@ func (r *refresher) processOne(ctx context.Context, key string) error {
 	if err := fn(ctx, key, *entry.Inputs); err != nil {
 		slog.Warn("refresher.refresh_failed",
 			slog.String("subsystem", "cache"),
-			slog.String("handler_kind", entry.Inputs.HandlerKind),
+			slog.String("handler_kind", entry.Inputs.CacheEntryClass),
 			slog.String("key_hash", key),
 			slog.Int("requeues", r.queue.NumRequeues(key)),
 			slog.Any("err", err),

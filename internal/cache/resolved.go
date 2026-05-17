@@ -43,10 +43,10 @@ import (
 
 // Resolver-cache env knobs (defaults match chart-0.30.7 spec).
 const (
-	envResolvedCacheEnabled     = "RESOLVED_CACHE_ENABLED"
-	envResolvedCacheMaxEntries  = "RESOLVED_CACHE_MAX_ENTRIES"
-	envResolvedCacheMaxBytes    = "RESOLVED_CACHE_MAX_BYTES"
-	envResolvedCacheTTLSeconds  = "RESOLVED_CACHE_TTL_SECONDS"
+	envResolvedCacheEnabled      = "RESOLVED_CACHE_ENABLED"
+	envResolvedCacheMaxEntries   = "RESOLVED_CACHE_MAX_ENTRIES"
+	envResolvedCacheMaxBytes     = "RESOLVED_CACHE_MAX_BYTES"
+	envResolvedCacheTTLSeconds   = "RESOLVED_CACHE_TTL_SECONDS"
 	envResolvedCacheSummaryEvery = "RESOLVED_CACHE_SUMMARY_EVERY_SECONDS"
 
 	// envResolvedCacheApistageEnabled is the Ship E (0.30.116) opt-in
@@ -56,19 +56,25 @@ const (
 	// resolved-output store + the refresher).
 	envResolvedCacheApistageEnabled = "RESOLVED_CACHE_APISTAGE_ENABLED"
 
-	defaultResolvedCacheMaxEntries = 100_000
-	defaultResolvedCacheMaxBytes   = int64(2) * 1024 * 1024 * 1024 // 2 GiB
-	defaultResolvedCacheTTLSeconds = 3600
+	defaultResolvedCacheMaxEntries          = 100_000
+	defaultResolvedCacheMaxBytes            = int64(2) * 1024 * 1024 * 1024 // 2 GiB
+	defaultResolvedCacheTTLSeconds          = 3600
 	defaultResolvedCacheSummaryEverySeconds = 300 // 5 min aggregate INFO line
 )
 
-// HandlerKindApistage is the ResolvedKeyInputs.HandlerKind discriminant
-// for a per-api-stage L1 entry (Ship E, 0.30.116). The resolved-output
-// store, the dep-tracker, the LRU/TTL machinery, and ComputeKey are all
-// reused verbatim — "apistage" is just a third granularity of L1 key,
-// not a new cache. The refresher's resolve-once seam branches on it to
-// re-run a single stage rather than a whole RESTAction.
-const HandlerKindApistage = "apistage"
+// CacheEntryClassApistage is the ResolvedKeyInputs.CacheEntryClass
+// discriminant for a per-api-stage L1 entry (Ship E, 0.30.116). The
+// resolved-output store, the dep-tracker, the LRU/TTL machinery, and
+// ComputeKey are all reused verbatim — "apistage" is just a third
+// granularity of L1 key, not a new cache. The refresher's resolve-once
+// seam branches on it to re-run a single stage rather than a whole
+// RESTAction.
+//
+// NOTE the STRING VALUE is unchanged ("apistage"): it is hashed into the
+// cache key (ComputeKey) and is the refresher registry key — rotating it
+// would invalidate every in-flight entry. The 0.30.118 rename touches the
+// Go const IDENTIFIER only.
+const CacheEntryClassApistage = "apistage"
 
 // ResolvedEntry is the L1 cache value. The pre-encoded JSON bytes are
 // what we hand back on a hit; storing the encoded form (rather than the
@@ -96,19 +102,23 @@ type ResolvedEntry struct {
 // resolvedKeyVersion below as part of any such change so the salt
 // guarantees clean separation across rolling restarts.
 type ResolvedKeyInputs struct {
-	HandlerKind string   // "restactions", "widgets", or "apistage"
-	Group       string   // dispatched CR's GVR Group
-	Version     string   // dispatched CR's GVR Version
-	Resource    string   // dispatched CR's GVR Resource
-	Namespace   string   // dispatched CR namespace
-	Name        string   // dispatched CR name
-	Username    string   // bind-identity username
-	Groups      []string // bind-identity groups (will be sorted before hash)
-	PerPage     int
-	Page        int
-	Extras      map[string]any
+	// CacheEntryClass is the entry-class discriminant — one of the string
+	// values "restactions", "widgets", or "apistage". (Renamed from
+	// HandlerKind in 0.30.118; the string VALUES are unchanged — they are
+	// hashed into the key and used as refresher registry keys.)
+	CacheEntryClass string
+	Group           string   // dispatched CR's GVR Group
+	Version         string   // dispatched CR's GVR Version
+	Resource        string   // dispatched CR's GVR Resource
+	Namespace       string   // dispatched CR namespace
+	Name            string   // dispatched CR name
+	Username        string   // bind-identity username
+	Groups          []string // bind-identity groups (will be sorted before hash)
+	PerPage         int
+	Page            int
+	Extras          map[string]any
 
-	// Stage is set ONLY for HandlerKind=="apistage" entries (Ship E,
+	// Stage is set ONLY for CacheEntryClass=="apistage" entries (Ship E,
 	// 0.30.116). It carries the per-stage discriminator string —
 	// stage id + O5 canonical filter-hash + a hash of the stage's
 	// effective dict input (its dependsOn predecessor output). Empty
@@ -152,12 +162,12 @@ type ResolvedCacheStore struct {
 	curBytes int64
 
 	// Falsifier counters (atomic; safe to read without mu).
-	hitTotal        atomic.Uint64
-	missTotal       atomic.Uint64
-	evictLRUTotal   atomic.Uint64
-	evictTTLTotal   atomic.Uint64
+	hitTotal         atomic.Uint64
+	missTotal        atomic.Uint64
+	evictLRUTotal    atomic.Uint64
+	evictTTLTotal    atomic.Uint64
 	evictDeleteTotal atomic.Uint64 // 0.30.8: DELETE-event-driven evictions
-	storeTotal      atomic.Uint64
+	storeTotal       atomic.Uint64
 
 	// Ship E (0.30.116) api-stage counters. apistageStoreTotal counts
 	// Put()s of an "apistage"-kind entry; apistageEvictTotal counts
@@ -166,7 +176,7 @@ type ResolvedCacheStore struct {
 	// high ratio means the maxEntries/maxBytes budget is too small for
 	// the N-identities × M-stages cardinality and the api-stage entries
 	// are churning rather than being reused. The store classifies via
-	// entry.Inputs.HandlerKind, so the opaque key string never needs a
+	// entry.Inputs.CacheEntryClass, so the opaque key string never needs a
 	// per-kind tag.
 	apistageStoreTotal atomic.Uint64
 	apistageEvictTotal atomic.Uint64
@@ -275,7 +285,7 @@ func ComputeKey(in ResolvedKeyInputs) string {
 	// space on rolling restart.
 	h.Write([]byte(resolvedKeyVersion))
 	h.Write([]byte{0})
-	h.Write([]byte(in.HandlerKind))
+	h.Write([]byte(in.CacheEntryClass))
 	h.Write([]byte{0})
 	h.Write([]byte(in.Group))
 	h.Write([]byte{0})
@@ -452,10 +462,10 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 }
 
 // isApistageEntry reports whether entry is a Ship E api-stage L1 entry —
-// classified by its Inputs.HandlerKind. Nil-safe.
+// classified by its Inputs.CacheEntryClass. Nil-safe.
 func isApistageEntry(entry *ResolvedEntry) bool {
 	return entry != nil && entry.Inputs != nil &&
-		entry.Inputs.HandlerKind == HandlerKindApistage
+		entry.Inputs.CacheEntryClass == CacheEntryClassApistage
 }
 
 // Len returns the number of entries currently held. Safe to call
@@ -579,7 +589,7 @@ func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 		c.curBytes = 0
 	}
 	// Ship E (0.30.116): count an api-stage eviction for the O6 pressure
-	// metric. Classified off the dropped entry's HandlerKind.
+	// metric. Classified off the dropped entry's CacheEntryClass.
 	if isApistageEntry(item.entry) {
 		c.apistageEvictTotal.Add(1)
 	}

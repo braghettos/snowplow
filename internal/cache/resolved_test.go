@@ -51,17 +51,17 @@ func TestResolvedCacheEnabled_DefaultsOnWhenCacheEnabledOn(t *testing.T) {
 
 func TestComputeKey_StableAcrossCalls(t *testing.T) {
 	in := ResolvedKeyInputs{
-		HandlerKind: "widgets",
-		Group:       "widgets.templates.krateo.io",
-		Version:     "v1beta1",
-		Resource:    "compositionsgrids",
-		Namespace:   "demo",
-		Name:        "main",
-		Username:    "alice",
-		Groups:      []string{"users", "admins"},
-		PerPage:     20,
-		Page:        1,
-		Extras:      map[string]any{"foo": "bar", "n": float64(7)},
+		CacheEntryClass: "widgets",
+		Group:           "widgets.templates.krateo.io",
+		Version:         "v1beta1",
+		Resource:        "compositionsgrids",
+		Namespace:       "demo",
+		Name:            "main",
+		Username:        "alice",
+		Groups:          []string{"users", "admins"},
+		PerPage:         20,
+		Page:            1,
+		Extras:          map[string]any{"foo": "bar", "n": float64(7)},
 	}
 	a := ComputeKey(in)
 	b := ComputeKey(in)
@@ -83,7 +83,7 @@ func TestComputeKey_GroupOrderInvariant(t *testing.T) {
 
 func TestComputeKey_SensitiveToEveryField(t *testing.T) {
 	base := ResolvedKeyInputs{
-		HandlerKind: "widgets", Group: "g", Version: "v", Resource: "r",
+		CacheEntryClass: "widgets", Group: "g", Version: "v", Resource: "r",
 		Namespace: "ns", Name: "n", Username: "u", Groups: []string{"x"},
 		PerPage: 1, Page: 1, Extras: map[string]any{"k": "v"},
 	}
@@ -91,7 +91,7 @@ func TestComputeKey_SensitiveToEveryField(t *testing.T) {
 		name string
 		fn   func(*ResolvedKeyInputs)
 	}{
-		{"HandlerKind", func(in *ResolvedKeyInputs) { in.HandlerKind = "restactions" }},
+		{"CacheEntryClass", func(in *ResolvedKeyInputs) { in.CacheEntryClass = "restactions" }},
 		{"Group", func(in *ResolvedKeyInputs) { in.Group = "g2" }},
 		{"Version", func(in *ResolvedKeyInputs) { in.Version = "v2" }},
 		{"Resource", func(in *ResolvedKeyInputs) { in.Resource = "r2" }},
@@ -272,7 +272,7 @@ func TestResolvedCache_EmptyTreatedAsMiss(t *testing.T) {
 // pre-0.30.116 entry's key shifts on the rolling restart.
 func TestComputeKey_EmptyStageByteIdenticalToPreShipE(t *testing.T) {
 	in := ResolvedKeyInputs{
-		HandlerKind: "restactions", Group: "g", Version: "v", Resource: "r",
+		CacheEntryClass: "restactions", Group: "g", Version: "v", Resource: "r",
 		Namespace: "ns", Name: "n", Username: "u", Groups: []string{"x"},
 		PerPage: 1, Page: 1,
 	}
@@ -304,16 +304,16 @@ func TestApistageEvictPressure(t *testing.T) {
 	}
 }
 
-// TestApistageCounters_ClassifiedByHandlerKind asserts the store counts
-// api-stage Put()s + evictions via the entry's HandlerKind — a non-
+// TestApistageCounters_ClassifiedByCacheEntryClass asserts the store counts
+// api-stage Put()s + evictions via the entry's CacheEntryClass — a non-
 // apistage entry never moves the api-stage counters (AC-E7).
-func TestApistageCounters_ClassifiedByHandlerKind(t *testing.T) {
+func TestApistageCounters_ClassifiedByCacheEntryClass(t *testing.T) {
 	c := newResolvedCache(1, 1<<20, time.Hour) // entry cap 1 → next Put evicts
 
 	// A non-apistage entry: api-stage counters stay 0.
 	c.Put("plain", &ResolvedEntry{
 		RawJSON: []byte(`{}`),
-		Inputs:  &ResolvedKeyInputs{HandlerKind: "restactions"},
+		Inputs:  &ResolvedKeyInputs{CacheEntryClass: "restactions"},
 	})
 	if s := c.Stats(); s.ApistageStoreTotal != 0 {
 		t.Fatalf("non-apistage Put bumped apistage_store_total to %d", s.ApistageStoreTotal)
@@ -323,7 +323,7 @@ func TestApistageCounters_ClassifiedByHandlerKind(t *testing.T) {
 	// "plain" entry (non-apistage → apistage_evict stays 0).
 	c.Put("stageA", &ResolvedEntry{
 		RawJSON: []byte(`{"value":1}`),
-		Inputs:  &ResolvedKeyInputs{HandlerKind: HandlerKindApistage, Stage: "s1"},
+		Inputs:  &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassApistage, Stage: "s1"},
 	})
 	if s := c.Stats(); s.ApistageStoreTotal != 1 {
 		t.Fatalf("apistage Put: apistage_store_total=%d want 1", s.ApistageStoreTotal)
@@ -336,7 +336,7 @@ func TestApistageCounters_ClassifiedByHandlerKind(t *testing.T) {
 	// evict counter ticks.
 	c.Put("stageB", &ResolvedEntry{
 		RawJSON: []byte(`{"value":2}`),
-		Inputs:  &ResolvedKeyInputs{HandlerKind: HandlerKindApistage, Stage: "s2"},
+		Inputs:  &ResolvedKeyInputs{CacheEntryClass: CacheEntryClassApistage, Stage: "s2"},
 	})
 	if s := c.Stats(); s.ApistageEvictTotal != 1 {
 		t.Fatalf("evicting an apistage entry: apistage_evict_total=%d want 1", s.ApistageEvictTotal)

@@ -87,7 +87,7 @@ func RegisterRefreshHandlers(saRC *rest.Config) {
 	// nil handler -> skippedNoHandler -> silently TTL-only, never
 	// refreshed (the dep-scoped refresh AC-E3 promised). The SAME
 	// refreshFunc closure serves it: the resolve-once seam already routes
-	// HandlerKindApistage (resolve_populate.go re-resolves the owning
+	// CacheEntryClassApistage (resolve_populate.go re-resolves the owning
 	// RESTAction, whose in-loop key-swap re-Puts the stage entry).
-	cache.RegisterRefreshFunc(cache.HandlerKindApistage, refreshFunc)
+	cache.RegisterRefreshFunc(cache.CacheEntryClassApistage, refreshFunc)
 }

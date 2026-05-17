@@ -188,12 +188,12 @@ func TestFalsifierFD2_CRDDeleteDirtyMarksDeps(t *testing.T) {
 	store.Put(getL1, &ResolvedEntry{
 		RawJSON: []byte(`{}`),
 		Inputs: &ResolvedKeyInputs{
-			HandlerKind: "widgets",
-			Group:       "widgets.krateo.io",
-			Version:     "v1",
-			Resource:    "buttons",
-			Namespace:   "bench-ns-07",
-			Name:        "save-btn",
+			CacheEntryClass: "widgets",
+			Group:           "widgets.krateo.io",
+			Version:         "v1",
+			Resource:        "buttons",
+			Namespace:       "bench-ns-07",
+			Name:            "save-btn",
 		},
 	})
 	d.Record(getL1, gvr, "bench-ns-07", "thing-1")
@@ -270,9 +270,9 @@ func TestShipD_ReconcileAutoDiscoverCRDsFiresD1(t *testing.T) {
 	})
 	sch := k8sruntime.NewScheme()
 	listKinds := map[schema.GroupVersionResource]string{
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:                "RoleList",
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}:         "RoleBindingList",
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:         "ClusterRoleList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:               "RoleList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}:        "RoleBindingList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:        "ClusterRoleList",
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}: "ClusterRoleBindingList",
 		customResourceDefinitionGVR: "CustomResourceDefinitionList",
 		gvr:                         "SyntheticWidgetList",
@@ -340,9 +340,9 @@ func newSyntheticCRDWatchWatcher(t *testing.T, gvr schema.GroupVersionResource) 
 	t.Helper()
 	sch := k8sruntime.NewScheme()
 	listKinds := map[schema.GroupVersionResource]string{
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:                "RoleList",
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}:         "RoleBindingList",
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:         "ClusterRoleList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}:               "RoleList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}:        "RoleBindingList",
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"}:        "ClusterRoleList",
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"}: "ClusterRoleBindingList",
 		customResourceDefinitionGVR: "CustomResourceDefinitionList",
 		gvr:                         "SyntheticWidgetList",
