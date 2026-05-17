@@ -81,6 +81,17 @@ type ResolveOptions struct {
 	// every API call takes the apiserver branch via httpcall.Do.
 	// Routing for K8s-served endpoints flips on at 0.30.2.
 	Watcher *cache.ResourceWatcher
+
+	// RESTActionNamespace / RESTActionName identify the owning
+	// RESTAction CR (Ship E, 0.30.116). They are folded into the
+	// per-api-stage L1 key so a stage id is scoped to its RESTAction.
+	// restactions.Resolve threads them from the RESTAction's
+	// ObjectMeta. Empty when the caller did not supply them — the
+	// api-stage key-swap then no-ops for that resolve (cache miss is
+	// always safe), so a caller that forgets to thread them degrades
+	// to the 0.30.115 path rather than mis-keying.
+	RESTActionNamespace string
+	RESTActionName      string
 }
 
 func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
@@ -155,6 +166,27 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 
 	log.Info("base dict for api resolver", slog.Any("dict", dict))
 
+	// Ship E (0.30.116): the per-api-stage L1 key-swap is active only
+	// when RESOLVED_CACHE_APISTAGE_ENABLED=true (default off). Read the
+	// gate + the store handle ONCE before the loop; flag-off both stay
+	// inert and every stage runs the byte-identical 0.30.115 path.
+	//
+	// The api-stage L1 caches resolved STAGE OUTPUT in the
+	// ResolvedCacheStore — it does not depend on the informer pivot, so
+	// opts.Watcher is not consulted here (ApistageL1Enabled already
+	// gates CACHE_ENABLED + RESOLVED_CACHE_ENABLED). RESTActionName
+	// being empty means the caller did not thread the owning
+	// RESTAction's identity — without it the stage key cannot be scoped,
+	// so the key-swap no-ops (degrades to the 0.30.115 path).
+	apistageEnabled := cache.ApistageL1Enabled() && opts.RESTActionName != ""
+	var apistageStore *cache.ResolvedCacheStore
+	if apistageEnabled {
+		apistageStore = cache.ResolvedCache()
+		if apistageStore == nil {
+			apistageEnabled = false
+		}
+	}
+
 	for _, id := range names {
 		// Get the api with this identifier
 		apiCall, ok := apiMap[id]
@@ -164,6 +196,46 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		}
 		if apiCall.Headers == nil {
 			apiCall.Headers = []string{headerAcceptJSON}
+		}
+
+		// Ship E (0.30.116) — per-api-stage L1 key-swap. Gated by
+		// apistageEnabled (RESOLVED_CACHE_APISTAGE_ENABLED=true). The
+		// stage key is per-user-keyed (Username+Groups — never cohort),
+		// scoped to the owning RESTAction GVR/namespace/name, and folds
+		// in the O5 canonical filter-hash + the stage's effective dict
+		// input. A hit serves dict[id] from L1 and skips the stage's
+		// K8s call(s) entirely; a miss runs the stage under the stage
+		// key's WithL1KeyContext so the inner-call dep-recording
+		// attributes this stage's LIST/GET to the stage entry (O4), then
+		// stores dict[id] under the stage key.
+		//
+		// stageCtx is the context the stage body resolves under: on the
+		// apistage path it carries WithL1KeyContext(stageKey); flag-off
+		// it is the unchanged request ctx.
+		stageCtx := ctx
+		var stageKey string
+		var stageInputs cache.ResolvedKeyInputs
+		if apistageEnabled {
+			stageInputs = stageKeyInputs(
+				opts.RESTActionNamespace, opts.RESTActionName,
+				user.Username, user.Groups, apiCall, dict, opts.PerPage, opts.Page)
+			stageKey = cache.ComputeKey(stageInputs)
+			if entry, hit := apistageStore.Get(stageKey); hit && entry != nil {
+				if v, decoded := decodeStageValue(entry.RawJSON); decoded {
+					dict[id] = v
+					log.Info("apistage.l1_hit",
+						slog.String("subsystem", "cache"),
+						slog.String("name", id),
+						slog.String("key_hash", stageKey),
+						slog.String("hint", "stage served from api-stage L1 — K8s call skipped"),
+					)
+					continue
+				}
+			}
+			// Miss — resolve the stage under the stage key so the
+			// existing inner-call dep-recording (resolve.go ~line 300)
+			// attributes this stage's K8s LIST/GET to the stage entry.
+			stageCtx = cache.WithL1KeyContext(ctx, stageKey)
 		}
 
 		// Tag 0.30.9 Sub-scope A: detect userAccessFilter.
@@ -276,7 +348,12 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		// that read must be serialised against concurrent jsonHandler
 		// writes too, so we take dictMu there as well.
 		var dictMu sync.Mutex
-		g, gctx := errgroup.WithContext(ctx)
+		// Ship E (0.30.116): errgroup derives from stageCtx — on the
+		// apistage path that carries WithL1KeyContext(stageKey), so the
+		// inner-call dep-recording below attributes this stage's K8s
+		// LIST/GET to the stage entry (O4). Flag-off stageCtx == ctx,
+		// so this is byte-identical to 0.30.115.
+		g, gctx := errgroup.WithContext(stageCtx)
 		g.SetLimit(iterParallelism())
 
 		for i := range tmp {
@@ -297,7 +374,15 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			// Edge type 3 dep recording — see 0.30.94 ship for full
 			// rationale. cache.Deps() is sync.Map-backed; idempotent
 			// LoadOrStore; safe from this (parent-goroutine) site.
-			if l1Key := cache.L1KeyFromContext(ctx); l1Key != "" && !cache.Disabled() {
+			//
+			// Ship E (0.30.116): read the L1 key from stageCtx. Flag-on,
+			// that is the api-stage stageKey — so the dep edge attaches
+			// to the STAGE entry (O4: an informer event on this GVR
+			// dirty-marks the stage entry and the refresher re-resolves
+			// it). Flag-off stageCtx == ctx, so the edge attaches to
+			// whatever L1 key the request path threaded — byte-identical
+			// to 0.30.115.
+			if l1Key := cache.L1KeyFromContext(stageCtx); l1Key != "" && !cache.Disabled() {
 				if ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet {
 					if gvr, ns, name, parseOK := cache.ParseAPIServerPathToDep(call.Path); parseOK {
 						if name == "" {
@@ -500,6 +585,36 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		if uafActive {
 			rf := applyUserAccessFilter(ctx, dict, apiCall)
 			emitRefilterFalsifier(log, apiCall, user.Username, rf)
+		}
+
+		// Ship E (0.30.116): store the resolved stage output under the
+		// stage key. Reached ONLY on the apistage path and ONLY after
+		// g.Wait() succeeded + the UAF refilter ran — a stage that
+		// short-circuited on a hard error returned `dict` above and
+		// never reaches here, so a failed stage is never cached. The
+		// stored value is the post-refilter dict[id] — byte-identical
+		// to what a subsequent hit serves. The entry's Inputs identify
+		// it as an "apistage" entry of the owning RESTAction so the
+		// refresher's resolve-once seam can re-run this single stage.
+		if apistageEnabled {
+			if encoded, encErr := encodeStageValue(dict[id]); encErr == nil {
+				inputsCopy := stageInputs
+				apistageStore.Put(stageKey, &cache.ResolvedEntry{
+					RawJSON: encoded,
+					Inputs:  &inputsCopy,
+				})
+				log.Info("apistage.l1_store",
+					slog.String("subsystem", "cache"),
+					slog.String("name", id),
+					slog.String("key_hash", stageKey),
+				)
+			} else {
+				log.Warn("apistage.encode_failed",
+					slog.String("subsystem", "cache"),
+					slog.String("name", id),
+					slog.Any("err", encErr),
+				)
+			}
 		}
 	}
 

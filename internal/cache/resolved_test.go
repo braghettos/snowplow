@@ -102,6 +102,7 @@ func TestComputeKey_SensitiveToEveryField(t *testing.T) {
 		{"PerPage", func(in *ResolvedKeyInputs) { in.PerPage = 2 }},
 		{"Page", func(in *ResolvedKeyInputs) { in.Page = 2 }},
 		{"Extras", func(in *ResolvedKeyInputs) { in.Extras = map[string]any{"k": "w"} }},
+		{"Stage", func(in *ResolvedKeyInputs) { in.Stage = "stage\x1fcompositions\x1f\x1f" }},
 	}
 	baseKey := ComputeKey(base)
 	for _, m := range mutators {
@@ -259,5 +260,113 @@ func TestResolvedCache_EmptyTreatedAsMiss(t *testing.T) {
 	c.Put("x", &ResolvedEntry{RawJSON: []byte("y")}) // must not panic
 	if c.Len() != 0 || c.Bytes() != 0 {
 		t.Fatalf("nil cache should report zero metrics")
+	}
+}
+
+// --- Ship E (0.30.116) — api-stage L1 ---------------------------------------
+
+// TestComputeKey_EmptyStageByteIdenticalToPreShipE asserts AC-E1 at the
+// key layer: a ResolvedKeyInputs with Stage=="" (every "restactions" /
+// "widgets" entry) hashes byte-identically whether the Stage field
+// exists or not — ComputeKey folds Stage in ONLY when non-empty, so no
+// pre-0.30.116 entry's key shifts on the rolling restart.
+func TestComputeKey_EmptyStageByteIdenticalToPreShipE(t *testing.T) {
+	in := ResolvedKeyInputs{
+		HandlerKind: "restactions", Group: "g", Version: "v", Resource: "r",
+		Namespace: "ns", Name: "n", Username: "u", Groups: []string{"x"},
+		PerPage: 1, Page: 1,
+	}
+	withEmptyStage := in
+	withEmptyStage.Stage = ""
+	if ComputeKey(in) != ComputeKey(withEmptyStage) {
+		t.Fatalf("AC-E1: an empty Stage shifted the key — a non-apistage entry " +
+			"must hash identically to pre-0.30.116")
+	}
+	// A non-empty Stage MUST shift the key (it is the apistage discriminator).
+	withStage := in
+	withStage.Stage = "stage\x1fcompositions\x1fabc\x1fdef"
+	if ComputeKey(in) == ComputeKey(withStage) {
+		t.Fatalf("a non-empty Stage did not change the key — apistage entries would collide")
+	}
+}
+
+// TestApistageEvictPressure asserts AC-E7: the O6 budget signal is the
+// evict/store ratio, 0 when no api-stage entry was ever stored.
+func TestApistageEvictPressure(t *testing.T) {
+	var s ResolvedCacheStats
+	if got := s.ApistageEvictPressure(); got != 0 {
+		t.Fatalf("ApistageEvictPressure with zero stores = %v, want 0", got)
+	}
+	s.ApistageStoreTotal = 10
+	s.ApistageEvictTotal = 3
+	if got := s.ApistageEvictPressure(); got != 0.3 {
+		t.Fatalf("ApistageEvictPressure = %v, want 0.3", got)
+	}
+}
+
+// TestApistageCounters_ClassifiedByHandlerKind asserts the store counts
+// api-stage Put()s + evictions via the entry's HandlerKind — a non-
+// apistage entry never moves the api-stage counters (AC-E7).
+func TestApistageCounters_ClassifiedByHandlerKind(t *testing.T) {
+	c := newResolvedCache(1, 1<<20, time.Hour) // entry cap 1 → next Put evicts
+
+	// A non-apistage entry: api-stage counters stay 0.
+	c.Put("plain", &ResolvedEntry{
+		RawJSON: []byte(`{}`),
+		Inputs:  &ResolvedKeyInputs{HandlerKind: "restactions"},
+	})
+	if s := c.Stats(); s.ApistageStoreTotal != 0 {
+		t.Fatalf("non-apistage Put bumped apistage_store_total to %d", s.ApistageStoreTotal)
+	}
+
+	// An api-stage entry: store counter ticks; the cap-1 store evicts the
+	// "plain" entry (non-apistage → apistage_evict stays 0).
+	c.Put("stageA", &ResolvedEntry{
+		RawJSON: []byte(`{"value":1}`),
+		Inputs:  &ResolvedKeyInputs{HandlerKind: HandlerKindApistage, Stage: "s1"},
+	})
+	if s := c.Stats(); s.ApistageStoreTotal != 1 {
+		t.Fatalf("apistage Put: apistage_store_total=%d want 1", s.ApistageStoreTotal)
+	}
+	if s := c.Stats(); s.ApistageEvictTotal != 0 {
+		t.Fatalf("evicting a non-apistage entry bumped apistage_evict_total to %d", s.ApistageEvictTotal)
+	}
+
+	// A second api-stage Put evicts the first api-stage entry → apistage
+	// evict counter ticks.
+	c.Put("stageB", &ResolvedEntry{
+		RawJSON: []byte(`{"value":2}`),
+		Inputs:  &ResolvedKeyInputs{HandlerKind: HandlerKindApistage, Stage: "s2"},
+	})
+	if s := c.Stats(); s.ApistageEvictTotal != 1 {
+		t.Fatalf("evicting an apistage entry: apistage_evict_total=%d want 1", s.ApistageEvictTotal)
+	}
+}
+
+// TestApistageL1Enabled_DefaultOffAndGates asserts AC-E6: the feature is
+// default-off and gated under CACHE_ENABLED + RESOLVED_CACHE_ENABLED.
+func TestApistageL1Enabled_DefaultOffAndGates(t *testing.T) {
+	// CACHE off → apistage off regardless of its own flag.
+	t.Setenv("CACHE_ENABLED", "false")
+	t.Setenv("RESOLVED_CACHE_APISTAGE_ENABLED", "true")
+	if ApistageL1Enabled() {
+		t.Fatalf("AC-E6: apistage L1 active with CACHE_ENABLED=false")
+	}
+	// CACHE on, RESOLVED_CACHE off → apistage off.
+	t.Setenv("CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_ENABLED", "false")
+	if ApistageL1Enabled() {
+		t.Fatalf("AC-E6: apistage L1 active with RESOLVED_CACHE_ENABLED=false")
+	}
+	// All gates open but the apistage flag unset → default OFF.
+	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
+	t.Setenv("RESOLVED_CACHE_APISTAGE_ENABLED", "")
+	if ApistageL1Enabled() {
+		t.Fatalf("AC-E6: apistage L1 must default OFF when its flag is unset")
+	}
+	// Explicit opt-in → on.
+	t.Setenv("RESOLVED_CACHE_APISTAGE_ENABLED", "true")
+	if !ApistageL1Enabled() {
+		t.Fatalf("AC-E6: apistage L1 must be on when all three gates are open")
 	}
 }

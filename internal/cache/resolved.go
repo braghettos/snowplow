@@ -49,11 +49,26 @@ const (
 	envResolvedCacheTTLSeconds  = "RESOLVED_CACHE_TTL_SECONDS"
 	envResolvedCacheSummaryEvery = "RESOLVED_CACHE_SUMMARY_EVERY_SECONDS"
 
+	// envResolvedCacheApistageEnabled is the Ship E (0.30.116) opt-in
+	// gate for the per-api-stage L1 key-swap. Default OFF — flag-off the
+	// RESTAction resolver runs byte-identical to 0.30.115 (AC-E1). It is
+	// gated UNDER ResolvedCacheEnabled() (the api-stage L1 needs the
+	// resolved-output store + the refresher).
+	envResolvedCacheApistageEnabled = "RESOLVED_CACHE_APISTAGE_ENABLED"
+
 	defaultResolvedCacheMaxEntries = 100_000
 	defaultResolvedCacheMaxBytes   = int64(2) * 1024 * 1024 * 1024 // 2 GiB
 	defaultResolvedCacheTTLSeconds = 3600
 	defaultResolvedCacheSummaryEverySeconds = 300 // 5 min aggregate INFO line
 )
+
+// HandlerKindApistage is the ResolvedKeyInputs.HandlerKind discriminant
+// for a per-api-stage L1 entry (Ship E, 0.30.116). The resolved-output
+// store, the dep-tracker, the LRU/TTL machinery, and ComputeKey are all
+// reused verbatim — "apistage" is just a third granularity of L1 key,
+// not a new cache. The refresher's resolve-once seam branches on it to
+// re-run a single stage rather than a whole RESTAction.
+const HandlerKindApistage = "apistage"
 
 // ResolvedEntry is the L1 cache value. The pre-encoded JSON bytes are
 // what we hand back on a hit; storing the encoded form (rather than the
@@ -81,7 +96,7 @@ type ResolvedEntry struct {
 // resolvedKeyVersion below as part of any such change so the salt
 // guarantees clean separation across rolling restarts.
 type ResolvedKeyInputs struct {
-	HandlerKind string   // "restactions" or "widgets"
+	HandlerKind string   // "restactions", "widgets", or "apistage"
 	Group       string   // dispatched CR's GVR Group
 	Version     string   // dispatched CR's GVR Version
 	Resource    string   // dispatched CR's GVR Resource
@@ -92,11 +107,27 @@ type ResolvedKeyInputs struct {
 	PerPage     int
 	Page        int
 	Extras      map[string]any
+
+	// Stage is set ONLY for HandlerKind=="apistage" entries (Ship E,
+	// 0.30.116). It carries the per-stage discriminator string —
+	// stage id + O5 canonical filter-hash + a hash of the stage's
+	// effective dict input (its dependsOn predecessor output). Empty
+	// for "restactions"/"widgets" entries, so ComputeKey is
+	// byte-identical to 0.30.115 for every non-apistage key (a
+	// pre-existing entry's key does not shift). The api-stage resolver
+	// builds the Stage value; ComputeKey only folds it into the hash.
+	Stage string
 }
 
 // resolvedKeyVersion is folded into every key hash so a key-schema
 // change forces a clean break across rolling pods. Bump on any change
 // to ResolvedKeyInputs fields or the key-encoding logic.
+//
+// NOT bumped for Ship E's Stage field: ComputeKey folds Stage in only
+// when it is non-empty (see ComputeKey), so every "restactions" /
+// "widgets" key — Stage=="" — hashes byte-identically to v1. A version
+// bump would needlessly rotate the whole key space on the 0.30.116
+// rolling restart for zero correctness gain.
 const resolvedKeyVersion = "v1"
 
 // ResolvedCacheStore is the L1 resolved-output cache: a bounded LRU
@@ -127,6 +158,18 @@ type ResolvedCacheStore struct {
 	evictTTLTotal   atomic.Uint64
 	evictDeleteTotal atomic.Uint64 // 0.30.8: DELETE-event-driven evictions
 	storeTotal      atomic.Uint64
+
+	// Ship E (0.30.116) api-stage counters. apistageStoreTotal counts
+	// Put()s of an "apistage"-kind entry; apistageEvictTotal counts
+	// evictions (LRU/TTL/DELETE) of one. apistage_evict_pressure in the
+	// summary line is the evict/store ratio — the O6 budget signal: a
+	// high ratio means the maxEntries/maxBytes budget is too small for
+	// the N-identities × M-stages cardinality and the api-stage entries
+	// are churning rather than being reused. The store classifies via
+	// entry.Inputs.HandlerKind, so the opaque key string never needs a
+	// per-kind tag.
+	apistageStoreTotal atomic.Uint64
+	apistageEvictTotal atomic.Uint64
 }
 
 type lruItem struct {
@@ -160,6 +203,23 @@ func ResolvedCacheEnabled() bool {
 	default:
 		return true
 	}
+}
+
+// ApistageL1Enabled reports whether the Ship E (0.30.116) per-api-stage
+// L1 key-swap is opted in. THREE gates, all must hold:
+//  1. CACHE_ENABLED=true        — the whole cache subsystem (Disabled()).
+//  2. RESOLVED_CACHE_ENABLED!=false — the resolved-output L1 store +
+//     refresher, which the api-stage entry reuses verbatim.
+//  3. RESOLVED_CACHE_APISTAGE_ENABLED=="true" — the per-feature opt-in.
+//
+// Default OFF (gate 3 must be the explicit string "true", mirroring
+// PrewarmEnabled). Flag-off the RESTAction resolver runs byte-identical
+// to 0.30.115 — no per-stage Get/Put, no api-stage L1 key (AC-E1).
+func ApistageL1Enabled() bool {
+	if !ResolvedCacheEnabled() {
+		return false
+	}
+	return os.Getenv(envResolvedCacheApistageEnabled) == "true"
 }
 
 // ResolvedCache returns the singleton resolved-output cache, lazily
@@ -243,6 +303,19 @@ func ComputeKey(in ResolvedKeyInputs) string {
 	h.Write([]byte{0})
 	h.Write([]byte(strconv.Itoa(in.Page)))
 	h.Write([]byte{0})
+
+	// Stage (Ship E, 0.30.116): folded in ONLY when non-empty. An empty
+	// Stage writes nothing — so a "restactions"/"widgets" key (Stage=="")
+	// hashes byte-identically to the pre-0.30.116 encoding and no
+	// in-flight entry's key shifts. The non-empty branch writes a
+	// sentinel byte (0x01) before the value so an api-stage key can
+	// never collide with a hypothetical extras-only key that happened to
+	// produce the same trailing bytes.
+	if in.Stage != "" {
+		h.Write([]byte{0x01})
+		h.Write([]byte(in.Stage))
+		h.Write([]byte{0})
+	}
 
 	// Extras: canonicalise via sorted-key JSON. We deliberately use
 	// json.Marshal on a SORTED-KEY surrogate instead of MarshalIndent
@@ -348,6 +421,8 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	apistage := isApistageEntry(entry)
+
 	// Replace-in-place semantics if key already present.
 	if el, ok := c.index[key]; ok {
 		old := el.Value.(*lruItem)
@@ -357,6 +432,9 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 		c.curBytes += bytes
 		c.order.MoveToFront(el)
 		c.storeTotal.Add(1)
+		if apistage {
+			c.apistageStoreTotal.Add(1)
+		}
 		c.evictUntilUnderCapsLocked()
 		return
 	}
@@ -366,8 +444,18 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 	c.index[key] = el
 	c.curBytes += bytes
 	c.storeTotal.Add(1)
+	if apistage {
+		c.apistageStoreTotal.Add(1)
+	}
 
 	c.evictUntilUnderCapsLocked()
+}
+
+// isApistageEntry reports whether entry is a Ship E api-stage L1 entry —
+// classified by its Inputs.HandlerKind. Nil-safe.
+func isApistageEntry(entry *ResolvedEntry) bool {
+	return entry != nil && entry.Inputs != nil &&
+		entry.Inputs.HandlerKind == HandlerKindApistage
 }
 
 // Len returns the number of entries currently held. Safe to call
@@ -405,6 +493,10 @@ type ResolvedCacheStats struct {
 	EvictLRUTotal    uint64
 	EvictTTLTotal    uint64
 	EvictDeleteTotal uint64 // 0.30.8: DELETE-event-driven evictions
+
+	// Ship E (0.30.116) api-stage counters.
+	ApistageStoreTotal uint64
+	ApistageEvictTotal uint64
 }
 
 func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
@@ -416,17 +508,34 @@ func (c *ResolvedCacheStore) Stats() ResolvedCacheStats {
 	bytes := c.curBytes
 	c.mu.Unlock()
 	return ResolvedCacheStats{
-		Entries:          entries,
-		Bytes:            bytes,
-		MaxEntries:       c.maxEntries,
-		MaxBytes:         c.maxBytes,
-		HitTotal:         c.hitTotal.Load(),
-		MissTotal:        c.missTotal.Load(),
-		StoreTotal:       c.storeTotal.Load(),
-		EvictLRUTotal:    c.evictLRUTotal.Load(),
-		EvictTTLTotal:    c.evictTTLTotal.Load(),
-		EvictDeleteTotal: c.evictDeleteTotal.Load(),
+		Entries:            entries,
+		Bytes:              bytes,
+		MaxEntries:         c.maxEntries,
+		MaxBytes:           c.maxBytes,
+		HitTotal:           c.hitTotal.Load(),
+		MissTotal:          c.missTotal.Load(),
+		StoreTotal:         c.storeTotal.Load(),
+		EvictLRUTotal:      c.evictLRUTotal.Load(),
+		EvictTTLTotal:      c.evictTTLTotal.Load(),
+		EvictDeleteTotal:   c.evictDeleteTotal.Load(),
+		ApistageStoreTotal: c.apistageStoreTotal.Load(),
+		ApistageEvictTotal: c.apistageEvictTotal.Load(),
 	}
+}
+
+// ApistageEvictPressure is the Ship E (0.30.116) O6 budget signal: the
+// ratio of api-stage entry evictions to api-stage entry stores. 0 means
+// no api-stage churn (every stored stage entry is still resident or was
+// never stored). A ratio approaching 1 means the maxEntries/maxBytes
+// budget is too small for the N-identities × M-stages cardinality — the
+// api-stage entries are being evicted as fast as they are written, so
+// the key-swap buys nothing. The tester's 50K bench reads this to set
+// the budget; the feature ships default-off until it is green.
+func (s ResolvedCacheStats) ApistageEvictPressure() float64 {
+	if s.ApistageStoreTotal == 0 {
+		return 0
+	}
+	return float64(s.ApistageEvictTotal) / float64(s.ApistageStoreTotal)
 }
 
 // HitRate computes a simple cumulative hit rate. Returns 0 when there
@@ -469,6 +578,11 @@ func (c *ResolvedCacheStore) removeElementLocked(el *list.Element) {
 		// Defensive — should never happen with non-negative bytes.
 		c.curBytes = 0
 	}
+	// Ship E (0.30.116): count an api-stage eviction for the O6 pressure
+	// metric. Classified off the dropped entry's HandlerKind.
+	if isApistageEntry(item.entry) {
+		c.apistageEvictTotal.Add(1)
+	}
 	// Dep-tracker cleanup. Safe even when L1 is the only consumer
 	// (Deps() is always non-nil); a no-op when no edges were ever
 	// recorded for this key.
@@ -502,14 +616,21 @@ func (c *ResolvedCacheStore) deleteForDep(key string) bool {
 	// for THIS key, and LoadAndDelete inside RemoveL1Key is a no-op
 	// the second time. We accept the trivial double-call rather than
 	// branching the eviction body.
-	delete(c.index, el.Value.(*lruItem).key)
+	item := el.Value.(*lruItem)
+	delete(c.index, item.key)
 	c.order.Remove(el)
-	c.curBytes -= el.Value.(*lruItem).bytes
+	c.curBytes -= item.bytes
 	if c.curBytes < 0 {
 		c.curBytes = 0
 	}
+	// Ship E (0.30.116): count an api-stage DELETE-eviction for the O6
+	// pressure metric — same classification as removeElementLocked.
+	apistage := isApistageEntry(item.entry)
 	c.mu.Unlock()
 	c.evictDeleteTotal.Add(1)
+	if apistage {
+		c.apistageEvictTotal.Add(1)
+	}
 	return true
 }
 
@@ -566,6 +687,11 @@ func startResolvedCacheSummary(c *ResolvedCacheStore) {
 				slog.Uint64("store_total", s.StoreTotal),
 				slog.Int("max_entries", s.MaxEntries),
 				slog.Int64("max_bytes", s.MaxBytes),
+				// Ship E (0.30.116) O6 budget signal — AC-E7.
+				slog.Uint64("apistage_store_total", s.ApistageStoreTotal),
+				slog.Uint64("apistage_evict_total", s.ApistageEvictTotal),
+				slog.Float64("apistage_evict_pressure", s.ApistageEvictPressure()),
+				slog.Bool("apistage_enabled", ApistageL1Enabled()),
 			)
 		}
 	}()

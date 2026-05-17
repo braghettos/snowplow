@@ -41,6 +41,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*templates.RESTAction, e
 		PerPage: opts.PerPage,
 		Page:    opts.Page,
 		Extras:  opts.Extras,
+		// Ship E (0.30.116): the owning RESTAction's identity, folded
+		// into the per-api-stage L1 key so a stage id is scoped to its
+		// RESTAction. opts.In is the typed RESTAction CR.
+		RESTActionNamespace: opts.In.GetNamespace(),
+		RESTActionName:      opts.In.GetName(),
 	})
 	if dict == nil {
 		dict = map[string]any{}

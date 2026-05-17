@@ -197,6 +197,28 @@ func resolveOnceProd(ctx context.Context, inputs cache.ResolvedKeyInputs) ([]byt
 		return resolveRestActionForRefresh(ctx, got, inputs, authnNS)
 	case "widgets":
 		return resolveWidgetForRefresh(ctx, got, inputs, authnNS)
+	case cache.HandlerKindApistage:
+		// Ship E (0.30.116): an api-stage L1 entry. Its Inputs identify
+		// the OWNING RESTAction (Group/Version/Resource/Namespace/Name);
+		// re-resolving that whole RESTAction re-runs every stage, and —
+		// because the refresh ctx carries RESOLVED_CACHE_APISTAGE_ENABLED
+		// the same as the request path — the resolver's in-loop key-swap
+		// re-Puts a fresh entry for THIS stage (and its siblings). The
+		// single dirty-marked stage converges as a side effect of the
+		// parent re-resolve; no predecessor-state reconstruction needed.
+		//
+		// CRITICAL: this returns (nil, nil) on success. The stage entry
+		// has ALREADY been re-Put by the resolver's key-swap, under the
+		// stage key, with the correct apistage value shape. If we
+		// returned the RESTAction's encoded bytes, resolveAndPopulateL1
+		// would Put THOSE bytes under the stage key — overwriting the
+		// correct stage entry with whole-RESTAction output. (nil, nil)
+		// makes resolveAndPopulateL1 skip its own Put: the work is done.
+		// A resolve ERROR still propagates so the refresher retries.
+		if _, err := resolveRestActionForRefresh(ctx, got, inputs, authnNS); err != nil {
+			return nil, err
+		}
+		return nil, nil
 	default:
 		// Unknown handler kind — skip-to-TTL.
 		return nil, nil
