@@ -103,35 +103,59 @@ spec:
                     payload:
                       description: Payload is the request body
                       type: string
-                    verb:
-                      description: Verb is the request method (GET if omitted)
-                      type: string
                     userAccessFilter:
-                      description: |
+                      description: |-
                         UserAccessFilter declares that this API call dispatches via
                         the snowplow ServiceAccount (cluster-wide read) and that the
-                        returned result set is refiltered through EvaluateRBAC per
-                        object before being returned. Added at Tag 0.30.9. Optional.
+                        returned result set MUST be in-process-refiltered through
+                        EvaluateRBAC before being returned to the caller. Added at
+                        Tag 0.30.9 Sub-scope A — atomic ship: when present, both
+                        ServiceAccount-dispatch AND refilter take effect; there is
+                        no per-mechanism toggle. Optional — RestActions without this
+                        field unchanged from 0.30.8 (per-user-token dispatch).
+
+                        Per Revision 2 (binding): even with UserAccessFilter set,
+                        EvaluateRBAC continues to fire on the dispatch CR itself —
+                        UserAccessFilter changes WHO dispatches the inner call, NOT
+                        whether the outer dispatch is RBAC-gated. The refilter step
+                        also calls EvaluateRBAC per object returned by the SA call.
                       properties:
-                        verb:
-                          description: Verb is the Kubernetes RBAC verb checked per object.
-                          type: string
                         group:
-                          description: Group is the API group ('' for the core group).
-                          type: string
-                        resource:
-                          description: Resource is the plural resource name.
+                          description: |-
+                            Group is the API group of the checked resource. Empty string
+                            = core group. Required (use "" explicitly for core).
                           type: string
                         namespaceFrom:
-                          description: |
-                            NamespaceFrom is a JQ path expression evaluated against each returned
-                            object to derive the per-object namespace for the EvaluateRBAC call.
+                          description: |-
+                            NamespaceFrom is a JQ path expression evaluated against each
+                            returned object to derive the per-object namespace for the
+                            EvaluateRBAC call. Typical values:
+                              - ".metadata.name" when the returned objects ARE namespaces
+                                (cluster-scoped check by name, returns namespace itself).
+                              - ".metadata.namespace" when the returned objects live IN
+                                namespaces (e.g. CustomResourceDefinitions don't, but
+                                compositions do).
+                              - "" / unset when the resource is cluster-scoped and the
+                                RBAC check is also cluster-scoped (namespace="").
+                          type: string
+                        resource:
+                          description: |-
+                            Resource is the plural resource name (e.g. "namespaces").
+                            Required.
+                          type: string
+                        verb:
+                          description: |-
+                            Verb is the Kubernetes RBAC verb checked per object.
+                            Required. Lower-case ("get", "list", "watch", etc.).
                           type: string
                       required:
-                      - verb
                       - group
                       - resource
+                      - verb
                       type: object
+                    verb:
+                      description: Verb is the request method (GET if omitempty)
+                      type: string
                   required:
                   - name
                   type: object

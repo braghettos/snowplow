@@ -10,6 +10,23 @@ env:
 
 jobs:
 
+  # Stage 1 of the CRD pipeline (Go type -> crds/): assert the committed
+  # crds/ manifests match what controller-gen produces from the current
+  # Go types, using the controller-tools version pinned in go.mod. A
+  # stale or hand-edited crds/ fails the PR — so a CRD-field change to
+  # apis/ can never be merged without the regenerated YAML alongside it.
+  codegen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Gather dependencies
+        run: go mod download
+      - name: Verify crds/ is in sync with the Go types
+        run: bash scripts/gen.sh --check
+
   test:
     runs-on: ubuntu-latest
     steps:
