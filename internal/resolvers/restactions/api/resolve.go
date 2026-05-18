@@ -14,6 +14,7 @@ import (
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	"github.com/krateoplatformops/plumbing/endpoints"
+	"github.com/krateoplatformops/plumbing/env"
 	httpcall "github.com/krateoplatformops/plumbing/http/request"
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/maps"
@@ -65,7 +66,45 @@ const lazyRegisterSlowThreshold = 250 * time.Millisecond
 const (
 	//annotationKeyVerboseAPI = "krateo.io/verbose"
 	headerAcceptJSON = "Accept: application/json"
+
+	// envVerboseWireDump is the Ship 0.30.121 R1-b operator kill-switch
+	// for httpcall's DumpResponse verbose wire-dump. When false (the
+	// default) endpoint.Debug is NEVER set regardless of the per-RESTAction
+	// krateo.io/verbose annotation — so a stray annotation on a heavy
+	// RESTAction cannot OOM the pod. Only when this is explicitly "true"
+	// does the per-call verbose decision (R1-a) get a chance to flip Debug.
+	envVerboseWireDump = "RESOLVER_VERBOSE_WIRE_DUMP"
 )
+
+// verboseWireDumpEnabled reports whether the R1-b operator kill-switch
+// permits the httpcall verbose wire-dump at all. Default false.
+func verboseWireDumpEnabled() bool {
+	return env.Bool(envVerboseWireDump, false)
+}
+
+// callWantsWireDump implements the Ship 0.30.121 R1-a per-call verbose
+// decision. The verbose wire-dump (httpcall DumpResponse) stringifies the
+// entire HTTP response body — for a K8s collection LIST that is the
+// multi-MB compositions envelope, the dominant transient-memory cost. A
+// K8s collection LIST is identified by ParseAPIServerPathToDep yielding a
+// parseable apiserver path with an EMPTY object name. For every other
+// call shape (a GET-by-name, an external endpoint, a nested /call) the
+// body is small and the wire-dump is cheap — verbose stays available
+// there for debugging. The decision is keyed on the parsed call shape
+// ONLY — no resource/name literal (feedback_no_special_cases).
+func callWantsWireDump(verbose bool, callPath string) bool {
+	if !verbose {
+		return false
+	}
+	if gvr, _, name, ok := cache.ParseAPIServerPathToDep(callPath); ok && name == "" {
+		// A K8s collection LIST — suppress the wire-dump (this is the
+		// ~1.94 GiB alloc_space line). gvr is parsed only to confirm the
+		// apiserver-path shape; its value is not otherwise needed.
+		_ = gvr
+		return false
+	}
+	return true
+}
 
 type ResolveOptions struct {
 	RC      *rest.Config
@@ -258,9 +297,14 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 			}
 			ep = resolved
 		}
-		if opts.Verbose {
-			ep.Debug = opts.Verbose
-		}
+		// Ship 0.30.121 R1 — the verbose wire-dump (httpcall's DumpResponse)
+		// is the single largest transient-memory consumer (~1.94 GiB
+		// alloc_space on the 50K bench: it stringifies every HTTP response
+		// body, including the multi-MB compositions LIST). The blanket
+		// `ep.Debug = opts.Verbose` set here is REMOVED — Debug is now
+		// decided PER-CALL inside the g.Go worker (R1-a: never for a K8s
+		// collection LIST) and additionally gated on RESOLVER_VERBOSE_WIRE_DUMP
+		// (R1-b: an operator kill-switch, default off). See the worker below.
 		log.Debug("resolved endpoint for api call",
 			slog.String("name", id), slog.String("host", ep.ServerURL),
 			slog.Bool("uaf", uafActive))
@@ -318,9 +362,29 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 		g, gctx := errgroup.WithContext(ctx)
 		g.SetLimit(iterParallelism())
 
+		// Ship 0.30.121 R1-b — the operator kill-switch. Compute once per
+		// stage: verbose is permitted ONLY when the RESTAction asked for it
+		// (opts.Verbose) AND the env flag explicitly enables the wire-dump.
+		// Default off => wireVerbose is false => no call ever gets Debug.
+		wireVerbose := opts.Verbose && verboseWireDumpEnabled()
+
 		for i := range tmp {
 			call := tmp[i]
-			call.Endpoint = &ep
+			// Ship 0.30.121 R1-a — per-call verbose decision. `ep` is shared
+			// across every tmp[] call of this stage; setting ep.Debug in
+			// place would race the concurrent g.Go workers. When this call
+			// wants the wire-dump, take a SHALLOW COPY of the Endpoint value
+			// and flip Debug on the copy, so peers keep the un-Debugged
+			// shared Endpoint. A K8s collection LIST never wants it
+			// (callWantsWireDump returns false) — that suppresses the
+			// ~1.94 GiB DumpResponse alloc_space line.
+			if callWantsWireDump(wireVerbose, call.Path) {
+				epCopy := ep
+				epCopy.Debug = true
+				call.Endpoint = &epCopy
+			} else {
+				call.Endpoint = &ep
+			}
 			// Wrap jsonHandler so every dict[id] mutation goes through
 			// dictMu. The inner closure is the per-call ResponseHandler
 			// that httpcall.Do invokes from inside its goroutine.

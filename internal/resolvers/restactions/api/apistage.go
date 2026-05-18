@@ -113,29 +113,35 @@ func gateContentEnvelope(
 	return gateGetEnvelope(ctx, gvr, raw)
 }
 
-// gateListEnvelope unmarshals a LIST envelope, runs filterListByRBAC over
-// its items with the request identity, and re-marshals the narrowed set
-// into the SAME apiserver-shaped envelope (marshalAsList) so the stage
-// jsonHandler/filter sees an identical shape to a fresh dispatch.
-func gateListEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw []byte) ([]byte, bool) {
+// parsedListEnvelope is the Ship 0.30.121 R3 pre-parsed form of a LIST
+// content envelope: the items decoded ONCE into []*unstructured plus the
+// envelope's apiVersion/kind. parseListEnvelope produces it at the
+// content-entry Put site; gateListItems consumes it on every Get-hit so
+// the per-hit json.Unmarshal (the ~1.73 GiB double-unmarshal) is gone.
+type parsedListEnvelope struct {
+	items      []*unstructured.Unstructured
+	apiVersion string
+	kind       string
+}
+
+// parseListEnvelope decodes a raw LIST envelope ONCE — Ship 0.30.121 R3.
+// Called at the content-entry Put site so the parsed items can be stored
+// on the ResolvedEntry; the content-gate then runs filterListByRBAC over
+// the stored items and skips re-unmarshalling on every hit. Returns ok=false
+// on a malformed envelope (the caller stores RawJSON only — the gate then
+// falls back to the unmarshal path, byte-identical to pre-0.30.121).
+func parseListEnvelope(gvr schema.GroupVersionResource, raw []byte) (parsedListEnvelope, bool) {
 	var envelope struct {
 		APIVersion string           `json:"apiVersion"`
 		Kind       string           `json:"kind"`
 		Items      []map[string]any `json:"items"`
 	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
-		// A malformed stored envelope cannot be vouched for — fail closed.
-		return nil, false
+		return parsedListEnvelope{}, false
 	}
 	items := make([]*unstructured.Unstructured, 0, len(envelope.Items))
 	for _, it := range envelope.Items {
 		items = append(items, &unstructured.Unstructured{Object: it})
-	}
-	kept, identityOK := filterListByRBAC(ctx, gvr, items)
-	if !identityOK {
-		// FAIL-CLOSED: no identity — same contract as the inline gate's
-		// served=false (caller falls through to the apiserver).
-		return nil, false
 	}
 	apiVersion := envelope.APIVersion
 	if apiVersion == "" {
@@ -145,11 +151,45 @@ func gateListEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw 
 	if kind == "" {
 		kind = listKindForResource(gvr.Resource)
 	}
-	gated, err := marshalAsList(apiVersion, kind, kept)
+	return parsedListEnvelope{items: items, apiVersion: apiVersion, kind: kind}, true
+}
+
+// gateListItems runs filterListByRBAC over an ALREADY-PARSED item slice
+// and re-marshals the narrowed set into the apiserver-shaped envelope —
+// Ship 0.30.121 R3. This is the unmarshal-free gate path: identical
+// parse->filter->marshalAsList pipeline to gateListEnvelope, only the
+// json.Unmarshal has been hoisted out to the Put site (parseListEnvelope).
+func gateListItems(ctx context.Context, gvr schema.GroupVersionResource, parsed parsedListEnvelope) ([]byte, bool) {
+	kept, identityOK := filterListByRBAC(ctx, gvr, parsed.items)
+	if !identityOK {
+		// FAIL-CLOSED: no identity — same contract as the inline gate's
+		// served=false (caller falls through to the apiserver).
+		return nil, false
+	}
+	gated, err := marshalAsList(parsed.apiVersion, parsed.kind, kept)
 	if err != nil {
 		return nil, false
 	}
 	return gated, true
+}
+
+// gateListEnvelope unmarshals a LIST envelope, runs filterListByRBAC over
+// its items with the request identity, and re-marshals the narrowed set
+// into the SAME apiserver-shaped envelope (marshalAsList) so the stage
+// jsonHandler/filter sees an identical shape to a fresh dispatch.
+//
+// Ship 0.30.121 R3 — this remains the fallback unmarshal path, used when
+// the content entry carries no pre-parsed Items (a malformed-at-Put
+// envelope, or a refresh path that stored RawJSON only). The hot path
+// (a content-Get-hit on an entry with Items) goes through gateListItems
+// and never reaches here. Output is byte-identical between the two.
+func gateListEnvelope(ctx context.Context, gvr schema.GroupVersionResource, raw []byte) ([]byte, bool) {
+	parsed, ok := parseListEnvelope(gvr, raw)
+	if !ok {
+		// A malformed stored envelope cannot be vouched for — fail closed.
+		return nil, false
+	}
+	return gateListItems(ctx, gvr, parsed)
 }
 
 // gateGetEnvelope runs filterGetByRBAC on a single-object envelope.
@@ -238,16 +278,38 @@ func apistageContentServe(
 		return nil, false, false
 	}
 	contentKey := cache.ComputeKey(contentKeyInputs(gvr, ns, name))
+	isList := name == ""
 
 	// Step 2 — content Get / un-gated dispatch + Put.
+	//
+	// Ship 0.30.121 R3 — for a LIST content entry the items are parsed
+	// ONCE here (at the Put site, or carried on the hit entry) so the
+	// per-hit gate skips json.Unmarshal. `parsed`/`haveParsed` carry the
+	// pre-parsed form when available; `envelope` carries the raw bytes
+	// for the GET path and the unmarshal fallback.
 	var envelope []byte
+	var parsed parsedListEnvelope
+	var haveParsed bool
 	if entry, hit := store.Get(contentKey); hit && entry != nil {
 		envelope = entry.RawJSON
+		// R3: a LIST entry stored with pre-parsed Items — gate directly
+		// over them, no re-unmarshal. An entry without Items (legacy /
+		// refresh-stored / malformed-at-Put) falls back to the RawJSON
+		// unmarshal path below.
+		if isList && len(entry.Items) > 0 {
+			parsed = parsedListEnvelope{
+				items:      entry.Items,
+				apiVersion: entry.ItemsAPIVersion,
+				kind:       entry.ItemsKind,
+			}
+			haveParsed = true
+		}
 		log.Debug("apistage.content_hit",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("ns", ns),
 			slog.String("name", name),
+			slog.Bool("preparsed", haveParsed),
 			slog.String("key_hash", contentKey),
 		)
 	} else {
@@ -259,15 +321,30 @@ func apistageContentServe(
 			return nil, false, false
 		}
 		envelope = dispatched
-		store.Put(contentKey, &cache.ResolvedEntry{
+		newEntry := &cache.ResolvedEntry{
 			RawJSON: dispatched,
 			Inputs:  ptrTo(contentKeyInputs(gvr, ns, name)),
-		})
+		}
+		// R3: parse the LIST envelope ONCE and attach the items to the
+		// entry, so every future content-Get-hit gates without a
+		// re-unmarshal. A malformed envelope (parseOK=false) stores
+		// RawJSON only — the gate then takes the unmarshal fallback.
+		if isList {
+			if p, parseOK := parseListEnvelope(gvr, dispatched); parseOK {
+				newEntry.Items = p.items
+				newEntry.ItemsAPIVersion = p.apiVersion
+				newEntry.ItemsKind = p.kind
+				parsed = p
+				haveParsed = true
+			}
+		}
+		store.Put(contentKey, newEntry)
 		log.Debug("apistage.content_store",
 			slog.String("subsystem", "cache"),
 			slog.String("gvr", gvr.String()),
 			slog.String("ns", ns),
 			slog.String("name", name),
+			slog.Bool("preparsed", haveParsed),
 			slog.String("key_hash", contentKey),
 		)
 	}
@@ -279,7 +356,16 @@ func apistageContentServe(
 		// the bytes (the prewarm resolve discards dict).
 		return nil, false, true
 	}
-	gated, gateOK := gateContentEnvelope(ctx, callPathVerb{path: call.Path}, envelope)
+	// R3: a LIST with pre-parsed items gates unmarshal-free; everything
+	// else (GET-by-name, or a LIST whose envelope failed to pre-parse)
+	// takes gateContentEnvelope's RawJSON path. Output is byte-identical.
+	var gated []byte
+	var gateOK bool
+	if haveParsed {
+		gated, gateOK = gateListItems(ctx, gvr, parsed)
+	} else {
+		gated, gateOK = gateContentEnvelope(ctx, callPathVerb{path: call.Path}, envelope)
+	}
 	if !gateOK {
 		// Fail-closed — no identity / GET denied. Fall through to apiserver.
 		return nil, false, true

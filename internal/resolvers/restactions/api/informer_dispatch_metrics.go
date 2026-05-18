@@ -46,25 +46,34 @@ var (
 	// is the expected steady state for narrow-RBAC users; it is the
 	// falsifier signal that the pivot is no longer over-exposing.
 	dispatchInformerRBACDropped atomic.Uint64
+	// dispatchInformerSyncWaitServed counts Gate-6 dispatches that were
+	// served from cache AFTER a Ship 0.30.121 R2-b bounded sync-wait — a
+	// GVR that was unsynced on entry became servable within
+	// RESOLVER_SYNC_WAIT_MS. A non-zero value means the R2-b knob is
+	// converting would-be apiserver LISTs into cache serves; it stays 0
+	// when the knob is at its default (0 = disabled).
+	dispatchInformerSyncWaitServed atomic.Uint64
 )
 
 // DispatchInformerStats is an atomic snapshot of the pivot serve-rate
 // counters. Fields may drift by a single in-flight call — fine for log
 // aggregation. Exported so tests can assert increments deterministically.
 type DispatchInformerStats struct {
-	ListServed  uint64
-	GetServed   uint64
-	Fallthrough uint64
-	RBACDropped uint64
+	ListServed     uint64
+	GetServed      uint64
+	Fallthrough    uint64
+	RBACDropped    uint64
+	SyncWaitServed uint64
 }
 
 // DispatchInformerStatsSnapshot returns the current counter values.
 func DispatchInformerStatsSnapshot() DispatchInformerStats {
 	return DispatchInformerStats{
-		ListServed:  dispatchInformerListServed.Load(),
-		GetServed:   dispatchInformerGetServed.Load(),
-		Fallthrough: dispatchInformerFallthrough.Load(),
-		RBACDropped: dispatchInformerRBACDropped.Load(),
+		ListServed:     dispatchInformerListServed.Load(),
+		GetServed:      dispatchInformerGetServed.Load(),
+		Fallthrough:    dispatchInformerFallthrough.Load(),
+		RBACDropped:    dispatchInformerRBACDropped.Load(),
+		SyncWaitServed: dispatchInformerSyncWaitServed.Load(),
 	}
 }
 
@@ -102,6 +111,7 @@ func startDispatchSummary() {
 					slog.Uint64("get_served", s.GetServed),
 					slog.Uint64("apiserver_fallthrough", s.Fallthrough),
 					slog.Uint64("rbac_dropped", s.RBACDropped),
+					slog.Uint64("sync_wait_served", s.SyncWaitServed),
 				)
 			}
 		}()

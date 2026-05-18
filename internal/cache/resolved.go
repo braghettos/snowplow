@@ -39,6 +39,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 // Resolver-cache env knobs (defaults match chart-0.30.7 spec).
@@ -94,6 +96,26 @@ type ResolvedEntry struct {
 	// Nil-safe: a missing Inputs (e.g., legacy 0.30.7 entries during a
 	// rolling restart) skips refresh but still serves TTL+LRU correctly.
 	Inputs *ResolvedKeyInputs
+
+	// Items / ItemsAPIVersion / ItemsKind — Ship 0.30.121 R3 — the
+	// pre-parsed LIST envelope for a CacheEntryClassApistage CONTENT
+	// entry. F1's content-gate (gateListEnvelope) re-unmarshalled the
+	// stored RawJSON envelope on EVERY content-Get-hit to run
+	// filterListByRBAC over the items — the ~1.73 GiB double-unmarshal.
+	// R3 parses the envelope's items ONCE at the content-entry Put site
+	// and stores them here; the content-gate then runs filterListByRBAC
+	// directly over Items and skips the unmarshal. Output is byte-
+	// identical by construction (same parse -> filter -> marshalAsList
+	// pipeline; only the unmarshal TIMING moves from per-hit to per-Put).
+	//
+	// Populated ONLY for CacheEntryClassApistage LIST content entries
+	// (name=="" — a collection). Nil for restactions/widgets entries and
+	// for apistage GET-by-name entries (gateGetEnvelope is left as-is).
+	// A nil Items means "no pre-parse — gate via the RawJSON unmarshal
+	// path" so the field is purely additive and back-compatible.
+	Items           []*unstructured.Unstructured
+	ItemsAPIVersion string
+	ItemsKind       string
 }
 
 // ResolvedKeyInputs is the canonical key-input bundle. The exact set
@@ -446,7 +468,7 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 	if entry.CreatedAt.IsZero() {
 		entry.CreatedAt = time.Now()
 	}
-	bytes := int64(len(entry.RawJSON))
+	bytes := entryBytes(entry)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -486,6 +508,36 @@ func (c *ResolvedCacheStore) Put(key string, entry *ResolvedEntry) {
 func isApistageEntry(entry *ResolvedEntry) bool {
 	return entry != nil && entry.Inputs != nil &&
 		entry.Inputs.CacheEntryClass == CacheEntryClassApistage
+}
+
+// itemsTreeOverheadFactor estimates the in-memory footprint of a parsed
+// []*unstructured.Unstructured tree relative to the JSON text it was
+// parsed from. A Go map[string]any / []any interface tree carries
+// per-node header + boxing overhead well above the compact JSON byte
+// length; 3x is a deliberately conservative floor so the LRU byte cap
+// does not silently under-count the R3 pre-parsed Items (Ship 0.30.121).
+const itemsTreeOverheadFactor = 3
+
+// entryBytes is the LRU byte-accounting weight of an L1 entry — Ship
+// 0.30.121 R3. It counts the pre-encoded RawJSON envelope AND, when the
+// entry carries the R3 pre-parsed Items (an apistage LIST content
+// entry), the estimated in-memory footprint of that parsed tree. Without
+// the Items term the byte cap silently under-counts every content entry
+// by roughly its own envelope size, letting curBytes drift far past
+// maxBytes. Items is parsed from RawJSON, so its tree size is estimated
+// as itemsTreeOverheadFactor * len(RawJSON) rather than re-serialising
+// each item (which would re-introduce the very marshal R3 removes).
+// A nil/empty Items contributes nothing — restactions/widgets entries
+// and apistage GET entries are accounted exactly as pre-0.30.121.
+func entryBytes(entry *ResolvedEntry) int64 {
+	if entry == nil {
+		return 0
+	}
+	b := int64(len(entry.RawJSON))
+	if len(entry.Items) > 0 {
+		b += int64(len(entry.RawJSON)) * itemsTreeOverheadFactor
+	}
+	return b
 }
 
 // Len returns the number of entries currently held. Safe to call

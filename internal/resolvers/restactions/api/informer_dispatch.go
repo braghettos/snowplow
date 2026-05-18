@@ -55,8 +55,10 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
+	"github.com/krateoplatformops/plumbing/env"
 	httpcall "github.com/krateoplatformops/plumbing/http/request"
 	"github.com/krateoplatformops/plumbing/ptr"
 	"github.com/krateoplatformops/snowplow/internal/cache"
@@ -69,6 +71,26 @@ import (
 // process-wide; a per-RestAction override would re-introduce the
 // per-resource carve-out we explicitly disallow.
 const resolverUseInformerEnv = "RESOLVER_USE_INFORMER"
+
+// envSyncWaitMS is the Ship 0.30.121 R2-b knob: the maximum time a Gate-6
+// dispatch will block waiting for a freshly-registered GVR's informer to
+// finish its initial WaitForCacheSync. Default 0 = disabled = today's
+// behaviour (no wait — fall straight through to the apiserver). When set
+// positive, a Gate-6 miss does ONE bounded channel-select wait, then
+// re-checks servability: a synced informer serves the request from cache
+// instead of paying a second apiserver LIST. The wait is single-attempt
+// and hard-capped — no unbounded goroutine, no retry loop.
+const envSyncWaitMS = "RESOLVER_SYNC_WAIT_MS"
+
+// syncWaitBudget returns the R2-b bounded sync-wait duration, 0 when
+// disabled (the default). A non-positive env value disables the wait.
+func syncWaitBudget() time.Duration {
+	ms := env.Int(envSyncWaitMS, 0)
+	if ms <= 0 {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
+}
 
 // resolverUseInformer reads the env-var on each call. Returns the raw
 // value lowercased; callers compare against "true" / "shadow" / "".
@@ -304,25 +326,69 @@ func dispatchViaInformer(ctx context.Context, call httpcall.RequestOptions) ([]b
 	// Gate 6: informer registered + synced. If the GVR is not yet
 	// registered, fire EnsureResourceType (sub-microsecond singleflight
 	// when already registered; lazy registration when not) so a
-	// SUBSEQUENT call after sync completes can serve. Either way, this
-	// dispatch falls through to apiserver — pre-sync reads would
-	// return empty slices that look indistinguishable from a real
-	// "no objects" answer.
+	// SUBSEQUENT call after sync completes can serve.
+	//
+	// Ship 0.30.121 R2-b — bounded single-attempt sync-wait. By default
+	// (RESOLVER_SYNC_WAIT_MS=0) an unsynced GVR falls straight through to
+	// the apiserver, byte-identical to pre-0.30.121: pre-sync reads would
+	// return empty slices indistinguishable from a real "no objects"
+	// answer. When the knob is set positive, this dispatch does ONE
+	// channel-select wait — hard-capped at the budget, no retry loop, no
+	// goroutine — on the per-GVR sync channel EnsureResourceType returns.
+	// After the wait it re-checks IsServable: a synced informer serves
+	// the request from cache (eliminating a second apiserver LIST — the
+	// ~5.81 GiB httpcall.Do alloc line); a still-unsynced informer falls
+	// through exactly as before. The Gate-6 fall-through itself is
+	// preserved unconditionally — serving an unsynced empty list broke S4
+	// (regression journal 2026-05-15).
 	if !rw.IsSynced(gvr) {
-		// Best-effort lazy registration. EnsureResourceType is
-		// idempotent (singleflight under rw.mu); duplicate calls
-		// are sub-microsecond no-ops. The actual sync completion
-		// happens asynchronously; we cannot wait here without
-		// blocking the resolver hot path.
-		_, _ = rw.EnsureResourceType(gvr)
-		log.Debug("informer_dispatch.fallthrough.not_synced",
-			slog.String("gvr", gvr.String()),
-			slog.String("ns", namespace),
-			slog.String("name", name),
-			slog.String("path", call.Path),
-		)
-		dispatchInformerFallthrough.Add(1)
-		return nil, false
+		// Best-effort lazy registration. EnsureResourceType is idempotent
+		// (singleflight under rw.mu); duplicate calls are sub-microsecond
+		// no-ops. It returns the per-GVR sync channel — closed once that
+		// informer's initial WaitForCacheSync completes.
+		_, syncCh := rw.EnsureResourceType(gvr)
+
+		// R2-b bounded single-attempt sync-wait. servedAfterWait is set
+		// only when the budget is positive AND the informer became
+		// servable within it — that case proceeds to the served path; in
+		// every other case the dispatch falls through to the apiserver.
+		servedAfterWait := false
+		if budget := syncWaitBudget(); budget > 0 && syncCh != nil {
+			timer := time.NewTimer(budget)
+			select {
+			case <-syncCh:
+				// Initial WaitForCacheSync completed within the budget.
+				timer.Stop()
+			case <-ctx.Done():
+				// Request cancelled — abandon the wait, fall through.
+				timer.Stop()
+			case <-timer.C:
+				// Budget exhausted — informer still not synced.
+			}
+			// Re-check servability ONCE after the bounded wait. A now-
+			// servable GVR proceeds to the served path below (no second
+			// apiserver LIST).
+			if rw.IsServable(gvr) {
+				log.Debug("informer_dispatch.sync_wait.served",
+					slog.String("gvr", gvr.String()),
+					slog.String("ns", namespace),
+					slog.String("path", call.Path),
+				)
+				dispatchInformerSyncWaitServed.Add(1)
+				servedAfterWait = true
+			}
+		}
+
+		if !servedAfterWait {
+			log.Debug("informer_dispatch.fallthrough.not_synced",
+				slog.String("gvr", gvr.String()),
+				slog.String("ns", namespace),
+				slog.String("name", name),
+				slog.String("path", call.Path),
+			)
+			dispatchInformerFallthrough.Add(1)
+			return nil, false
+		}
 	}
 
 	// Served path. Two shapes: LIST (name=="") and GET-by-name.
