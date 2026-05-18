@@ -84,7 +84,6 @@ package dispatchers
 import (
 	"context"
 	"log/slog"
-	"net/url"
 	"strings"
 	"time"
 
@@ -95,6 +94,7 @@ import (
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	idynamic "github.com/krateoplatformops/snowplow/internal/dynamic"
+	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"github.com/krateoplatformops/snowplow/internal/objects"
 	"github.com/krateoplatformops/snowplow/internal/resolvers/widgets"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -646,7 +646,7 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 			continue
 		}
 
-		ref, ok := parseCallPathToObjectRef(child.Path)
+		ref, ok := util.ParseCallPathToObjectRef(child.Path)
 		if !ok {
 			// A child path that is not a /call?... widget endpoint
 			// (external link, malformed) — nothing to recurse into.
@@ -802,42 +802,10 @@ func extractResourcesRefsItems(obj map[string]any) []navChildRef {
 	return out
 }
 
-// parseCallPathToObjectRef parses a `/call?resource=...&apiVersion=...&
-// name=...&namespace=...` widget endpoint into the ObjectReference the
-// objects.Get fetch needs. Returns ok=false for any path that is not a
-// /call widget endpoint (external link, missing resource/apiVersion).
-//
-// This mirrors the frontend recursion contract: every navigation child's
-// `path` is itself a /call?... widget endpoint. It is NOT a hardcoded
-// resource/path special-case — it is the generic /call query-param
-// decoder, the same params util.ParseGVR / util.ParseNamespacedName read
-// off a real HTTP request.
-func parseCallPathToObjectRef(path string) (templatesv1.ObjectReference, bool) {
-	u, err := url.Parse(path)
-	if err != nil {
-		return templatesv1.ObjectReference{}, false
-	}
-	// Only a /call endpoint carries a widget CR. The trimmed path must
-	// end in "/call" (it may be host-qualified or root-relative).
-	trimmed := strings.TrimRight(u.Path, "/")
-	if trimmed != "" && !strings.HasSuffix(trimmed, "/call") {
-		return templatesv1.ObjectReference{}, false
-	}
-	q := u.Query()
-	resource := q.Get("resource")
-	apiVersion := q.Get("apiVersion")
-	if resource == "" || apiVersion == "" {
-		return templatesv1.ObjectReference{}, false
-	}
-	return templatesv1.ObjectReference{
-		Reference: templatesv1.Reference{
-			Name:      q.Get("name"),
-			Namespace: q.Get("namespace"),
-		},
-		Resource:   resource,
-		APIVersion: apiVersion,
-	}, true
-}
+// parseCallPathToObjectRef was LIFTED to internal/handlers/util/callpath.go
+// at Ship 0.30.123 (#155) — util.ParseCallPathToObjectRef — so the
+// resolver package (which cannot import dispatchers) can share the same
+// /call decoder. Call sites here now use util.ParseCallPathToObjectRef.
 
 // navWidgetEndpointKey renders an ObjectReference into the stable dedupe
 // key the visited-set is keyed on.

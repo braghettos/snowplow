@@ -50,6 +50,7 @@ import (
 
 	"github.com/krateoplatformops/plumbing/env"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
+	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"github.com/krateoplatformops/snowplow/internal/objects"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -159,7 +160,7 @@ func listNavigationRootsFromConfigMap(ctx context.Context, dynCli k8sdynamic.Int
 			)
 			continue
 		}
-		ref, ok := parseCallPathToObjectRef(rr.url)
+		ref, ok := util.ParseCallPathToObjectRef(rr.url)
 		if !ok {
 			log.Warn("phase1.roots.entry_point_unparseable",
 				slog.String("subsystem", "cache"),

@@ -41,8 +41,6 @@ import (
 	"testing"
 
 	"github.com/krateoplatformops/snowplow/internal/cache"
-	"github.com/krateoplatformops/snowplow/internal/objects"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 // goodEntry is the non-trivial "correct" L1 payload the refresher must
@@ -178,80 +176,10 @@ func TestRefresher_LegitimateEmptyIsStored(t *testing.T) {
 	}
 }
 
-// --- Test 3 — layer (a) exportJwt skip-to-TTL ------------------------------
-
-// restActionUnstructured builds a minimal unstructured RESTAction CR with
-// a single api stage; exportJwt controls whether that stage carries
-// exportJwt:true.
-func restActionUnstructured(exportJwt bool) *unstructured.Unstructured {
-	stage := map[string]any{
-		"name": "allNamespacesAndCrds",
-		"path": "/call",
-	}
-	if exportJwt {
-		stage["exportJwt"] = true
-	}
-	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "templates.krateo.io/v1",
-		"kind":       "RESTAction",
-		"metadata": map[string]any{
-			"name":      "compositions-list",
-			"namespace": "krateo-system",
-		},
-		"spec": map[string]any{
-			"api": []any{stage},
-		},
-	}}
-}
-
-// TestRefresher_ExportJwtRESTActionSkippedToTTL drives
-// resolveRestActionForRefresh with a RESTAction CR whose single stage
-// carries exportJwt:true. Layer (a) must short-circuit to the (nil,nil)
-// skip-to-TTL sentinel BEFORE restactions.Resolve is reached, and bump
-// the refresh_skipped_export_jwt counter. The sibling case (exportJwt
-// unset) must NOT short-circuit via layer (a) — the counter stays flat.
-func TestRefresher_ExportJwtRESTActionSkippedToTTL(t *testing.T) {
-	t.Setenv("CACHE_ENABLED", "true")
-	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
-	cache.ResetResolvedCacheForTest()
-	t.Cleanup(cache.ResetResolvedCacheForTest)
-	cache.ResetRefresherForTest()
-	t.Cleanup(cache.ResetRefresherForTest)
-
-	inputs := cache.ResolvedKeyInputs{
-		CacheEntryClass: "restactions",
-		Resource:        "restactions",
-		Namespace:       "krateo-system",
-		Name:            "compositions-list",
-	}
-
-	// exportJwt:true — must skip-to-TTL via (nil,nil).
-	before := cache.RefresherSkippedExportJwt()
-	got := objects.Result{Unstructured: restActionUnstructured(true)}
-	encoded, err := resolveRestActionForRefresh(context.Background(), got, inputs, "")
-	if err != nil {
-		t.Fatalf("exportJwt stage: layer (a) must skip-to-TTL cleanly, not error; got %v", err)
-	}
-	if encoded != nil {
-		t.Fatalf("exportJwt stage: expected (nil,nil) skip-to-TTL sentinel; got %d bytes", len(encoded))
-	}
-	if after := cache.RefresherSkippedExportJwt(); after != before+1 {
-		t.Fatalf("exportJwt stage: refresh_skipped_export_jwt counter %d -> %d; want +1",
-			before, after)
-	}
-
-	// exportJwt unset — layer (a) must NOT short-circuit. We cannot run
-	// restactions.Resolve hermetically (no cluster), so we assert the
-	// negative directly: the export-jwt counter does not advance for a
-	// CR that has no exportJwt stage. Whatever resolveRestActionForRefresh
-	// then does downstream (resolve / error), it is NOT the layer-(a)
-	// skip — that is the property under test.
-	beforeSibling := cache.RefresherSkippedExportJwt()
-	gotSibling := objects.Result{Unstructured: restActionUnstructured(false)}
-	_, _ = resolveRestActionForRefresh(context.Background(), gotSibling, inputs, "")
-	if after := cache.RefresherSkippedExportJwt(); after != beforeSibling {
-		t.Fatalf("non-exportJwt stage: refresh_skipped_export_jwt counter advanced %d -> %d; "+
-			"layer (a) must key ONLY on the declarative exportJwt field",
-			beforeSibling, after)
-	}
-}
+// NOTE — the former Test 3 (TestRefresher_ExportJwtRESTActionSkippedToTTL)
+// and its restActionUnstructured helper were REMOVED at Ship 0.30.123
+// (#155). They validated the Ship 0.30.120 layer-(a) exportJwt
+// skip-to-TTL net, which 0.30.123 deletes: in-process nested /call now
+// resolves an exportJwt loopback stage correctly, so the refresher no
+// longer skips those RESTActions. The layer-(b) error-aware Put-gate
+// (Tests 1 and 2 above) STAYS and remains covered.

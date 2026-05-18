@@ -22,6 +22,7 @@ import (
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/handlers"
 	"github.com/krateoplatformops/snowplow/internal/handlers/dispatchers"
+	restactionsapi "github.com/krateoplatformops/snowplow/internal/resolvers/restactions/api"
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
 	httpSwagger "github.com/swaggo/http-swagger"
 
@@ -98,6 +99,18 @@ func main() {
 		use.TraceId(),
 		use.Logger(log),
 	)
+
+	// Ship 0.30.123 (#155) — wire the in-process nested-/call resolver
+	// seam. When a RESTAction stage's path is a /call?resource=... loopback
+	// into snowplow's own /call endpoint, the api resolver invokes this
+	// IN-PROCESS instead of issuing an HTTP request — so a JWT-less /
+	// SA-credentialed resolve can complete an exportJwt loopback stage.
+	// Wired unconditionally at startup (not cache-gated): the seam itself
+	// is cache-agnostic; ResolveNestedCall internally gates its RBAC check
+	// on !cache.Disabled(). Mirrors the api.resolveOnceFn seam pattern.
+	// RESOLVER_INPROCESS_NESTED_CALL (default true) is the runtime gate;
+	// a nil resolver (this wiring skipped) is the structural fallback.
+	restactionsapi.RegisterNestedCallResolver(dispatchers.ResolveNestedCall)
 
 	// Cache subsystem — Tag 0.30.4 (cache=on activation).
 	//

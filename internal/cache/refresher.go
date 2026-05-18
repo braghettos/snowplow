@@ -106,17 +106,18 @@ type refresher struct {
 	skippedNoEntryTotal atomic.Uint64
 	skippedNoHandler    atomic.Uint64
 
-	// Ship 0.30.120 — two-layer poison-fix counters.
-	//   refresherSkippedStageError: layer (b) — L1 Puts the error-aware
-	//     gate declined because a stage error was observed during the
-	//     refresh re-resolve (a continueOnError'd 401 from an exportJwt
-	//     loopback). The prior good entry is kept; TTL is the outer net.
-	//   refresherSkippedExportJwt: layer (a) — refreshes short-circuited
-	//     to TTL because the re-fetched RESTAction CR carries an
-	//     exportJwt:true stage (a background refresh has no per-user JWT
-	//     so that stage can never resolve correctly).
+	// Ship 0.30.120 layer (b) — error-aware Put-gate counter.
+	// refresherSkippedStageError counts L1 Puts the error-aware gate
+	// declined because a stage error was observed during the refresh
+	// re-resolve (a continueOnError'd failure — a genuine RBAC denial,
+	// an apiserver fault). The prior good entry is kept; TTL is the
+	// outer net.
+	//
+	// (The Ship 0.30.120 layer-(a) refresherSkippedExportJwt counter was
+	// REMOVED at Ship 0.30.123 (#155) — in-process nested /call resolves
+	// an exportJwt loopback stage correctly, so the layer-(a) skip-to-TTL
+	// net is obsolete. Layer (b) stays as the general backstop.)
 	refresherSkippedStageError atomic.Uint64
-	refresherSkippedExportJwt  atomic.Uint64
 
 	startedOnce sync.Once
 	stopOnce    sync.Once
@@ -351,7 +352,6 @@ type refresherStats struct {
 	skippedNoEntry    uint64
 	skippedNoHandler  uint64
 	skippedStageError uint64 // Ship 0.30.120 layer (b)
-	skippedExportJwt  uint64 // Ship 0.30.120 layer (a)
 }
 
 func refresherStatsSnapshot() refresherStats {
@@ -368,7 +368,6 @@ func refresherStatsSnapshot() refresherStats {
 		skippedNoEntry:    r.skippedNoEntryTotal.Load(),
 		skippedNoHandler:  r.skippedNoHandler.Load(),
 		skippedStageError: r.refresherSkippedStageError.Load(),
-		skippedExportJwt:  r.refresherSkippedExportJwt.Load(),
 	}
 }
 

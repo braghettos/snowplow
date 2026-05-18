@@ -22,6 +22,7 @@ import (
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"github.com/krateoplatformops/snowplow/internal/dynamic"
+	"github.com/krateoplatformops/snowplow/internal/handlers/util"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -433,6 +434,83 @@ func Resolve(ctx context.Context, opts ResolveOptions) map[string]any {
 					slog.String("host", call.Endpoint.ServerURL),
 					slog.String("path", call.Path),
 				)
+
+				// Ship 0.30.123 (#155) — in-process nested /call. This is
+				// the FIRST dispatch branch (before the informer pivot,
+				// before httpcall.Do). When the stage's `path` is a
+				// /call?resource=...&apiVersion=... loopback into snowplow's
+				// OWN /call endpoint, resolve the referenced RESTAction
+				// IN-PROCESS — no HTTP request, no Authorization header,
+				// identity carried by the WithUserInfo already on ctx. This
+				// lets a JWT-less / SA-credentialed resolve complete an
+				// exportJwt loopback stage (the 0.30.120 poison) and is the
+				// hard prerequisite for F2's startup SA-prewarm.
+				//
+				// Three structural gates, ALL must hold or the branch is
+				// skipped and the call falls through to the informer pivot
+				// / httpcall.Do exactly as 0.30.121:
+				//   1. RESOLVER_INPROCESS_NESTED_CALL enabled (default true);
+				//   2. the resolver seam is wired (nestedCallResolver != nil
+				//      — the second structural fallback);
+				//   3. the call is a GET whose path parses as a /call
+				//      loopback (util.ParseCallPathToObjectRef — SHAPE only,
+				//      no resource/name/host literal).
+				// On a nested error: honour ContinueOnError / ErrorKey
+				// exactly as the HTTP path, AND bump the 0.30.120 stage-error
+				// sink so layer (b)'s Put-gate still sees the failure.
+				if inprocessNestedCallEnabled() && nestedCallResolver != nil &&
+					ptr.Deref(call.Verb, http.MethodGet) == http.MethodGet {
+					if ref, isLoopback := util.ParseCallPathToObjectRef(call.Path); isLoopback {
+						statusRaw, nerr := nestedCallResolver(gctx, ref,
+							opts.PerPage, opts.Page, opts.Extras)
+						if nerr != nil {
+							log.Error("nested /call resolution failed",
+								slog.String("name", id),
+								slog.String("path", call.Path),
+								slog.String("dispatch", "in-process-nested-call"),
+								slog.String("error", nerr.Error()))
+							dictMu.Lock()
+							dict[call.ErrorKey] = nerr.Error()
+							dictMu.Unlock()
+							// Layer (b) backstop (0.30.120): record the stage
+							// error on the refresher's sink (nil on the
+							// request path) so the error-aware Put-gate still
+							// sees a nested-/call failure.
+							if stageErrSink != nil {
+								stageErrSink.Add(1)
+							}
+							if !call.ContinueOnError {
+								return fmt.Errorf("api %s failed: %s", id, nerr.Error())
+							}
+							// ContinueOnError: fall through to the success-log
+							// line, mirroring the httpcall.Do ContinueOnError
+							// contract.
+						} else {
+							// The in-process result IS the referenced
+							// RESTAction's Status.Raw — byte-identical to the
+							// HTTP /call response body. Feed it to the stage's
+							// ResponseHandler exactly as the HTTP return is fed.
+							if err := call.ResponseHandler(readerFromBytes(statusRaw)); err != nil {
+								return err
+							}
+						}
+						dictMu.Lock()
+						depth := mapDepth(dict)
+						dictMu.Unlock()
+						dispatch := "in-process-nested-call"
+						if nerr != nil {
+							dispatch = "in-process-nested-call-error"
+						}
+						log.Info("api successfully resolved",
+							slog.String("name", id),
+							slog.String("host", call.Endpoint.ServerURL),
+							slog.String("path", call.Path),
+							slog.Int("depth", depth),
+							slog.String("dispatch", dispatch),
+						)
+						return nil
+					}
+				}
 
 				// 0.30.95 resolver pivot — dispatch GET reads to the
 				// informer cache when RESOLVER_USE_INFORMER=true.

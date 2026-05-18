@@ -88,16 +88,10 @@ func BumpRefresherSkippedStageError() {
 	refresherSingleton().refresherSkippedStageError.Add(1)
 }
 
-// RefresherSkippedExportJwt returns the process-wide count of refreshes
-// short-circuited to TTL because the re-fetched RESTAction CR carries an
-// exportJwt:true stage (Ship 0.30.120 layer (a)).
-func RefresherSkippedExportJwt() uint64 {
-	return refresherSingleton().refresherSkippedExportJwt.Load()
-}
-
-// BumpRefresherSkippedExportJwt increments the exportJwt skip-to-TTL
-// counter. Called by resolveRestActionForRefresh (dispatchers package)
-// when the re-fetched RESTAction CR carries an exportJwt:true stage.
-func BumpRefresherSkippedExportJwt() {
-	refresherSingleton().refresherSkippedExportJwt.Add(1)
-}
+// NOTE — the Ship 0.30.120 layer-(a) RefresherSkippedExportJwt /
+// BumpRefresherSkippedExportJwt accessors were REMOVED at Ship 0.30.123
+// (#155). Layer (a) (the exportJwt skip-to-TTL net) is obsolete:
+// in-process nested /call now resolves an exportJwt loopback stage
+// correctly, so the refresher no longer declines to refresh those
+// RESTActions. Layer (b) — the error-aware Put-gate above — STAYS as the
+// general backstop for any genuinely-failing stage.

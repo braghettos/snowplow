@@ -45,7 +45,6 @@ import (
 	"github.com/krateoplatformops/plumbing/endpoints"
 	"github.com/krateoplatformops/plumbing/env"
 	"github.com/krateoplatformops/plumbing/jwtutil"
-	"github.com/krateoplatformops/plumbing/ptr"
 	"github.com/krateoplatformops/snowplow/apis"
 	templatesv1 "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/cache"
@@ -287,35 +286,19 @@ func resolveRestActionForRefresh(ctx context.Context, got objects.Result, inputs
 		return nil, fmt.Errorf("unstructured -> RESTAction: %w", err)
 	}
 
-	// Ship 0.30.120 layer (a) — exportJwt skip-to-TTL. A stage with
-	// exportJwt:true makes a nested snowplow /call loopback that needs
-	// the requesting user's bearer token. A background refresh has only
-	// the SA transport — no per-user JWT — so that loopback can never
-	// resolve correctly: it 401s, continueOnError swallows the 401 as a
-	// structurally-valid empty result, and the refresher would Put an
-	// under-served entry over the user's good one. When the re-fetched
-	// CR carries any exportJwt:true stage, decline to store: return
-	// (nil, nil) — the established "skip-to-TTL" sentinel
-	// (resolveAndPopulateL1 treats encoded==nil as a no-op). The prior
-	// good entry stays; TTL is the outer net.
+	// Ship 0.30.123 (#155): the Ship 0.30.120 layer-(a) exportJwt
+	// skip-to-TTL scan was REMOVED here. Layer (a) existed only because a
+	// background refresh had no way to complete an exportJwt /call-loopback
+	// stage (no per-user JWT) — so it declined to refresh those RESTActions
+	// at all. 0.30.123's in-process nested /call resolves a /call-loopback
+	// stage WITHOUT an Authorization header (identity carried on ctx), so
+	// the refresher CAN now correctly refresh an exportJwt RESTAction with
+	// real, non-empty content. The skip-to-TTL net is obsolete.
 	//
-	// Keyed on the declarative ExportJWT CRD field ONLY — no resource /
-	// name / path literal (no_special_cases rule). This is layer (a):
-	// the short-circuit-before-resolve net; layer (b) (the error-aware
-	// Put-gate) is the general backstop for any other swallowed stage
-	// error.
-	for _, stage := range cr.Spec.API {
-		if stage != nil && ptr.Deref(stage.ExportJWT, false) {
-			cache.BumpRefresherSkippedExportJwt()
-			xcontext.Logger(ctx).Info("resolveRestActionForRefresh: RESTAction has exportJwt stage; skipping refresh to TTL",
-				slog.String("subsystem", "cache"),
-				slog.String("restaction", inputs.Name),
-				slog.String("namespace", inputs.Namespace),
-				slog.String("effect", "background refresh has no per-user JWT; prior good entry kept, TTL is the outer net"),
-			)
-			return nil, nil
-		}
-	}
+	// Layer (b) — the error-aware Put-gate in resolveAndPopulateL1 — STAYS
+	// as the general backstop: any stage that still errors (a genuine RBAC
+	// denial, an apiserver fault) bumps the stage-error sink and the
+	// Put-gate declines to overwrite the good entry.
 
 	res, err := restactions.Resolve(ctx, restactions.ResolveOptions{
 		In:      &cr,
