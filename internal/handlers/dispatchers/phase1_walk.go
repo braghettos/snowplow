@@ -546,44 +546,56 @@ func resolveNavigationRoot(ctx context.Context, root *unstructured.Unstructured,
 		gvrSamples:      map[string]int{},
 		apiRefHarvester: harvester,
 	}
-	return w.walk(rctx, root, 0)
+	// The root has no parent — its per-(parent,GVR) sample budgets are
+	// scoped under the empty parent key (Ship 0.30.126).
+	return w.walk(rctx, root, 0, "")
 }
 
-// phase1PerGVRSampleLimit caps how many widget CRs of the SAME GVR the
-// walk resolves+recurses into across the whole walk. It is the key
-// 0.30.105 data-fan-out bound.
+// phase1PerGVRSampleLimit caps how many widget CRs of the same GVR, UNDER
+// ONE PARENT widget, the walk resolves+recurses into. It is the key
+// 0.30.105 data-fan-out bound, re-scoped per-parent at Ship 0.30.126.
 //
 // WHY (the on-cluster finding): a Compositions Page DataGrid yields one
 // resourcesRefs child PER COMPOSITION ROW — at production scale that is
-// ~49K children, every one a `githubscaffoldingwithcompositionpage`
-// widget of the SAME GVR. Recursing into all of them turns the startup
-// walk into a 49K-deep per-composition resolution storm that blows the
-// PHASE1_TIMEOUT_SECONDS budget (the first on-cluster 0.30.105 bench
-// CrashLooped the pod). But for INFORMER DISCOVERY every row-widget of a
-// given GVR is identical — resolving one fires the exact same
-// lazyRegisterInnerCallPaths apiRef chain as resolving the 49000th. So
-// the walk samples a SMALL bounded number per distinct child GVR: enough
-// to traverse genuine navigation structure (each distinct widget GVR is
-// still visited) while skipping the per-row data fan-out.
+// ~49K children, every one a widget of the SAME GVR. Recursing into all
+// of them turns the startup walk into a 49K-deep per-composition
+// resolution storm that blows the PHASE1_TIMEOUT_SECONDS budget (the
+// first on-cluster 0.30.105 bench CrashLooped the pod). But for INFORMER
+// DISCOVERY every row-widget of a given GVR is identical — resolving one
+// fires the exact same lazyRegisterInnerCallPaths apiRef chain as
+// resolving the 49000th. So the walk samples a SMALL bounded number per
+// (parent, child-GVR): enough to traverse genuine navigation structure
+// while skipping the per-row data fan-out.
 //
 // The limit is >1 so a parent that legitimately has a couple of
 // different-purpose children sharing a GVR is not under-covered; it is
-// small because additional same-GVR widgets discover no new informer.
+// small because additional same-GVR widgets under that parent discover
+// no new informer.
 //
-// STRUCTURAL ASSUMPTION (architect follow-up note): this bound's safety
-// rests on no single parent widget having more than
-// phase1PerGVRSampleLimit distinct same-GVR DataGrid/Table siblings. The
-// gvrSamples counter is keyed on GVR alone, so siblings that share a GVR
-// share one budget. Today the navigation tree never crosses that count,
-// so every distinct-purpose widget is sampled. If a future navigation
-// tree adds same-GVR sibling widgets beyond this count, an
-// earlier-iterated sibling could exhaust the budget and a later
-// distinct-purpose sibling (e.g. the Compositions DataGrid) could be
-// skipped before its informer chain is discovered — at which point this
-// limit MUST rise (or the counter must key on a finer identity than the
-// bare GVR). Until then, 4 is a deliberate, navigation-shape-validated
-// constant, not an arbitrary one.
+// THE BUDGET KEY (Ship 0.30.126): gvrSamples is keyed on
+// (parentEndpoint, GVR), NOT the bare GVR. Pre-0.30.126 the bare-GVR key
+// let the Compositions DataGrid's per-composition-panel flood drain the
+// SHARED `panels` budget — so the Dashboard page's structural `panels`
+// widgets (same GVR, different parent) were skipped before the walk
+// reached `compositions-list`, and F2's apiRef harvester (which rides
+// this walk) never harvested it. Scoping the budget per parent makes
+// every parent's same-GVR children independent: the flood is still
+// capped at phase1PerGVRSampleLimit PER PARENT — the 49K-resolution
+// storm stays bounded — while a sibling parent's structural widgets are
+// never starved. 4 is a deliberate, navigation-shape-validated constant.
 const phase1PerGVRSampleLimit = 4
+
+// parentScopedGVRKey builds the gvrSamples budget key — Ship 0.30.126.
+// The key is (parentEndpoint, GVR): each parent widget's same-GVR
+// children draw on an independent phase1PerGVRSampleLimit budget, so a
+// DataGrid flooding one GVR cannot starve a sibling page's structural
+// widgets of the same GVR. parentEndpoint is the navWidgetEndpointKey of
+// the widget whose children are being iterated ("" for the root). The
+// '#' separator cannot appear in a navWidgetEndpointKey
+// (apiVersion|resource|namespace|name), so the key is unambiguous.
+func parentScopedGVRKey(parentEndpoint, apiVersion, resource string) string {
+	return parentEndpoint + "#" + apiVersion + "|" + resource
+}
 
 // phase1Walker carries the per-root recursive-walk state. A fresh walker
 // is created per navigation root so the dedupe state never crosses roots
@@ -620,7 +632,13 @@ type phase1Walker struct {
 // of the navigation tree. The function returns an error ONLY for the
 // top-level root resolve failure, so the caller (phase1WarmupWith) can
 // log a root as failed.
-func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, depth int) error {
+// parentEndpoint is the navWidgetEndpointKey of `in` itself — the parent
+// of every child this invocation iterates. The root call passes "".
+// Ship 0.30.126: it scopes the per-GVR data-fan-out budget per PARENT
+// widget (see phase1PerGVRSampleLimit), so a DataGrid flooding one GVR
+// cannot drain the budget of a sibling page's structural widgets of the
+// same GVR.
+func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, depth int, parentEndpoint string) error {
 	log := slog.Default()
 	if in == nil {
 		return nil
@@ -703,16 +721,26 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 			continue
 		}
 
-		// DATA-FAN-OUT BOUND: skip this child once its GVR has already
-		// been sampled phase1PerGVRSampleLimit times. A Compositions Page
-		// DataGrid yields one child per composition row — ~49K children
-		// of the same GVR — and resolving every one would blow the
-		// PHASE1_TIMEOUT budget. Every same-GVR row-widget fires the
-		// identical lazyRegisterInnerCallPaths apiRef chain, so a small
-		// sample saturates informer discovery for that GVR. Distinct
-		// navigation-structure GVRs are each still visited up to the
-		// limit. See phase1PerGVRSampleLimit.
-		gvrKey := ref.APIVersion + "|" + ref.Resource
+		// DATA-FAN-OUT BOUND: skip this child once this PARENT's children
+		// of this GVR have been sampled phase1PerGVRSampleLimit times. A
+		// Compositions Page DataGrid yields one child per composition row
+		// — ~49K children of the same GVR — and resolving every one would
+		// blow the PHASE1_TIMEOUT budget. Every same-GVR row-widget fires
+		// the identical lazyRegisterInnerCallPaths apiRef chain, so a small
+		// sample saturates informer discovery for that GVR under that
+		// parent.
+		//
+		// Ship 0.30.126: the budget key is (parentEndpoint, GVR), NOT the
+		// bare GVR. A bare-GVR key let the Compositions DataGrid's
+		// per-composition-panel flood drain the shared `panels` budget, so
+		// the Dashboard page's STRUCTURAL `panels` widgets — same GVR,
+		// different parent — were skipped and the walk never reached
+		// `compositions-list`. Scoping per parent gives every parent's
+		// same-GVR children an independent budget: the flood is still
+		// capped at phase1PerGVRSampleLimit PER PARENT (the 49K-resolution
+		// storm stays bounded), and a sibling parent's structural widgets
+		// are never starved.
+		gvrKey := parentScopedGVRKey(parentEndpoint, ref.APIVersion, ref.Resource)
 		if w.gvrSamples[gvrKey] >= phase1PerGVRSampleLimit {
 			continue
 		}
@@ -736,8 +764,12 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 		if got.Unstructured == nil {
 			continue
 		}
-		// Recurse into the child widget subtree.
-		_ = w.walk(ctx, got.Unstructured, depth+1)
+		// Recurse into the child widget subtree. The child's own endpoint
+		// key (`key` == navWidgetEndpointKey(ref)) becomes parentEndpoint
+		// for ITS children — so the per-(parent,GVR) sample budget is
+		// scoped under this child when the recursion iterates its
+		// descendants (Ship 0.30.126).
+		_ = w.walk(ctx, got.Unstructured, depth+1, key)
 	}
 	return nil
 }
