@@ -283,26 +283,10 @@ func TestApplyUserAccessFilter_NilUAFIsNoOp(t *testing.T) {
 	}
 }
 
-// TestTrimJSONString covers the JQ-output stripper edge cases.
-func TestTrimJSONString(t *testing.T) {
-	cases := []struct {
-		in, want string
-	}{
-		{`"value"`, "value"},
-		{`"value"` + "\n", "value"},
-		{"  \"value\"  ", "value"},
-		{`null`, ""},
-		{``, ""},
-		{`""`, ""},
-		{`bare-word`, "bare-word"}, // safety: not surrounded by quotes
-	}
-	for _, c := range cases {
-		got := trimJSONString(c.in)
-		if got != c.want {
-			t.Errorf("trimJSONString(%q) = %q; want %q", c.in, got, c.want)
-		}
-	}
-}
+// Ship A (0.30.137): TestTrimJSONString removed alongside trimJSONString.
+// The helper became dead code when evalJQString migrated to EvalValue
+// (design §3.4.4 / AC-A.5). Its string/null/non-string edge-case coverage
+// is subsumed by the evalJQString truth-table tests in jqvalue_test.go.
 
 // --- Ship 0.30.129 — ResourcesFrom (RBAC-aware fan-out) -------------------
 

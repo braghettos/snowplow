@@ -33,12 +33,11 @@ package api
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/jqutil"
 	templates "github.com/krateoplatformops/snowplow/apis/templates/v1"
 	"github.com/krateoplatformops/snowplow/internal/rbac"
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
@@ -289,23 +288,28 @@ func resolveUAFResources(ctx context.Context, log *slog.Logger, uaf *templates.U
 	if uaf.ResourcesFrom == "" {
 		return []string{uaf.Resource}, true
 	}
-	v, err := jqutil.Eval(ctx, jqutil.EvalOptions{
-		Query:        uaf.ResourcesFrom,
-		Data:         dict,
-		ModuleLoader: jqsupport.ModuleLoader(),
-	})
+	// Ship A (0.30.137): EvalValue returns gojq's result value directly
+	// (design §3.4.3). Fail-closed for every non-single-array outcome.
+	v, ok, err := EvalValue(ctx, uaf.ResourcesFrom, dict, jqsupport.ModuleLoader())
 	if err != nil {
+		// Parse/compile/runtime error OR ErrMultiYield. Pre-Ship-A the
+		// jqutil.Eval err branch logs "JQ eval failed"; the multi-yield
+		// case surfaced as a json.Unmarshal error logged "not a JSON
+		// array". Both fail-closed identically — one warn; the distinction
+		// was never security-load-bearing.
 		log.Warn("userAccessFilter: ResourcesFrom JQ eval failed; fail-closed",
 			slog.String("expr", uaf.ResourcesFrom),
 			slog.Any("err", err),
 		)
 		return nil, false
 	}
-	var arr []any
-	if uerr := json.Unmarshal([]byte(v), &arr); uerr != nil {
+	arr, isArr := v.([]any) // !ok (zero-yield) => v==nil => isArr false
+	if !ok || !isArr {
+		// Zero-yield, or a non-array result. Pre-Ship-A json.Unmarshal of
+		// "" or of a non-array into []any errors -> "not a JSON array" ->
+		// fail-closed.
 		log.Warn("userAccessFilter: ResourcesFrom result is not a JSON array; fail-closed",
 			slog.String("expr", uaf.ResourcesFrom),
-			slog.Any("err", uerr),
 		)
 		return nil, false
 	}
@@ -331,48 +335,47 @@ func resolveUAFResources(ctx context.Context, log *slog.Logger, uaf *templates.U
 	return out, true
 }
 
-// evalJQString evaluates expr against data and returns a Go string. The
-// jqutil.Eval returns a JSON-encoded result, so a JQ expression like
-// ".metadata.name" produces `"some-name"` (a JSON string literal); we
-// strip the surrounding quotes here.
+// evalJQString evaluates expr against data and returns a Go string.
 //
-// data is any (0.30.111 Part 1): jqutil.EvalOptions.Data is already
-// declared `any`, so a bare-string receiver needs no jqutil change —
-// jq `.` on a string yields the string. A map receiver is unchanged.
+// Ship A (0.30.137): EvalValue returns gojq's result value directly
+// (design §3.4.4). A string result IS the Go string — no quote-stripping
+// round-trip. A null result maps to "" (pre-Ship-A trimJSONString("null")).
+// A non-string single value is JSON-serialised verbatim (cold branch).
+//
+// DELIBERATE CHANGE (design §3.4.5, RATIFIED): a multi-yield expression
+// pre-Ship-A returned the concatenated invalid-JSON string verbatim with
+// err==nil — silent garbage flowing into a URL path / ResourceRef field /
+// RBAC namespace. Ship A surfaces it as ErrMultiYield, so this returns
+// ("", err) and the caller's existing error handling fires (fail-closed at
+// both consumers — evalSingle's NamespaceFrom RBAC path treats it as denied).
+//
+// data is any (0.30.111 Part 1): jq `.` on a string yields the string;
+// a map receiver is unchanged.
 func evalJQString(ctx context.Context, expr string, data any) (string, error) {
-	s, err := jqutil.Eval(ctx, jqutil.EvalOptions{
-		Query:        expr,
-		Data:         data,
-		ModuleLoader: jqsupport.ModuleLoader(),
-	})
+	v, ok, err := EvalValue(ctx, expr, data, jqsupport.ModuleLoader())
+	if errors.Is(err, ErrMultiYield) {
+		// DELIBERATE CHANGE — see §3.4.5. Pre-Ship-A a multi-yield expr
+		// returned the concatenated invalid-JSON string verbatim (latent
+		// garbage). Ship A surfaces it as an error.
+		return "", err
+	}
 	if err != nil {
 		return "", err
 	}
-	// jqutil.Eval returns the JSON serialisation. For string results
-	// that means `"value"\n` — trim the wrapper.
-	out := trimJSONString(s)
-	return out, nil
-}
-
-// trimJSONString strips outer whitespace + surrounding double quotes
-// from a single-line JSON string. Returns "" when the input is
-// `null` or `""`. Keeps the implementation minimal — JQ produces
-// well-formed JSON so we don't need a full json.Unmarshal cycle.
-func trimJSONString(s string) string {
-	// Trim leading/trailing whitespace.
-	for len(s) > 0 && (s[0] == ' ' || s[0] == '\n' || s[0] == '\r' || s[0] == '\t') {
-		s = s[1:]
+	if !ok {
+		// Zero-yield. Pre-Ship-A: trimJSONString("") == "".
+		return "", nil
 	}
-	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\n' || s[len(s)-1] == '\r' || s[len(s)-1] == '\t') {
-		s = s[:len(s)-1]
+	switch s := v.(type) {
+	case string:
+		return s, nil // pre-Ship-A: trimJSONString strips the quotes
+	case nil:
+		return "", nil // pre-Ship-A: trimJSONString("null") == ""
+	default:
+		// Non-string single value. Pre-Ship-A: trimJSONString of the JSON
+		// serialisation == the serialisation verbatim. Cold branch.
+		return encodeValueCompact(s), nil
 	}
-	if s == "null" || s == "" {
-		return ""
-	}
-	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		return s[1 : len(s)-1]
-	}
-	return s
 }
 
 // setRefilteredEmpty replaces dict[apiName] with the canonical empty

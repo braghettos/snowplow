@@ -3,11 +3,12 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
-	"github.com/krateoplatformops/plumbing/jqutil"
 	"github.com/krateoplatformops/plumbing/ptr"
 	jqsupport "github.com/krateoplatformops/snowplow/internal/support/jq"
 )
@@ -92,17 +93,29 @@ func jsonHandlerCore(ctx context.Context, opts jsonHandlerOptions, tmp any) erro
 	if opts.filter != nil {
 		q := ptr.Deref(opts.filter, "")
 		log.Debug("found local filter on api result", slog.String("filter", q))
-		s, err := jqutil.Eval(context.TODO(), jqutil.EvalOptions{
-			Query: q, Data: pig,
-			ModuleLoader: jqsupport.ModuleLoader(),
-		})
-		if err != nil {
+		// Ship A (0.30.137): EvalValue returns gojq's result value
+		// directly — no jqutil encode-to-string + json.Unmarshal-back
+		// round-trip (design §3.4.2). Behaviour byte-identical per the
+		// §3.4.2 truth table.
+		v, ok, err := EvalValue(context.TODO(), q, pig, jqsupport.ModuleLoader())
+		switch {
+		case errors.Is(err, ErrMultiYield):
+			// Current: multi-yield -> invalid concatenated JSON ->
+			// json.Unmarshal errors -> return err -> stage fails.
+			return err
+		case err != nil:
+			// Parse/compile/runtime gojq-error. Current: log.Error, tmp
+			// unchanged, stage continues. (jqutil.Eval err branch.)
 			log.Error("unable to evaluate JQ filter",
 				slog.String("filter", q), slog.Any("error", err))
-		} else {
-			if err := json.Unmarshal([]byte(s), &tmp); err != nil {
-				return err
-			}
+		case !ok:
+			// Zero-yield (jq `empty`). Current: jqutil.Eval returns "",
+			// json.Unmarshal("") errors -> return err -> stage fails.
+			return fmt.Errorf("jq filter %q yielded no value", q)
+		default:
+			// Single value. Current: json.Unmarshal(s) -> tmp. Ship A:
+			// tmp = v directly (the §3.1-3.3 equivalence proof).
+			tmp = v
 		}
 	}
 
