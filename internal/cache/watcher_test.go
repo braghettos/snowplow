@@ -208,11 +208,21 @@ func TestNewResourceWatcher_AddResourceTypeIdempotent(t *testing.T) {
 // TestNewResourceWatcher_GoroutineFootprintBounded sanity-checks that
 // constructor activation does not leak unbounded goroutines per GVR.
 // We expect roughly one Reflector + one informer + one bookkeeping
-// goroutine per registered GVR (≤ 5×len). At 0.30.9 Sub-scope B
-// each registered GVR ALSO has one sync-watcher goroutine (closes
-// the per-GVR sync channel on HasSynced) — short-lived but counted
-// here. Headroom = 10× absorbs client-go version drift + the new
-// sync-watcher.
+// goroutine per registered GVR (≤ 5×len). At 0.30.9 Sub-scope B each
+// registered GVR ALSO has one sync-watcher goroutine (closes the
+// per-GVR sync channel on HasSynced) — short-lived but counted here.
+//
+// Ship B (0.30.138) adds TWO bounded transient goroutines per cache=on
+// construction (NOT per-GVR):
+//
+//   - waitAndPublishInitialRBACSnapshot — one-shot, dies after the
+//     initial snapshot publishes.
+//   - the rebuild goroutine spawned by the initial scheduleRBACRebuild
+//     — bounded by the atomic.Bool tryLock at 1 in-flight max
+//     (AC-B.5), short-lived (~5–10 ms for the live cluster footprint).
+//
+// Headroom = 12× absorbs client-go version drift, the existing
+// sync-watcher per GVR, AND the Ship B additions.
 func TestNewResourceWatcher_GoroutineFootprintBounded(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 
@@ -232,7 +242,7 @@ func TestNewResourceWatcher_GoroutineFootprintBounded(t *testing.T) {
 
 	after := runtime.NumGoroutine()
 	delta := after - before
-	const headroom = 10
+	const headroom = 12
 	maxAllowed := len(cache.RBACResourceTypes) * headroom
 	if delta > maxAllowed {
 		t.Fatalf("goroutine delta = %d (want <= %d); before=%d after=%d", delta, maxAllowed, before, after)

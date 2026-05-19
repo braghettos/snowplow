@@ -85,21 +85,11 @@ type EvaluateOptions struct {
 	Name string
 }
 
-// well-known RBAC GVRs — must match cache.RBACResourceTypes.
-var (
-	rolesGVR = schema.GroupVersionResource{
-		Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles",
-	}
-	roleBindingsGVR = schema.GroupVersionResource{
-		Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings",
-	}
-	clusterRolesGVR = schema.GroupVersionResource{
-		Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles",
-	}
-	clusterRoleBindingsGVR = schema.GroupVersionResource{
-		Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings",
-	}
-)
+// Ship B (0.30.138): the rbac-package GVR vars are dead — the snapshot
+// reads come from `*cache.RBACSnapshot` fields, and the writer side
+// owns the GVR set via `rbacTypedGVRs` (strip.go:101-106). Removing
+// the duplicate set here aligns with the single-source-of-truth rule
+// recorded in the design's `feedback_no_special_cases` discussion.
 
 // EvaluateRBAC returns true iff opts describes an action permitted by
 // the cluster Role-Based Access Control rules, evaluated against the
@@ -150,7 +140,33 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, error) {
 		return false, fmt.Errorf("rbac: cache=on but ResourceWatcher not wired")
 	}
 
-	allowed, err := evaluateAgainstInformer(ctx, rw, opts)
+	// Ship B (0.30.138, AC-B.3) — SINGLE rbacSnap.Load() at the top of
+	// EvaluateRBAC. The resulting *cache.RBACSnapshot is threaded as an
+	// explicit parameter into evaluateAgainstInformer AND roleRefPermits,
+	// so every read inside one EvaluateRBAC call observes the SAME
+	// snapshot version. A Load() per site would let two reads in the
+	// same eval see two different snapshots (e.g. a CRB in the new
+	// snapshot but its referenced ClusterRole only in the old) —
+	// correctness regression. The architect-review gate rejects on this
+	// alone.
+	snap := rw.Snapshot()
+	if snap == nil {
+		// AC-B.8 — degrade-to-deny pre-readiness gate. Cache=on
+		// activated but the 4 RBAC syncCh have not all closed AND the
+		// initial rebuildRBACSnapshot has not yet published. Fail
+		// closed; never fall through to UserCan (would violate
+		// Revision 1).
+		log.Warn("rbac.evaluate: typed-RBAC snapshot not yet published — denying",
+			slog.String("user", opts.Username),
+			slog.String("verb", opts.Verb),
+			slog.String("group", opts.Group),
+			slog.String("resource", opts.Resource),
+			slog.String("namespace", opts.Namespace),
+		)
+		return false, fmt.Errorf("rbac: snapshot not yet built")
+	}
+
+	allowed, err := evaluateAgainstInformer(ctx, snap, opts)
 	if err != nil {
 		log.Error("rbac.evaluate: informer evaluation failed",
 			slog.String("user", opts.Username), slog.Any("err", err))
@@ -175,38 +191,36 @@ func EvaluateRBAC(ctx context.Context, opts EvaluateOptions) (bool, error) {
 // For every match the bound Role / ClusterRole is resolved and its
 // rules walked. First permitting rule wins (RBAC semantics).
 //
-// 0.30.6 — reads typed *rbacv1.{ClusterRole,Role}Binding directly from
-// the indexer (typed transform fires once at Add/Update event time per
-// strip.go stripAndType*). Per-call FromUnstructured cost is zero.
-// Defensive Unstructured fallback is retained for safety: if for any
-// reason an indexer entry is still an Unstructured (e.g. test seeding
-// path, transform conversion failure logged WARN at write time), the
-// per-call conversion runs and logs WARN at read time so the regression
-// is loud (plan §"Code-path falsifier" — fallback=true rate MUST stay
-// below 1%).
+// Ship B (0.30.138) — reads typed *rbacv1.{ClusterRole,Role}Binding
+// from a pre-built `*cache.RBACSnapshot` passed in by EvaluateRBAC. No
+// per-call ListTypedObjects / GetTypedObject. AC-B.3: the snap pointer
+// is captured ONCE at the top of EvaluateRBAC and threaded through
+// every sub-read so one eval observes one coherent snapshot version.
 //
-// 0.30.6 also reorders subject-prefilter to run BEFORE the typed read
-// in the inner loop where the typed object is already in hand. The
-// outer ListTypedObjects walk picks subjects from the typed object
-// directly; the prefilter still short-circuits the rule-walk (the
-// expensive part) when no subject matches.
-func evaluateAgainstInformer(ctx context.Context, rw *cache.ResourceWatcher, opts EvaluateOptions) (bool, error) {
+// The pre-Ship-B defensive Unstructured fallback (`as{Kind}` helpers in
+// this file) is no longer reachable from this hot path — the snapshot
+// writer skips non-typed indexer entries upstream with its own WARN
+// (mirroring the 0.30.6 fallback=true invariant). The as{Kind} helpers
+// stay in this file for documentation and for any future caller that
+// reads the indexer outside the snapshot path.
+//
+// 0.30.6's subject-prefilter ordering is preserved (subject match
+// BEFORE the rule walk) so a no-subject CRB still costs only the
+// subject scan, not the expensive PolicyRule walk.
+func evaluateAgainstInformer(ctx context.Context, snap *cache.RBACSnapshot, opts EvaluateOptions) (bool, error) {
 	log := xcontext.Logger(ctx)
 
 	// 1) ClusterRoleBindings — apply cluster-wide. Cluster-wide
-	//    permits override namespace scope.
-	crbs := rw.ListTypedObjects(clusterRoleBindingsGVR, "")
-	for _, obj := range crbs {
-		crb, err := asClusterRoleBinding(obj, log)
-		if err != nil {
-			return false, err
-		}
+	//    permits override namespace scope. (Pre-Ship-B: evaluate.go:198
+	//    ListTypedObjects(clusterRoleBindingsGVR, ""). Ship B: snapshot
+	//    field read — no slice allocation per call.)
+	for _, crb := range snap.ClusterRoleBindings {
 		// Subject prefilter FIRST — skip the entire roleRefPermits
 		// walk when no subject matches. Cheaper than the rule-walk.
 		if !anySubjectMatches(crb.Subjects, opts) {
 			continue
 		}
-		permits, err := roleRefPermits(rw, "", crb.RoleRef, opts, log)
+		permits, err := roleRefPermits(snap, "", crb.RoleRef, opts, log)
 		if err != nil {
 			return false, err
 		}
@@ -219,17 +233,14 @@ func evaluateAgainstInformer(ctx context.Context, rw *cache.ResourceWatcher, opt
 	//    A RoleBinding's permit is scoped to its own namespace; the
 	//    RoleRef can point at a Role (same namespace) or a ClusterRole
 	//    (cluster-wide) but the binding's effect is the namespace.
+	//    (Pre-Ship-B: evaluate.go:223 ListTypedObjects(roleBindingsGVR,
+	//    opts.Namespace). Ship B: snapshot map lookup.)
 	if opts.Namespace != "" {
-		rbs := rw.ListTypedObjects(roleBindingsGVR, opts.Namespace)
-		for _, obj := range rbs {
-			rb, err := asRoleBinding(obj, log)
-			if err != nil {
-				return false, err
-			}
+		for _, rb := range snap.RoleBindingsByNS[opts.Namespace] {
 			if !anySubjectMatches(rb.Subjects, opts) {
 				continue
 			}
-			permits, err := roleRefPermits(rw, opts.Namespace, rb.RoleRef, opts, log)
+			permits, err := roleRefPermits(snap, opts.Namespace, rb.RoleRef, opts, log)
 			if err != nil {
 				return false, err
 			}
@@ -242,22 +253,24 @@ func evaluateAgainstInformer(ctx context.Context, rw *cache.ResourceWatcher, opt
 	return false, nil
 }
 
-// roleRefPermits resolves ref (Role or ClusterRole) and walks its
-// rules. namespace is the RoleBinding's namespace (used to resolve
-// kind=Role); empty when ref came from a ClusterRoleBinding.
+// roleRefPermits resolves ref (Role or ClusterRole) against the
+// passed-in snapshot and walks its rules. namespace is the
+// RoleBinding's namespace (used to resolve kind=Role); empty when ref
+// came from a ClusterRoleBinding.
 //
-// 0.30.6 — reads typed *rbacv1.{ClusterRole,Role} directly via
-// GetTypedObject; defensive Unstructured fallback logs WARN.
-func roleRefPermits(rw *cache.ResourceWatcher, namespace string, ref rbacv1.RoleRef, opts EvaluateOptions, log *slog.Logger) (bool, error) {
+// Ship B (0.30.138) — map lookups on the snapshot replace the
+// per-call GetTypedObject reads (pre-Ship-B: evaluate.go:254/:270). A
+// missed lookup (`!ok`) is recorded via cache.RecordRBACSnapshotMiss
+// (AC-B.10) and treated as a deny — same fail-closed posture as
+// today's GetTypedObject !ok.
+func roleRefPermits(snap *cache.RBACSnapshot, namespace string, ref rbacv1.RoleRef, opts EvaluateOptions, log *slog.Logger) (bool, error) {
+	_ = log // reserved for future per-ref debug logging; kept in signature for parity
 	switch ref.Kind {
 	case "ClusterRole":
-		obj, ok := rw.GetTypedObject(clusterRolesGVR, "", ref.Name)
+		cr, ok := snap.ClusterRolesByName[ref.Name]
 		if !ok {
+			cache.RecordRBACSnapshotMiss("ClusterRole", "", ref.Name)
 			return false, nil
-		}
-		cr, err := asClusterRole(obj, log)
-		if err != nil {
-			return false, err
 		}
 		return rulesPermit(cr.Rules, opts), nil
 
@@ -267,13 +280,10 @@ func roleRefPermits(rw *cache.ResourceWatcher, namespace string, ref rbacv1.Role
 			// Kubernetes — treat as deny.
 			return false, nil
 		}
-		obj, ok := rw.GetTypedObject(rolesGVR, namespace, ref.Name)
+		r, ok := snap.RolesByNSName[namespace+"/"+ref.Name]
 		if !ok {
+			cache.RecordRBACSnapshotMiss("Role", namespace, ref.Name)
 			return false, nil
-		}
-		r, err := asRole(obj, log)
-		if err != nil {
-			return false, err
 		}
 		return rulesPermit(r.Rules, opts), nil
 

@@ -388,6 +388,26 @@ func NewResourceWatcher(ctx context.Context, dyn dynamic.Interface) (*ResourceWa
 		go waitInformerSync(gi.Informer().HasSynced, ch, rw.stopCh)
 	}
 
+	// Ship B (0.30.138) — typed-RBAC snapshot wiring assertion. By this
+	// point addResourceTypeLocked has been called for every GVR in
+	// RBACResourceTypes (the eager-registration loop above) AND each
+	// call has attached the snapshot event handler via the
+	// isTypedRBACGVR branch in addResourceTypeLocked. If the assertion
+	// fires, the snapshot writer wiring regressed and the boot panics —
+	// analogous to AssertRBACTypedOverridesRegistered (strip.go:173).
+	AssertRBACSnapshotWired()
+
+	// Ship B (0.30.138) — initial snapshot publish. Spawn ONE goroutine
+	// that waits for all 4 RBAC syncCh to close (the same Servable
+	// signal the design AC-B.9 names) then synchronously runs the
+	// initial rebuildRBACSnapshot — publishing the first snapshot
+	// before the first user request that depends on it can succeed.
+	//
+	// Between cache=on activation and this publish, rbacSnap.Load()
+	// returns nil → EvaluateRBAC AC-B.8 degrade-to-deny fires. No
+	// silent-fall-through to UserCan (would violate Revision 1).
+	go waitAndPublishInitialRBACSnapshot(rw)
+
 	slog.Info("cache.plumbing_present=true cache.routed=true rbac.informer_started=true",
 		slog.String("subsystem", "cache"),
 		slog.Int64("list_page_limit", listPageLimit),
@@ -741,6 +761,29 @@ func (rw *ResourceWatcher) addResourceTypeMetadataOnlyLocked(gvr schema.GroupVer
 	// interface used by metaNSName. ADD post-sync gate, UPDATE
 	// dirty-mark, DELETE classify+evict-via-worker are byte-identical
 	// to the full-informer path.
+	// Ship B (0.30.138) — typed-RBAC snapshot writer wiring (defensive
+	// site). The metadata-only path serves PartialObjectMetadata, which
+	// the snapshot writer cannot type-assert to *rbacv1.* — so in
+	// practice an RBAC GVR registered metadata-only would simply produce
+	// an empty snapshot field. Production never reaches here for RBAC
+	// (the eager-registration loop at NewResourceWatcher uses the full
+	// addResourceTypeLocked path); the guard exists so a future caller
+	// that adds RBAC metadata-only does not silently bypass snapshot
+	// wiring. isTypedRBACGVR is false for every non-RBAC GVR — no
+	// overhead on the steady-state metadata-only path.
+	if isTypedRBACGVR(gvr) {
+		if _, regErr := gi.Informer().AddEventHandler(rw.rbacSnapshotEventHandlers()); regErr != nil {
+			slog.Warn("cache.rbac.snapshot.add_event_handler_failed",
+				slog.String("subsystem", "cache"),
+				slog.String("resource_type", resourceType),
+				slog.String("path", "metadata-only"),
+				slog.String("error", regErr.Error()),
+			)
+		} else {
+			markRBACSnapshotWired()
+		}
+	}
+
 	if _, regErr := gi.Informer().AddEventHandler(rw.depEventHandlers(gvr)); regErr != nil {
 		slog.Warn("cache.deps.add_event_handler_failed",
 			slog.String("subsystem", "cache"),
@@ -1073,6 +1116,30 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 			slog.String("resource_type", resourceType),
 			slog.String("error", regErr.Error()),
 		)
+	}
+
+	// Ship B (0.30.138) — typed-RBAC snapshot writer wiring. For each
+	// of the 4 typed-RBAC GVRs (rbacTypedGVRs, strip.go:101-106) attach
+	// a second event handler that schedules a snapshot rebuild on
+	// ADD/UPDATE/DELETE. Non-RBAC GVRs are skipped — they have no
+	// snapshot to maintain.
+	//
+	// The handler bodies are O(1) atomics (dirty flip + tryLock); the
+	// actual indexer walk runs on a detached goroutine bounded by the
+	// atomic.Bool tryLock (max one in-flight rebuild — watcher.go:1028
+	// "Bounded async L1 refresh" lineage / Bug 7). Safe to attach on
+	// the same processor goroutine as depEventHandlers — neither
+	// handler blocks.
+	if isTypedRBACGVR(gvr) {
+		if _, regErr := gi.Informer().AddEventHandler(rw.rbacSnapshotEventHandlers()); regErr != nil {
+			slog.Warn("cache.rbac.snapshot.add_event_handler_failed",
+				slog.String("subsystem", "cache"),
+				slog.String("resource_type", resourceType),
+				slog.String("error", regErr.Error()),
+			)
+		} else {
+			markRBACSnapshotWired()
+		}
 	}
 
 	// 0.30.99 Tag B — watch-handler coverage guard. Install the
