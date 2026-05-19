@@ -927,34 +927,78 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	// its group is one the CRD-watch auto-registers, which is exactly the
 	// set RemoveResourceType is ever wired to tear down.
 	var gi informers.GenericInformer
-	standalone := matchesAutoDiscoverGroup(gvr.Group)
-	if standalone {
-		indexers := clientcache.Indexers{clientcache.NamespaceIndex: clientcache.MetaNamespaceIndexFunc}
+	indexers := clientcache.Indexers{clientcache.NamespaceIndex: clientcache.MetaNamespaceIndexFunc}
 
-		// Ship 0.30.122 R4 Lever 1: route a streaming-list GVR (the
-		// composition group) through the streaming ListWatch — its
-		// ListFunc streams the paged LIST body item-by-item instead of
-		// materialising the whole 48,999-object pre-transform set (the
-		// ~17.7 GiB relist transient that OOMKilled 0.30.121). Gated by
-		// RESOLVER_COMPOSITION_STREAMING_LIST (default ON) AND a wired
-		// *rest.Config. When either is absent, OR newStreamingDynamicInformer
-		// fails to build its REST client, we fall back to the standard
-		// NewFilteredDynamicInformer below — byte-identical to 0.30.121
-		// (AC-7 toggle).
-		if matchesStreamingListGroup(gvr) && compositionStreamingListEnabled() {
-			if sgi, ok := newStreamingDynamicInformer(
-				rw.restConfig, rw.dyn, gvr, indexers, listOptionsTweak,
-			); ok {
-				gi = sgi
-				slog.Info("cache.streaming_list.informer_routed",
-					slog.String("subsystem", "cache"),
-					slog.String("gvr", gvr.String()),
-					slog.String("path", "streaming-listwatch"),
-					slog.String("hint", "R4 Lever 1 — composition LIST streamed item-by-item"),
-				)
-			}
+	// Ship 0.30.133 — registration-ordering race fix. The streaming-list
+	// routing check is evaluated FIRST, independently of `standalone`.
+	//
+	// THE BUG: the streaming-routing check used to be nested inside
+	// `if standalone { ... }`, where `standalone :=
+	// matchesAutoDiscoverGroup(gvr.Group)` is FALSE until Phase 1's
+	// navigation walk has called AddAutoDiscoverGroup. A composition
+	// `EnsureResourceType` landing BEFORE that walk therefore fell to
+	// the `else` branch — `rw.factory.ForResource(gvr)`, the STOCK
+	// shared-factory informer whose stock ListFunc builds the full
+	// 48,999-item UnstructuredList (the ~80%-of-heap
+	// NewFilteredDynamicInformer.func3 driver H2a was meant to remove).
+	// The composition GVR's representation depended on registration
+	// timing — a race.
+	//
+	// THE FIX: matchesStreamingListGroup derives from
+	// bytesResourceOverrides (strip.go) — a write-once init-time set,
+	// fully timing-independent. Evaluating the streaming-routing check
+	// before `standalone` makes the composition GVR route to the
+	// streaming informer on its FIRST registration regardless of
+	// Phase-1 timing. The `standalone`/factory logic below is unchanged
+	// for every non-streaming GVR.
+	//
+	// Ship 0.30.122 R4 Lever 1 (original rationale, unchanged): the
+	// streaming ListFunc streams the paged LIST body item-by-item
+	// instead of materialising the whole 48,999-object pre-transform
+	// set (the ~17.7 GiB relist transient that OOMKilled 0.30.121).
+	// Gated by RESOLVER_COMPOSITION_STREAMING_LIST (default ON) AND a
+	// wired *rest.Config. When either is absent, OR
+	// newStreamingDynamicInformer fails to build its REST client, gi
+	// stays nil and we fall through to the standalone/factory logic
+	// below — the CACHE_ENABLED / AC-7 toggle path.
+	if matchesStreamingListGroup(gvr) && compositionStreamingListEnabled() {
+		if sgi, ok := newStreamingDynamicInformer(
+			rw.restConfig, rw.dyn, gvr, indexers, listOptionsTweak,
+		); ok {
+			gi = sgi
+			slog.Info("cache.streaming_list.informer_routed",
+				slog.String("subsystem", "cache"),
+				slog.String("gvr", gvr.String()),
+				slog.String("path", "streaming-listwatch"),
+				slog.String("hint", "R4 Lever 1 — composition LIST streamed item-by-item"),
+			)
 		}
-		if gi == nil {
+	}
+
+	// Non-streaming routing — UNCHANGED from pre-fix (AC-3). Reached
+	// when gi is still nil: either gvr is not a streaming-list group,
+	// OR the streaming path is toggled off / could not build its REST
+	// client (the CACHE_ENABLED / AC-7 fallback — AC-5).
+	//
+	// R6 (0.30.115): removable GVRs get a STANDALONE informer, not a
+	// shared-factory one. The shared dynamicSharedInformerFactory caches
+	// informers by GVR with no eviction API, so a factory-built informer
+	// torn down by RemoveResourceType would be handed back — stopped and
+	// frozen — by a later EnsureResourceType (CRD delete→recreate). A
+	// standalone informer is owned outright: RemoveResourceType drops it
+	// and a re-register constructs a fresh one. NewFilteredDynamicInformer
+	// is the exact constructor the shared factory calls internally
+	// (client-go dynamicinformer/informer.go:84), with the SAME
+	// listOptionsTweak — paging/strip policy is byte-identical.
+	//
+	// The removable discriminator is matchesAutoDiscoverGroup — the
+	// existing navigation-derived predicate. No new per-resource
+	// special-case (feedback_no_special_cases.md): a GVR is removable iff
+	// its group is one the CRD-watch auto-registers, which is exactly the
+	// set RemoveResourceType is ever wired to tear down.
+	if gi == nil {
+		standalone := matchesAutoDiscoverGroup(gvr.Group)
+		if standalone {
 			gi = dynamicinformer.NewFilteredDynamicInformer(
 				rw.dyn,
 				gvr,
@@ -963,9 +1007,9 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 				indexers,
 				listOptionsTweak,
 			)
+		} else {
+			gi = rw.factory.ForResource(gvr)
 		}
-	} else {
-		gi = rw.factory.ForResource(gvr)
 	}
 	rw.informers[gvr] = gi
 
