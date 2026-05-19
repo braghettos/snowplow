@@ -37,7 +37,6 @@ import (
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	httpcall "github.com/krateoplatformops/plumbing/http/request"
-	"github.com/krateoplatformops/plumbing/maps"
 	"github.com/krateoplatformops/plumbing/ptr"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -224,7 +223,13 @@ func listEnvelopeValue(apiVersion, listKind string, items []*unstructured.Unstru
 	}
 	// Per-call isolation: hand the caller a private deep copy so the
 	// downstream in-place gojq mutation never touches the cached maps.
-	return maps.DeepCopyJSON(envelope)
+	//
+	// Ship C (0.30.139): migrated from `plumbing/maps.DeepCopyJSON` to
+	// the snowplow-local monomorphic `CopyJSONMap` (jsoncopy.go) — same
+	// byte-shape, leaf-fast-path case ordering + in-package call-frame
+	// elision, projected 0.7–1.3 GB / 60-call reduction on this site
+	// (gated ≥0.6 GB, small-win-or-revert).
+	return CopyJSONMap(envelope)
 }
 
 // gateListEnvelope unmarshals a LIST envelope, runs filterListByRBAC over
