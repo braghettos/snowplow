@@ -242,17 +242,27 @@ func TestR4_StreamingListEmpty(t *testing.T) {
 	}
 }
 
-// --- Test 4 — group routing predicate -------------------------------------
+// --- Test 4 — streaming routing predicate (updated for Ship H5) -----------
 
-// TestR4_StreamingListGroupRouting asserts the declarative routing
-// predicate: the composition group matches, an unrelated group does not.
+// TestR4_StreamingListGroupRouting asserts the routing predicate. Pre-H5
+// this checked a positive allow-list (composition matches, others do
+// not). H5 inverted routing: streaming is the default, and the predicate
+// is isStreamingException — true ONLY for the typed-RBAC GVRs. So the
+// composition group AND an arbitrary other group both stream (neither is
+// an exception); the typed-RBAC GVRs do not.
 func TestR4_StreamingListGroupRouting(t *testing.T) {
-	if !matchesStreamingListGroup(r4CompositionGVR) {
-		t.Fatalf("composition GVR must match the streaming-list group set")
+	if isStreamingException(r4CompositionGVR) {
+		t.Fatalf("composition GVR must NOT be a streaming exception — it streams by default")
 	}
 	other := schema.GroupVersionResource{Group: "widgets.krateo.io", Version: "v1", Resource: "panels"}
-	if matchesStreamingListGroup(other) {
-		t.Fatalf("a non-composition GVR must NOT match the streaming-list group set")
+	if isStreamingException(other) {
+		t.Fatalf("an arbitrary GVR must NOT be a streaming exception — H5: streaming is the default")
+	}
+	// The typed-RBAC GVRs ARE the exception.
+	for _, gvr := range rbacTypedGVRs {
+		if !isStreamingException(gvr) {
+			t.Fatalf("typed-RBAC GVR %q must be a streaming exception", gvr)
+		}
 	}
 }
 

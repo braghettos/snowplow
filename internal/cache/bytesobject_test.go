@@ -321,12 +321,15 @@ func TestBytesObject_ConcurrentDecode_Race(t *testing.T) {
 	wg.Wait()
 }
 
-// TestBytesObject_TransformRoutedByGroup — SB-3.
+// TestBytesObject_TransformRoutedByGroup — updated for the Ship H5
+// routing inversion.
 //
-// The bytes-override transform converts a composition-group object to
-// a *bytesObject and leaves a non-composition object as a plain
-// *unstructured.Unstructured. Routing is by GROUP via
-// bytesResourceOverrides — no resource literal.
+// Pre-H5 the bytes-override converted only allow-listed groups and left
+// everything else *unstructured. Post-H5 the transform converts EVERY
+// non-typed-RBAC object to a *bytesObject (the `!isStreamingException`
+// re-gate) — a composition AND an arbitrary `apps` deployment both
+// become bytesObjects. A typed-RBAC GVR is the exception: the typed
+// override runs first and produces a typed struct.
 func TestBytesObject_TransformRoutedByGroup(t *testing.T) {
 	resetStripLoggingForTest()
 	t.Setenv("CACHE_ENABLED", "true")
@@ -341,7 +344,8 @@ func TestBytesObject_TransformRoutedByGroup(t *testing.T) {
 		t.Fatalf("composition object stored as %T, want *bytesObject", outComp)
 	}
 
-	// Non-composition group -> plain Unstructured (default strip path).
+	// H5: a non-composition, non-RBAC group -> ALSO *bytesObject
+	// (streaming is the default; the bytes-override re-gate covers it).
 	deployGVR := schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}
 	tfDeploy := StripBulkyFieldsForResourceType("apps/v1/deployments", deployGVR)
 	deploy := &unstructured.Unstructured{Object: map[string]interface{}{
@@ -352,8 +356,27 @@ func TestBytesObject_TransformRoutedByGroup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("deployment transform: %v", err)
 	}
-	if _, ok := outDeploy.(*unstructured.Unstructured); !ok {
-		t.Fatalf("deployment object stored as %T, want *unstructured.Unstructured", outDeploy)
+	if _, ok := outDeploy.(*bytesObject); !ok {
+		t.Fatalf("H5: non-RBAC deployment object stored as %T, want *bytesObject "+
+			"(streaming is the default — the bytes-override is no longer allow-listed)", outDeploy)
+	}
+
+	// The typed-RBAC exception: a typed-RBAC GVR is NOT converted to a
+	// bytesObject — the typed override runs first and yields a typed
+	// struct (here a *rbacv1.ClusterRole).
+	crGVR := rbacTypedGVRs[2] // clusterroles
+	tfRBAC := StripBulkyFieldsForResourceType("rbac.authorization.k8s.io/v1/clusterroles", crGVR)
+	cr := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
+		"metadata": map[string]interface{}{"name": "cr1"},
+	}}
+	outCR, err := tfRBAC(cr)
+	if err != nil {
+		t.Fatalf("clusterrole transform: %v", err)
+	}
+	if _, ok := outCR.(*bytesObject); ok {
+		t.Fatalf("H5: typed-RBAC object became a *bytesObject — it must take the typed path, "+
+			"not the bytes-override (got %T)", outCR)
 	}
 }
 
@@ -498,80 +521,70 @@ func TestBytesObject_RuntimeObjectContract(t *testing.T) {
 	}
 }
 
-// TestBytesObject_BytesGroupNeverMetadataOnly — B1 (blocker fix).
+// TestBytesObject_BytesGroupNeverMetadataOnly — B1, updated for the
+// Ship H5 routing inversion.
 //
-// A bytes-override group MUST resolve to the full-Unstructured /
-// SetTransform-bearing path, never the metadata-only path. The
-// metadata-only path (addResourceTypeMetadataOnlyLocked) SKIPS
-// SetTransform — so if a composition GVR routed there, the H1
-// bytes-override would never run (silent no-op). shouldUseMetadataOnly
-// is the single per-GVR routing predicate; it must return false for
-// the bytes-override group regardless of annotation / seed state.
+// A bytes-streaming GVR MUST NOT route to the metadata-only path (it
+// SKIPS SetTransform → the bytes-override would never run). Pre-H5 the
+// guard was an allow-list; H5 re-expressed it as `!isStreamingException`
+// — true for every non-typed-RBAC GVR. Consequence: shouldUseMetadataOnly
+// now returns false for EVERY non-RBAC GVR (Rule 2) AND for the RBAC
+// GVRs (Rule 1) — the metadata-only path is fully inert post-H5. This
+// test confirms that: a composition GVR, an arbitrary GVR, and an
+// annotated GVR all resolve to NOT-metadata-only.
 func TestBytesObject_BytesGroupNeverMetadataOnly(t *testing.T) {
-	// Baseline: a composition GVR is not metadata-only.
-	if shouldUseMetadataOnly(compositionGVR) {
-		t.Fatal("composition GVR routed metadata-only — H1 bytes-override would be a silent no-op (B1)")
-	}
-
-	// Even when the EXACT GVR is in the annotated set (the realistic
-	// risk: a `krateo.io/cache-mode: metadata` annotation on a
-	// composition CRD), Rule 2 must still win and return false.
 	resetMetadataOnlyAnnotationsForTest()
-	annotatedGVRs.Store(compositionGVR, struct{}{})
 	defer resetMetadataOnlyAnnotationsForTest()
 
+	// A composition GVR is never metadata-only.
 	if shouldUseMetadataOnly(compositionGVR) {
-		t.Fatal("annotated composition GVR routed metadata-only — B1 guard not winning over the annotation rule")
+		t.Fatal("composition GVR routed metadata-only — the bytes-override would be a silent no-op")
 	}
 
-	// A different composition-group resource/version is also covered
-	// (the guard is group-keyed, matching the per-blueprint dynamic
-	// CRD naming).
-	otherCompGVR := schema.GroupVersionResource{
-		Group:    "composition.krateo.io",
-		Version:  "v12-8-3",
-		Resource: "fireworksappcompositions",
-	}
-	annotatedGVRs.Store(otherCompGVR, struct{}{})
-	if shouldUseMetadataOnly(otherCompGVR) {
-		t.Fatal("annotated composition-group GVR (other version) routed metadata-only — B1 guard not group-keyed")
+	// Even with the exact GVR annotated `krateo.io/cache-mode: metadata`,
+	// Rule 2 (!isStreamingException) wins and returns false.
+	annotatedGVRs.Store(compositionGVR, struct{}{})
+	if shouldUseMetadataOnly(compositionGVR) {
+		t.Fatal("annotated composition GVR routed metadata-only — Rule 2 not winning over the annotation rule")
 	}
 
-	// A NON-composition annotated GVR must still route metadata-only —
-	// the guard is scoped to the bytes-override group, it does not
-	// disable metadata-only globally.
-	nonComp := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "things"}
-	annotatedGVRs.Store(nonComp, struct{}{})
-	if !shouldUseMetadataOnly(nonComp) {
-		t.Fatal("non-composition annotated GVR no longer metadata-only — B1 guard over-reached")
+	// H5: an arbitrary non-composition, non-RBAC GVR is ALSO never
+	// metadata-only — the metadata-only path is inert post-inversion.
+	// (Pre-H5 an annotated non-composition GVR DID route metadata-only;
+	// H5 deliberately makes that impossible — every non-RBAC GVR streams
+	// to bytes, and streaming and metadata-only are mutually exclusive.)
+	arbitrary := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "things"}
+	annotatedGVRs.Store(arbitrary, struct{}{})
+	if shouldUseMetadataOnly(arbitrary) {
+		t.Fatal("H5: an annotated non-RBAC GVR routed metadata-only — post-inversion the " +
+			"metadata-only path must be inert (every non-RBAC GVR streams to bytes)")
 	}
 }
 
-// TestStreamingLister_BytesGroupPanics — B2.
+// TestStreamingLister_BytesGroupPanics — B2 (updated for the Ship H5
+// routing inversion).
 //
-// streamingDynamicInformer.Lister() on a bytes-override GVR must panic
-// loudly (dynamiclister would silently drop *bytesObject values). A
-// non-bytes GVR must not panic.
+// streamingDynamicInformer.Lister() must panic loudly — a streaming
+// informer's store is always *bytesObject-backed and dynamiclister
+// would silently drop every value. Pre-H5 the panic was conditional on
+// a bytes-override group; post-H5 a streamingDynamicInformer is
+// constructed ONLY for streaming GVRs, so the panic is unconditional.
+// Asserted here for two GVRs — a composition GVR and an arbitrary
+// non-allow-list GVR — both must panic.
 func TestStreamingLister_BytesGroupPanics(t *testing.T) {
-	// A bytes-override GVR must panic loudly.
-	d := &streamingDynamicInformer{gvr: compositionGVR}
-	func() {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Fatal("Lister() on a bytes-override GVR did not panic — B2 silent-drop trap not loud")
-			}
+	for _, gvr := range []schema.GroupVersionResource{
+		compositionGVR,
+		{Group: "apps", Version: "v1", Resource: "deployments"},
+	} {
+		func() {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Fatalf("Lister() for %s did not panic — B2 silent-drop trap not loud", gvr)
+				}
+			}()
+			d := &streamingDynamicInformer{gvr: gvr}
+			_ = d.Lister()
 		}()
-		_ = d.Lister()
-	}()
-
-	// A non-bytes GVR must NOT hit the B2 panic guard. The guard keys
-	// on matchesBytesOverrideGroup(d.gvr); for a non-composition GVR
-	// that predicate is false, so the panic branch is not taken (the
-	// real Lister() then proceeds to dynamiclister, which is correct
-	// for the plain-Unstructured store every non-bytes GVR carries).
-	nonBytesGVR := schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}
-	if matchesBytesOverrideGroup(nonBytesGVR) {
-		t.Fatal("non-bytes GVR matched the bytes-override group — B2 guard would panic spuriously")
 	}
 }
 

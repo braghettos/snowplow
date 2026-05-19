@@ -175,23 +175,32 @@ func TestShouldUseMetadataOnly_AnnotationDiscovery(t *testing.T) {
 	lister := &fakeCRDLister{items: []apiextensionsv1.CustomResourceDefinition{crd}}
 	discoverMetadataOnlyAnnotationsWithClient(context.Background(), lister)
 
-	wantTrue := []schema.GroupVersionResource{
+	// The discovery MECHANISM still populates annotatedGVRs from the
+	// CRD annotation — verified directly via the sync.Map.
+	servedDiscovered := []schema.GroupVersionResource{
 		{Group: "example.com", Version: "v1", Resource: "widgets"},
 		{Group: "example.com", Version: "v1alpha1", Resource: "widgets"},
 	}
-	for _, gvr := range wantTrue {
-		if !shouldUseMetadataOnly(gvr) {
-			t.Fatalf("annotation discovery: expected %v ⇒ metadata-only; got false", gvr)
+	for _, gvr := range servedDiscovered {
+		if _, ok := annotatedGVRs.Load(gvr); !ok {
+			t.Fatalf("annotation discovery: %v not added to annotatedGVRs — discovery mechanism broken", gvr)
 		}
-		if got := metadataOnlyReason(gvr); got != "annotation" {
-			t.Fatalf("reason: expected 'annotation' for %v; got %q", gvr, got)
+		// Ship H5 — the metadata-only PATH is now inert: shouldUseMetadataOnly
+		// returns false for every non-typed-RBAC GVR (Rule 2,
+		// !isStreamingException), so even an annotation-discovered GVR
+		// does NOT route metadata-only. The discovery mechanism is left
+		// intact (a later dead-code-removal ship deletes it) but it can
+		// no longer change routing — every non-RBAC GVR streams to bytes.
+		if shouldUseMetadataOnly(gvr) {
+			t.Fatalf("H5: annotation-discovered %v routed metadata-only — the metadata-only "+
+				"path must be inert post-inversion (every non-RBAC GVR streams)", gvr)
 		}
 	}
 
 	// v1beta1 was not served, so it should NOT be in the annotated set.
 	notServed := schema.GroupVersionResource{Group: "example.com", Version: "v1beta1", Resource: "widgets"}
-	if shouldUseMetadataOnly(notServed) {
-		t.Fatalf("not-served version v1beta1 MUST NOT route metadata-only")
+	if _, ok := annotatedGVRs.Load(notServed); ok {
+		t.Fatalf("not-served version v1beta1 MUST NOT be added to annotatedGVRs")
 	}
 }
 
@@ -253,14 +262,25 @@ func TestShouldUseMetadataOnly_AnnotationDiscoveryIgnoresUnannotated(t *testing.
 	plain := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "plains"}
 	wrong := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "wrongvalues"}
 
-	if !shouldUseMetadataOnly(annotated) {
-		t.Fatalf("annotated CRD MUST opt in")
+	// The discovery MECHANISM still distinguishes annotated CRDs from
+	// plain / wrong-value ones — verified via annotatedGVRs directly.
+	if _, ok := annotatedGVRs.Load(annotated); !ok {
+		t.Fatalf("annotated CRD MUST be added to annotatedGVRs by discovery")
 	}
-	if shouldUseMetadataOnly(plain) {
-		t.Fatalf("plain CRD MUST stay on full informer")
+	if _, ok := annotatedGVRs.Load(plain); ok {
+		t.Fatalf("plain CRD MUST NOT be added to annotatedGVRs")
 	}
-	if shouldUseMetadataOnly(wrong) {
-		t.Fatalf("wrong-value annotation MUST stay on full informer")
+	if _, ok := annotatedGVRs.Load(wrong); ok {
+		t.Fatalf("wrong-value annotation MUST NOT be added to annotatedGVRs")
+	}
+
+	// Ship H5 — the metadata-only PATH is inert: shouldUseMetadataOnly
+	// returns false for ALL three (every non-RBAC GVR streams). The
+	// discovery mechanism is intact but can no longer change routing.
+	for _, gvr := range []schema.GroupVersionResource{annotated, plain, wrong} {
+		if shouldUseMetadataOnly(gvr) {
+			t.Fatalf("H5: %v routed metadata-only — the metadata-only path must be inert", gvr)
+		}
 	}
 }
 

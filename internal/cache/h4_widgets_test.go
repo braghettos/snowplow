@@ -256,29 +256,22 @@ func TestH4_AC2_WidgetResolvesByteIdentical(t *testing.T) {
 
 // TestH4_AC4_OtherRoutingUnchanged — AC-4.
 //
-// Adding the widget group changes routing for widgets.templates.krateo.io
-// ONLY. (a) bytesResourceOverrides gained exactly one entry — it now
-// holds exactly {composition.krateo.io, widgets.templates.krateo.io}
-// (the grep-equivalent assertion). (b) a non-widget non-composition GVR
-// routes byte-identically to pre-H4: streaming predicate false; the
-// 0.30.133 standalone/factory decision unchanged.
+// SUPERSEDED BY THE SHIP H5 ROUTING INVERSION. The original H4 AC-4
+// asserted bytesResourceOverrides held exactly {composition, widgets}
+// and a non-widget GVR did NOT stream. H5 deleted bytesResourceOverrides
+// and made streaming the DEFAULT — a non-widget GVR now DOES stream
+// (that is H5 AC-7, the structural falsifier in streaming_route_race_test.go).
+// This test is re-pointed to assert the H5-correct state: the widget
+// group still streams (now via the default, not an allow-list entry),
+// and the allow-list is gone.
 func TestH4_AC4_OtherRoutingUnchanged(t *testing.T) {
-	// (a) bytesResourceOverrides has exactly the two expected groups.
-	want := map[string]struct{}{
-		"composition.krateo.io":       {},
-		"widgets.templates.krateo.io": {},
-	}
-	if len(bytesResourceOverrides) != len(want) {
-		t.Fatalf("AC-4 FAIL: bytesResourceOverrides has %d entries, want %d — H4 must add "+
-			"exactly one group key", len(bytesResourceOverrides), len(want))
-	}
-	for g := range want {
-		if _, ok := bytesResourceOverrides[g]; !ok {
-			t.Fatalf("AC-4 FAIL: bytesResourceOverrides missing %q", g)
-		}
+	// The widget group still streams — post-H5 via the default
+	// (isStreamingException is false for it), not an allow-list entry.
+	if isStreamingException(h4WidgetGVR) {
+		t.Fatal("widget GVR became a streaming exception — H5: only typed-RBAC is excepted")
 	}
 
-	// (b) a non-widget non-composition GVR is not streaming-routed.
+	// The widget GVR still routes to the streaming informer end-to-end.
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv(envCompositionStreamingList, "true")
 	ResetDepsForTest()
@@ -286,21 +279,11 @@ func TestH4_AC4_OtherRoutingUnchanged(t *testing.T) {
 	ResetAutoDiscoverGroupsForTest()
 	t.Cleanup(ResetAutoDiscoverGroupsForTest)
 
-	otherGVR := schema.GroupVersionResource{
-		Group: "synthetic-h4-other.krateo.io", Version: "v1", Resource: "things",
-	}
-	if matchesStreamingListGroup(otherGVR) {
-		t.Fatal("AC-4 FAIL: a non-widget non-composition GVR matched the streaming-list group set")
-	}
-	if matchesBytesOverrideGroup(otherGVR) {
-		t.Fatal("AC-4 FAIL: a non-widget non-composition GVR matched bytesResourceOverrides")
-	}
-
-	rw := newRouteRaceWatcher(t, true, otherGVR)
+	rw := newRouteRaceWatcher(t, true, h4WidgetGVR)
 	t.Cleanup(func() { rw.Stop(); time.Sleep(50 * time.Millisecond) })
-	rw.EnsureResourceType(otherGVR)
-	if isStreamingInformer(rw, otherGVR) {
-		t.Fatal("AC-4 FAIL: a non-widget non-composition GVR routed to the streaming informer")
+	rw.EnsureResourceType(h4WidgetGVR)
+	if !isStreamingInformer(rw, h4WidgetGVR) {
+		t.Fatal("widget GVR no longer routes to the streaming informer post-H5")
 	}
 }
 

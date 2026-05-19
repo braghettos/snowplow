@@ -105,55 +105,40 @@ var rbacTypedGVRs = []schema.GroupVersionResource{
 	{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"},
 }
 
-// bytesResourceOverrides is the declarative routing set: the GVR
-// *groups* whose informer-store objects use the GC-lean bytesObject
-// representation.
+// isStreamingException reports whether gvr is EXCLUDED from the
+// bytes-streaming default — Ship H5, the routing inversion.
 //
-// SINGLE SOURCE OF TRUTH (Ship H2a — SB-3): this one set drives BOTH
-//   - the H1 SetTransform bytes-override (WATCH-event ingestion path,
-//     StripBulkyFieldsForResourceType below), AND
-//   - the H2a streaming-list routing (matchesStreamingListGroup in
-//     streaming_list.go DERIVES from this set — it is not a separate
-//     map).
+// THE INVERSION (Ship H5): H1..H4 grew a per-group allow-list
+// (`bytesResourceOverrides`) — composition, then widgets — that had to
+// be edited every time a new group's stock informer surfaced as a
+// `NewFilteredDynamicInformer.func3` heap offender. That is
+// whack-a-mole: a future GVR re-creates `func3` until someone notices
+// and edits the list. H5 ends it structurally: bytes-streaming is the
+// DEFAULT for every dynamic GVR; the stock-informer path is reachable
+// only by a principled EXCEPTION.
 //
-// Post-H2a the streaming LIST decodes items directly into bytesObject,
-// so streaming a GVR and storing it as bytes are inseparable — one set
-// expresses both. A second group map would let the two drift and
-// silently half-disable H2a.
+// THE EXCEPTION — typed-RBAC, and only typed-RBAC. A GVR is excepted
+// iff it has a typed-converting override (`typedResourceOverrides`).
+// This is NOT a hardcoded RBAC-GVR literal — it is a declarative
+// discriminant: a GVR has a typed override iff it has a purpose-built
+// typed Go representation (the 4 `rbacv1` kinds today). The exception
+// is NECESSARY, not a preference: `stripAndType` consumes a
+// `*unstructured.Unstructured`; a `*bytesObject` from the streaming
+// ListFunc would fail its cast — typed-RBAC genuinely requires the
+// stock informer to deliver `*unstructured.Unstructured` to the typed
+// transform. Any future GVR given a typed override is automatically
+// excepted; everything else streams. feedback_no_special_cases-clean.
 //
-// Keyed by GROUP — NOT the full GVR — because these groups host
-// dynamically-named CRDs (the composition group one per blueprint; the
-// widgets group nine widget kinds), so the resource segment is not
-// known at compile time. The group is the only compile-time-stable
-// discriminator. A resource-literal key would be the exact
-// special-case feedback_no_special_cases.md forbids; a group key is an
-// additive, declarative routing mechanism — the same shape as
-// resourceOverrides / typedResourceOverrides.
+// SINGLE SOURCE OF TRUTH (Ship H5 — carrying H2a's SB-3): this one
+// predicate drives BOTH the watcher.go informer-routing choice (stock
+// vs streaming) AND the bytes-override re-gate below
+// (StripBulkyFieldsForResourceType). One predicate, two call sites —
+// they cannot drift.
 //
-// Membership — each entry is a data-gated heap-attribution finding:
-//   - composition.krateo.io — the 0.30.131 LIST-decode offender
-//     (5.28 GiB UnstructuredList.UnmarshalJSON).
-//   - widgets.templates.krateo.io (Ship H4) — the team-lead-verified
-//     0.30.133 heap attribution: NewFilteredDynamicInformer.func3 =
-//     4,440 MB / ~74% of heap = the STOCK informers for the entire
-//     widgets group (~720K objects across 9 populated GVRs). Adding
-//     the group key routes every widget GVR through the SAME
-//     streaming-list + bytesObject machinery compositions already use
-//     — no code-logic change, the 0.30.133 hoist makes it
-//     timing-independent.
-//
-// Reads are lock-free (write-once at init).
-var bytesResourceOverrides = map[string]struct{}{
-	"composition.krateo.io":       {},
-	"widgets.templates.krateo.io": {},
-}
-
-// matchesBytesOverrideGroup reports whether gvr's group is routed
-// through the bytesObject representation (and, since H2a, the streaming
-// LIST). The single per-group routing predicate.
-func matchesBytesOverrideGroup(gvr schema.GroupVersionResource) bool {
-	_, ok := bytesResourceOverrides[gvr.Group]
-	return ok
+// Reads are lock-free (typedResourceOverrides is write-once at init).
+func isStreamingException(gvr schema.GroupVersionResource) bool {
+	_, typed := typedResourceOverrides[gvr]
+	return typed
 }
 
 func init() {
@@ -278,23 +263,41 @@ func StripBulkyFieldsForResourceType(resourceType string, gvr schema.GroupVersio
 		// Ship H1 — bytes-backed informer store. AFTER the default
 		// strip has run (SB-1: the pre-existing managedFields /
 		// last-applied policy is preserved exactly — H1 removes NO
-		// field), convert a bytes-override-routed object to the
-		// GC-lean bytesObject. The strip ran first so `raw` carries
-		// the stripped-but-otherwise-complete object JSON — identical
-		// content to what the plain-Unstructured path would have
-		// stored, only a different storage SHAPE.
+		// field), convert the object to the GC-lean bytesObject. The
+		// strip ran first so `raw` carries the stripped-but-otherwise-
+		// complete object JSON — identical content to what the
+		// plain-Unstructured path would have stored, only a different
+		// storage SHAPE.
 		//
-		// SB-2: this block sits INSIDE `if !Disabled()` — a sibling of
-		// the typedResourceOverrides lookup above — so CACHE_ENABLED=
-		// false cleanly reverts to the plain-Unstructured path (the
-		// `return uns, nil` below). SB-3: routing is the declarative
-		// group-keyed bytesResourceOverrides set; no resource literal.
+		// Ship H5 — THE WATCH-PATH RE-GATE (AC-3, load-bearing). This
+		// block is gated `!isStreamingException(gvr)` — NOT the deleted
+		// per-group allow-list. SetTransform runs not only on LIST
+		// items but on every WATCH-delivered ADD/UPDATE event, and a
+		// streaming GVR's WATCH events arrive as
+		// *unstructured.Unstructured (H2a streamed only the ListFunc,
+		// not the WatchFunc). If this block stayed gated on a group
+		// allow-list, a now-default-streaming GVR's WATCH events would
+		// never be converted to bytesObject and the store would drift
+		// back to map[string]interface{} under churn — eroding H5's
+		// gain. Gating on `!isStreamingException` makes the WATCH-event
+		// conversion cover exactly the set that streams its LIST: the
+		// streaming informer and the bytes representation are
+		// inseparable on BOTH the LIST and the WATCH path.
+		//
+		// A typed-RBAC GVR is excepted here — but the typedOverride
+		// branch above already returned for it, so this block is never
+		// reached for an excepted GVR; the `!isStreamingException`
+		// guard is belt-and-suspenders making the contract explicit.
+		//
+		// SB-2: this block sits INSIDE `if !Disabled()` — so
+		// CACHE_ENABLED=false cleanly reverts to the plain-Unstructured
+		// path (the `return uns, nil` below).
 		//
 		// On marshal failure newBytesObject returns an error and we
 		// fall through to storing the plain Unstructured — a malformed
 		// object never stalls the informer (same fail-open contract as
 		// the typed-RBAC override).
-		if !Disabled() && matchesBytesOverrideGroup(gvr) {
+		if !Disabled() && !isStreamingException(gvr) {
 			if bo, err := newBytesObject(uns); err == nil {
 				logFirstBytesOnce(resourceType, len(bo.raw))
 				return bo, nil

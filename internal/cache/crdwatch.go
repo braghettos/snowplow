@@ -358,9 +358,13 @@ func (rw *ResourceWatcher) ReconcileAutoDiscoverCRDs() int {
 
 // compositionGVRFromCRDObject derives the GVR of a CRD's served (storage)
 // version from a CustomResourceDefinition object. The object arrives
-// from the dynamic informer as *unstructured.Unstructured (post-strip);
-// it may also arrive typed if a future path converts it — both shapes
-// are handled via runtime conversion.
+// from the CRD informer's store in one of three shapes:
+//   - *unstructured.Unstructured — the pre-H5 stock-informer shape;
+//   - *bytesObject — the Ship H5 shape (post-inversion the CRD informer,
+//     group apiextensions.k8s.io, is NOT a streaming exception, so its
+//     store holds bytesObjects — decode-on-access here);
+//   - *apiextensionsv1.CustomResourceDefinition — a typed shape, handled
+//     directly.
 //
 // Returns ok=false when the object is not a CRD, has no served version,
 // or is malformed. We pick the FIRST served version (the storage version
@@ -370,6 +374,22 @@ func compositionGVRFromCRDObject(obj interface{}) (schema.GroupVersionResource, 
 	// Unwrap a tombstone if one slipped through.
 	if tomb, ok := obj.(clientcache.DeletedFinalStateUnknown); ok {
 		obj = tomb.Obj
+	}
+
+	// Ship H5 — decode-on-access for a *bytesObject. Post the H5 routing
+	// inversion the CRD informer's store holds *bytesObject (the
+	// apiextensions group streams like every non-RBAC group). A bytes-
+	// Object implements neither the typed-CRD case nor toUnstructuredMap's
+	// UnstructuredContent interface, so without this it would be silently
+	// dropped — ReconcileAutoDiscoverCRDs / the CRD AddFunc would register
+	// zero composition informers. Decode reconstructs the Unstructured the
+	// downstream conversion expects.
+	if bo, ok := obj.(*bytesObject); ok {
+		if uns, err := bo.Decode(); err == nil && uns != nil {
+			obj = uns
+		} else {
+			return schema.GroupVersionResource{}, false
+		}
 	}
 
 	var crd apiextensionsv1.CustomResourceDefinition

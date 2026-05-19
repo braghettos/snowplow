@@ -77,20 +77,28 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/dynamic/dynamiclister"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/rest"
 	clientcache "k8s.io/client-go/tools/cache"
 )
 
-// envCompositionStreamingList gates the R4 Lever-1 streaming ListWatch.
+// envCompositionStreamingList gates the streaming ListWatch.
 // Default ON — the streaming path IS the fix. Set to "false" to revert
-// the composition GVR to the standard NewFilteredDynamicInformer (AC-7
-// toggle).
+// to the standard NewFilteredDynamicInformer.
+//
+// Ship H5 — SCOPE NOTE: since the H5 routing inversion this toggle
+// governs the streaming path for EVERY dynamic informer, not only the
+// composition group. The env-var name `RESOLVER_COMPOSITION_STREAMING_LIST`
+// is therefore a misnomer post-H5 — a rename is deliberately deferred
+// (it touches the Helm chart configmap, out of H5's code-only scope;
+// feedback_chart_only_for_snowplow). A later ship renames it (e.g.
+// STREAMING_LIST_ENABLED). The behaviour is correct; only the name
+// lags.
 const envCompositionStreamingList = "RESOLVER_COMPOSITION_STREAMING_LIST"
 
-// compositionStreamingListEnabled reports whether the R4 streaming
-// ListWatch is enabled (default true).
+// compositionStreamingListEnabled reports whether the streaming
+// ListWatch is enabled (default true). Post-H5 it gates streaming for
+// every dynamic informer (see envCompositionStreamingList's scope note).
 func compositionStreamingListEnabled() bool {
 	return boolFromEnv(envCompositionStreamingList, true)
 }
@@ -104,28 +112,12 @@ func compositionStreamingListEnabled() bool {
 // separate page-limit constant/config would buy zero memory and only
 // multiply round-trips, so none is added.
 
-// matchesStreamingListGroup reports whether gvr's group is routed
-// through the streaming ListWatch.
-//
-// SINGLE SOURCE OF TRUTH (Ship H2a — SB-3): the streaming-list routing
-// is NOT a separate group set — it is DERIVED FROM bytesResourceOverrides
-// (strip.go). Since H2a, the streaming ListFunc decodes items directly
-// into *bytesObject; a GVR can therefore only be streamed if it is also
-// a bytes-override group (the streaming path produces the bytes
-// representation). Keeping a separate `streamingListGVRs` map would let
-// the two sets drift — one updated, the other not — silently
-// half-disabling H2a (streaming on, bytes off, or vice versa). Deriving
-// from the one set makes the streaming path and the bytes representation
-// inseparable by construction.
-//
-// Keyed by GROUP (not the full GVR) — the composition group hosts one
-// dynamically-named CRD per blueprint, so the resource segment is not
-// known at compile time; the group is the stable, declarative
-// discriminator. No per-resource literal — additive routing, not a
-// special case (feedback_no_special_cases.md).
-func matchesStreamingListGroup(gvr schema.GroupVersionResource) bool {
-	return matchesBytesOverrideGroup(gvr)
-}
+// Ship H5 — the streaming-routing predicate is no longer a positive
+// group allow-list. `matchesStreamingListGroup` is DELETED: streaming
+// is the default for every dynamic GVR, and the routing decision is
+// `!isStreamingException(gvr)` (strip.go) — one predicate shared by the
+// watcher.go informer routing AND the strip.go bytes-override re-gate.
+// See isStreamingException for the full inversion rationale.
 
 // streamingDynamicInformer is the R4 GenericInformer wrapper — the exact
 // shape of client-go's unexported dynamicInformer, but built around a
@@ -142,37 +134,42 @@ func (d *streamingDynamicInformer) Informer() clientcache.SharedIndexInformer {
 
 // Lister returns a GenericLister over this informer's indexer.
 //
-// Ship H1 — B2 SILENT-DROP GUARD: dynamiclister.New produces a lister
-// whose List/Get type-assert every indexer value to
-// *unstructured.Unstructured. The composition group is routed through
-// BOTH the streaming informer (this type) AND the H1 bytes-override
-// (the SetTransform installed in addResourceTypeLocked stores
-// *bytesObject for this group). A dynamiclister would therefore
-// SILENTLY DROP every bytesObject — an empty/short list, no crash, no
-// log: exactly the FINDING 1 silent-drop defect class, but on a path
-// the five watcher.go cast sites do not cover.
+// Ship H1 — B2 SILENT-DROP GUARD (made unconditional at Ship H5):
+// dynamiclister.New produces a lister whose List/Get type-assert every
+// indexer value to *unstructured.Unstructured. A streamingDynamicInformer's
+// store holds *bytesObject — its streaming ListFunc builds bytesObjects
+// directly (H2a) and the strip.go bytes-override converts its WATCH
+// events too. A dynamiclister would therefore SILENTLY DROP every
+// bytesObject — an empty/short list, no crash, no log: the FINDING 1
+// silent-drop defect class, on a path the five watcher.go cast sites do
+// not cover.
 //
-// Verified at H1 ship time: there are ZERO production callers of
-// Lister() — every cache read goes through GetObject / ListObjects /
-// GetTypedObject / ListTypedObjects (which read GetIndexer() directly
-// and decode-on-access). So this panic is unreachable today.
+// Ship H5 — the panic is now UNCONDITIONAL. Pre-H5 a streamingDynamic-
+// Informer was constructed only for the bytesResourceOverrides allow-list,
+// so the guard keyed on group membership. Post-H5 the routing inversion
+// means a streamingDynamicInformer is constructed ONLY for non-exception
+// (bytes-streaming) GVRs — every streaming informer's store is bytes-
+// backed without exception. So Lister() on this type is always the
+// silent-drop trap; the guard panics unconditionally.
 //
-// It is retained as a LOUD trap: if a future caller invokes Lister()
-// on a bytes-routed GVR, it fails immediately with a diagnostic
-// message pointing at the fix — rather than silently returning a
-// truncated list that would be misdiagnosed for ships. A future caller
-// that genuinely needs a lister here must add a bytesObject-aware
-// lister (decode-on-access), the same way the five cast sites were
-// converted. Per feedback_no_park_broken_behind_flag: a known
-// silent-drop trap is made loud, not left latent.
+// Verified at H1 ship time, re-checked at H5: there are ZERO production
+// callers of Lister() — every cache read goes through GetObject /
+// ListObjects / GetTypedObject / ListTypedObjects (which read
+// GetIndexer() directly and decode-on-access). So this panic is
+// unreachable today.
+//
+// It is retained as a LOUD trap: a future caller invoking Lister() fails
+// immediately with a diagnostic pointing at the fix — rather than
+// silently returning a truncated list. A future caller that genuinely
+// needs a lister here must add a bytesObject-aware lister (decode-on-
+// access). Per feedback_no_park_broken_behind_flag: a known silent-drop
+// trap is made loud, not left latent.
 func (d *streamingDynamicInformer) Lister() clientcache.GenericLister {
-	if matchesBytesOverrideGroup(d.gvr) {
-		panic("cache: streamingDynamicInformer.Lister() called for bytes-override GVR " +
-			d.gvr.String() + " — dynamiclister would silently drop *bytesObject values " +
-			"(H1 bytes-backed store). Read via ResourceWatcher.ListObjects / GetObject " +
-			"(decode-on-access) or add a bytesObject-aware lister; do NOT use dynamiclister here.")
-	}
-	return dynamiclister.NewRuntimeObjectShim(dynamiclister.New(d.informer.GetIndexer(), d.gvr))
+	panic("cache: streamingDynamicInformer.Lister() called for " +
+		d.gvr.String() + " — a streaming informer's store is *bytesObject-backed " +
+		"and dynamiclister would silently drop every value. Read via " +
+		"ResourceWatcher.ListObjects / GetObject (decode-on-access) or add a " +
+		"bytesObject-aware lister; do NOT use dynamiclister here.")
 }
 
 var _ informers.GenericInformer = &streamingDynamicInformer{}

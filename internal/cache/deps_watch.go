@@ -164,6 +164,18 @@ func (w *depWatch) stopDeleteWorker() {
 // bodies are byte-identical across the two paths — metaNSName extracts
 // (ns, name) via the nsNameAccessor interface that both shapes satisfy.
 //
+// Ship H5 — *bytesObject-SAFE BY CONSTRUCTION. Post the H5 routing
+// inversion the streaming informers deliver *bytesObject to these
+// handlers. That is safe WITHOUT change here: every handler reads ONLY
+// (namespace, name) via metaNSName, and *bytesObject embeds ObjectMeta
+// so it satisfies metaNSName's nsNameAccessor interface exactly as
+// *unstructured.Unstructured and *PartialObjectMetadata do. The
+// dep-tracker never reads object CONTENT — so it needs no decode-on-
+// access. WARNING for a future editor: a content-assert added here
+// (obj.(*unstructured.Unstructured), reading spec/status, etc.) would
+// NOT be *bytesObject-safe and would silently drop every streamed
+// object — it must decode via decodeBytesObject first.
+//
 // R1 — AddFunc IS wired here (pre-0.30.110 it was deliberately omitted).
 // The initial-replay gate consults rw.syncCh[gvr]:
 //

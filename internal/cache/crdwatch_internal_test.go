@@ -102,6 +102,42 @@ func TestCompositionGVRFromCRDObject_UnwrapsTombstone(t *testing.T) {
 	}
 }
 
+// TestCompositionGVRFromCRDObject_DecodesBytesObject — Ship H5 regression
+// guard for the crdwatch decode-on-access fix.
+//
+// Post the H5 routing inversion the CRD informer (group
+// apiextensions.k8s.io) is NOT a streaming exception, so its store
+// holds *bytesObject. compositionGVRFromCRDObject must decode a
+// *bytesObject — without that branch the CRD is silently dropped and
+// ReconcileAutoDiscoverCRDs / the CRD AddFunc register zero composition
+// informers. This is the crdwatch analogue of the AC-3 WATCH-event
+// test: a *bytesObject-shaped CRD must NOT be silently dropped.
+func TestCompositionGVRFromCRDObject_DecodesBytesObject(t *testing.T) {
+	crd := crdUnstructured("composition.krateo.io", "githubscaffoldings", []map[string]any{
+		{"name": "v1alpha1", "served": true, "storage": false},
+		{"name": "v1", "served": true, "storage": true},
+	})
+	// The CRD informer's store holds *bytesObject post-H5 — build one
+	// from the CRD Unstructured exactly as the SetTransform would.
+	bo, err := newBytesObject(crd)
+	if err != nil {
+		t.Fatalf("newBytesObject(CRD): %v", err)
+	}
+
+	gvr, ok := compositionGVRFromCRDObject(bo)
+	if !ok {
+		t.Fatalf("H5 regression: compositionGVRFromCRDObject silently dropped a *bytesObject " +
+			"CRD — the crdwatch decode-on-access branch is missing/broken; composition " +
+			"informers would never auto-register")
+	}
+	want := schema.GroupVersionResource{
+		Group: "composition.krateo.io", Version: "v1", Resource: "githubscaffoldings",
+	}
+	if gvr != want {
+		t.Fatalf("gvr = %v, want %v (storage version must win, derived from the decoded bytesObject)", gvr, want)
+	}
+}
+
 func TestToUnstructuredMap(t *testing.T) {
 	u := &unstructured.Unstructured{Object: map[string]any{"k": "v"}}
 	m, ok := toUnstructuredMap(u)

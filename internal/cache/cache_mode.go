@@ -157,29 +157,37 @@ func shouldUseMetadataOnly(gvr schema.GroupVersionResource) bool {
 		return false
 	}
 
-	// Rule 2 (Ship H1 — B1): a bytes-override group is NEVER
-	// metadata-only. The two routings are MUTUALLY EXCLUSIVE BY DESIGN
-	// and this is the single point that encodes it:
+	// Rule 2 (Ship H1 B1 — predicate updated for the Ship H5 routing
+	// inversion): a bytes-streaming GVR is NEVER metadata-only. The two
+	// routings are MUTUALLY EXCLUSIVE BY DESIGN and this is the single
+	// point that encodes it:
 	//
 	//   - metadata-only stores *metav1.PartialObjectMetadata — it
 	//     DROPS spec/status. It also SKIPS SetTransform
-	//     (addResourceTypeMetadataOnlyLocked, watcher.go) — so the H1
+	//     (addResourceTypeMetadataOnlyLocked, watcher.go) — so the
 	//     bytes-override, which lives inside the TransformFunc, would
 	//     never run.
-	//   - the bytes representation IS the memory fix for this group and
-	//     it KEEPS every field (the resolver needs the full
-	//     spec/status; metadata-only would break the resolver, not
-	//     just H1).
+	//   - the bytes representation KEEPS every field (the resolver
+	//     needs the full spec/status; metadata-only would break the
+	//     resolver).
 	//
-	// Without this guard a `krateo.io/cache-mode: metadata` annotation
-	// (or a future seed pattern) on a composition CRD could silently
-	// route the composition GVR to the metadata-only path, where H1 is
-	// a no-op: no error, no log, scanobject unchanged — an on-cluster
-	// falsifier would then misread "H1 failed" when H1 never ran. The
-	// guard makes the H1 mechanism robust regardless of cluster
-	// annotation state. It is checked BEFORE the annotation/seed rules
-	// so it strictly wins.
-	if matchesBytesOverrideGroup(gvr) {
+	// H1 keyed this on the per-group bytesResourceOverrides allow-list.
+	// Ship H5 inverted routing — bytes-streaming is the default for
+	// every non-typed-RBAC GVR — and deleted the allow-list. The guard
+	// is re-expressed on the SAME single predicate the routing now uses:
+	// `!isStreamingException(gvr)` is true for exactly the GVRs that
+	// stream to bytes. This is the faithful evolution of the B1 guard,
+	// not a change to shouldUseMetadataOnly's structure: post-H5 only
+	// the 4 typed-RBAC GVRs are non-streaming, and Rule 1 already
+	// returns false for those — so the metadata-only path is inert
+	// (no GVR reaches a `return true`). The metadata-only mechanism is
+	// superseded; a later dead-code-removal ship deletes it. H5 leaves
+	// it inert and does not restructure shouldUseMetadataOnly.
+	//
+	// Checked BEFORE the annotation/seed rules so it strictly wins —
+	// a `krateo.io/cache-mode: metadata` annotation cannot route a
+	// streaming GVR to the metadata-only path.
+	if !isStreamingException(gvr) {
 		return false
 	}
 

@@ -153,67 +153,57 @@ func TestRouteRace_AC2_NoStockInformerEitherOrder(t *testing.T) {
 	})
 }
 
-// TestRouteRace_AC3_NonStreamingRoutingUnchanged — AC-3.
+// TestRouteRace_AC3_NonStreamingRoutingUnchanged — SUPERSEDED BY THE
+// SHIP H5 ROUTING INVERSION.
 //
-// For non-composition GVRs the standalone/factory decision must be
-// byte-identical to pre-fix:
-//   - a non-composition group in autoDiscoverGroups -> standalone
-//     informer (NewFilteredDynamicInformer), NOT streaming, NOT factory.
-//   - a non-composition group NOT in autoDiscoverGroups -> factory
-//     informer (rw.factory.ForResource), NOT streaming.
+// The original 0.30.133 AC-3 asserted non-composition GVRs did NOT
+// stream — they took the stock standalone/factory path. H5 inverted
+// routing: streaming is the DEFAULT for every non-typed-RBAC GVR, so a
+// non-composition GVR now DOES stream. (That inversion is H5 AC-1 /
+// AC-7.) This test is re-pointed to assert the H5-correct state: an
+// arbitrary non-composition GVR — auto-discovered or not — routes to
+// the streaming informer, and only the typed-RBAC GVRs do not.
 func TestRouteRace_AC3_NonStreamingRoutingUnchanged(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	t.Setenv(envCompositionStreamingList, "true")
 
-	standaloneGVR := schema.GroupVersionResource{
-		Group: "synthetic-ac3-standalone.krateo.io", Version: "v1", Resource: "things",
+	autoDiscGVR := schema.GroupVersionResource{
+		Group: "synthetic-ac3-autodisc.krateo.io", Version: "v1", Resource: "things",
 	}
-	factoryGVR := schema.GroupVersionResource{
-		Group: "synthetic-ac3-factory.krateo.io", Version: "v1", Resource: "things",
+	plainGVR := schema.GroupVersionResource{
+		Group: "synthetic-ac3-plain.krateo.io", Version: "v1", Resource: "things",
 	}
 
-	t.Run("non-composition standalone GVR", func(t *testing.T) {
+	t.Run("auto-discovered non-composition GVR streams (H5 default)", func(t *testing.T) {
 		ResetDepsForTest()
 		t.Cleanup(ResetDepsForTest)
 		ResetAutoDiscoverGroupsForTest()
 		t.Cleanup(ResetAutoDiscoverGroupsForTest)
-		AddAutoDiscoverGroup(standaloneGVR.Group)
+		AddAutoDiscoverGroup(autoDiscGVR.Group)
 
-		rw := newRouteRaceWatcher(t, true, standaloneGVR)
+		rw := newRouteRaceWatcher(t, true, autoDiscGVR)
 		t.Cleanup(func() { rw.Stop(); time.Sleep(50 * time.Millisecond) })
-		rw.EnsureResourceType(standaloneGVR)
+		rw.EnsureResourceType(autoDiscGVR)
 
-		if isStreamingInformer(rw, standaloneGVR) {
-			t.Fatal("AC-3 FAIL: a non-composition GVR routed to the streaming informer — " +
-				"streaming routing must be scoped to bytesResourceOverrides groups only")
-		}
-		rw.mu.RLock()
-		_, registered := rw.informers[standaloneGVR]
-		rw.mu.RUnlock()
-		if !registered {
-			t.Fatal("AC-3 FAIL: non-composition standalone GVR not registered at all")
+		if !isStreamingInformer(rw, autoDiscGVR) {
+			t.Fatal("H5: an auto-discovered non-composition GVR did NOT stream — " +
+				"streaming is the default for every non-typed-RBAC GVR")
 		}
 	})
 
-	t.Run("non-composition factory GVR", func(t *testing.T) {
+	t.Run("plain non-composition GVR streams (H5 default)", func(t *testing.T) {
 		ResetDepsForTest()
 		t.Cleanup(ResetDepsForTest)
 		ResetAutoDiscoverGroupsForTest()
 		t.Cleanup(ResetAutoDiscoverGroupsForTest)
-		// factoryGVR's group is NOT auto-discovered -> factory branch.
 
-		rw := newRouteRaceWatcher(t, true, factoryGVR)
+		rw := newRouteRaceWatcher(t, true, plainGVR)
 		t.Cleanup(func() { rw.Stop(); time.Sleep(50 * time.Millisecond) })
-		rw.EnsureResourceType(factoryGVR)
+		rw.EnsureResourceType(plainGVR)
 
-		if isStreamingInformer(rw, factoryGVR) {
-			t.Fatal("AC-3 FAIL: a non-composition non-standalone GVR routed to streaming")
-		}
-		rw.mu.RLock()
-		_, registered := rw.informers[factoryGVR]
-		rw.mu.RUnlock()
-		if !registered {
-			t.Fatal("AC-3 FAIL: non-composition factory GVR not registered")
+		if !isStreamingInformer(rw, plainGVR) {
+			t.Fatal("H5: a plain non-composition GVR did NOT stream — " +
+				"streaming is the default regardless of auto-discover state")
 		}
 	})
 }

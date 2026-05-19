@@ -929,39 +929,40 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 	var gi informers.GenericInformer
 	indexers := clientcache.Indexers{clientcache.NamespaceIndex: clientcache.MetaNamespaceIndexFunc}
 
-	// Ship 0.30.133 — registration-ordering race fix. The streaming-list
-	// routing check is evaluated FIRST, independently of `standalone`.
+	// Ship H5 — THE ROUTING INVERSION. Bytes-streaming is now the
+	// DEFAULT for every dynamic informer; the stock NewFilteredDynamic-
+	// Informer / factory path is reachable only as a principled
+	// EXCEPTION (typed-RBAC) or as a failure fallback.
 	//
-	// THE BUG: the streaming-routing check used to be nested inside
-	// `if standalone { ... }`, where `standalone :=
-	// matchesAutoDiscoverGroup(gvr.Group)` is FALSE until Phase 1's
-	// navigation walk has called AddAutoDiscoverGroup. A composition
-	// `EnsureResourceType` landing BEFORE that walk therefore fell to
-	// the `else` branch — `rw.factory.ForResource(gvr)`, the STOCK
-	// shared-factory informer whose stock ListFunc builds the full
-	// 48,999-item UnstructuredList (the ~80%-of-heap
-	// NewFilteredDynamicInformer.func3 driver H2a was meant to remove).
-	// The composition GVR's representation depended on registration
-	// timing — a race.
+	// WHY (the whack-a-mole H5 ends): H1..H4 grew a per-group allow-list
+	// — bytesResourceOverrides — that had to be edited each time a new
+	// group's stock informer surfaced as a NewFilteredDynamicInformer
+	// .func3 heap offender (composition at H1-H2a, widgets at H4). A
+	// future GVR re-created `func3` until someone noticed and edited the
+	// list. H5 inverts the rule: streaming unless excepted. No allow-list
+	// — so no future GVR can silently re-create `func3`.
 	//
-	// THE FIX: matchesStreamingListGroup derives from
-	// bytesResourceOverrides (strip.go) — a write-once init-time set,
-	// fully timing-independent. Evaluating the streaming-routing check
-	// before `standalone` makes the composition GVR route to the
-	// streaming informer on its FIRST registration regardless of
-	// Phase-1 timing. The `standalone`/factory logic below is unchanged
-	// for every non-streaming GVR.
+	// THE EXCEPTION — isStreamingException(gvr) (strip.go), true iff the
+	// GVR has a typed-converting override (typedResourceOverrides — the
+	// 4 typed-RBAC GVRs). typed-RBAC genuinely REQUIRES the stock
+	// informer: stripAndType consumes a *unstructured.Unstructured, and
+	// a *bytesObject from the streaming ListFunc would fail its cast.
+	// The exception is a declarative discriminant (a GVR has a typed
+	// override iff it has a purpose-built typed Go representation), not
+	// a hardcoded literal — feedback_no_special_cases-clean.
 	//
-	// Ship 0.30.122 R4 Lever 1 (original rationale, unchanged): the
-	// streaming ListFunc streams the paged LIST body item-by-item
-	// instead of materialising the whole 48,999-object pre-transform
-	// set (the ~17.7 GiB relist transient that OOMKilled 0.30.121).
-	// Gated by RESOLVER_COMPOSITION_STREAMING_LIST (default ON) AND a
-	// wired *rest.Config. When either is absent, OR
-	// newStreamingDynamicInformer fails to build its REST client, gi
-	// stays nil and we fall through to the standalone/factory logic
-	// below — the CACHE_ENABLED / AC-7 toggle path.
-	if matchesStreamingListGroup(gvr) && compositionStreamingListEnabled() {
+	// SINGLE SOURCE OF TRUTH: isStreamingException drives BOTH this
+	// informer-routing choice AND the strip.go bytes-override re-gate —
+	// one predicate, two call sites, cannot drift.
+	//
+	// Streaming is attempted for every non-excepted GVR. Gated by
+	// RESOLVER_COMPOSITION_STREAMING_LIST (default ON — see the scope
+	// note on envCompositionStreamingList: post-H5 it governs ALL
+	// informers) AND a wired *rest.Config. When the GVR is excepted, OR
+	// the toggle is off, OR newStreamingDynamicInformer cannot build its
+	// REST client, gi stays nil and we fall through to the
+	// stock-informer path below.
+	if !isStreamingException(gvr) && compositionStreamingListEnabled() {
 		if sgi, ok := newStreamingDynamicInformer(
 			rw.restConfig, rw.dyn, gvr, indexers, listOptionsTweak,
 		); ok {
@@ -970,15 +971,16 @@ func (rw *ResourceWatcher) addResourceTypeLocked(gvr schema.GroupVersionResource
 				slog.String("subsystem", "cache"),
 				slog.String("gvr", gvr.String()),
 				slog.String("path", "streaming-listwatch"),
-				slog.String("hint", "R4 Lever 1 — composition LIST streamed item-by-item"),
+				slog.String("hint", "H5 — bytes-streaming is the default for every dynamic informer"),
 			)
 		}
 	}
 
-	// Non-streaming routing — UNCHANGED from pre-fix (AC-3). Reached
-	// when gi is still nil: either gvr is not a streaming-list group,
-	// OR the streaming path is toggled off / could not build its REST
-	// client (the CACHE_ENABLED / AC-7 fallback — AC-5).
+	// Stock-informer path — Ship H5: the EXCEPTION / FAILURE fallback,
+	// no longer the default. Reached when gi is still nil: the GVR is a
+	// typed-RBAC exception, OR the streaming toggle is off, OR
+	// newStreamingDynamicInformer could not build its REST client
+	// (the CACHE_ENABLED / toggle fallback — AC-6).
 	//
 	// R6 (0.30.115): removable GVRs get a STANDALONE informer, not a
 	// shared-factory one. The shared dynamicSharedInformerFactory caches

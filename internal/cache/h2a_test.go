@@ -419,32 +419,32 @@ func TestH2a_ConcurrentListObjects_Race(t *testing.T) {
 	wg.Wait()
 }
 
-// TestH2a_SingleSourceOfTruth_GroupSets — SB-3.
+// TestH2a_SingleSourceOfTruth_GroupSets — SB-3, updated for the Ship H5
+// routing inversion.
 //
-// matchesStreamingListGroup must be DERIVED FROM bytesResourceOverrides
-// — there is no separate streamingListGVRs map that could drift. For
-// every group, the streaming-list predicate and the bytes-override
-// predicate must agree.
+// Pre-H5 this asserted matchesStreamingListGroup and the bytes-override
+// predicate agreed (both derived from bytesResourceOverrides). H5
+// collapsed them into ONE predicate — isStreamingException — used by
+// both the watcher.go routing AND the strip.go bytes-override. The
+// single-source-of-truth property is now structural: there is one
+// predicate, so there is nothing to drift. This test confirms the
+// predicate is consistent and composition still streams.
 func TestH2a_SingleSourceOfTruth_GroupSets(t *testing.T) {
-	groups := []string{
-		"composition.krateo.io",
-		"apps",
-		"rbac.authorization.k8s.io",
-		"widgets.templates.krateo.io",
-		"",
-	}
-	for _, g := range groups {
-		gvr := schema.GroupVersionResource{Group: g, Version: "v1", Resource: "things"}
-		streaming := matchesStreamingListGroup(gvr)
-		bytes := matchesBytesOverrideGroup(gvr)
-		if streaming != bytes {
-			t.Fatalf("group %q: matchesStreamingListGroup=%v but matchesBytesOverrideGroup=%v "+
-				"— SB-3: the two predicates MUST agree (single source of truth)", g, streaming, bytes)
+	// composition + widgets + an arbitrary group all stream (not
+	// excepted); the 4 typed-RBAC GVRs are the only exceptions.
+	for _, gvr := range []schema.GroupVersionResource{
+		compositionGVR,
+		{Group: "widgets.templates.krateo.io", Version: "v1beta1", Resource: "panels"},
+		{Group: "apps", Version: "v1", Resource: "deployments"},
+	} {
+		if isStreamingException(gvr) {
+			t.Fatalf("group %q is a streaming exception — H5: only typed-RBAC GVRs are excepted", gvr.Group)
 		}
 	}
-	// And the composition group is in fact routed through both.
-	if !matchesStreamingListGroup(compositionGVR) {
-		t.Fatal("composition group not streaming-routed — H2a inert")
+	for _, gvr := range rbacTypedGVRs {
+		if !isStreamingException(gvr) {
+			t.Fatalf("typed-RBAC GVR %q is NOT a streaming exception — RBAC must take the stock path", gvr)
+		}
 	}
 }
 
