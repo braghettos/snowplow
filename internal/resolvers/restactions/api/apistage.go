@@ -37,6 +37,7 @@ import (
 
 	xcontext "github.com/krateoplatformops/plumbing/context"
 	httpcall "github.com/krateoplatformops/plumbing/http/request"
+	"github.com/krateoplatformops/plumbing/maps"
 	"github.com/krateoplatformops/plumbing/ptr"
 	"github.com/krateoplatformops/snowplow/internal/cache"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -187,6 +188,28 @@ func gateListItems(ctx context.Context, gvr schema.GroupVersionResource, parsed 
 // input, returned WITHOUT the json.Marshal. Field set + ordering of the
 // map are irrelevant to the served body: the stage filter / jsonHandler
 // operate on the decoded value and re-encode canonically downstream.
+//
+// Ship 0.30.130 — corrected P-CORE-2 (per-call value isolation). The
+// `items` here is the cached content entry's R3 pre-parsed Items, whose
+// it.Object map[string]any are OWNED by entry.Items and SHARED across
+// every content-Get-hit. Returning those maps directly aliased the
+// served value tree to the cache: jsonHandlerCore feeds the tree into
+// jqutil.Eval, and gojq mutates every map in place (normalizeNumbers
+// iterate-and-write, deleteEmpty/delpaths delete-and-write). Two
+// concurrent Resolve workers Get-hitting the same entry then ran gojq
+// over the same maps -> `fatal error: concurrent map iteration and map
+// write` (the 0.30.128/0.30.129 deploy crash).
+//
+// The fix: deep-copy the assembled envelope via maps.DeepCopyJSON so
+// every caller receives a PRIVATE value tree — no map shared with
+// entry.Items. This restores the per-call isolation the pre-0.30.128
+// marshal+unmarshal round-trip provided, without that redundant
+// round-trip (the deep copy is structurally cheaper — it never
+// re-serialises). DeepCopyJSON recursively copies every json.Unmarshal
+// value type (map/slice/scalars/json.Number); the items come straight
+// from parseListEnvelope's json.Unmarshal so no non-JSON type can reach
+// its panic-on-unknown default. P-CORE-1 (decode-once-at-entry-load) is
+// untouched — only the per-hit aliasing is removed.
 func listEnvelopeValue(apiVersion, listKind string, items []*unstructured.Unstructured) map[string]any {
 	itemList := make([]any, 0, len(items))
 	for _, it := range items {
@@ -194,11 +217,14 @@ func listEnvelopeValue(apiVersion, listKind string, items []*unstructured.Unstru
 			itemList = append(itemList, it.Object)
 		}
 	}
-	return map[string]any{
+	envelope := map[string]any{
 		"apiVersion": apiVersion,
 		"kind":       listKind,
 		"items":      itemList,
 	}
+	// Per-call isolation: hand the caller a private deep copy so the
+	// downstream in-place gojq mutation never touches the cached maps.
+	return maps.DeepCopyJSON(envelope)
 }
 
 // gateListEnvelope unmarshals a LIST envelope, runs filterListByRBAC over
