@@ -5,8 +5,19 @@
 // called at 5 resolve.go sites only to fill the `depth` field of the
 // "api successfully resolved" log line — ~23% of pod CPU. Ship #6 gates
 // it: depthForLog (support.go) runs mapDepth (under dictMu) ONLY when
-// the logger's Debug level is enabled; on the common (Info) path it
-// does no work, takes no lock, and returns a sentinel.
+// the gate is enabled; on the common path it does no work, takes no
+// lock, and returns a sentinel.
+//
+// #222 / 0.30.140 — REGRESSION FIX. The Ship #6 gate originally read
+// `log.Enabled(ctx, slog.LevelDebug)`, but xcontext.Logger(ctx)
+// fabricates a fresh Debug-enabled handler when ctx lacks the logger
+// key — three caller chains (phase1 walker, F2 prewarm, refresher)
+// reached Resolve with an un-stamped ctx and the gate fired TRUE under
+// configmap DEBUG=false. The gate now reads env.Bool("DEBUG", false)
+// directly so the configmap is the single source of truth, immune to
+// ctx-logger fabrication. These tests drive the gate via t.Setenv
+// accordingly; the logger argument is still passed (signature parity)
+// but its level no longer drives the gate.
 //
 // Coverage of the PM-gate ACs that are hermetically verifiable:
 //
@@ -36,17 +47,12 @@ import (
 	"time"
 )
 
-// debugLogger returns a *slog.Logger whose handler is enabled at Debug
-// (so depthForLog runs mapDepth).
-func debugLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
-}
-
-// infoLogger returns a *slog.Logger whose handler is enabled only at
-// Info — Debug is OFF (the production pod default; depthForLog must
-// then NOT run mapDepth).
-func infoLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelInfo}))
+// discardLoggerForGate returns a *slog.Logger written to io.Discard.
+// Its handler level is irrelevant to the #222 env-driven gate — the
+// logger is still passed to depthForLog for signature parity, but the
+// gate is now driven by t.Setenv("DEBUG", ...).
+func discardLoggerForGate() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 // nestedDict builds a dict of a known mapDepth — `depth` levels of
@@ -60,18 +66,22 @@ func nestedDict(depth int) map[string]any {
 
 // TestDepthForLog_AC1_NotComputedOnCommonPath — AC-1.
 //
-// On the common (non-Debug) path depthForLog must NOT walk the tree: it
-// returns the sentinel depthSentinelNotComputed and does no mapDepth
-// work. A nil logger (xcontext.Logger fallback edge) also returns the
-// sentinel.
+// On the common (DEBUG=false) path depthForLog must NOT walk the tree:
+// it returns the sentinel depthSentinelNotComputed and does no mapDepth
+// work. A nil logger also returns the sentinel.
+//
+// #222 / 0.30.140: the gate is driven by env.Bool("DEBUG", false), NOT
+// the logger level. t.Setenv("DEBUG", "false") models the production
+// configmap default.
 func TestDepthForLog_AC1_NotComputedOnCommonPath(t *testing.T) {
+	t.Setenv("DEBUG", "false")
 	var mu sync.Mutex
 	dict := nestedDict(7)
 
-	// Info-level logger: Debug disabled -> sentinel, no walk.
-	got := depthForLog(context.Background(), infoLogger(), &mu, dict)
+	// DEBUG=false -> sentinel, no walk.
+	got := depthForLog(context.Background(), discardLoggerForGate(), &mu, dict)
 	if got != depthSentinelNotComputed {
-		t.Fatalf("AC-1 FAIL: non-Debug depthForLog = %d, want sentinel %d — mapDepth ran on "+
+		t.Fatalf("AC-1 FAIL: DEBUG=false depthForLog = %d, want sentinel %d — mapDepth ran on "+
 			"the common path", got, depthSentinelNotComputed)
 	}
 
@@ -79,16 +89,31 @@ func TestDepthForLog_AC1_NotComputedOnCommonPath(t *testing.T) {
 	if got := depthForLog(context.Background(), nil, &mu, dict); got != depthSentinelNotComputed {
 		t.Fatalf("AC-1 FAIL: nil-logger depthForLog = %d, want sentinel %d", got, depthSentinelNotComputed)
 	}
+
+	// #222 falsifier: even with a Debug-level logger, DEBUG=false MUST
+	// gate the walk OFF. Pre-#222 a Debug-enabled fabricated logger
+	// from xcontext.Logger(ctx) on an un-stamped ctx wrongly enabled
+	// the walk on the phase1 walker / F2 prewarm / refresher chains.
+	debugLevelLogger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	if got := depthForLog(context.Background(), debugLevelLogger, &mu, dict); got != depthSentinelNotComputed {
+		t.Fatalf("#222 REGRESSION: DEBUG=false but Debug-level logger -> depthForLog = %d, "+
+			"want sentinel %d. The env gate must dominate the logger level — pre-#222 the "+
+			"un-stamped-ctx caller chains (walker/prewarm/refresher) wrongly ran mapDepth.", got, depthSentinelNotComputed)
+	}
 }
 
 // TestDepthForLog_AC2_DeferredNotLost — AC-2.
 //
-// Under Debug, depthForLog runs mapDepth and returns the EXACT depth —
-// byte-identical to the pre-#6 unconditional mapDepth(dict). Verified
-// against dicts of known depth.
+// Under DEBUG=true, depthForLog runs mapDepth and returns the EXACT
+// depth — byte-identical to the pre-#6 unconditional mapDepth(dict).
+// Verified against dicts of known depth.
+//
+// #222 / 0.30.140: the gate is driven by DEBUG=true, NOT the logger
+// level. The logger argument is still passed for signature parity.
 func TestDepthForLog_AC2_DeferredNotLost(t *testing.T) {
+	t.Setenv("DEBUG", "true")
 	var mu sync.Mutex
-	log := debugLogger()
+	log := discardLoggerForGate()
 
 	for _, want := range []int{1, 2, 5, 12} {
 		dict := nestedDict(want)
@@ -112,15 +137,16 @@ func TestDepthForLog_AC2_DeferredNotLost(t *testing.T) {
 
 // TestDepthForLog_AC3_ConcurrentRaceClean — AC-3 (HARD — concurrency).
 //
-// Gating a lock is a concurrency change. Under Debug, depthForLog runs
-// mapDepth UNDER dictMu — serialising the full-tree read against
+// Gating a lock is a concurrency change. Under DEBUG=true, depthForLog
+// runs mapDepth UNDER dictMu — serialising the full-tree read against
 // concurrent writers of the same dict. This test runs >=16 goroutines:
-// readers calling depthForLog at Debug level + writers mutating the
+// readers calling depthForLog with DEBUG=true + writers mutating the
 // shared dict under the SAME mutex (the jsonHandler-write analogue).
 // Run under `go test -race`; an unsynchronised read/write trips here.
 func TestDepthForLog_AC3_ConcurrentRaceClean(t *testing.T) {
+	t.Setenv("DEBUG", "true")
 	var mu sync.Mutex
-	log := debugLogger()
+	log := discardLoggerForGate()
 
 	// The shared dict — guarded by mu, exactly as `dict` is guarded by
 	// dictMu in Resolve.
@@ -163,13 +189,14 @@ func TestDepthForLog_AC3_ConcurrentRaceClean(t *testing.T) {
 
 // TestDepthForLog_AC3_CommonPathTakesNoLock — AC-3, the other half.
 //
-// On the common (non-Debug) path depthForLog must NOT acquire the
+// On the common (DEBUG=false) path depthForLog must NOT acquire the
 // mutex — there is no mapDepth call to protect. Proven by: hold the
-// mutex on the test goroutine, then call depthForLog with an Info-level
-// logger. If depthForLog tried to Lock(), it would deadlock; instead it
-// returns the sentinel immediately. A watchdog goroutine fails the test
-// on a deadlock rather than hanging it.
+// mutex on the test goroutine, then call depthForLog. If depthForLog
+// tried to Lock(), it would deadlock; instead it returns the sentinel
+// immediately. A watchdog goroutine fails the test on a deadlock
+// rather than hanging it.
 func TestDepthForLog_AC3_CommonPathTakesNoLock(t *testing.T) {
+	t.Setenv("DEBUG", "false")
 	var mu sync.Mutex
 	dict := nestedDict(5)
 
@@ -178,7 +205,7 @@ func TestDepthForLog_AC3_CommonPathTakesNoLock(t *testing.T) {
 
 	done := make(chan int, 1)
 	go func() {
-		done <- depthForLog(context.Background(), infoLogger(), &mu, dict)
+		done <- depthForLog(context.Background(), discardLoggerForGate(), &mu, dict)
 	}()
 
 	select {
@@ -187,8 +214,8 @@ func TestDepthForLog_AC3_CommonPathTakesNoLock(t *testing.T) {
 			t.Fatalf("AC-3 FAIL: common-path depthForLog = %d, want sentinel", got)
 		}
 	case <-time.After(2 * time.Second):
-		// 2s is ample: depthForLog's non-Debug path is a single
-		// log.Enabled check + return; it cannot legitimately take 2s.
+		// 2s is ample: depthForLog's DEBUG=false path is a single
+		// env.Bool check + return; it cannot legitimately take 2s.
 		t.Fatal("AC-3 FAIL: common-path depthForLog blocked on dictMu — it must NOT acquire " +
 			"the lock when mapDepth is gated out")
 	}

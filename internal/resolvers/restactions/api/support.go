@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+
+	"github.com/krateoplatformops/plumbing/env"
 )
 
 // depthSentinelNotComputed is the value the "depth" log field carries
@@ -34,8 +36,25 @@ const depthSentinelNotComputed = -1
 // debug path mapDepth runs UNDER mu exactly as before, serialising the
 // full-tree read against concurrent jsonHandler writes to dict. The
 // caller passes the same *sync.Mutex (dictMu) that guards dict.
+//
+// #222 / 0.30.140 — REGRESSION FIX. Ship #6's original gate read
+// `log.Enabled(ctx, slog.LevelDebug)` — but xcontext.Logger(ctx)
+// (plumbing/context.go:24-32) fabricates a fresh Debug-enabled
+// JSONHandler when ctx lacks contextKeyLogger, and three caller chains
+// reach Resolve with an un-stamped ctx: phase1 walker
+// (phase1_walk.go:517), F2 prewarm (phase1_content_prewarm.go:213), and
+// the cache refresher (cache/refresher.go:180). The gate therefore
+// fired TRUE even with DEBUG=false in the configmap — pprof confirmed
+// mapDepth at 1.84 s on the request path AND ~7.82 s on the sibling
+// refresher chain (the Ship #6 tester gate measured only the request
+// path with a stamped ctx, missing the regression). The env-driven
+// check honours the configmap directly and is immune to ctx-logger
+// fragility. The signature keeps ctx + log for caller-site parity
+// (every depthForLog(ctx, log, &mu, dict) call site in resolve.go
+// stays as-is — only the gate body changes).
 func depthForLog(ctx context.Context, log *slog.Logger, mu *sync.Mutex, dict any) int {
-	if log == nil || !log.Enabled(ctx, slog.LevelDebug) {
+	_ = ctx // reserved for future per-request gating
+	if log == nil || !env.Bool("DEBUG", false) {
 		return depthSentinelNotComputed
 	}
 	mu.Lock()
