@@ -198,7 +198,7 @@ volumes: []
 volumeMounts: []
 
 # Extra envFrom entries appended to the default (chart-managed
-# ConfigMap + jwt-sign-key Secret). Used to pick up ConfigMaps owned
+# ConfigMap). Used to pick up ConfigMaps owned
 # by other components without re-templating them here.
 extraEnvFrom:
   - configMapRef:
@@ -331,4 +331,29 @@ seedAuthn:
   tokenAudience: authn
   tokenPath: /var/run/secrets/krateo.io/serviceaccount/token
 
-jwtSignKeySecretName: jwt-sign-key
+# JWT verification key configuration.
+# snowplow verifies RS256 JWTs issued by authn using authn's RSA *public* key,
+# fetched from authn's JWKS endpoint (/.well-known/jwks.json). snowplow holds no
+# copy of the key and no Secret is mounted for it: rotating authn's keypair needs
+# no snowplow redeploy, and there is no public-key Secret to keep in sync.
+#
+# The key set is fetched lazily (on the first token validation, NOT at startup)
+# and cached, so snowplow starts even when authn is not up yet and recovers by
+# itself once authn answers. While the key set cannot be fetched, authenticated
+# requests get 503 (retryable) rather than 401.
+jwt:
+  # Full JWKS URL. Empty (the default) derives it from URL_AUTHN — the authn base
+  # URL already configured for the #57 seed token exchange — as
+  # <URL_AUTHN>/.well-known/jwks.json. Set this only to point at a different authn.
+  jwksUrl: ""
+  # How long a successfully fetched key set is served before it is refreshed.
+  # Signing keys rotate rarely, so minutes-scale caching keeps authn off the hot
+  # path of every token validation.
+  cacheTTL: 5m
+  # Minimum gap between two JWKS fetch attempts. This throttles the refetch that
+  # an unrecognised "kid" triggers, so tokens naming a key authn never published
+  # cannot turn into one request-per-validation flood against authn.
+  minRefreshInterval: 30s
+  # Timeout for a single JWKS fetch. Also bounds how long a token validation can
+  # block, since concurrent cache misses are collapsed into one fetch.
+  requestTimeout: 5s

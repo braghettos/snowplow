@@ -16,6 +16,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
 	"log/slog"
@@ -38,7 +40,27 @@ import (
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 )
 
-const refreshTestSignKey = "test-sign-key-ship1-live-refresh"
+const refreshTestKeyID = "test-kid-ship1-live-refresh"
+
+// refreshTestPrivateKey / refreshTestKeys are the asymmetric keypair these
+// tests sign/verify with (RS256, replacing the old HS256 shared secret).
+// Production resolves the verification key from authn's JWKS endpoint; a
+// StaticKeySource satisfies the same jwtutil.KeySource contract without a
+// network dependency, keeping these tests hermetic (the fetch/cache behaviour
+// is covered in plumbing's jwtutil/jwks_test.go).
+var (
+	refreshTestPrivateKey *rsa.PrivateKey
+	refreshTestKeys       jwtutil.KeySource
+)
+
+func init() {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		panic(err)
+	}
+	refreshTestPrivateKey = key
+	refreshTestKeys = jwtutil.NewStaticKeySource(&key.PublicKey)
+}
 
 func mintToken(t *testing.T, username string) string {
 	t.Helper()
@@ -46,7 +68,8 @@ func mintToken(t *testing.T, username string) string {
 		Username:   username,
 		Groups:     []string{"devs"},
 		Duration:   time.Hour,
-		SigningKey: refreshTestSignKey,
+		KeyID:      refreshTestKeyID,
+		PrivateKey: refreshTestPrivateKey,
 	})
 	if err != nil {
 		t.Fatalf("CreateToken: %v", err)
@@ -149,7 +172,7 @@ func seedAuthTestWidget(t *testing.T) {
 // test server. Returns the base URL.
 func refreshServer(t *testing.T) string {
 	t.Helper()
-	h := middleware.RefreshAuth(refreshTestSignKey)(Refreshes(refreshTestSignKey))
+	h := middleware.RefreshAuth(refreshTestKeys)(Refreshes())
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return srv.URL
@@ -248,8 +271,12 @@ func TestRefreshes_Auth_InvalidToken401(t *testing.T) {
 	t.Setenv("RESOLVED_CACHE_ENABLED", "true")
 	base := refreshServer(t)
 
+	wrongKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generating RSA key: %v", err)
+	}
 	bad, err := jwtutil.CreateToken(jwtutil.CreateTokenOptions{
-		Username: "userA", Duration: time.Hour, SigningKey: "WRONG-KEY",
+		Username: "userA", Duration: time.Hour, KeyID: refreshTestKeyID, PrivateKey: wrongKey,
 	})
 	if err != nil {
 		t.Fatalf("CreateToken: %v", err)

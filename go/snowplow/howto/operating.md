@@ -33,7 +33,9 @@ via `envFrom` (`values.yaml`, `env:` block).
 
 Minimum the chart needs:
 
-- a JWT signing key Secret (`jwtSignKeySecretName`, default `jwt-sign-key`);
+- a reachable authn JWKS endpoint (`jwt.jwksUrl`, empty by default → derived from
+  `URL_AUTHN`) — the RS256 verification keys are fetched from there and cached, so no
+  key Secret is mounted;
 - `CACHE_ENABLED=true` (chart default) to run the cache path;
 - resources sized for the informer + in-process cache (chart default
   `limits: 8Gi / 4 cpu`, `requests: 4Gi / 2 cpu`).

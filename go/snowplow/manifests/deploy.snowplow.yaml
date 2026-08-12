@@ -59,7 +59,10 @@ spec:
           - --blizzard=false
           - --port=8081
           - --authn-namespace=demo-system
-          - --jwt-sign-key=AbbraCadabbra
+          # RS256 verification keys come from authn's JWKS endpoint — no key
+          # material is mounted. Point --url-authn at authn and the JWKS URL is
+          # derived as <url-authn>/.well-known/jwks.json.
+          - --url-authn=http://authn.demo-system.svc.cluster.local:8082
           - --pretty-log=false
           - --jq-modules-path=/jq-modules
         ports:

@@ -24,6 +24,7 @@ import (
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/env"
+	"github.com/krateo-platformops/plumbing/jwtutil"
 	"github.com/krateo-platformops/plumbing/kubeutil"
 	"github.com/krateo-platformops/plumbing/server/use"
 	"github.com/krateo-platformops/plumbing/server/use/cors"
@@ -120,7 +121,19 @@ func main() {
 	port := flag.Int("port", env.ServicePort("PORT", 8081), "port to listen on")
 	authnNS := flag.String("authn-namespace", env.String("AUTHN_NAMESPACE", ""),
 		"krateo authn service clientconfig secrets namespace")
-	signKey := flag.String("jwt-sign-key", env.String("JWT_SIGN_KEY", ""), "secret key used to sign JWT tokens")
+	// JWT verification keys come from authn's JWKS endpoint, not from a mounted
+	// Secret: snowplow holds no copy of authn's public key, and authn can rotate
+	// its keypair without a snowplow redeploy. Empty URL → derived from
+	// --url-authn below, so the common case needs no extra configuration.
+	jwksURL := flag.String("jwks-url", env.String("JWT_JWKS_URL", ""),
+		"authn JWKS URL supplying the RS256 verification keys (empty → <url-authn>"+jwtutil.DefaultJWKSPath+")")
+	jwksCacheTTL := flag.Duration("jwks-cache-ttl", env.Duration("JWT_JWKS_CACHE_TTL", 5*time.Minute),
+		"how long a fetched JWKS key set is served before it is refreshed")
+	jwksMinRefresh := flag.Duration("jwks-min-refresh-interval",
+		env.Duration("JWT_JWKS_MIN_REFRESH_INTERVAL", 30*time.Second),
+		"minimum gap between two JWKS fetch attempts; throttles refetches triggered by an unknown kid")
+	jwksTimeout := flag.Duration("jwks-request-timeout", env.Duration("JWT_JWKS_REQUEST_TIMEOUT", 5*time.Second),
+		"timeout for a single JWKS fetch; also bounds how long a token validation can block")
 	jqModPath := flag.String("jq-modules-path", env.String(jqsupport.EnvModulesPath, ""),
 		"loads JQ custom modules from the filesystem")
 	// Ship Resilience-1 (0.30.162) — comma-separated list of
@@ -205,6 +218,37 @@ func main() {
 	if *debugOn {
 		log.Debug("environment variables", slog.Any("env", os.Environ()))
 	}
+
+	// authn signs tokens asymmetrically (RS256); snowplow verifies them against
+	// the public key authn publishes at its JWKS endpoint. The key set is
+	// fetched lazily (first validation, NOT at boot) and cached for
+	// --jwks-cache-ttl, so:
+	//   - snowplow starts and serves its unauthenticated routes even when authn
+	//     is not up yet, and recovers on its own once authn answers — no startup
+	//     ordering dependency and no crash loop on an authn restart;
+	//   - a rotated kid triggers exactly one refetch (throttled by
+	//     --jwks-min-refresh-interval), so no redeploy is needed to follow a
+	//     keypair rotation;
+	//   - authn stays off the hot path of every token validation.
+	// Absent an explicit --jwks-url, derive it from the authn base URL already
+	// configured for the #57 token exchange — one URL to get wrong, not two.
+	resolvedJWKSURL := strings.TrimSpace(*jwksURL)
+	if resolvedJWKSURL == "" {
+		resolvedJWKSURL = jwtutil.JWKSURL(*urlAuthn)
+	}
+	if resolvedJWKSURL == "" {
+		log.Error("no JWKS URL: set --jwks-url/JWT_JWKS_URL or --url-authn/URL_AUTHN")
+		os.Exit(1)
+	}
+	jwtKeys := jwtutil.NewJWKSKeySource(resolvedJWKSURL,
+		jwtutil.WithJWKSCacheTTL(*jwksCacheTTL),
+		jwtutil.WithJWKSMinRefreshInterval(*jwksMinRefresh),
+		jwtutil.WithJWKSRequestTimeout(*jwksTimeout))
+	log.Info("JWT verification keys sourced from authn JWKS",
+		slog.String("jwks_url", resolvedJWKSURL),
+		slog.Duration("cache_ttl", *jwksCacheTTL),
+		slog.Duration("min_refresh_interval", *jwksMinRefresh),
+		slog.Duration("request_timeout", *jwksTimeout))
 
 	// #57 — wire the prewarm seed's authn token source + the self-loopback
 	// host once at startup. The authn.Client exchanges snowplow's projected
@@ -957,7 +1001,7 @@ func main() {
 	cache.RegisterScopedRoute("GET /api-info/names", cache.ScopePlurals)
 
 	mux.Handle("GET /list", chain.Append(
-		middleware.UserConfig(*signKey, *authnNS),
+		middleware.UserConfig(jwtKeys, *authnNS),
 		cache.FallthroughScopeMiddleware(cache.ScopeList)).
 		Then(handlers.List()))
 	cache.RegisterScopedRoute("GET /list", cache.ScopeList)
@@ -968,7 +1012,7 @@ func main() {
 	// is the F-1 site). The restactions / widgets dispatcher entries
 	// inherit the scope via the same ctx.
 	mux.Handle("GET /call", chain.Append(
-		middleware.UserConfig(*signKey, *authnNS),
+		middleware.UserConfig(jwtKeys, *authnNS),
 		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric),
 		handlers.Dispatcher(dispatchers.All())).
 		Then(handlers.Call()))
@@ -984,7 +1028,7 @@ func main() {
 	// classification and the read-path invariant hold; a scheduled
 	// export is just a CronJob curling this route (see howto/export.md).
 	mux.Handle("GET /export", chain.Append(
-		middleware.UserConfig(*signKey, *authnNS),
+		middleware.UserConfig(jwtKeys, *authnNS),
 		cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric)).
 		Then(handlers.Export(
 			handlers.Dispatcher(dispatchers.All())(handlers.Call()))))
@@ -1002,8 +1046,8 @@ func main() {
 	// REFRESH_SSE_ENABLED=false the handler serves a clean idle stream
 	// (transparent fallback, project_cache_off_is_transparent_fallback).
 	mux.Handle("GET /refreshes", chain.Append(
-		middleware.RefreshAuth(*signKey)).
-		Then(handlers.Refreshes(*signKey)))
+		middleware.RefreshAuth(jwtKeys)).
+		Then(handlers.Refreshes()))
 
 	// GET /rbac — RESTAction read-set enumeration for core-provider RBAC
 	// pre-generation (design docs/restaction-rbac-endpoint-design.md). It
@@ -1016,7 +1060,7 @@ func main() {
 	// like /refreshes above, it issues ZERO per-user apiserver reads, so it sits
 	// outside the read-path-scoped invariant (fallthrough_assert.go).
 	mux.Handle("GET /rbac", chain.Append(
-		middleware.UserConfig(*signKey, *authnNS)).
+		middleware.UserConfig(jwtKeys, *authnNS)).
 		Then(handlers.RBAC()))
 
 	// Ship D — write-verb `/call` routes also get the middleware (PM
@@ -1025,30 +1069,30 @@ func main() {
 	// escapes: a future GET-class route mistakenly registered under
 	// `call-write-*` would still trip the counter on the wrong cell.
 	mux.Handle("POST /call", chain.Append(
-		middleware.UserConfig(*signKey, *authnNS),
+		middleware.UserConfig(jwtKeys, *authnNS),
 		cache.FallthroughScopeMiddleware(cache.ScopeCallWritePost)).
 		Then(handlers.Call()))
 	cache.RegisterScopedRoute("POST /call", cache.ScopeCallWritePost)
 
 	mux.Handle("PUT /call", chain.Append(
-		middleware.UserConfig(*signKey, *authnNS),
+		middleware.UserConfig(jwtKeys, *authnNS),
 		cache.FallthroughScopeMiddleware(cache.ScopeCallWritePut)).
 		Then(handlers.Call()))
 	cache.RegisterScopedRoute("PUT /call", cache.ScopeCallWritePut)
 
 	mux.Handle("PATCH /call", chain.Append(
-		middleware.UserConfig(*signKey, *authnNS),
+		middleware.UserConfig(jwtKeys, *authnNS),
 		cache.FallthroughScopeMiddleware(cache.ScopeCallWritePatch)).
 		Then(handlers.Call()))
 	cache.RegisterScopedRoute("PATCH /call", cache.ScopeCallWritePatch)
 
 	mux.Handle("DELETE /call", chain.Append(
-		middleware.UserConfig(*signKey, *authnNS),
+		middleware.UserConfig(jwtKeys, *authnNS),
 		cache.FallthroughScopeMiddleware(cache.ScopeCallWriteDelete)).
 		Then(handlers.Call()))
 	cache.RegisterScopedRoute("DELETE /call", cache.ScopeCallWriteDelete)
 
-	mux.Handle("POST /jq", chain.Append(middleware.UserConfig(*signKey, *authnNS)).Then(handlers.JQ()))
+	mux.Handle("POST /jq", chain.Append(middleware.UserConfig(jwtKeys, *authnNS)).Then(handlers.JQ()))
 
 	// /debug/pprof/* — registered on the custom mux (server does NOT use http.DefaultServeMux).
 	// Exposes goroutine, heap, profile, allocs, mutex, block, cmdline, symbol, threadcreate, trace.
@@ -1120,7 +1164,7 @@ func main() {
 	// the same RefreshAuth chain form as /refreshes (no apiserver read, no
 	// UserConfig Secret lookup).
 	mux.Handle("GET /debug/refreshes", chain.Append(
-		middleware.RefreshAuth(*signKey)).
+		middleware.RefreshAuth(jwtKeys)).
 		Then(handlers.DebugRefreshes()))
 
 	ctx, stop := signal.NotifyContext(context.Background(), []os.Signal{

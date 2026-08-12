@@ -59,14 +59,20 @@ loopback token exchange, **unconditionally**. So the install fails fast unless t
 cluster has:
 
 - the `serviceaccount.authn.krateo.io` CRD (chart `authn-crds`), and — for the exchange
-  to work at runtime — the Krateo **authn** operator (>= 0.24.0);
-- a JWT signing-key Secret named by `jwtSignKeySecretName` (default `jwt-sign-key`,
-  key `JWT_SIGN_KEY`) in the release namespace — the pod does not start without it.
+  to work at runtime — the Krateo **authn** operator (>= 0.24.0).
 
-The installer sequences authn before snowplow for exactly this reason. Without a
-running authn the install still succeeds (CRD present is enough) and `/call` serves
-normally — only the seed's best-effort boot warmth is lost. Details in the `seedAuthn`
-block of [`helm/snowplow/values.yaml`](../helm/snowplow/values.yaml).
+**No key material is required at install time.** snowplow fetches authn's RSA public
+key from authn's JWKS endpoint (`<URL_AUTHN>/.well-known/jwks.json`) on the first token
+validation, so there is no public-key Secret to pre-create and nothing to re-sync when
+authn rotates its keypair.
+
+The installer sequences authn before snowplow anyway, but snowplow does not depend on
+that ordering: because the JWKS fetch is lazy, snowplow starts without authn and
+recovers on its own once authn answers. Without a running authn the install still
+succeeds (CRD present is enough) and unauthenticated routes serve normally;
+authenticated requests get `503` until the key set can be fetched. Details in the
+`seedAuthn` and `jwt` blocks of
+[`helm/snowplow/values.yaml`](../helm/snowplow/values.yaml).
 
 ## Quickstart on Kind
 

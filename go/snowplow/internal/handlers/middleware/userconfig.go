@@ -4,11 +4,26 @@
 //
 // PROVENANCE / UPSTREAM DRIFT MONITOR (AC-D3.1 + AC-D3.14).
 //   - Upstream module:  github.com/krateo-platformops/plumbing
-//   - Upstream version: v1.13.0                       (pinned in go.mod)
+//   - Upstream version: v1.13.3-0.20260812075309-213cef1a48c9 (pinned in go.mod;
+//     a pseudo-version pending plumbing PR #21 being tagged — re-pin both this
+//     comment and PinnedPlumbingVersion to the real tag once it lands, no
+//     further re-audit needed since the content is identical)
 //   - Upstream file:    server/use/userconfig.go
-//   - Upstream func:    use.UserConfig(signingKey, authnNS string)
+//   - Upstream func:    use.UserConfig(keys jwtutil.KeySource, authnNS string)
 //                       func(http.Handler) http.Handler
 //   - Upstream lines:   :19-73 (73-line single function)
+//
+// asymmetric-signing migration: upstream now verifies RS256 against an RSA
+// public key instead of an HMAC shared secret, and resolves that key through a
+// jwtutil.KeySource keyed on the token's "kid" rather than holding one parsed
+// key. In production the source is a jwtutil.JWKSKeySource pointed at authn's
+// /.well-known/jwks.json, which fetches and caches the key set — so snowplow no
+// longer mounts authn's public key from a Secret at all, and authn can rotate
+// its keypair without a snowplow redeploy. The transcription below mirrors
+// upstream: every request path that used to call jwtutil.Validate(signingKey,
+// ...) now calls jwtutil.ValidateWithKeySource(keys, ...). A key that cannot be
+// resolved is reported 503 (our fault, retryable) rather than 401, byte-identical
+// to upstream's ErrKeyUnavailable handling.
 //
 // This file is a VERBATIM transcription of `use.UserConfig`'s control
 // flow with ONE intentional behaviour-additive change: the
@@ -57,7 +72,7 @@ import (
 // version drifts from this constant, `TestUserConfigMirror_PlumbingVersionPin`
 // fails and the operator must re-audit upstream
 // `server/use/userconfig.go` line-by-line before bumping this string.
-const PinnedPlumbingVersion = "v1.13.0"
+const PinnedPlumbingVersion = "v1.13.3-0.20260812075309-213cef1a48c9"
 
 // UserConfig is the snowplow-local cache-aware sibling of plumbing's
 // `use.UserConfig`. Signature is byte-identical (same parameters,
@@ -68,7 +83,8 @@ const PinnedPlumbingVersion = "v1.13.0"
 //
 //   1.  Authorization header presence check — Unauthorized on miss.
 //   2.  `Bearer ` prefix validation — Unauthorized on mismatch.
-//   3.  `jwtutil.Validate(signingKey, token)` — Unauthorized on error.
+//   3.  `jwtutil.ValidateWithKeySource(keys, token)` — Unauthorized on a bad or
+//       expired token, ServiceUnavailable when the key itself is unresolvable.
 //   4.  `rest.InClusterConfig()` — InternalError on error.
 //
 //      (Steps 1-4 are byte-identical to upstream; the early `return`s
@@ -127,9 +143,16 @@ const PinnedPlumbingVersion = "v1.13.0"
 // is invoked on every call → apiserver-side rate returns to within
 // ±10% of the pre-D.3 baseline. The flag is verified-removable
 // (`project_caching_is_provisional`).
-func UserConfig(signingKey, authnNS string) func(http.Handler) http.Handler {
+func UserConfig(keys jwtutil.KeySource, authnNS string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		fn := func(wri http.ResponseWriter, req *http.Request) {
+			// Upstream — a missing key source is a wiring bug, surfaced on every
+			// request as an InternalError, before the auth-header check.
+			if keys == nil {
+				response.InternalError(wri, fmt.Errorf("no JWT key source configured"))
+				return
+			}
+
 			// Upstream :22-26 — Authorization header presence.
 			authHeader := req.Header.Get("Authorization")
 			if authHeader == "" {
@@ -144,12 +167,20 @@ func UserConfig(signingKey, authnNS string) func(http.Handler) http.Handler {
 				return
 			}
 
-			// Upstream :34-42 — jwtutil.Validate. Both expired + generic-invalid
-			// branches go to Unauthorized; we preserve the if/else shape
-			// verbatim so a future divergence in upstream is loud at audit
-			// time even if the observable behaviour is identical today.
-			userInfo, err := jwtutil.Validate(signingKey, parts[1])
+			// Upstream :34-42 — jwtutil.ValidateWithKeySource. Both expired +
+			// generic-invalid branches go to Unauthorized; we preserve the
+			// if/else shape verbatim so a future divergence in upstream is loud
+			// at audit time even if the observable behaviour is identical today.
+			userInfo, err := jwtutil.ValidateWithKeySource(keys, parts[1])
 			if err != nil {
+				// Upstream — an unresolvable key (JWKS unreachable, unknown
+				// kid) is OUR failure, not a bad credential: 503 so the client
+				// retries instead of re-authenticating against an authn that is
+				// merely down.
+				if errors.Is(err, jwtutil.ErrKeyUnavailable) {
+					response.ServiceUnavailable(wri, err)
+					return
+				}
 				if errors.Is(err, jwtutil.ErrTokenExpired) {
 					response.Unauthorized(wri, err)
 				} else {
