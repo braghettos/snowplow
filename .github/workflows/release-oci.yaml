@@ -1,26 +1,11 @@
-# Canonical Krateo OCI package-build workflow — THE single way every krateo-* repo builds
-# and publishes Helm packages. Identical byte-for-byte across ALL repos (no per-repo config):
-# it is fully shape-agnostic and discovers what to publish from the repo layout itself.
+# Publishes this repo's Helm charts on a release tag. The workflow itself is the org-wide reusable —
+# this file supplies only the triggers, so "identical across every chart repo" becomes structural
+# instead of a 137-line copy each repo has to keep in step by hand.
 #
-# What it publishes: every FIRST-CLASS chart in the repo — any directory containing a
-# Chart.yaml that is NOT a vendored subchart (i.e. not sitting in some other chart's
-# charts/ directory). That covers every layout in the org with one rule:
-#   • single-chart repos:  chart/  crds-subchart/  target-chart/  kagent/chart/
-#   • multi-chart repos:   charts/*            (each immediate child is first-class)
-#   • vendored deps:       chart/charts/<dep>  (SKIPPED — grandparent is itself a chart)
-#
-# How versions are set (a chart opts in purely by which placeholders it authors):
-#   • CHART_VERSION → the release tag (or workflow_dispatch input)
-#   • SOURCE_REF    → the release tag           (federated agents pin their source to it)
-#   • APP_VERSION   → latest semver tag of the application repo (the deployed image tag),
-#                     auto-derived as <org>/<repo minus -chart suffix>; a no-op for charts
-#                     that ship no image (no APP_VERSION placeholder) or whose app repo
-#                     has no tags.
-# A chart with none of these placeholders keeps its own literally-pinned versions untouched.
-#
-# Collision guard: refuses to push unless OCI_REPO carries a chart-namespace path segment,
-# so a chart named e.g. `frontend` can never collide with a same-named container image at
-# the registry root. Universal, harmless for every repo.
+# The shared workflow also gates the publish on every chart-referenced image existing: a chart that
+# names an image which was never published used to publish cleanly and then ImagePullBackOff on every
+# install, with the symptom surfacing several layers from the cause
+# (krateo-platformops/oasgen-provider#62).
 name: release-oci
 
 on:
@@ -35,103 +20,12 @@ on:
         description: "App image version (APP_VERSION). Default: latest tag of the app repo."
         required: false
 
-permissions:
-  contents: read
-  packages: write
-
-env:
-  OCI_REPO: oci://ghcr.io/krateo-platformops/charts
-
 jobs:
-  package-and-push:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      # Collision guard: require a chart-namespace path segment under host/org (e.g. .../krateo).
-      # A bare registry root (oci://ghcr.io/<org>) would push a chart named <X> to
-      # ghcr.io/<org>/<X> and collide with a same-named container image. Fail fast.
-      - name: Assert chart-namespaced OCI_REPO (no registry-root push)
-        run: |
-          path="${OCI_REPO#oci://}"
-          segs="$(printf '%s' "$path" | tr '/' '\n' | grep -c .)"
-          if [ "$segs" -lt 3 ]; then
-            echo "::error::OCI_REPO='${OCI_REPO}' is the registry root (${segs} path segments)."
-            echo "::error::Use a chart-namespaced repo, e.g. oci://ghcr.io/krateo-platformops/charts."
-            exit 1
-          fi
-
-      - name: Resolve versions
-        id: ver
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CHART_VERSION_INPUT: ${{ github.event.inputs.chart_version }}
-          APP_VERSION_INPUT: ${{ github.event.inputs.app_version }}
-        run: |
-          set -euo pipefail
-          CHART_VERSION="${CHART_VERSION_INPUT:-${GITHUB_REF_NAME}}"
-          # App repo by convention: <org>/<this repo with any -chart suffix stripped>.
-          APP_REPO="${GITHUB_REPOSITORY%-chart}"
-          if [ -n "${APP_VERSION_INPUT}" ]; then
-            APP_VERSION="${APP_VERSION_INPUT}"
-          else
-            APP_VERSION="$(gh api "repos/${APP_REPO}/tags" --paginate --jq '.[].name' 2>/dev/null \
-              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
-          fi
-          echo "chart_version=${CHART_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "app_version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "resolved: CHART_VERSION=${CHART_VERSION}  APP_VERSION=${APP_VERSION:-<none>}  (APP_REPO=${APP_REPO})"
-
-      - name: Helm setup
-        uses: azure/setup-helm@v5.0.0
-        with:
-          version: v3.19.0
-
-      - name: Registry login
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Discover, version, package & push every first-class chart
-        env:
-          CHART_VERSION: ${{ steps.ver.outputs.chart_version }}
-          APP_VERSION: ${{ steps.ver.outputs.app_version }}
-        run: |
-          set -euo pipefail
-
-          # Discover first-class charts: a Chart.yaml is a vendored subchart (SKIP) iff its
-          # parent dir is named `charts` AND its grandparent is itself a chart. Everything
-          # else is first-class and gets published.
-          charts=()
-          while IFS= read -r cf; do
-            d="$(dirname "$cf")"
-            parent="$(dirname "$d")"
-            if [ "$(basename "$parent")" = "charts" ] && [ -f "$(dirname "$parent")/Chart.yaml" ]; then
-              continue
-            fi
-            charts+=("$d")
-          done < <(find . -name Chart.yaml | sort)
-
-          if [ "${#charts[@]}" -eq 0 ]; then
-            echo "::error::no first-class charts found"; exit 1
-          fi
-          echo "First-class charts: ${charts[*]}"
-
-          mkdir -p dist
-          for d in "${charts[@]}"; do
-            echo "::group::package ${d}"
-            # Opt-in placeholder substitution (untouched if a placeholder is absent).
-            sed -i "s/CHART_VERSION/${CHART_VERSION}/g; s/SOURCE_REF/${CHART_VERSION}/g" "${d}/Chart.yaml"
-            if [ -n "${APP_VERSION}" ]; then
-              sed -i "s/APP_VERSION/${APP_VERSION}/g" "${d}/Chart.yaml"
-            fi
-            if grep -q '^dependencies:' "${d}/Chart.yaml"; then
-              helm dependency build "${d}" >/dev/null 2>&1 || helm dependency update "${d}" >/dev/null 2>&1 || true
-            fi
-            helm package "${d}" -d dist/
-            echo "::endgroup::"
-          done
-
-          for tgz in dist/*.tgz; do
-            echo "Pushing ${tgz} -> ${OCI_REPO}"
-            helm push "${tgz}" "${OCI_REPO}"
-          done
+  release-oci:
+    uses: krateo-platformops/.github/.github/workflows/release-oci.yaml@main
+    permissions:
+      contents: read
+      packages: write
+    with:
+      chart_version: ${{ github.event.inputs.chart_version || '' }}
+      app_version: ${{ github.event.inputs.app_version || '' }}
