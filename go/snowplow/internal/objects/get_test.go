@@ -5,6 +5,10 @@ package objects
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"log/slog"
 	"os"
@@ -105,9 +109,18 @@ func TestMain(m *testing.M) {
 }
 
 func TestGet(t *testing.T) {
-	const (
-		jwtSignKey = "abbracadabbra"
-	)
+	const keyID = "test-kid"
+
+	// authn now signs with RS256; e2e.SignUp expects a PEM-encoded RSA private
+	// key rather than a symmetric secret.
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generating RSA key: %v", err)
+	}
+	signKeyPEM := string(pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
+	}))
 
 	os.Setenv("DEBUG", "0")
 
@@ -117,7 +130,8 @@ func TestGet(t *testing.T) {
 			Username:   "cyberjoker",
 			Groups:     []string{"devs"},
 			Namespace:  namespace,
-			JWTSignKey: jwtSignKey,
+			JWTSignKey: signKeyPEM,
+			JWTKeyID:   keyID,
 		})).
 		Setup(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			r, err := resources.New(cfg.Client().RESTConfig())
