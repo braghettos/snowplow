@@ -9,7 +9,7 @@ require (
 	github.com/google/go-cmp v0.7.0
 	github.com/itchyny/gojq v0.12.17
 	github.com/klauspost/compress v1.18.0
-	github.com/krateo-platformops/plumbing v1.13.3-0.20260812075309-213cef1a48c9
+	github.com/krateo-platformops/plumbing v1.14.0
 	github.com/stretchr/testify v1.11.1
 	github.com/swaggo/http-swagger v1.3.4
 	github.com/swaggo/swag v1.16.4
