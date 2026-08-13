@@ -55,7 +55,9 @@ reference), [endpoints.md](../go/snowplow/howto/endpoints.md),
 ## The HTTP surface
 
 Everything is served on the single `http` port (default `8081`). Authenticated routes
-take a Krateo JWT (`Authorization: Bearer …`), validated against `JWT_SIGN_KEY`. The
+take a Krateo JWT (`Authorization: Bearer …`), validated as RS256 against authn's
+public key, fetched and cached from authn's JWKS endpoint
+(`/.well-known/jwks.json`; see [configuration](./configuration.md)). The
 authoritative machine-readable spec is
 [`go/snowplow/docs/swagger.json`](../go/snowplow/docs/swagger.json) (served live at
 `GET /swagger/`).

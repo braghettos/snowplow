@@ -22,14 +22,16 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 )
 
-const rbacTestSignKey = "test-sign-key-rbac-inspect-endpoint"
 const rbacTestAuthnNS = "krateo-system"
 
 // rbacServer wires the production chain (UserConfig -> RBAC) on a test server,
-// exactly as main.go mounts GET /rbac.
+// exactly as main.go mounts GET /rbac. The key source is the package-level
+// refreshTestKeys (refreshes_test.go): both cases below are rejected on the
+// Authorization header itself, before any key is resolved, so the source is
+// never consulted — it only has to satisfy UserConfig's non-nil check.
 func rbacServer(t *testing.T) string {
 	t.Helper()
-	h := middleware.UserConfig(rbacTestSignKey, rbacTestAuthnNS)(RBAC())
+	h := middleware.UserConfig(refreshTestKeys, rbacTestAuthnNS)(RBAC())
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return srv.URL

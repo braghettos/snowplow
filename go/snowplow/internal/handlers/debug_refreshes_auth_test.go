@@ -19,7 +19,7 @@ import (
 // on a test server, mirroring the main.go mount exactly.
 func debugRefreshesServer(t *testing.T) string {
 	t.Helper()
-	h := middleware.RefreshAuth(refreshTestSignKey)(DebugRefreshes())
+	h := middleware.RefreshAuth(refreshTestKeys)(DebugRefreshes())
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return srv.URL

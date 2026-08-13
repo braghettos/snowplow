@@ -39,7 +39,8 @@ func mintTokenOutsider(t *testing.T, username string) string {
 		Username:   username,
 		Groups:     []string{"outsiders"},
 		Duration:   time.Hour,
-		SigningKey: refreshTestSignKey,
+		KeyID:      refreshTestKeyID,
+		PrivateKey: refreshTestPrivateKey,
 	})
 	if err != nil {
 		t.Fatalf("CreateToken: %v", err)

@@ -34,7 +34,7 @@ import (
 // idle SSE handler blocks streaming, so Close must follow a client-conn drop).
 func refreshServerGzip(t *testing.T) *httptest.Server {
 	t.Helper()
-	h := middleware.RefreshAuth(refreshTestSignKey)(Refreshes(refreshTestSignKey))
+	h := middleware.RefreshAuth(refreshTestKeys)(Refreshes())
 	srv := httptest.NewServer(middleware.Gzip(h))
 	return srv
 }

@@ -502,7 +502,7 @@
           }
         }
       },
-      "description": "Additional envFrom entries appended to the chart-managed ConfigMap and jwt-sign-key Secret.",
+      "description": "Additional envFrom entries appended to the chart-managed ConfigMap.",
       "title": "Extra Env From"
     },
     "initContainers": {
@@ -610,10 +610,33 @@
       "description": "Env vars rendered into the chart's snowplow ConfigMap and consumed via envFrom.",
       "title": "Env"
     },
-    "jwtSignKeySecretName": {
-      "type": "string",
-      "description": "Name of the Secret holding the JWT signing key.",
-      "title": "JWT Sign Key Secret Name"
+    "jwt": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "snowplow verifies RS256 JWTs issued by authn using authn's RSA public key, fetched from authn's JWKS endpoint (/.well-known/jwks.json) and cached. No key material is mounted: snowplow holds neither a private/signing key nor a copy of the public key, so rotating authn's keypair needs no snowplow redeploy. The key set is fetched lazily on first validation, not at startup, so snowplow does not depend on authn being up first.",
+      "title": "JWT verification keys (JWKS)",
+      "properties": {
+        "jwksUrl": {
+          "type": "string",
+          "description": "Full JWKS URL. Empty derives it from URL_AUTHN as <URL_AUTHN>/.well-known/jwks.json; set only to point at a different authn.",
+          "title": "JWKS URL"
+        },
+        "cacheTTL": {
+          "type": "string",
+          "description": "How long a fetched key set is served before it is refreshed (Go duration, e.g. \"5m\").",
+          "title": "JWKS cache TTL"
+        },
+        "minRefreshInterval": {
+          "type": "string",
+          "description": "Minimum gap between two JWKS fetch attempts (Go duration, e.g. \"30s\"). Throttles the refetch an unknown \"kid\" triggers so it cannot become one fetch per request.",
+          "title": "JWKS minimum refresh interval"
+        },
+        "requestTimeout": {
+          "type": "string",
+          "description": "Timeout for a single JWKS fetch (Go duration, e.g. \"5s\"). Also bounds how long a token validation can block.",
+          "title": "JWKS request timeout"
+        }
+      }
     },
     "seedAuthn": {
       "type": "object",

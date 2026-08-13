@@ -21,10 +21,18 @@ The container takes **no direct `env:` array**. Every value that reaches the pro
 goes through `envFrom` ([`deployment.yaml`](../helm/snowplow/templates/deployment.yaml)):
 
 1. the chart-managed `snowplow` ConfigMap — rendered from `.Values.env`;
-2. the JWT signing-key Secret — `jwtSignKeySecretName` (default `jwt-sign-key`,
-   key `JWT_SIGN_KEY`); the pod does not start without it;
+2. a small `env:` array for the JWKS knobs (`jwt.*` below) — no key material, just
+   the URL and cache tuning;
 3. `extraEnvFrom` — by default the optional `snowplow-api-override` ConfigMap, so the
    portal blueprint can layer config without re-templating this chart.
+
+**No key Secret is mounted.** snowplow verifies RS256 JWTs against authn's public key
+fetched from authn's JWKS endpoint (`/.well-known/jwks.json`), so it holds no copy of
+the key: rotating authn's keypair needs no snowplow redeploy and there is no
+public-key Secret to keep in sync. The key set is fetched **lazily on the first token
+validation, not at startup** — snowplow starts and serves its unauthenticated routes
+even when authn is not up yet, and recovers by itself once authn answers. While the
+key set cannot be fetched, authenticated requests get `503` (retryable), not `401`.
 
 A `checksum/configmap` pod annotation rolls the Deployment when the ConfigMap changes.
 
@@ -42,7 +50,10 @@ A `checksum/configmap` pod annotation rolls the Deployment when the ConfigMap ch
 | `startupProbe` / `livenessProbe` | `/health`, widened thresholds | `/health` binds early and never gates prewarm; liveness must not kill a warming pod. |
 | `readinessProbe` | `/readyz` | Flips 503→200 on **prewarm-complete**, not mere informer sync. |
 | `ingress` | `enabled: false` | Standard chart ingress if you need it. |
-| `jwtSignKeySecretName` | `jwt-sign-key` | Secret holding `JWT_SIGN_KEY` (shared with authn). |
+| `jwt.jwksUrl` | `""` (derives from `URL_AUTHN`) | Where the RS256 verification keys come from. Empty derives `<URL_AUTHN>/.well-known/jwks.json` — one URL to get wrong, not two. Set only to point at a different authn. |
+| `jwt.cacheTTL` | `5m` | How long a fetched key set is served before refresh. Signing keys rotate rarely, so this keeps authn off the hot path of every validation. |
+| `jwt.minRefreshInterval` | `30s` | Floor between two JWKS fetches. Throttles the refetch an unrecognised `kid` triggers, so tokens naming a key authn never published cannot become one fetch per request. |
+| `jwt.requestTimeout` | `5s` | Per-fetch timeout. Also bounds how long a validation can block, since concurrent cache misses collapse into one fetch. |
 | `seedAuthn.*` | group `krateo:snowplow-seed`, namespace `krateo-system`, audience `authn` | The prewarm-seed loopback-auth artifacts (allowlist CR + ClusterRole/Binding + projected token) — **always rendered**; see [usage](./usage.md) for the hard dependency. |
 | `extraEnvFrom` | `snowplow-api-override` ConfigMap (optional) | Extra env sources appended after the defaults. |
 | `env.*` | see below | Rendered into the `snowplow` ConfigMap. |

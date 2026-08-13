@@ -73,11 +73,14 @@ type subRequest struct {
 	Extras    map[string]any `json:"extras"`
 }
 
-// Refreshes returns the GET /refreshes SSE handler. signingKey is accepted
-// for symmetry with the other auth-bearing handlers and future use; identity
-// is already resolved onto ctx by middleware.RefreshAuth, so the handler does
-// not re-validate the token here.
-func Refreshes(signingKey string) http.HandlerFunc {
+// Refreshes returns the GET /refreshes SSE handler. It takes no verification
+// key: identity is already resolved onto ctx by middleware.RefreshAuth and the
+// handler never re-validates the token. (It previously accepted the signing key
+// "for symmetry and future use" and ignored it; the asymmetric-signing
+// migration replaced that key with a fetched-and-cached JWKS key source, and
+// threading an unused one through here would only invite the reader to think
+// this handler verifies something. It does not.)
+func Refreshes() http.HandlerFunc {
 	return func(wri http.ResponseWriter, req *http.Request) {
 		log := xcontext.Logger(req.Context())
 

@@ -20,6 +20,11 @@
 package middleware_test
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/base64"
+	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -30,17 +35,44 @@ import (
 	"github.com/krateo-platformops/snowplow/internal/handlers/middleware"
 )
 
-const refreshAuthTestKey = "test-signing-key-for-refreshauth-m17-2026-07-30"
+const refreshAuthTestKeyID = "test-kid-for-refreshauth-m17-2026-07-30"
 
-// mintRefreshToken issues a JWT signed with the test key. A negative duration
-// yields an already-expired token (jwtutil.Validate → ErrTokenExpired).
+// refreshAuthTestPrivateKey / refreshAuthTestKeys are the asymmetric keypair
+// these tests sign/verify with (RS256, replacing the old HS256 shared secret).
+// Generated once at package init; a failure here means the test binary itself
+// is broken, so a panic is appropriate.
+//
+// In production the middleware resolves its key through a JWKS-fetching source
+// (jwtutil.JWKSKeySource against authn's /.well-known/jwks.json); a
+// StaticKeySource is the same jwtutil.KeySource contract without the network,
+// which keeps these tests hermetic. The JWKS fetch/cache/rotation behaviour
+// itself is covered upstream in plumbing's jwtutil/jwks_test.go; what matters
+// here is the middleware's handling of what the source returns — including the
+// key-unavailable path, exercised by failingKeySource below.
+var (
+	refreshAuthTestPrivateKey *rsa.PrivateKey
+	refreshAuthTestKeys       jwtutil.KeySource
+)
+
+func init() {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		panic(err)
+	}
+	refreshAuthTestPrivateKey = key
+	refreshAuthTestKeys = jwtutil.NewStaticKeySource(&key.PublicKey)
+}
+
+// mintRefreshToken issues a JWT signed with the test private key. A negative
+// duration yields an already-expired token (jwtutil.Validate → ErrTokenExpired).
 func mintRefreshToken(t *testing.T, username string, dur time.Duration) string {
 	t.Helper()
 	tok, err := jwtutil.CreateToken(jwtutil.CreateTokenOptions{
 		Username:   username,
 		Groups:     []string{"devs"},
 		Duration:   dur,
-		SigningKey: refreshAuthTestKey,
+		KeyID:      refreshAuthTestKeyID,
+		PrivateKey: refreshAuthTestPrivateKey,
 	})
 	if err != nil {
 		t.Fatalf("CreateToken: %v", err)
@@ -60,7 +92,7 @@ func runRefreshAuth(t *testing.T, req *http.Request) (status int, reached bool, 
 		}
 		w.WriteHeader(http.StatusOK)
 	})
-	h := middleware.RefreshAuth(refreshAuthTestKey)(terminal)
+	h := middleware.RefreshAuth(refreshAuthTestKeys)(terminal)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec.Code, reached, username
@@ -171,7 +203,7 @@ func TestRefreshAuth_ExpiredTokenRejected(t *testing.T) {
 // the query string (?token=) in addition to header/cookie — the exact
 // vulnerability M17(b) guards against. It exists only to prove the M17(b)
 // assertion is discriminating.
-func queryReadingAuth(signingKey string) func(http.Handler) http.Handler {
+func queryReadingAuth(publicKey *rsa.PublicKey) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			var token string
@@ -190,7 +222,7 @@ func queryReadingAuth(signingKey string) func(http.Handler) http.Handler {
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
-			ui, err := jwtutil.Validate(signingKey, token)
+			ui, err := jwtutil.Validate(publicKey, token)
 			if err != nil {
 				w.WriteHeader(http.StatusUnauthorized)
 				return
@@ -220,7 +252,7 @@ func TestRefreshAuth_RED_QueryStringMustNotAuthenticate(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 	wrongRec := httptest.NewRecorder()
-	queryReadingAuth(refreshAuthTestKey)(wrongTerminal).ServeHTTP(wrongRec, newReq())
+	queryReadingAuth(&refreshAuthTestPrivateKey.PublicKey)(wrongTerminal).ServeHTTP(wrongRec, newReq())
 	if wrongRec.Code != http.StatusOK || !wrongReached {
 		t.Fatalf("RED setup invalid: the query-reading shadow impl should have authenticated the "+
 			"token-in-URL request; status=%d reached=%v", wrongRec.Code, wrongReached)
@@ -231,5 +263,103 @@ func TestRefreshAuth_RED_QueryStringMustNotAuthenticate(t *testing.T) {
 	if status != http.StatusUnauthorized || reached {
 		t.Fatalf("RED: middleware.RefreshAuth must NOT authenticate a token-in-URL request "+
 			"(the shadow impl did); status=%d reached=%v", status, reached)
+	}
+}
+
+// --- JWKS key resolution ----------------------------------------------------
+
+// failingKeySource is a jwtutil.KeySource that never yields a key, standing in
+// for a JWKSKeySource whose authn endpoint is unreachable.
+type failingKeySource struct{}
+
+func (failingKeySource) PublicKey(string) (*rsa.PublicKey, error) {
+	return nil, jwtutil.ErrKeyUnavailable
+}
+
+// TestRefreshAuth_KeyUnavailable_503 pins the availability contract introduced
+// with the move to authn's JWKS endpoint: when the key set cannot be fetched the
+// token has NOT been proven bad, so the answer must be 503 (retryable) and NOT
+// 401. A 401 here would tell a browser to discard a perfectly good session and
+// bounce the user through login because authn happened to be restarting.
+func TestRefreshAuth_KeyUnavailable_503(t *testing.T) {
+	terminal := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Fatal("handler must not be reached when the verification key is unavailable")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/refreshes", nil)
+	req.Header.Set("Authorization", "Bearer "+mintRefreshToken(t, "userA", time.Hour))
+
+	rec := httptest.NewRecorder()
+	middleware.RefreshAuth(failingKeySource{})(terminal).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unfetchable JWKS must yield 503, got %d", rec.Code)
+	}
+}
+
+// TestRefreshAuth_NilKeySource_500 covers the wiring bug: no key source at all
+// is our misconfiguration, not a client problem.
+func TestRefreshAuth_NilKeySource_500(t *testing.T) {
+	terminal := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Fatal("handler must not be reached without a key source")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/refreshes", nil)
+	req.Header.Set("Authorization", "Bearer "+mintRefreshToken(t, "userA", time.Hour))
+
+	rec := httptest.NewRecorder()
+	middleware.RefreshAuth(nil)(terminal).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("nil key source must yield 500, got %d", rec.Code)
+	}
+}
+
+// TestRefreshAuth_JWKSSource_EndToEnd wires the REAL JWKSKeySource against a
+// stub authn serving a real JWKS document, proving the production wiring path
+// (fetch → parse → verify) authenticates a token authn would actually issue.
+func TestRefreshAuth_JWKSSource_EndToEnd(t *testing.T) {
+	pub := &refreshAuthTestPrivateKey.PublicKey
+	jwks := fmt.Sprintf(
+		`{"keys":[{"kty":"RSA","use":"sig","alg":"RS256","kid":%q,"n":%q,"e":%q}]}`,
+		refreshAuthTestKeyID,
+		base64.RawURLEncoding.EncodeToString(pub.N.Bytes()),
+		base64.RawURLEncoding.EncodeToString(big.NewInt(int64(pub.E)).Bytes()),
+	)
+
+	var fetches int
+	authnSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != jwtutil.DefaultJWKSPath {
+			t.Errorf("unexpected JWKS path %q", r.URL.Path)
+		}
+		fetches++
+		fmt.Fprint(w, jwks)
+	}))
+	defer authnSrv.Close()
+
+	var reached bool
+	terminal := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusOK)
+	})
+	h := middleware.RefreshAuth(jwtutil.NewJWKSKeySource(jwtutil.JWKSURL(authnSrv.URL)))(terminal)
+
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/refreshes", nil)
+		req.Header.Set("Authorization", "Bearer "+mintRefreshToken(t, "userA", time.Hour))
+		rec := httptest.NewRecorder()
+		reached = false
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK || !reached {
+			t.Fatalf("request %d: JWKS-verified token must authenticate; status=%d reached=%v",
+				i, rec.Code, reached)
+		}
+	}
+
+	// The key set is cached, so authn is hit once for three validations — the
+	// property that keeps authn off the per-request path.
+	if fetches != 1 {
+		t.Fatalf("JWKS should be fetched once and cached, got %d fetches", fetches)
 	}
 }

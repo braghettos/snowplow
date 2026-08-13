@@ -45,11 +45,28 @@ spec:
           envFrom:
             - configMapRef:
                 name: {{ include "snowplow.fullname" . }}
-            - secretRef:
-                name: {{ .Values.jwtSignKeySecretName }}
             {{- with .Values.extraEnvFrom }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          env:
+            # RS256 verification keys are fetched from authn's JWKS endpoint —
+            # snowplow holds no copy of authn's public key. JWT_JWKS_URL is left
+            # unset by default so the binary derives it from URL_AUTHN (already in
+            # the ConfigMap for the #57 token exchange); set jwt.jwksUrl only to
+            # point at a different authn.
+            {{- with .Values.jwt.jwksUrl }}
+            - name: JWT_JWKS_URL
+              value: {{ . | quote }}
+            {{- end }}
+            # Cache tuning: how long a fetched key set is trusted, the floor
+            # between fetch attempts (throttles refetches an unknown kid would
+            # trigger), and the per-fetch timeout.
+            - name: JWT_JWKS_CACHE_TTL
+              value: {{ .Values.jwt.cacheTTL | quote }}
+            - name: JWT_JWKS_MIN_REFRESH_INTERVAL
+              value: {{ .Values.jwt.minRefreshInterval | quote }}
+            - name: JWT_JWKS_REQUEST_TIMEOUT
+              value: {{ .Values.jwt.requestTimeout | quote }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: {{ include "krateo.image" (dict "img" .Values.image "global" .Values.global "defaultTag" .Chart.AppVersion) | quote }}

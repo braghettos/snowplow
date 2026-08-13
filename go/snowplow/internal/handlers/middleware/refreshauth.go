@@ -12,12 +12,14 @@
 //     only native credential channel is a cookie (withCredentials:true). So
 //     mounting /refreshes behind UserConfig as-is would 401 every browser
 //     connection.
-//   - jwtutil.Validate (validate.go:16) is a PURE, STATELESS HS256
+//   - jwtutil.ValidateWithKeySource is a STATELESS RS256 signature
 //     verification: UserInfo{Username,Groups} is embedded in the signed token
 //     (jwtutil/create.go), with NO session store and NO server-side lookup.
 //     So the identical UserInfo is recoverable from the SAME JWT regardless of
 //     transport. RefreshAuth extracts the token from a header OR a cookie and
-//     calls the byte-identical jwtutil.Validate(signingKey, token).
+//     calls the byte-identical jwtutil.ValidateWithKeySource(keys, token).
+//     (The verification key itself is fetched from authn's JWKS and cached by
+//     the shared KeySource, so this stays off the per-request I/O path.)
 //
 // WHAT IT DELIBERATELY SKIPS:
 //   - The `<user>-clientconfig` Secret / WithUserConfig lookup that UserConfig
@@ -35,6 +37,7 @@
 package middleware
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -93,11 +96,19 @@ func refreshTokenFromRequest(req *http.Request) (string, bool) {
 // downstream handler reads identity exactly as the /call path does. On any
 // failure it responds 401 (Unauthorized) and does not chain.
 //
-// Signature mirrors UserConfig's single-string-key shape minus authnNS (no
-// Secret lookup), so the mux mount is a one-line Append.
-func RefreshAuth(signingKey string) func(http.Handler) http.Handler {
+// Signature mirrors UserConfig's single-key-source shape minus authnNS (no
+// Secret lookup), so the mux mount is a one-line Append. As of the
+// asymmetric-signing migration the "key" is resolved through a
+// jwtutil.KeySource — in production authn's JWKS endpoint, fetched and cached
+// (see main.go) rather than mounted from a Secret.
+func RefreshAuth(keys jwtutil.KeySource) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		fn := func(wri http.ResponseWriter, req *http.Request) {
+			if keys == nil {
+				response.InternalError(wri, fmt.Errorf("no JWT key source configured"))
+				return
+			}
+
 			token, ok := refreshTokenFromRequest(req)
 			if !ok {
 				response.Unauthorized(wri, fmt.Errorf("missing credentials: no bearer header or session cookie"))
@@ -106,9 +117,14 @@ func RefreshAuth(signingKey string) func(http.Handler) http.Handler {
 
 			// The IDENTICAL stateless validation UserConfig performs at
 			// userconfig.go:151. Both expired + generic-invalid map to 401
-			// (jwtutil.Validate returns ErrTokenExpired / ErrTokenInvalid).
-			userInfo, err := jwtutil.Validate(signingKey, token)
+			// (jwtutil.Validate returns ErrTokenExpired / ErrTokenInvalid);
+			// a key we cannot fetch is OUR fault, so it maps to 503 instead.
+			userInfo, err := jwtutil.ValidateWithKeySource(keys, token)
 			if err != nil {
+				if errors.Is(err, jwtutil.ErrKeyUnavailable) {
+					response.ServiceUnavailable(wri, err)
+					return
+				}
 				response.Unauthorized(wri, err)
 				return
 			}

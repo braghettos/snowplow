@@ -32,6 +32,8 @@ package middleware_test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -57,19 +59,44 @@ import (
 )
 
 const (
-	testSigningKey = "test-signing-key-for-snowplow-d3-byte-equivalence-2026-05-20"
-	testAuthnNS    = "krateo-system"
-	testUsername   = "alice"
+	testKeyID   = "test-kid-for-snowplow-d3-byte-equivalence-2026-05-20"
+	testAuthnNS = "krateo-system"
+	testUsername = "alice"
 )
 
-// helperMakeToken issues a valid JWT signed with the test key.
+// testPrivateKey / testKeys are the asymmetric keypair these tests sign/verify
+// with (RS256, replacing the old HS256 shared secret). Generated once at package
+// init; a failure here means the test binary itself is broken, so a panic is
+// appropriate.
+//
+// testKeys is a StaticKeySource rather than the JWKSKeySource production uses:
+// both satisfy jwtutil.KeySource, and the static one keeps the byte-equivalence
+// comparison against upstream use.UserConfig hermetic (no HTTP server in the
+// loop). The JWKS fetch/cache/rotation semantics are covered upstream in
+// plumbing's jwtutil/jwks_test.go.
+var (
+	testPrivateKey *rsa.PrivateKey
+	testKeys       jwtutil.KeySource
+)
+
+func init() {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		panic(err)
+	}
+	testPrivateKey = key
+	testKeys = jwtutil.NewStaticKeySource(&key.PublicKey)
+}
+
+// helperMakeToken issues a valid JWT signed with the test private key.
 func helperMakeToken(t *testing.T, username string, expires time.Duration) string {
 	t.Helper()
 	tok, err := jwtutil.CreateToken(jwtutil.CreateTokenOptions{
 		Username:   username,
 		Groups:     []string{"krateo:admins"},
 		Duration:   expires,
-		SigningKey: testSigningKey,
+		KeyID:      testKeyID,
+		PrivateKey: testPrivateKey,
 	})
 	if err != nil {
 		t.Fatalf("CreateToken: %v", err)
@@ -125,8 +152,8 @@ func TestUserConfig_ByteEquivalence_CacheMiss(t *testing.T) {
 	// the cache lookup.
 	t.Setenv("CACHE_ENABLED", "false")
 
-	upstream := use.UserConfig(testSigningKey, testAuthnNS)
-	snowplow := middleware.UserConfig(testSigningKey, testAuthnNS)
+	upstream := use.UserConfig(testKeys, testAuthnNS)
+	snowplow := middleware.UserConfig(testKeys, testAuthnNS)
 
 	cases := []struct {
 		name    string
@@ -173,11 +200,16 @@ func TestUserConfig_ByteEquivalence_CacheMiss(t *testing.T) {
 			name: "jwt_validate_wrong_signing_key",
 			mkReq: func(t *testing.T) *http.Request {
 				// Token signed with a DIFFERENT key — Validate rejects.
+				otherKey, err := rsa.GenerateKey(rand.Reader, 2048)
+				if err != nil {
+					t.Fatalf("generating RSA key: %v", err)
+				}
 				wrongTok, err := jwtutil.CreateToken(jwtutil.CreateTokenOptions{
 					Username:   "bob",
 					Groups:     []string{"krateo:users"},
 					Duration:   1 * time.Hour,
-					SigningKey: "DIFFERENT-key",
+					KeyID:      testKeyID,
+					PrivateKey: otherKey,
 				})
 				if err != nil {
 					t.Fatalf("CreateToken: %v", err)
@@ -246,8 +278,8 @@ func TestUserConfig_ByteEquivalence_InClusterConfigFails(t *testing.T) {
 		return r
 	}
 
-	upstream := use.UserConfig(testSigningKey, testAuthnNS)
-	snowplow := middleware.UserConfig(testSigningKey, testAuthnNS)
+	upstream := use.UserConfig(testKeys, testAuthnNS)
+	snowplow := middleware.UserConfig(testKeys, testAuthnNS)
 
 	upStatus, upBody := serveOnce(t, upstream, mkReq())
 	snStatus, snBody := serveOnce(t, snowplow, mkReq())
@@ -335,7 +367,7 @@ func TestUserConfig_CacheMiss_RecordsFallthrough(t *testing.T) {
 
 	// Wrap our middleware with the scope marker, exactly as main.go
 	// does for /call — the recorder reads the scope from ctx.
-	mw := middleware.UserConfig(testSigningKey, testAuthnNS)
+	mw := middleware.UserConfig(testKeys, testAuthnNS)
 	scoped := cache.FallthroughScopeMiddleware(cache.ScopeCallGeneric)
 	chain := use.NewChain(scoped, mw)
 	terminal := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -441,7 +473,7 @@ func TestUserConfig_CacheHit_BypassesApiserver(t *testing.T) {
 	})
 
 	tok := helperMakeToken(t, testUsername, 1*time.Hour)
-	chain := use.NewChain(middleware.UserConfig(testSigningKey, testAuthnNS))
+	chain := use.NewChain(middleware.UserConfig(testKeys, testAuthnNS))
 	wrapped := chain.Then(terminal)
 
 	r := httptest.NewRequest(http.MethodGet, "/call?x=1", nil)

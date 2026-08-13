@@ -67,7 +67,7 @@ it is measured: [north-star](../go/snowplow/docs/architecture/north-star.md).
 
 | Peer | Relationship |
 |---|---|
-| **authn** | Issues the Krateo JWTs snowplow validates (shared `JWT_SIGN_KEY`). The prewarm seed exchanges a projected ServiceAccount token at authn for its loopback JWT — a hard install-time dependency on the `serviceaccount.authn.krateo.io` CRD (see [usage](./usage.md)). |
+| **authn** | Issues the Krateo JWTs snowplow validates — signed asymmetrically (RS256) with authn's private key; snowplow verifies them against authn's **public** key, which it fetches and caches from authn's JWKS endpoint at `/.well-known/jwks.json` (no key material is mounted into snowplow, so authn can rotate its keypair without a snowplow redeploy). The prewarm seed exchanges a projected ServiceAccount token at authn for its loopback JWT — a hard install-time dependency on the `serviceaccount.authn.krateo.io` CRD (see [usage](./usage.md)). |
 | **frontend** | The SPA renders what `/call` returns; snowplow reads the frontend nav ConfigMaps (`INIT` / `ROUTES_LOADER`) as prewarm roots. Widget CRDs are frontend-owned. |
 | **sse-proxy** | Serves the portal's *event* streams; snowplow serves the portal's *content* (it also has its own `/refreshes` SSE lane for live-refresh nudges). |
 | **core-provider / cdc** | Compositions and their CRs are the bulk of what RESTActions read; `GET /rbac` enumerates a RESTAction's read-set so core-provider can pre-generate RBAC. |
