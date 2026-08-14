@@ -46,6 +46,10 @@ spec:
         app: snowplow
     spec:
       serviceAccountName: snowplow
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       volumes:
       - name: jq-modules
         configMap:
@@ -54,6 +58,15 @@ spec:
       - name: snowplow
         image: kind.local/snowplow:latest
         imagePullPolicy: Never
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
         args:
           - --debug=false
           - --blizzard=false
