@@ -1,0 +1,27 @@
+# Trivy misconfiguration exceptions — reviewed, accepted-by-design (2026-08-14).
+#
+# KSV-0041 "Manage secrets" + KSV-0046 "Manage all resources" on the snowplow
+# ClusterRole (manifests/deploy.snowplow.yaml and the shipped helm/snowplow
+# chart) are DELIBERATE and functionally required, not an accidental over-grant:
+#
+#  - The `apiGroups:["*"] resources:["*"] verbs:[get,list,watch]` rule is
+#    READ-ONLY (no create/update/delete — the pod cannot mutate or escalate).
+#    snowplow dynamically discovers CRDs at runtime (autoDiscoverGroups cache
+#    warmup → informers on newly-observed CR types) because a portal widget /
+#    dashboard can reference ANY kind a customer registers. Enumerating the set
+#    is not possible ahead of time; broad READ is the intended default (see the
+#    rule's own comment in helm/snowplow/templates/clusterrole.yaml).
+#  - Secret read is required because RESTActions resolve endpointRef -> a
+#    credential Secret (internal/cache/secrets_informer.go,
+#    internal/resolvers/restactions/api/endpoints_cache.go) to call external
+#    APIs on the user's behalf. A #113 guardrail already blocks users from
+#    selecting per-user credential Secrets via query params.
+#
+# Residual risk (a compromised pod could read secrets cluster-wide) is inherent
+# to the dynamic-portal + RESTAction-gateway design and is NOT safely reducible
+# via RBAC narrowing (RBAC has no deny; narrowing breaks dynamic content +
+# RESTAction auth). Compensating controls live at the app layer (#113 guardrail,
+# PSA/audit). Revisit only via a product change that splits the discovery
+# identity from the content-serving identity.
+KSV-0041
+KSV-0046
