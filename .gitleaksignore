@@ -1,9 +1,15 @@
-# gitleaks false-positive allowlist (fingerprints: commit:file:rule:line).
-#
-# The resolvedKeyVersion golden anchor is a 64-char SHA-256 hex constant
-# (ComputeKey output captured empirically for the L3 key-version test). gitleaks'
-# generic-api-key rule flags it as a credential because the identifier contains
-# "Key". It is a test fixture, not a secret. The source line also carries an
-# inline //gitleaks:allow (covers the post-squash-merge scan on main, new SHA);
-# this fingerprint covers the PR-branch scan of the introducing commit's diff.
-dada1521fa9ea4bcaa7a6dd15fe313b6afe903a1:internal/cache/resolved_key_version_golden_test.go:generic-api-key:50
+# gitleaks false-positive suppressions (fingerprints: commit:file:rule:line).
+# All 10 are the high-false-positive generic-api-key entropy rule on non-secret material:
+#  - mock/generated tokens in *_test.go and the e2e benchmark script,
+#  - the childRefSentinelKey sentinel constant in the (since-removed) refilter.go.
+# Verified 2026-08-14: no real credentials. Fingerprints pin the historical commits.
+8c84994b706c9265817bf1d8ba9f06778ad289f3:e2e/bench/perf.py:generic-api-key:20
+9c7320f731b9be6e73c5720bff89d6c2a50cd8ff:internal/cache/internal_client_test.go:generic-api-key:34
+9c7320f731b9be6e73c5720bff89d6c2a50cd8ff:internal/dynamic/sa_credential_real_test.go:generic-api-key:82
+3899ac5703c47a15ec3c08f59e4f748785c34cf0:internal/handlers/dispatchers/gvr_discovered_integration_test.go:generic-api-key:330
+416a6206a1b37b2e8ff5e794247e6e435003787b:internal/handlers/dispatchers/inprocess_resolve_falsifier_test.go:generic-api-key:56
+9c7320f731b9be6e73c5720bff89d6c2a50cd8ff:internal/handlers/dispatchers/phase1_credential_real_test.go:generic-api-key:52
+4ee118800bcf0e62aa699d9795d2490cdf5c0afe:internal/handlers/middleware/userconfig_test.go:generic-api-key:60
+416a6206a1b37b2e8ff5e794247e6e435003787b:internal/resolvers/restactions/api/peer_dispatch_feed_error_test.go:generic-api-key:466
+37b7bce147e7e20365c0e3331e8f39f289a2a4ac:internal/resolvers/restactions/api/refilter.go:generic-api-key:80
+5d2cc5b1b536f629f73f21e0856ef78f6efa1f2f:internal/resolvers/restactions/api/refilter.go:generic-api-key:80
