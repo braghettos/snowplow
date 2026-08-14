@@ -7,7 +7,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # hadolint ignore=DL3008
-RUN apt-get update && apt-get install -y ca-certificates openssl git tzdata && \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssl git tzdata && \
   update-ca-certificates && \
   rm -rf /var/lib/apt/lists/*
 
