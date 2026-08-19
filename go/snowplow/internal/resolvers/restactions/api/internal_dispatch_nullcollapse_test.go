@@ -122,7 +122,7 @@ func TestPathHasNullPathSegment_Discriminates(t *testing.T) {
 		},
 		{
 			// A SEPARATE null class (disc-architect #118 caveat, confirmed
-			// against braghettos/gojq v0.12.21): when a downstream step's jq
+			// against krateo-platformops/gojq v0.12.21): when a downstream step's jq
 			// `split()` hits a null it THROWS, and evalJQ swallows the error
 			// into the path string (setup.go:92-94), so out.Path becomes the
 			// literal jq error message. It has NO slash / no `//`, so

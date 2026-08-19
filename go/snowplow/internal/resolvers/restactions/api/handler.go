@@ -48,7 +48,7 @@ type jsonHandlerOptions struct {
 	// NOT opts.dict: dict starts as a DeepCopy of Extras (resolve.go) but then
 	// accumulates stage outputs + a synthetic `slice`, so at later stages it
 	// is no longer the pure extras. The reference is SHARED, not deep-copied:
-	// gojq is the braghettos COW fork, so the filter cannot mutate the input
+	// gojq is the krateo-platformops COW fork, so the filter cannot mutate the input
 	// (mirrors the existing pig["slice"] shared-map pattern).
 	extras map[string]any
 }

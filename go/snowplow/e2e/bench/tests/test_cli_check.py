@@ -223,7 +223,7 @@ def test_verify_deployed_image_matches(monkeypatch):
 
     def fake_kubectl(*args, **kwargs):
         # The function calls `kubectl get deployment snowplow ... -o jsonpath=...`
-        return (0, "ghcr.io/braghettos/snowplow:0.30.232", "")
+        return (0, "ghcr.io/krateo-platformops/snowplow:0.30.232", "")
 
     monkeypatch.setattr(cli_mod, "kubectl", fake_kubectl)
     assert verify_deployed_image(expected_tag="0.30.232") is True
@@ -235,7 +235,7 @@ def test_verify_deployed_image_mismatch_returns_false(monkeypatch, capsys):
     monkeypatch.delenv("SKIP_IMAGE_CHECK", raising=False)
 
     def fake_kubectl(*args, **kwargs):
-        return (0, "ghcr.io/braghettos/snowplow:0.30.999", "")
+        return (0, "ghcr.io/krateo-platformops/snowplow:0.30.999", "")
 
     monkeypatch.setattr(cli_mod, "kubectl", fake_kubectl)
     assert verify_deployed_image(expected_tag="0.30.232") is False

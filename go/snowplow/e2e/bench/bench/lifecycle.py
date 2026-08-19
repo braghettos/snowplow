@@ -194,7 +194,7 @@ def _set_cache_via_helm(value):
 
     str_value = "true" if value else "false"
     helm_repo = os.environ.get(
-        "SNOWPLOW_HELM_REPO", "oci://ghcr.io/braghettos/charts/snowplow")
+        "SNOWPLOW_HELM_REPO", "oci://ghcr.io/krateo-platformops/charts/snowplow")
     helm_version = os.environ.get("SNOWPLOW_HELM_VERSION")  # optional
     chart_path = os.environ.get("SNOWPLOW_HELM_CHART_PATH")
 
@@ -288,7 +288,7 @@ def disable_cache():
 def cleanup_rogue_rbac():
     """Remove rogue RBAC left by previous test runs.
 
-    All user/group RBAC is defined by the braghettos/portal helm chart.
+    All user/group RBAC is defined by the krateo-platformops/portal helm chart.
     The test must NOT create custom roles — previous versions mistakenly
     created cluster-wide roles that defeated the chart's namespace-scoped
     permissions.

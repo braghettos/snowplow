@@ -308,7 +308,7 @@ def test_widget_kinds_includes_panels_and_restactions():
 # ─── #320: _flush_snowplow_cache — verifier-only, the bench NEVER deploys ────
 
 
-def _flush_kubectl_recorder(live_image="ghcr.io/braghettos/snowplow:0.30.258"):
+def _flush_kubectl_recorder(live_image="ghcr.io/krateo-platformops/snowplow:0.30.258"):
     """Recording kubectl stub: GET deployment returns `live_image`; every
     other call (rollout restart/status) succeeds."""
     calls = []
@@ -342,7 +342,7 @@ def test_flush_raises_on_image_mismatch_before_any_mutation(monkeypatch):
     """Live image behind the expected tag → RuntimeError directing the
     operator to helm-upgrade; nothing mutated (no set-image, no restart)."""
     calls, fake = _flush_kubectl_recorder(
-        live_image="ghcr.io/braghettos/snowplow:0.30.257")
+        live_image="ghcr.io/krateo-platformops/snowplow:0.30.257")
     monkeypatch.setattr(lifecycle_mod, "kubectl", fake)
     monkeypatch.setattr(lifecycle_mod, "log", lambda *a, **k: None)
     monkeypatch.setenv("EXPECTED_IMAGE_TAG", "0.30.258")

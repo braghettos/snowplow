@@ -98,7 +98,7 @@ func TestStepFilter_NoExtras_NoExtrasKey(t *testing.T) {
 // (`.extras + {seen:.x}`, `del(.extras.foo)`) AND reads `.extras.foo`. Every
 // goroutine must observe the ORIGINAL extras.foo unchanged, and `go test
 // -race` must be clean. This proves the COW share-reference decision: gojq is
-// the braghettos COW fork; input maps are never allocated() so mutating ops
+// the krateo-platformops COW fork; input maps are never allocated() so mutating ops
 // copy-on-write and reads can't mutate the shared input.
 func TestStepFilter_ConcurrentSharedExtras_Race(t *testing.T) {
 	ctx := context.Background()
