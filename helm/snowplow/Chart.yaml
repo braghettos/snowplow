@@ -27,7 +27,7 @@ appVersion: APP_VERSION
 # Bundling it makes the app release try to own the CRDs and collide with the
 # snowplow-crd release ("cannot be imported into the current release").
 home: https://krateo.io
-icon: https://raw.githubusercontent.com/krateoplatformops/krateo/main/docs/media/logo.svg
+icon: https://raw.githubusercontent.com/krateo-platformops/.github/main/brand/logo.svg
 keywords:
   - krateo
   - platformops
