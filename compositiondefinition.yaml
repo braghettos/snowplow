@@ -6,4 +6,4 @@ metadata:
 spec:
   chart:
     url: oci://ghcr.io/krateo-platformops/charts/snowplow
-    version: "1.0.47"
+    version: "1.10.1"
