@@ -83,6 +83,27 @@ func TestCall156_AC1_ClusterGetByName(t *testing.T) {
 	}
 }
 
+// AC-1 (core group): a cluster-scoped CORE-group resource builds the
+// /api/v1 base (no /apis/ prefix) with NO namespaces/ segment. Guards the
+// group=="" base branch × cluster scope — the /api vs /apis fork that the
+// apis-group clusterroles cases don't exercise. (review nit #5)
+func TestCall156_AC1_CoreGroupClusterNode(t *testing.T) {
+	h := newCallHandlerWithScope(fakeScopeResolver(false /*cluster*/, nil, nil))
+
+	got, err := uriFor(h, http.MethodGet,
+		"/call?apiVersion=v1&resource=nodes&name=node-1")
+	if err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+	want := "/api/v1/nodes/node-1"
+	if got != want {
+		t.Fatalf("core-group cluster GET URI = %q, want %q", got, want)
+	}
+	if strings.Contains(got, "namespaces/") || strings.Contains(got, "/apis/") {
+		t.Fatalf("core-group cluster URI %q must use /api/v1 with no namespaces/ or /apis/ prefix", got)
+	}
+}
+
 // --- AC-2: cluster POST (no name), PATCH+DELETE (with name) -----------------
 
 func TestCall156_AC2_ClusterWriteVerbs(t *testing.T) {

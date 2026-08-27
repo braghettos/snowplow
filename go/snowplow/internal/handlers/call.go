@@ -41,6 +41,10 @@ func Call() http.Handler {
 		// (dynamic.SharedSAScopeForGVR) — no rc threading through main.go's
 		// ~6 Call() mounts. Tests inject a fake via CallWithScopeResolver /
 		// the export_test seam so hermetic cases never touch a real mapper.
+		// The SA mapper is warmed at boot (Phase 1) and memoized, so a
+		// cluster-scoped /call inherits that warmup; only a boot-window first
+		// namespace-absent call can pay discovery synchronously, and it is
+		// self-healing (CRD add/update/delete invalidates via mapper.Reset()).
 		scopeResolver: dynamic.SharedSAScopeForGVR,
 	}
 }
@@ -71,7 +75,7 @@ type callHandler struct {
 // @Param  apiVersion       query   string  true  "Resource API Group and Version"
 // @Param  resource         query   string  true  "Resource Plural"
 // @Param  name             query   string  true  "Resource name"
-// @Param  namespace        query   string  true  "Resource namespace"
+// @Param  namespace        query   string  false "Resource namespace (required for namespaced resources; omit for cluster-scoped, e.g. ClusterRole/Node — issue #156)"
 // @Param  page             query   string  false "Pagination desired page"
 // @Param  perPage          query   string  false "Pagination desired per page items"
 // @Param  extras           query   string  false "JSON encoded map of extra params"

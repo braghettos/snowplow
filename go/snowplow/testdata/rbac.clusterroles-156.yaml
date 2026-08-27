@@ -9,6 +9,14 @@
 # access, so a `devs` user hitting a ClusterRole GET is 403'd by the
 # apiserver — the "user WITHOUT cluster RBAC" arm, a REAL apiserver 403,
 # not a snowplow-side block.
+#
+# Trivy KSV-0111 (bind to cluster-admin) is INTENTIONAL here: this fixture
+# models a platform admin exercising the cluster-scoped RBAC-grant path, and
+# the cluster-admin `*` grant is what lets the create-ClusterRole call clear
+# the apiserver escalation check in the kind arm. It is test-only scaffolding,
+# never deployed. Scoped inline-ignore (not a global .trivyignore entry, so a
+# real deploy binding to cluster-admin would still be flagged).
+# trivy:ignore:KSV-0111
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
