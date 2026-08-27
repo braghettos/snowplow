@@ -73,6 +73,20 @@ func newTestWatcher(t *testing.T, seed ...runtime.Object) {
 
 	cache.SetGlobal(rw)
 	t.Cleanup(func() { cache.SetGlobal(nil) })
+
+	// Deterministically publish the typed RBAC snapshot before returning.
+	// NewResourceWatcher publishes the FIRST snapshot from an ASYNC goroutine
+	// (waitAndPublishInitialRBACSnapshot) that races WaitForCacheSync's
+	// informer-HasSynced signal: HasSynced can fire before that goroutine has
+	// run rebuildRBACSnapshot + rbacSnap.Store. Without forcing it here,
+	// EvaluateRBAC may observe rbacSnap.Load()==nil and degrade-to-deny
+	// ("snapshot not yet published — denying"), flaking ANY test in this
+	// package under CI load (the -p1 + parallel-workflow contention delays the
+	// publish goroutine). Mirrors what f3_convergence / snapshot_authz_memo
+	// already do by hand — centralised in the shared harness so no future test
+	// can reintroduce the race. Idempotent + synchronous; production's async
+	// publish path is unchanged (this is a test-only seam).
+	cache.RebuildRBACSnapshotForTest(rw)
 }
 
 func clusterRole(name string, rules ...rbacv1.PolicyRule) *rbacv1.ClusterRole {
