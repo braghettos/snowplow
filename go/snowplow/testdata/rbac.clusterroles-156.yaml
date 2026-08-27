@@ -1,0 +1,24 @@
+# Issue #156 kind arm — RBAC scaffolding for the /call cluster-scoped
+# read+write end-to-end test (AC-4 / AC-5).
+#
+# The `cluster-admins` group is bound to the built-in cluster-admin
+# ClusterRole so a user in that group can CREATE and GET ClusterRoles via
+# /call (create-ClusterRole is subject to the apiserver escalation check;
+# cluster-admin holds `*` so it passes). The pre-existing `devs` group
+# (rbac.restactions.yaml) is NOT granted any rbac.authorization.k8s.io
+# access, so a `devs` user hitting a ClusterRole GET is 403'd by the
+# apiserver — the "user WITHOUT cluster RBAC" arm, a REAL apiserver 403,
+# not a snowplow-side block.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: issue156-cluster-admins
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: Group
+  name: cluster-admins
+  apiGroup: rbac.authorization.k8s.io
