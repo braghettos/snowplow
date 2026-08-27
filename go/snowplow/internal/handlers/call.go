@@ -24,6 +24,7 @@ import (
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/ptr"
 	"github.com/krateo-platformops/snowplow/internal/cache"
+	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/handlers/util"
 	"github.com/krateo-platformops/snowplow/internal/support/audit"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -34,14 +35,38 @@ func Call() http.Handler {
 	return &callHandler{
 		authnNS: env.String("AUTHN_NAMESPACE", ""),
 		verbose: env.True("DEBUG"),
+		// Issue #156: scope resolution is consulted ONLY when a /call
+		// request omits `namespace` (a 400 today). The default backs the
+		// resolver with the process-wide SA discovery singleton
+		// (dynamic.SharedSAScopeForGVR) — no rc threading through main.go's
+		// ~6 Call() mounts. Tests inject a fake via CallWithScopeResolver /
+		// the export_test seam so hermetic cases never touch a real mapper.
+		// The SA mapper is warmed at boot (Phase 1) and memoized, so a
+		// cluster-scoped /call inherits that warmup; only a boot-window first
+		// namespace-absent call can pay discovery synchronously, and it is
+		// self-healing (CRD add/update/delete invalidates via mapper.Reset()).
+		scopeResolver: dynamic.SharedSAScopeForGVR,
 	}
 }
 
 var _ http.Handler = (*callHandler)(nil)
 
+// scopeResolverFn resolves whether a GVR is namespace-scoped. It returns
+// namespaced=true for a namespaced resource, false for a cluster-scoped
+// one, and a non-nil error when scope cannot be determined (unknown GVR,
+// mapper not synced). The /call handler FAILS-CLOSED (400) on error — it
+// NEVER guesses a scope on a write path.
+type scopeResolverFn func(gvr schema.GroupVersionResource) (namespaced bool, err error)
+
 type callHandler struct {
 	authnNS string
 	verbose bool
+	// scopeResolver is consulted ONLY on the namespace-absent branch of
+	// validateRequest (Issue #156). The namespace-present path is
+	// byte-identical to pre-#156 behaviour and NEVER calls this — so a
+	// cold/erroring resolver can never regress a currently-working
+	// namespaced request.
+	scopeResolver scopeResolverFn
 }
 
 // @Summary Call Endpoint
@@ -50,7 +75,7 @@ type callHandler struct {
 // @Param  apiVersion       query   string  true  "Resource API Group and Version"
 // @Param  resource         query   string  true  "Resource Plural"
 // @Param  name             query   string  true  "Resource name"
-// @Param  namespace        query   string  true  "Resource namespace"
+// @Param  namespace        query   string  false "Resource namespace (required for namespaced resources; omit for cluster-scoped, e.g. ClusterRole/Node — issue #156)"
 // @Param  page             query   string  false "Pagination desired page"
 // @Param  perPage          query   string  false "Pagination desired per page items"
 // @Param  extras           query   string  false "JSON encoded map of extra params"
@@ -183,9 +208,61 @@ func (r *callHandler) validateRequest(req *http.Request) (opts callOptions, err 
 		return
 	}
 
-	opts.nsn, err = util.ParseNamespacedName(req)
-	if err != nil {
-		return
+	// Issue #156 — scope-aware validation. We must NOT call the shared
+	// util.ParseNamespacedName here: it hard-rejects an empty `namespace`
+	// before scope is known (nsn.go:18), which is exactly the
+	// cluster-scoped write we now want to serve. Read name/namespace
+	// directly and apply the /call-LOCAL rule below. (util.ParseNamespacedName
+	// stays byte-unchanged for its other prod caller, dispatchers/helpers.go:38.)
+	name := req.URL.Query().Get("name")
+	namespace := req.URL.Query().Get("namespace")
+
+	if namespace != "" {
+		// namespace PRESENT → today's namespaced path, BYTE-IDENTICAL, and
+		// we deliberately do NOT consult the scope mapper: a namespaced
+		// write must not gain a boot-window / discovery-lag failure mode.
+		// Preserve the exact pre-#156 name-required check (nsn.go:12-14):
+		// util.ParseNamespacedName required a non-empty name for EVERY
+		// verb, so keep that (POST-without-name 400s today → still 400s).
+		if name == "" {
+			err = fmt.Errorf("missing 'name' query parameter")
+			return
+		}
+		opts.namespaced = true
+		opts.nsn = types.NamespacedName{Name: name, Namespace: namespace}
+	} else {
+		// namespace ABSENT → this 400s today (util.ParseNamespacedName
+		// rejects the empty namespace). NOW resolve scope: only take the
+		// new cluster-scoped path on a POSITIVE cluster-scope. Everything
+		// else (namespaced GVR, mapper miss/error/unknown) FAILS-CLOSED
+		// with a 400 — exactly as /call returns today — never a silent
+		// namespaced fallback and never a panic.
+		var namespaced bool
+		namespaced, err = r.resolveScope(opts.gvr)
+		if err != nil {
+			// Scope unknown (CRD not yet discovered, mapper not synced,
+			// ambiguous resource). Fail-closed: 400, same family as today's
+			// missing-namespace 400. Forces a retry once discovery settles.
+			err = fmt.Errorf("unable to resolve scope for resource %q (namespace omitted): %w", opts.gvr.Resource, err)
+			return
+		}
+		if namespaced {
+			// Genuinely namespaced GVR but no namespace supplied →
+			// backward-compatible 400 (byte-identical intent to today's
+			// missing-'namespace' rejection).
+			err = fmt.Errorf("missing 'namespace' query parameter")
+			return
+		}
+		// cluster-scoped GVR → the new capability. name is required for
+		// by-name verbs (GET/PUT/PATCH/DELETE); POST create may omit it
+		// (apiserver assigns / uses metadata.name in the body). buildURIPath
+		// omits the namespaces/<ns> segment when namespaced==false.
+		if name == "" && has([]string{http.MethodGet, http.MethodPut, http.MethodPatch, http.MethodDelete}, opts.verb) {
+			err = fmt.Errorf("missing 'name' query parameter")
+			return
+		}
+		opts.namespaced = false
+		opts.nsn = types.NamespacedName{Name: name} // Namespace deliberately empty
 	}
 
 	if val := req.URL.Query().Get("perPage"); val != "" {
@@ -212,6 +289,18 @@ func (r *callHandler) validateRequest(req *http.Request) (opts callOptions, err 
 	return
 }
 
+// resolveScope reports whether opts.gvr is namespace-scoped. It is called
+// ONLY on the namespace-absent branch of validateRequest (Issue #156). A
+// nil scopeResolver (a mis-constructed handler) is treated as scope-unknown
+// and fails-closed, never as "cluster" — so a wiring bug cannot silently
+// widen the URI.
+func (r *callHandler) resolveScope(gvr schema.GroupVersionResource) (namespaced bool, err error) {
+	if r.scopeResolver == nil {
+		return false, fmt.Errorf("scope resolver not configured")
+	}
+	return r.scopeResolver(gvr)
+}
+
 type callOptions struct {
 	gvr         schema.GroupVersionResource
 	nsn         types.NamespacedName
@@ -220,6 +309,12 @@ type callOptions struct {
 	perPage     int
 	page        int
 	dat         []byte
+	// namespaced records the resolved cluster scope of gvr (Issue #156).
+	// true  → emit the namespaces/<ns> URI segment (byte-identical to
+	//         pre-#156 behaviour; always the case when a namespace was
+	//         supplied).
+	// false → cluster-scoped: OMIT the namespaces/<ns> segment.
+	namespaced bool
 }
 
 func buildURIPath(opts callOptions) (string, error) {
@@ -228,8 +323,21 @@ func buildURIPath(opts callOptions) (string, error) {
 		base = path.Join("/api", opts.gvr.Version)
 	}
 
-	uriPath := path.Join(base, "namespaces", opts.nsn.Namespace, opts.gvr.Resource)
+	// Issue #156 — the ONLY scope-dependent difference is the
+	// namespaces/<ns> segment. namespaced==true reproduces today's path
+	// byte-for-byte; namespaced==false (a POSITIVE cluster scope resolved
+	// upstream) omits the segment → base/resource. The name-append block
+	// below is scope-independent and unchanged.
+	var uriPath string
+	if opts.namespaced {
+		uriPath = path.Join(base, "namespaces", opts.nsn.Namespace, opts.gvr.Resource)
+	} else {
+		uriPath = path.Join(base, opts.gvr.Resource)
+	}
 	if strings.EqualFold("namespaces", opts.gvr.Resource) {
+		// namespaces is itself cluster-scoped; either branch above yields
+		// base/resource for it, but keep this explicit special case for
+		// zero churn / backward-compat (harmless with the new branch).
 		uriPath = path.Join(base, opts.gvr.Resource)
 	}
 
