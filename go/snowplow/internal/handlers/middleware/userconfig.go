@@ -4,9 +4,10 @@
 //
 // PROVENANCE / UPSTREAM DRIFT MONITOR (AC-D3.1 + AC-D3.14).
 //   - Upstream module:  github.com/krateo-platformops/plumbing
-//   - Upstream version: v1.14.0 (pinned in go.mod; the tagged release of plumbing
-//     PR #21 — identical commit content to the pseudo-version it replaced, so no
-//     re-audit was needed for this re-pin)
+//   - Upstream version: v1.14.2 (pinned in go.mod). Bumped v1.14.0→v1.14.2 for the
+//     issue #160 jqutil json.Number encoder fix (plumbing PR #27/#28). Re-audited:
+//     the v1.14.0→v1.14.2 diff touches jqutil + crdgen + CI only — server/use/
+//     userconfig.go is UNCHANGED, so this verbatim mirror remains identical.
 //   - Upstream file:    server/use/userconfig.go
 //   - Upstream func:    use.UserConfig(keys jwtutil.KeySource, authnNS string)
 //                       func(http.Handler) http.Handler
@@ -71,7 +72,7 @@ import (
 // version drifts from this constant, `TestUserConfigMirror_PlumbingVersionPin`
 // fails and the operator must re-audit upstream
 // `server/use/userconfig.go` line-by-line before bumping this string.
-const PinnedPlumbingVersion = "v1.14.0"
+const PinnedPlumbingVersion = "v1.14.2"
 
 // UserConfig is the snowplow-local cache-aware sibling of plumbing's
 // `use.UserConfig`. Signature is byte-identical (same parameters,
