@@ -236,6 +236,13 @@ env:
   # false so prod emits cheap one-line JSON. Pairs with snowplow Fix 2b
   # (per-resolve success logs moved INFO->Debug).
   PRETTY_LOG: "false"
+  # Log floor (#163). snowplow INFO (~5 lines per /call) was ~54% of ALL cluster
+  # logs and dominated the otel_logs ClickHouse table, none of which the
+  # Observability views show (they render ERROR/WARN only). Default to WARN so
+  # prod is quiet at the source; ERROR/WARN + alerting/telemetry views are
+  # unaffected. Set to "info" (or DEBUG=true) to restore verbose logs for
+  # debugging. snowplow's binary default is "info"; this chart overrides to warn.
+  LOG_LEVEL: "warn"
   # Phase 1 informer-sync barrier bounds (snowplow Fix 1b).
   #   PHASE1_TIMEOUT_SECONDS  — absolute outer backstop for the whole
   #     Phase 1 warmup. #130 F3: RAISED 180->900 (the seed companion, TRACED).
