@@ -462,7 +462,10 @@ func (r *resolveRun) evalEndpointRef(ref *templates.Reference) (*templates.Refer
 func (r *resolveRun) collapseOrFanoutPlan(id string, apiCall *templates.API, ep endpoints.Endpoint, st *cache.PIPStageTiming) []httpcall.RequestOptions {
 	tmp := createRequestOptions(r.ctx, r.log, apiCall, r.dict)
 	if len(tmp) == 0 {
-		r.log.Warn("empty request options for http call", slog.Any("name", id))
+		// C-3 (a normal "continue" condition): an iterator stage evaluated to
+		// zero items, so there is nothing to call. Benign and per-resolve —
+		// DEBUG, not the WARN that dominates the healthy-cluster firehose.
+		r.log.Debug("empty request options for http call", slog.Any("name", id))
 		return tmp
 	}
 
@@ -1775,7 +1778,12 @@ func lazyRegisterInnerCallPaths(ctx context.Context, log *slog.Logger, opts []ht
 					if rcAny, ok := cache.InternalRESTConfigFromContext(ctx); ok {
 						if cfg, ok := rcAny.(*rest.Config); ok && cfg != nil {
 							if _, err := discoverGroupResourcesFn(ctx, cfg, grp); err != nil {
-								log.Warn("cache.discovery.group_resources_fetch_failed",
+								// Soft-fail: discovery is an optimization; the
+								// dispatch falls through to the apiserver and a
+								// subsequent walk retries. No operator action —
+								// cache-effectiveness is tracked by the
+								// apiserver_fallthrough metrics. DEBUG, not WARN.
+								log.Debug("cache.discovery.group_resources_fetch_failed",
 									slog.String("subsystem", "cache"),
 									slog.String("group", grp),
 									slog.Any("err", err),

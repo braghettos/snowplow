@@ -44,7 +44,10 @@ func createResourceReferencesFromTemplate(ctx context.Context, in *templatesv1.R
 	q, ok := jqutil.MaybeQuery(it)
 	if !ok || q == "" {
 		log := xcontext.Logger(ctx)
-		log.Warn("bad or empty iterator", slog.String("iterator", it))
+		// Iterator is optional (omitempty): an absent/non-jq value is the
+		// supported non-iterated mode — produce exactly one ResourceRef from
+		// the template. Not a fault; fires per-template — DEBUG, not WARN.
+		log.Debug("bad or empty iterator", slog.String("iterator", it))
 
 		all = make([]templatesv1.ResourceRef, 0, 1)
 		el := createResourceRef(in, ds)
@@ -65,7 +68,14 @@ func createResourceReferencesFromTemplate(ctx context.Context, in *templatesv1.R
 	}, action)
 	if err != nil {
 		log := xcontext.Logger(ctx)
-		log.Error("unable to execute iterator", slog.String("iterator", it), slog.Any("err", err))
+		if jqsupport.IsBenignNilIteration(err) {
+			// Iterator walked a null/absent upstream value → zero refs, exactly
+			// like an empty iterator. Data-dependent and benign — DEBUG, not the
+			// ERROR that would flood the WARN-floor firehose on a healthy cluster.
+			log.Debug("iterator yielded no items (nil upstream)", slog.String("iterator", it), slog.Any("err", err))
+		} else {
+			log.Error("unable to execute iterator", slog.String("iterator", it), slog.Any("err", err))
+		}
 	}
 
 	return
