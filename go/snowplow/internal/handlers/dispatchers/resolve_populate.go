@@ -273,7 +273,11 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// entry; TTL is the outer net) exactly as the stage-error gate does.
 	if extTouchedSink.Count() > 0 {
 		cache.BumpExternalSkippedPut()
-		log.Warn("resolveAndPopulateL1: re-resolve touched an external endpoint; declining to overwrite entry",
+		// Not a fault: a designed defense-in-depth decline (external data has no
+		// dep edge to invalidate it, so keep the prior entry; TTL is the outer
+		// net). Fires on every refresh of an external-touching entry — DEBUG.
+		// The BumpExternalSkippedPut counter carries the rate for operators.
+		log.Debug("resolveAndPopulateL1: re-resolve touched an external endpoint; declining to overwrite entry",
 			slog.String("subsystem", "cache"),
 			slog.String("key_hash", key),
 			slog.String("handler", inputs.CacheEntryClass),

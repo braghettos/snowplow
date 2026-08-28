@@ -48,7 +48,15 @@ func createRequestOptions(ctx context.Context, log *slog.Logger, in *templates.A
 
 	err := jqutil.ForEach(ctx, jqutil.EvalOptions{Query: it, Unquote: true, Data: dict}, action)
 	if err != nil {
-		log.Error("unable to execute iterator", slog.String("query", it), slog.Any("err", err))
+		if jqsupport.IsBenignNilIteration(err) {
+			// Iterator walked a null/absent upstream value → zero request
+			// options; the stage continues exactly as the empty-iterator case
+			// (C-3). Data-dependent and benign — DEBUG, not the ERROR that would
+			// flood the WARN-floor firehose on a healthy cluster.
+			log.Debug("iterator yielded no items (nil upstream)", slog.String("query", it), slog.Any("err", err))
+		} else {
+			log.Error("unable to execute iterator", slog.String("query", it), slog.Any("err", err))
+		}
 	}
 
 	return all
