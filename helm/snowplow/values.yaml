@@ -216,7 +216,10 @@ affinity: {}
 # via envFrom. Any value that should reach the snowplow process goes
 # here -- the container itself has no direct `env:` array.
 env:
-  DEBUG: "false"
+  # DEBUG dropped (#163): LOG_LEVEL below is the single verbosity knob. DEBUG is
+  # now only a DEPRECATED alias for LOG_LEVEL=debug; no need to set it here (with
+  # LOG_LEVEL=warn the default is already not-debug). Set LOG_LEVEL=debug for
+  # verbose logs + HTTP request tracing.
   BLIZZARD: "false"
   JQ_MODULES_PATH: /jq-modules
   # Go runtime: trigger proactive GC at 7 GiB so we stay under the

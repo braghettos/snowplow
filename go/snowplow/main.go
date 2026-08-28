@@ -115,7 +115,7 @@ func snowplowCORSOptions() cors.Options {
 // @description This the total new Krateo backend.
 // @BasePath /
 func main() {
-	debugOn := flag.Bool("debug", env.Bool("DEBUG", false), "enable or disable debug logs")
+	debugOn := flag.Bool("debug", env.Bool("DEBUG", false), "DEPRECATED: thin alias for --log-level=debug; use --log-level / LOG_LEVEL instead")
 	blizzardOn := flag.Bool("blizzard", env.Bool("BLIZZARD", false), "dump verbose output")
 	prettyLog := flag.Bool("pretty-log", env.Bool("PRETTY_LOG", true), "print a nice JSON formatted log")
 	logLevelFlag := flag.String("log-level", env.String("LOG_LEVEL", "info"),
@@ -185,19 +185,26 @@ func main() {
 	runtime.SetMutexProfileFraction(1)
 	runtime.SetBlockProfileRate(1)
 
-	os.Setenv("DEBUG", strconv.FormatBool(*debugOn))
-	os.Setenv("TRACE", strconv.FormatBool(*blizzardOn))
-	os.Setenv("AUTHN_NAMESPACE", *authnNS)
-	os.Setenv(jqsupport.EnvModulesPath, *jqModPath)
-
-	// Issue #163: the level floor is configurable via --log-level / LOG_LEVEL
-	// (default "info" → fully back-compatible). --debug / DEBUG=true still wins,
-	// forcing Debug. LOG_LEVEL=warn lets operators silence snowplow's INFO
-	// firehose (~54% of all cluster logs) at the source, with ERROR/WARN intact.
+	// LOG_LEVEL / --log-level (#163) is the SINGLE verbosity knob: it sets the
+	// slog level floor (debug|info|warn|error; default "info" → back-compatible;
+	// "warn" silences snowplow's INFO firehose — ~54% of all cluster logs — with
+	// ERROR/WARN intact). --debug / DEBUG=true is a DEPRECATED thin alias for
+	// LOG_LEVEL=debug: it forces Debug and nothing more.
 	logLevel := parseLogLevel(*logLevelFlag)
 	if *debugOn {
 		logLevel = slog.LevelDebug
 	}
+	// debugMode == "the effective level is Debug" (from LOG_LEVEL=debug OR the
+	// DEBUG alias) drives the debug-only diagnostics that previously keyed off
+	// DEBUG alone: plumbing's verbose HTTP request/response tracing (the
+	// env.True("DEBUG") reads at call.go + the dispatchers) and the startup env
+	// dump. Re-export it as the DEBUG env so those downstream readers observe it,
+	// so LOG_LEVEL=debug now enables the tracing exactly as DEBUG=true always did.
+	debugMode := logLevel == slog.LevelDebug
+	os.Setenv("DEBUG", strconv.FormatBool(debugMode))
+	os.Setenv("TRACE", strconv.FormatBool(*blizzardOn))
+	os.Setenv("AUTHN_NAMESPACE", *authnNS)
+	os.Setenv(jqsupport.EnvModulesPath, *jqModPath)
 
 	var lh slog.Handler
 	if *prettyLog {
@@ -221,7 +228,7 @@ func main() {
 	// dispatcher.call.complete log from per_call_log.go (0.30.171-debug)
 	// that uses slog.InfoContext(ctx, ...) and never appeared in pod logs.
 	slog.SetDefault(log)
-	if *debugOn {
+	if debugMode {
 		log.Debug("environment variables", slog.Any("env", os.Environ()))
 	}
 
