@@ -118,6 +118,8 @@ func main() {
 	debugOn := flag.Bool("debug", env.Bool("DEBUG", false), "enable or disable debug logs")
 	blizzardOn := flag.Bool("blizzard", env.Bool("BLIZZARD", false), "dump verbose output")
 	prettyLog := flag.Bool("pretty-log", env.Bool("PRETTY_LOG", true), "print a nice JSON formatted log")
+	logLevelFlag := flag.String("log-level", env.String("LOG_LEVEL", "info"),
+		"minimum log level: debug|info|warn|error (default info; --debug/DEBUG=true forces debug)")
 	port := flag.Int("port", env.ServicePort("PORT", 8081), "port to listen on")
 	authnNS := flag.String("authn-namespace", env.String("AUTHN_NAMESPACE", ""),
 		"krateo authn service clientconfig secrets namespace")
@@ -188,7 +190,11 @@ func main() {
 	os.Setenv("AUTHN_NAMESPACE", *authnNS)
 	os.Setenv(jqsupport.EnvModulesPath, *jqModPath)
 
-	logLevel := slog.LevelInfo
+	// Issue #163: the level floor is configurable via --log-level / LOG_LEVEL
+	// (default "info" → fully back-compatible). --debug / DEBUG=true still wins,
+	// forcing Debug. LOG_LEVEL=warn lets operators silence snowplow's INFO
+	// firehose (~54% of all cluster logs) at the source, with ERROR/WARN intact.
+	logLevel := parseLogLevel(*logLevelFlag)
 	if *debugOn {
 		logLevel = slog.LevelDebug
 	}
@@ -1292,6 +1298,24 @@ func main() {
 // only inside the !cache.Disabled() branch), not here.
 func resolvePrewarmRegisterDefault(raw string) bool {
 	return raw != "false"
+}
+
+// parseLogLevel maps a --log-level / LOG_LEVEL string to a slog.Level for the
+// handler's minimum floor (issue #163). Case- and whitespace-insensitive. Any
+// unrecognised value — including the empty string and the default "info" —
+// resolves to LevelInfo, so a typo never silences logs unexpectedly and the
+// default behaviour is byte-identical to pre-#163.
+func parseLogLevel(s string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 func splitCommaList(s string) []string {
