@@ -535,20 +535,18 @@ func dispatchViaInternalRESTConfig(ctx context.Context, call httpcall.RequestOpt
 	resultList.SetRemainingItemCount(nil)
 
 	// Falsifier event — proves the paged path executed (per
-	// feedback_falsifier_first_before_ship). WARN level so it is
-	// retained in pod logs at default verbosity; one event per served
-	// LIST, not per page (to keep the log volume bounded at scale).
+	// feedback_falsifier_first_before_ship). One event per served LIST,
+	// not per page (to keep the log volume bounded at scale).
 	//
-	// R2 — VERBOSITY NOTE (architect 0.30.250 review): WARN deliberately,
-	// NOT INFO. The pod ships with `DEBUG=false` by default which sets
-	// the slog handler level to INFO — at INFO this event would still
-	// fire, but a future log-volume-driven downgrade (e.g. raising the
-	// handler to WARN under high load) would silently lose the
-	// observability handle the ship relies on. WARN keeps the event
-	// available at every level the pod will ever ship with. The event
-	// fires once per served LIST so even at 50K-composition scale the
-	// volume is bounded by the /call rate, not the item count.
-	xcontext.Logger(ctx).Warn("internal_dispatch.paged_list.completed",
+	// LEVEL — DEBUG (#170). This is a success/completion event, not a
+	// fault. It fires once per served paged LIST, i.e. at the /call rate,
+	// which on a healthy portal at scale is ~253K/week — a firehose that
+	// drowns real warnings now that LOG_LEVEL=warn is the steady-state prod
+	// floor (#163). The old R2 note kept it at WARN to survive a floor
+	// raise, but LOG_LEVEL is now an explicit knob: this event stays fully
+	// visible (with its pages/items/total_ms fields) at LOG_LEVEL=debug when
+	// you actually need it, and the per-cell counters/metrics are unaffected.
+	xcontext.Logger(ctx).Debug("internal_dispatch.paged_list.completed",
 		slog.String("subsystem", "cache"),
 		slog.String("gvr", gvr.String()),
 		slog.String("namespace", namespace),

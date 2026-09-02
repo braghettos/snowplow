@@ -349,14 +349,22 @@ func RecordApiserverFallthrough(ctx context.Context, reason FallthroughReason, g
 	c.(*atomic.Uint64).Add(1)
 	fallthroughTotal.Add(1)
 
-	// 1%-sampled WARN — deterministic via mod 100 on a monotonic
+	// 1%-sampled DEBUG echo — deterministic via mod 100 on a monotonic
 	// counter. Allocation-free: the counter is package-level atomic.
 	// Two goroutines incrementing at the same tick both pass the gate
-	// — the duplicate WARN is informational only (PM-accepted as
-	// per the sampling spec — counter accuracy is per-cell, sampling
-	// is loose by design).
+	// — the duplicate line is informational only (counter accuracy is
+	// per-cell, sampling is loose by design).
+	//
+	// LEVEL — DEBUG (#170). The authoritative cache-effectiveness signal
+	// is the snowplow_apiserver_fallthrough_total / _cells expvar counters
+	// (updated unconditionally above); this sampled log is only a
+	// convenience echo of an already-exported metric. Even 1%-sampled it
+	// is ~14K/week at the WARN floor (#163), so it belongs at DEBUG — the
+	// counters remain the source of truth, and the echo stays available at
+	// LOG_LEVEL=debug. Consistent with the discovery soft-fail sibling
+	// (resolve.go: "apiserver_fallthrough metrics. DEBUG, not WARN.").
 	if fallthroughWarnSampleCounter.Add(1)%fallthroughWarnSampleEvery == 0 {
-		slog.Warn("apiserver_fallthrough",
+		slog.Debug("apiserver_fallthrough",
 			slog.String("subsystem", "cache"),
 			slog.String("path", scope.Path),
 			slog.String("gvr", gvr),
