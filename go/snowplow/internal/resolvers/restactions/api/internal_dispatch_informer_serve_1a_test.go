@@ -340,7 +340,10 @@ func TestServe1a_C1_NeverWorse_FallsThroughToLiveList(t *testing.T) {
 	}
 
 	var logBuf bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	// LevelDebug: internal_dispatch.paged_list.completed is a DEBUG event
+	// (#170) — capture it so the fall-through assertion below still verifies
+	// the live paged LIST completed (the level dropped WARN→DEBUG).
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	ctx := cache.WithInternalRESTConfig(context.Background(), rc)
 	ctx = cache.WithServeWatcher(ctx, rw)

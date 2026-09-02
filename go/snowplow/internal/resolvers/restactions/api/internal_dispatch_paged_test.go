@@ -240,7 +240,10 @@ func TestInternalRESTConfigDispatch_PagedList_FullWalk(t *testing.T) {
 	// Capture the WARN-level slog falsifier event by attaching a
 	// custom slog.Handler to the request context.
 	var logBuf bytes.Buffer
-	logHandler := slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})
+	// LevelDebug: internal_dispatch.paged_list.completed is a DEBUG event
+	// (#170) — capture it so the FALSIFIER-D assertion below still verifies
+	// the paged path fired (the level dropped WARN→DEBUG, the event did not).
+	logHandler := slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})
 	logger := slog.New(logHandler)
 
 	ctx := cache.WithInternalRESTConfig(context.Background(), rc)
@@ -345,13 +348,13 @@ func TestInternalRESTConfigDispatch_PagedList_FullWalk(t *testing.T) {
 			envelope.Metadata.Continue)
 	}
 
-	// FALSIFIER-D — the WARN-level slog falsifier event MUST fire ONCE,
+	// FALSIFIER-D — the DEBUG-level slog falsifier event MUST fire ONCE,
 	// carrying the expected pages / items / page_limit / total_ms.
 	logOut := logBuf.String()
 	if !strings.Contains(logOut, `"msg":"internal_dispatch.paged_list.completed"`) {
-		t.Fatalf("FALSIFIER-D FAIL: the WARN-level falsifier event "+
+		t.Fatalf("FALSIFIER-D FAIL: the DEBUG-level falsifier event "+
 			"`internal_dispatch.paged_list.completed` did NOT fire. "+
-			"A future code edit that drops the slog.Warn call would "+
+			"A future code edit that drops the slog.Debug call would "+
 			"silently regress the paged path's observability. Log "+
 			"buffer:\n%s", logOut)
 	}
