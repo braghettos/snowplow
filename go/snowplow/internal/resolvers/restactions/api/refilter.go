@@ -44,6 +44,73 @@ import (
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 )
 
+// uafReadVerbs is the closed set of Kubernetes RBAC verbs a userAccessFilter
+// may CHECK per object — A-4 (1.12.3). It is the runtime twin of the
+// XValidation bound on apis/templates/v1/core.go's API struct, and exists
+// because the CRD rule only guards CRs written THROUGH the apiserver after
+// 1.12.3: a CR admitted by an older schema, or written straight to etcd,
+// still reaches this code.
+//
+// WHY IT MUST BE BOUNDED. uaf.Verb is threaded verbatim into
+// rbac.EvaluateRBAC (evalSingle below). A userAccessFilter is by construction
+// a READ-path narrowing — it decides which items of a ServiceAccount-dispatched
+// list the requester is allowed to SEE. Checking a write verb inverts that
+// scope: `verb: create` keeps exactly the items the requester may CREATE, which
+// on a read path is neither a subset of nor a superset of what they may read.
+// A user holding a broad create grant and a narrow get grant would be SHOWN
+// objects they cannot read. Bounding the verb is the only way to keep the
+// filter's meaning ("what you may see") stable.
+//
+// Lower-case only, matching the RBAC evaluator's exact-match verb tables
+// (rbac/evaluate.go stringSliceMatches / nameSpecificVerbs) and the CEL rule.
+// Not a resource/path/user special-case (feedback_no_special_cases): a fixed,
+// mechanism-level verb vocabulary, uniform across every userAccessFilter.
+var uafReadVerbs = map[string]struct{}{
+	"get":   {},
+	"list":  {},
+	"watch": {},
+}
+
+// uafVerbIsRead reports whether verb is one of the read verbs a
+// userAccessFilter is allowed to check. Anything else (a write verb, a typo,
+// an upper-case "GET", the empty string) is NOT read and fails closed.
+func uafVerbIsRead(verb string) bool {
+	_, ok := uafReadVerbs[verb]
+	return ok
+}
+
+// uafVerbGuardFailsClosed is the shared A-4 runtime gate for BOTH refilter
+// entry points (applyUserAccessFilterOnPig — the live jsonHandlerCore callsite
+// — and its applyUserAccessFilter twin). It reports whether the caller must
+// drop every item, and emits the operator Warn exactly ONCE per RA/stage
+// evaluation, never per item: a non-read verb is a single authoring mistake in
+// one CR, so per-item logging would be pure noise on a 500-item list.
+//
+// Fail CLOSED rather than fall back to a read verb: silently rewriting
+// `create` to `get` would serve a filtered list the author never described,
+// and an operator would never learn the CR is wrong. An empty list plus a Warn
+// naming the offending verb is the diagnosable failure.
+func uafVerbGuardFailsClosed(log *slog.Logger, stageName string, uaf *templates.UserAccessFilterSpec) bool {
+	if uafVerbIsRead(uaf.Verb) {
+		return false
+	}
+	if log == nil {
+		// A missing logger must never turn the gate OFF — the drop decision is
+		// the security property, the Warn is only the operator's diagnostic.
+		// emitRefilterFalsifierFromHandler guards the same way.
+		return true
+	}
+	log.Warn("userAccessFilter: verb is not a read verb; dropping all items (fail-closed)",
+		slog.String("subsystem", "uaf"),
+		slog.String("api", stageName),
+		slog.String("verb", uaf.Verb),
+		slog.String("allowed", "get, list, watch (lower-case)"),
+		slog.String("effect", "every item dropped for this stage; a userAccessFilter narrows a READ path, so checking a write verb would keep the objects the requester may MUTATE — a scope inversion"),
+		slog.String("fix", "set userAccessFilter.verb to get, list or watch; CRs admitted from 1.12.3 onward are rejected by the CRD schema"),
+	)
+	return true
+}
+
 // refilterResult is the (kept, dropped, total) summary the resolver
 // logs as the per-call falsifier per plan §"Code-path falsifier":
 //   userAccessFilter.dispatch=service_account ... refilter_dropped=N refilter_kept=M evaluate_rbac_calls=K
@@ -77,6 +144,12 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 		return res
 	}
 	uaf := apiCall.UserAccessFilter
+
+	// A-4 runtime bound (1.12.3) — ONCE per stage, before any per-item work.
+	if uafVerbGuardFailsClosed(log, apiCall.Name, uaf) {
+		_ = setRefilteredEmpty(dict, apiCall.Name)
+		return res
+	}
 
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
@@ -600,6 +673,14 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 	res := refilterResult{}
 
 	if uaf == nil {
+		return res
+	}
+
+	// A-4 runtime bound (1.12.3) — ONCE per stage, before any per-item work.
+	// This is the LIVE production callsite (the applyUserAccessFilter twin above
+	// carries the identical guard so neither entry point can drift).
+	if uafVerbGuardFailsClosed(log, stageName, uaf) {
+		_ = setRefilteredEmpty(pig, stageName)
 		return res
 	}
 

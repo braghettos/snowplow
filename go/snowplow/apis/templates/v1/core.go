@@ -30,6 +30,30 @@ type Dependency struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.userAccessFilter) || !has(self.verb) || self.verb == '' || self.verb in ['GET', 'HEAD', 'get', 'head']",message="userAccessFilter is only allowed on read-verb HTTP stages (GET/HEAD, case-insensitive); CRUD verbs would expose mutation under filter scope."
 // +kubebuilder:validation:XValidation:rule="!has(self.userAccessFilter) || !has(self.exportJwt) || !self.exportJwt",message="userAccessFilter stages MUST NOT have exportJwt: true; would leak the raw JWT through the user-facing filtered response."
 // +kubebuilder:validation:XValidation:rule="!has(self.userAccessFilter) || ((has(self.userAccessFilter.resource) && size(self.userAccessFilter.resource) > 0) || (has(self.userAccessFilter.resourcesFrom) && size(self.userAccessFilter.resourcesFrom) > 0)) && self.userAccessFilter.verb != ''",message="userAccessFilter must specify a non-empty verb and exactly one of resource or resourcesFrom; a degenerate filter would collapse the SubjectAccessReview check to a wildcard."
+//
+// A-4 (1.12.3) — READ-VERB BOUND on userAccessFilter.verb. Rule 1 above bounds
+// the enclosing HTTP STAGE verb; nothing bounded the RBAC verb the refilter
+// CHECKS per object. userAccessFilter.verb is threaded verbatim into
+// rbac.EvaluateRBAC (refilter.go evalSingle), so an author writing
+// `verb: create` makes the read path admit every object the requester may
+// CREATE — a scope inversion: the filter stops meaning "what you may see" and
+// starts meaning "what you may write". Author-controlled, hence defence in
+// depth, but the CRD is the right place to make it unwritable.
+//
+// LOWER-CASE ONLY, deliberately asymmetric with rule 1's case-insensitive
+// GET/HEAD. Rule 1 bounds an HTTP METHOD (conventionally upper-case on the
+// wire); this bounds a KUBERNETES RBAC VERB, and the evaluator matches it by
+// exact lower-case string equality against rule.Verbs (rbac/evaluate.go
+// stringSliceMatches / nameSpecificVerbs, both lower-case tables). An
+// upper-case "GET" would therefore match NO PolicyRule and silently deny every
+// item; rejecting it at admission surfaces the typo instead of shipping a
+// filter that returns an empty list forever. The CRD field doc already states
+// lower-case; this makes it enforceable.
+//
+// The runtime twin is uafVerbIsRead (refilter.go), which fails CLOSED on the
+// same set for any CR that predates this rule or was written directly to etcd.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.userAccessFilter) || self.userAccessFilter.verb in ['get', 'list', 'watch']",message="userAccessFilter.verb must be a READ verb (get, list or watch — lower-case, as the RBAC evaluator compares verbs by exact lower-case match); a write verb would admit every object the requester may MUTATE, inverting the filter's scope on a read path."
 type API struct {
 	// Name is a (unique) identifier
 	Name string `json:"name"`

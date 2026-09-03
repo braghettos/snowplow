@@ -74,6 +74,16 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	}
 	pcs.gvr = got.GVR.String()
 
+	// A-3 (1.12.3) — strip client-supplied identity extras the widget has not
+	// declared, ONCE, at the single point where the CR and the request extras
+	// first meet. Everything downstream (the key fold, widgets.Resolve, the
+	// inline-children embed, the F6 Put-guard) reads this sanitised map, so no
+	// consumer can be left holding the raw one. Key-inert by construction and a
+	// no-op for the identity-free and fully-declared corpora — see
+	// sanitizeUndeclaredIdentityExtras for why stripping the input beats
+	// declining the Put.
+	extras = sanitizeUndeclaredIdentityExtras(got.Unstructured.Object, extras)
+
 	log := xcontext.Logger(req.Context()).
 		With(
 			slog.Group("widget",

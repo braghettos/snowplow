@@ -10,13 +10,15 @@
 // verb-verbatim emit, the resourcesFrom fan-out, the dispatch-free property,
 // dedupe/sort, the unresolvable-stage fail-loud, and the endpointRef omission.
 //
-// The DECISIVE falsifier #1 (admission ACCEPTS a free-form verb like
-// `deletecollection`) round-trips through REAL CEL admission and therefore
-// lives in inspect_integration_test.go (kind). The unit-level companion here
-// (TestInspect_UAFVerbVerbatim_FreeFormVerb) proves the EMIT half — that a
-// hand-built UAF with verb=deletecollection produces the verb verbatim — so a
-// regression in the emit is caught fast without a cluster; the integration
-// test adds the admission-accepts-it half the unit test cannot.
+// A-4 (1.12.3) RETARGET. Falsifier #1 originally used `deletecollection` to
+// show that admission accepted a FREE-FORM UAF verb and that InspectReadSet
+// emitted it verbatim. A-4 bounds userAccessFilter.verb to get/list/watch, so
+// that premise is now deliberately false and the integration companion asserts
+// the REJECTION instead. The property this unit arm actually pins — the emit is
+// the UAF's OWN verb, not a hardcoded `get` — is unchanged and still
+// discriminating, so the fixture moves to `watch`: an ADMISSIBLE read verb that
+// is still different from `get` and from the `list` a plain collection stage
+// emits. A get-only or verb-less emit still fails it.
 
 package api
 
@@ -121,11 +123,12 @@ func findRow(rows []Resource, group, resource, verb string) (Resource, bool) {
 	return Resource{}, false
 }
 
-// Falsifier #1 (EMIT half) — a UAF stage with a free-form verb
-// (deletecollection) on namespaces emits exactly
-// {group:"", resource:"namespaces", verb:"deletecollection"}. A verb-less or
-// get-only emit FAILS. (The admission-accepts-it half is the integration test.)
-func TestInspect_UAFVerbVerbatim_FreeFormVerb(t *testing.T) {
+// Falsifier #1 (EMIT half) — a UAF stage whose verb is `watch` on namespaces
+// emits exactly {group:"", resource:"namespaces", verb:"watch"}. A verb-less or
+// get-only emit FAILS, which is the regression this arm exists to catch.
+// (The admission half is the integration test; since A-4 it asserts that a
+// NON-read verb is REJECTED.)
+func TestInspect_UAFVerbVerbatim_ReadVerbNotHardcodedGet(t *testing.T) {
 	withInspectSARESTConfig(t, fakeDiscoveryServer(t))
 
 	ra := &templates.RESTAction{
@@ -135,7 +138,7 @@ func TestInspect_UAFVerbVerbatim_FreeFormVerb(t *testing.T) {
 					Name: "ns",
 					Path: "/api/v1/namespaces",
 					UserAccessFilter: &templates.UserAccessFilterSpec{
-						Verb:     "deletecollection",
+						Verb:     "watch",
 						Group:    "",
 						Resource: "namespaces",
 					},
@@ -151,15 +154,15 @@ func TestInspect_UAFVerbVerbatim_FreeFormVerb(t *testing.T) {
 	if len(unresolved) != 0 {
 		t.Fatalf("expected zero unresolved stages, got %+v", unresolved)
 	}
-	row, ok := findRow(rows, "", "namespaces", "deletecollection")
+	row, ok := findRow(rows, "", "namespaces", "watch")
 	if !ok {
 		t.Fatalf("FALSIFIER #1 FAIL: read-set missing {group:\"\", resource:\"namespaces\", "+
-			"verb:\"deletecollection\"} — a verb-less or get-only emit would UNDER-GRANT the "+
+			"verb:\"watch\"} — a verb-less or get-only emit would UNDER-GRANT the "+
 			"UAF stage at the first /call. got rows=%+v", rows)
 	}
-	if row.Verb != "deletecollection" {
+	if row.Verb != "watch" {
 		t.Fatalf("FALSIFIER #1 FAIL: UAF row verb must be the UAF's own verb verbatim "+
-			"(deletecollection), got %q", row.Verb)
+			"(watch), got %q", row.Verb)
 	}
 	if row.Version != "" {
 		t.Fatalf("Q1: UAF rows are version-less (the SAR check is version-less); "+

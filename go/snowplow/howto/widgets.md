@@ -175,7 +175,11 @@ correctly but its result is *not* written to the shared cache
 (`effectiveKeyExtras` / `requestExtrasFullyDeclared`,
 `internal/handlers/dispatchers/helpers.go`). A widget whose output genuinely
 varies on an extras key **must declare it in `spec.keyExtras`**, or a shared
-cached body may be served across requests with different extras. See
+cached body may be served across requests with different extras. A
+client-supplied identity extra (`username`, `groups`, `displayName`) is
+stripped before the resolve unless the widget declares it in
+`spec.identityContext` or `spec.keyExtras`, so identity-dependent output
+**must declare `spec.identityContext`**. See
 [`extras.md`](extras.md) and the [caching](../docs/architecture/caching.md)
 deep-dive.
 
