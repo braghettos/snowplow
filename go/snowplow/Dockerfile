@@ -22,7 +22,7 @@ RUN go mod download
 COPY apis/ apis/
 COPY docs/ docs/
 COPY internal/ internal/
-COPY main.go main.go
+COPY *.go ./
 
 # Get the current commit hash
 ARG COMMIT_HASH
