@@ -13,10 +13,14 @@
 // and that widgets cell served 298,064 hits against 365 misses over 5d7h. It is
 // THE hot carrier; gating only the RA was gating the cold path.
 //
-// The same argument covers a subtler restactions case the declaration gate also
-// misses: a NON-UAF RESTAction that NESTS a UAF one. Its own spec declares no
+// A subtler case has the same shape and is NOT yet closed on this branch: a
+// NON-UAF RESTAction that NESTS a UAF one. Its own spec declares no
 // userAccessFilter, but its resolved body still contains per-requester-narrowed
-// rows.
+// rows. The sink is the right MECHANISM for it — but only once something bumps
+// it on that path, and the declaration bump present here inspects the PARENT,
+// which declares nothing. That case is closed by the refilter bump described
+// below, and is RED until it merges
+// (TestM1_NestedUAFChild_NoCellPut_RequiresRefilterBump).
 //
 // THE MECHANISM (mirrors StageErrorSink / ExternalTouchedSink exactly — the
 // established idiom for "something happened DOWN the resolve that the Put site

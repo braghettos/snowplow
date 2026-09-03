@@ -295,11 +295,16 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// sink — both gate the Put independently. nil-receiver-safe.
 	ctx, extTouchedSink := cache.WithExternalTouchedSink(ctx)
 	// 1.12.3 A-1 / R-1 — install the UAF-touched sink, third sibling of the two
-	// above. The refilter bumps it wherever it actually runs, however many
-	// resolver frames down; the Put-gate below reads Count()>0 and declines. This
-	// is what covers a NON-UAF RESTAction that NESTS a UAF one — its own spec
-	// declares no userAccessFilter, so the declaration limb of the gate is blind
-	// to it, but its resolved body still carries per-requester-narrowed rows.
+	// above. Whatever bumps it, wherever that happens and however many resolver
+	// frames down, the Put-gate below reads Count()>0 and declines.
+	//
+	// It is the mechanism INTENDED to cover a NON-UAF RESTAction that NESTS a UAF
+	// one — its own spec declares no userAccessFilter, so the declaration limb is
+	// blind to it, while its resolved body still carries per-requester-narrowed
+	// rows. That case is NOT closed on this branch: the only bump today is
+	// declaration-based (apiref.Resolve) and inspects the parent. It closes with
+	// the refilter bump on fix/1.12.3-authz-hardening; until then
+	// TestM1_NestedUAFChild_NoCellPut_RequiresRefilterBump is RED by design.
 	ctx, uafTouchedSink := cache.WithUAFTouchedSink(ctx)
 	res, err := restactionsResolveFn(ctx, restactions.ResolveOptions{
 		In:      &cr,

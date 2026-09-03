@@ -378,15 +378,38 @@ func TestA1_DeclineUAFPut_PredicateAndCounter(t *testing.T) {
 		t.Fatalf("the counter must tick on the decline itself (one tick per skipped Put); got %d", got)
 	}
 
-	// LIMB 2 — the OBSERVED refilter (R-1). This is the limb that covers the
-	// widgets carrier and the nested-RA case, where the entry's own Inputs carry
-	// NO HasUAF because the declaration lives frames below. A gate that only read
-	// HasUAF would pass this and leave the hot carrier open.
+	// LIMB 2 — the OBSERVED refilter (R-1), CONSUMER SIDE ONLY.
+	//
+	// SCOPE, stated precisely because the first version of this comment overstated
+	// it (and overstated coverage is the R-1 failure class itself): the sink is
+	// HAND-BUMPED here, so what this proves is exactly one implication —
+	//
+	//     Count() > 0  ⇒  the gate declines, even with HasUAF false
+	//
+	// That is the CONSUMER question. It says nothing about the PRODUCER question,
+	// "does anything in production actually make Count() > 0 for a given shape?",
+	// which is where the real coverage lives and where the limbs differ:
+	//
+	//   - WIDGETS CARRIER (R-1): producer coverage is real on this branch —
+	//     apiref.Resolve's declaration bump fires because the apiRef'd RA itself
+	//     declares the filter. Proven end-to-end by
+	//     TestR2_UAFCrossUser_WidgetNoSharedCellServe.
+	//   - NESTED-RA CHAIN (a non-UAF parent whose inner step consumes a UAF
+	//     child): NOT covered on this branch. No production bump fires — the
+	//     declaration bump inspects the PARENT, which declares nothing. Producer
+	//     coverage arrives with the refilter bump on fix/1.12.3-authz-hardening.
+	//     TestM1_NestedUAFChild_NoCellPut_RequiresRefilterBump is that arm; it is
+	//     RED here BY DESIGN and green on the assembled tree.
+	//
+	// So: this asserts the gate consumes the sink. It does not assert the nested
+	// chain is closed, and must not be cited as if it did.
 	_, sink := cache.WithUAFTouchedSink(context.Background())
 	sink.Bump()
 	if !declineUAFPut(&cache.ResolvedKeyInputs{CacheEntryClass: "restactions" /* HasUAF false */}, sink) {
-		t.Fatal("R-1: an entry whose resolve OBSERVED a refilter MUST be declined even though its own Inputs declare no UAF — " +
-			"this is the limb that covers the widget carrier and a non-UAF RA that nests a UAF one")
+		t.Fatal("R-1 consumer side: an entry whose resolve OBSERVED a refilter MUST be declined even though its own " +
+			"Inputs declare no UAF. This is the implication the widgets carrier depends on; whether a given shape " +
+			"actually bumps the sink is the producer question, covered by TestR2_... (widgets, closed here) and " +
+			"TestM1_... (nested chain, closed only once the authz refilter bump merges).")
 	}
 	if got := cache.RestactionsUAFPutDeclined(); got != 2 {
 		t.Fatalf("the observed-refilter decline must tick the counter too; got %d", got)
