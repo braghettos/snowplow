@@ -30,6 +30,31 @@ type Dependency struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.userAccessFilter) || !has(self.verb) || self.verb == '' || self.verb in ['GET', 'HEAD', 'get', 'head']",message="userAccessFilter is only allowed on read-verb HTTP stages (GET/HEAD, case-insensitive); CRUD verbs would expose mutation under filter scope."
 // +kubebuilder:validation:XValidation:rule="!has(self.userAccessFilter) || !has(self.exportJwt) || !self.exportJwt",message="userAccessFilter stages MUST NOT have exportJwt: true; would leak the raw JWT through the user-facing filtered response."
 // +kubebuilder:validation:XValidation:rule="!has(self.userAccessFilter) || ((has(self.userAccessFilter.resource) && size(self.userAccessFilter.resource) > 0) || (has(self.userAccessFilter.resourcesFrom) && size(self.userAccessFilter.resourcesFrom) > 0)) && self.userAccessFilter.verb != ''",message="userAccessFilter must specify a non-empty verb and exactly one of resource or resourcesFrom; a degenerate filter would collapse the SubjectAccessReview check to a wildcard."
+//
+// A-4 (1.12.3) — THERE IS DELIBERATELY NO FOURTH RULE BOUNDING
+// userAccessFilter.verb. Do not add one; it was tried and reverted.
+//
+// The temptation is obvious: uaf.Verb is threaded verbatim into
+// rbac.EvaluateRBAC (refilter.go evalSingle), so `verb: create` on a stage that
+// returns objects of the SAME resource keeps the objects the caller may WRITE
+// rather than the ones they may read — a scope inversion. But a blanket
+// `verb in ['get','list','watch']` rule is too coarse: three LIVE portal
+// RESTActions (testdata/portal_uaf_corpus.yaml, portal @ b2a558d) use
+// `verb: create` legitimately. Their api-step returns NAMESPACES and the filter
+// checks create on a DIFFERENT resource, so it answers "which namespaces may I
+// create X in" — a form picker that discloses nothing the caller cannot
+// already determine about their own grants. The rule would have failed the
+// portal upgrade and silently emptied three namespace pickers.
+//
+// The real invariant is narrower — SAME-RESOURCE — and it needs the resource
+// the api-step RETURNS, which CEL on this struct cannot derive (the path may be
+// jq-templated). So it lives at runtime: refilter.go carries uafVerbIsRead as a
+// WARN-ONLY signal in 1.12.3, and 1.13.0 flips it to enforce the same-resource
+// rule, failing OPEN on templated paths. See the 1.13.0 note there.
+//
+// TestA4_PortalCorpus_CreateVerbUAFs_Admitted and
+// TestA4_UAFVerbBound_NotReintroduced (uaf_verb_cel_test.go) fail if the rule
+// comes back, and name the three portal files it would break.
 type API struct {
 	// Name is a (unique) identifier
 	Name string `json:"name"`

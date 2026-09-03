@@ -82,6 +82,56 @@ func Resolve(ctx context.Context, opts ResolveOptions) (*Widget, error) {
 	// cache-on vs cache-off for the same JWT. INERT for the ~99% identity-free
 	// corpus: DeclaredIdentity returns nil when no identityContext is declared →
 	// opts.Extras is untouched → byte-identical to pre-A2.
+	// A-3 (1.12.3) — STRIP client-supplied identity extras this widget has not
+	// declared, BEFORE the injection merge below and before mergeExtras puts the
+	// extras in the jq dict.
+	//
+	// THE DEFECT. Identity keys are dropped from the widget CACHE KEY unless
+	// declared, which is correct — but nothing stopped them reaching the RESOLVE
+	// INPUT. For a widget declaring neither spec.identityContext nor
+	// spec.keyExtras, DeclaredIdentity below returns nil (no injection fires), so
+	// a request sending ?extras={"username":"evil"} had its own value merged into
+	// the dict by mergeExtras and rendered into the body. Because the key ignores
+	// identity, that body is then written into the per-BindingUID cell EVERY
+	// co-cohort member reads. The identity dimension partitions the KEY; it never
+	// sanitised the BODY, and the two were conflated.
+	//
+	// WHY HERE AND NOT AT THE DISPATCHER. Every caller must get the same
+	// contract: the /call dispatcher, the refresher's re-resolve, the boot/keepwarm
+	// seed and nested resolves all reach this function, and a fix at one call site
+	// leaves the others holding the raw map. This is the same single-derivation
+	// discipline DeclaredIdentity itself follows (the #64 anti-drift principle) —
+	// identity meets the resolve input in exactly one place.
+	//
+	// WHAT SURVIVES, and why each is safe:
+	//   - declared in spec.identityContext — DeclaredIdentity OVERWRITES it
+	//     server-side a few lines below (injection-wins, F-ARCH-3), so the client
+	//     value is discarded anyway and the body is trustworthy.
+	//   - declared in spec.keyExtras — the author asked for it to PARTITION the
+	//     key, so a spoofed value SELF-QUARANTINES: it lands in a cell that only
+	//     requests carrying that same value can ever reach, and no co-cohort user
+	//     sending a different value (or none) is exposed to it. This is the
+	//     pre-F6 self-quarantine, still intact for declared keys. It also keeps
+	//     the live widgets that declare username in keyExtras working unchanged.
+	//
+	// Note the asymmetry the two accessors give us, which is deliberate:
+	// GetIdentityContext is enum-filtered to {username, groups}, so displayName
+	// can never be declared THERE; GetKeyExtras is NOT enum-filtered, so a widget
+	// CAN declare displayName as a key extra and have it survive. That is the
+	// hidden dependency between the two accessors, pinned by
+	// TestA3_DisplayNameInKeyExtras_SurvivesAndPartitions.
+	//
+	// Non-identity extras are untouched: an undeclared `foo` still reaches the
+	// resolve input (the deliberate KEY-ONLY split, dispatchers
+	// f6_resolve_input_reach_test.go L12) and is still quarantined at the Put by
+	// requestExtrasFullyDeclared.
+	//
+	// KEY-INERT. This cannot move any cache key: the dispatcher folds request
+	// extras through filterDeclaredKeyExtras, which keeps ONLY
+	// spec.keyExtras-declared names, and every key stripped here is by
+	// construction outside that set.
+	opts.Extras = sanitizeUndeclaredIdentityExtras(opts.In.Object, opts.Extras)
+
 	if inj := DeclaredIdentity(ctx, opts.In.Object); len(inj) > 0 {
 		merged := make(map[string]any, len(opts.Extras)+len(inj))
 		for k, v := range opts.Extras {
@@ -403,6 +453,66 @@ func injectSlice(ds map[string]any, perPage, page int) {
 		"perPage": perPage,
 		"offset":  (page - 1) * perPage,
 	}
+}
+
+// sanitizeUndeclaredIdentityExtras returns the request extras with
+// identity-dimension keys the widget has NOT declared removed. See the A-3 block
+// in Resolve for the full rationale.
+//
+// identityDimensionKeys is the closed set the frontend can put on the wire as
+// caller identity: buildExtrasParam sends username + displayName when
+// SNOWPLOW_IDENTITY_INJECTION is off, and groups is the other identityContext
+// enum value. It is a fixed, mechanism-level identity vocabulary — not a
+// widget-name/route table (feedback_no_special_cases) — and it is the same axis
+// DeclaredIdentity honours.
+//
+// Returns the input map UNCHANGED (no copy) when nothing needs stripping — the
+// overwhelmingly common path, so the identity-free and fully-declared corpora
+// pay one map walk and no allocation.
+var identityDimensionKeys = map[string]struct{}{
+	"username":    {},
+	"groups":      {},
+	"displayName": {},
+}
+
+func sanitizeUndeclaredIdentityExtras(cr map[string]any, requestExtras map[string]any) map[string]any {
+	if len(requestExtras) == 0 {
+		return requestExtras
+	}
+	// authoritative reports whether the widget has declared this key on either
+	// axis, i.e. whether its value is server-controlled (identityContext) or
+	// self-quarantining (keyExtras).
+	authoritative := func(k string) bool {
+		for _, d := range GetIdentityContext(cr) {
+			if d == k {
+				return true
+			}
+		}
+		for _, d := range GetKeyExtras(cr) {
+			if d == k {
+				return true
+			}
+		}
+		return false
+	}
+	strip := false
+	for k := range requestExtras {
+		if _, isIdentity := identityDimensionKeys[k]; isIdentity && !authoritative(k) {
+			strip = true
+			break
+		}
+	}
+	if !strip {
+		return requestExtras
+	}
+	out := make(map[string]any, len(requestExtras))
+	for k, v := range requestExtras {
+		if _, isIdentity := identityDimensionKeys[k]; isIdentity && !authoritative(k) {
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // mergeExtras folds the per-request extras into the resolved data source

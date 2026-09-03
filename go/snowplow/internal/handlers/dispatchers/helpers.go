@@ -414,31 +414,51 @@ func filterDeclaredKeyExtras(cr map[string]any, requestExtras map[string]any) ma
 // clean. Clean requests (no undeclared extras) and the declared corpus pay
 // nothing — only a request carrying extras the widget did NOT declare is quarantined.
 //
-// IDENTITY-DIMENSION EXEMPTION (1.7.11 fix — tester falsifier, west4 2026-07-14):
-// the guard must judge the SAME dimension the folder filters. The folder
-// (effectiveKeyExtras) partitions request extras on TWO independent axes — the
-// author-declared keyExtras (filterDeclaredKeyExtras) AND the A2/A6 IDENTITY axis
-// (declaredIdentityForKey: username/groups declared via spec.identityContext).
-// The guard originally checked ONLY keyExtras, so a widget carrying identity
-// extras on the wire — which the frontend's buildExtrasParam sends (username,
-// displayName) whenever SNOWPLOW_IDENTITY_INJECTION is off — was declined even
-// when its keyExtras request keys were all declared. That is spurious: identity
-// keys are NEVER a shared-cell body-pollution risk. The per-cohort `widgets` cell
-// is already BindingUID-keyed (per RBAC-identity cohort), and the identity-free
-// widgetContent cell is re-gated per-user at serve (gateWidgetEnvelope). A request
-// carrying username/displayName/groups cannot leak one user's body to another via
-// a shared cell — that is exactly what the identity dimension already guarantees.
-// So identity keys are EXEMPT from the quarantine: they may reach the Put without
-// declining, mirroring how the folder treats them (folded-if-declared, dropped-as-
-// identity otherwise). The quarantine still fires for a genuinely-undeclared,
-// BODY-affecting request key (the F6-6 `foo` case) — that is the only shared-cell
-// pollution the guard exists to stop.
+// IDENTITY-DIMENSION EXEMPTION — WHY IT IS SAFE (rewritten for A-3, 1.12.3).
+//
+// Identity keys (username / groups / displayName) are EXEMPT from this
+// quarantine. The 1.7.11 fix introduced the exemption for the right practical
+// reason and the wrong stated one, so here is the actual justification:
+//
+//	An identity key can only reach the resolve dict AT ALL if the widget
+//	DECLARES it — widgets.Resolve strips every undeclared identity key from
+//	opts.Extras before mergeExtras (sanitizeUndeclaredIdentityExtras,
+//	internal/resolvers/widgets/resolve.go). And a DECLARED one cannot pollute a
+//	shared cell either: declared in spec.identityContext means DeclaredIdentity
+//	overwrites it with the JWT's own value server-side, so it is not
+//	client-controlled; declared in spec.keyExtras means it PARTITIONS the key, so
+//	a spoofed value self-quarantines into a cell only that value can reach.
+//
+// So the exemption is now true BY CONSTRUCTION rather than by assertion. The
+// 1.7.11 comment claimed identity keys are "never a shared-cell body-pollution
+// risk" because the cell is BindingUID-keyed; that argued about the KEY
+// dimension and was simply false about the RESOLVE-INPUT dimension, which is the
+// A-3 defect. Do not restore that reasoning — restore the sanitiser if it ever
+// goes missing.
+//
+// WHAT THE 1.7.11 FIX WAS PROTECTING, and still is. The frontend's
+// buildExtrasParam sends identity keys (username, displayName) on the wire
+// whenever SNOWPLOW_IDENTITY_INJECTION is off. Without the exemption a declared
+// widget carrying them was judged "undeclared" and DECLINED every Put, so its
+// content was never cached and every revisit MISSed — the 14/14-same-key,
+// 0/14-hit west4 failure. Tightening this predicate to demand an
+// identityContext declaration reintroduces exactly that, and unfixably, because
+// GetIdentityContext is enum-filtered to {username, groups} so displayName can
+// never be declared. TestFARCH_F6_7_RevisitHit_IdentityExtrasExempt is the
+// regression guard; do not "fix" it by changing the test.
+//
+// The quarantine still fires for a genuinely-undeclared, BODY-affecting
+// NON-identity request key (the F6-6 `foo` case) — that is the only shared-cell
+// pollution this guard exists to stop, and the only one still reachable.
 //
 // identityDimensionKeys is the closed set the frontend can put on the wire as
 // identity (audit §1: buildExtrasParam sends username + displayName when not
 // injecting) plus groups (the other A2 identityContext enum value). Not a
 // widget-name/route table (feedback_no_special_cases) — a fixed, mechanism-level
-// identity vocabulary, the same axis DeclaredIdentity honors.
+// identity vocabulary, the same axis DeclaredIdentity honors. It is duplicated
+// (not shared) with the twin in internal/resolvers/widgets/resolve.go: the two
+// packages must not import each other, and both are pinned to the same three
+// keys by TestA3_IdentityVocabularyIsInSync.
 var identityDimensionKeys = map[string]struct{}{
 	"username":    {},
 	"groups":      {},

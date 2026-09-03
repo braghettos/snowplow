@@ -136,10 +136,23 @@ a deterministic `fmt.Sprintf("%v", …)` so the key still varies with content.
   Undeclared request extras still reach the resolve's jq dict unchanged —
   they affect the *body*, never the *key*. To keep that from polluting the
   shared per-cohort cell, a request carrying extras the widget did **not**
-  declare (identity keys exempt) is served its own correct body but the
-  result is **not written to the cache** (`requestExtrasFullyDeclared` — the
-  self-quarantine guard). A widget whose output genuinely varies on a request
-  extra **must declare that key in `spec.keyExtras`**.
+  declare is served its own correct body but the result is **not written to
+  the cache** (`requestExtrasFullyDeclared` — the self-quarantine guard). A
+  widget whose output genuinely varies on a request extra **must declare that
+  key in `spec.keyExtras`**.
+
+  Identity keys (`username`, `groups`, `displayName`) are handled one step
+  earlier and never reach the resolve dict unless the widget declares them.
+  A client-supplied identity extra is **stripped** inside `widgets.Resolve`
+  (`sanitizeUndeclaredIdentityExtras`), so every caller — the `/call` dispatcher,
+  the refresher, the boot seed and nested resolves — gets the same contract.
+  It survives only when the widget names that key in
+  `spec.identityContext` — where the server overwrites it with the JWT's own
+  value — or in `spec.keyExtras`, where it partitions the key. So a widget
+  whose output depends on the caller's identity **must declare it in
+  `spec.identityContext`**; reading `.username` from the request extras
+  yields nothing, because a value the client chose would otherwise shape a
+  body written into the cell its whole RBAC cohort reads.
 
   The same filtered union feeds all four key consumers — dispatch lookup,
   the shared `widgetContent` cell, subscription arming, and the boot/keepwarm

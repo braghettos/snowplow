@@ -82,6 +82,29 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 		return
 	}
 
+	// A-3 (1.12.3) — WHY THE RESTAction PATH NEEDS NO IDENTITY SANITISER, while
+	// the widget path does. This is a real structural difference, not an
+	// oversight, and not "someone else's file".
+	//
+	// The A-3 defect is specific to the F6 fold-nothing key. widgets.go routes
+	// request extras through effectiveKeyExtras → filterDeclaredKeyExtras, which
+	// DROPS every key the widget did not declare in spec.keyExtras. Dropping them
+	// from the key while still feeding them to the resolver is what lets one
+	// user's extras-shaped body land in a cell a co-cohort user reads.
+	//
+	// restactions.go never calls effectiveKeyExtras. The raw `extras` map folds
+	// straight into dispatchCacheLookupKey below (:172 / :180) AND into
+	// restactionsResolveFn's ResolveOptions (:303) — the SAME map on both sides.
+	// So every request extra, identity or not, PARTITIONS the restactions key:
+	// a request carrying extras.username=evil derives its own cell that only an
+	// identical request can ever reach, and a caller sending different extras (or
+	// none) simply misses it. That is the pre-F6 self-quarantine, which F6 removed
+	// for widgets and which was never removed here.
+	//
+	// If this path ever adopts a declared-key filter, it inherits the A-3 defect
+	// with it and needs the same sanitiser — widgets.Resolve's
+	// sanitizeUndeclaredIdentityExtras — applied to the resolve input.
+
 	got := fetchObjectFn(req)
 	if got.Err != nil {
 		response.Encode(wri, got.Err)
