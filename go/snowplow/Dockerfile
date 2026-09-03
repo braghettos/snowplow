@@ -28,7 +28,7 @@ COPY main.go main.go
 ARG COMMIT_HASH
 
 # Build
-RUN CGO_ENABLED=0 GO111MODULE=on go build -a -a -ldflags "-X main.Build=${COMMIT_HASH}" -o /bin/server ./main.go && \
+RUN CGO_ENABLED=0 GO111MODULE=on go build -a -a -ldflags "-X main.build=${COMMIT_HASH}" -o /bin/server . && \
     strip /bin/server
 
 # Deployment environment
