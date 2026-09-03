@@ -7,9 +7,28 @@
 // (a closed-enum-labelled counter + sampled WARN) that surfaces any
 // future regression where a request takes the apiserver-fall-through
 // lane. NO BEHAVIOUR CHANGE — `RecordApiserverFallthrough` is a
-// telemetry-only call invoked by Layer B (the instrumented wrappers
-// in fallthrough_wrappers.go); it never short-circuits, redirects, or
-// modifies an upstream request.
+// telemetry-only call invoked at the construction sites listed in the
+// 1.12.4 design §5.2; it never short-circuits, redirects, or modifies
+// an upstream request.
+//
+// 1.12.4 — TWO FAMILIES, TWO MAPS (design §5). The counter's own
+// definition is "a `/call`-class read that caused snowplow to issue a
+// request to the live Kubernetes apiserver". Six of the 21 reasons
+// contradict that in their own doc-comments (resolver-plurals-hit is
+// an in-process cache HIT; resolver-plurals-miss double-counts the hop
+// already counted by plurals-discovery-hop; widget-content-hit and
+// widget-content-miss-per-user-fallback are L1 serves;
+// cluster-list-dispatch records a SUCCESSFUL collapse). On the krateo-057
+// corpus they were 828,525 of the 936,320 headline count — 88.5% of the
+// number an operator reads as "the cache is not serving".
+//
+// Those six now land on a SEPARATE counter and a SEPARATE cell map
+// (`snowplow_cache_diagnostic_total` / `_cells`). Two maps, not one map
+// with two scalar totals: the acceptance requirement is that
+// `resolver-plurals-hit` is ABSENT from the fallthrough cells map, which
+// a shared map cannot satisfy. Membership of `diagnosticReasons` is the
+// ONLY thing that routes a Record* call, so a call site cannot mis-route
+// a reason.
 //
 // CARDINALITY DISCIPLINE — PM-tight. The labels are closed enums:
 //
@@ -269,19 +288,104 @@ var fallthroughCounters sync.Map
 // having to enumerate the cell map.
 var fallthroughTotal atomic.Uint64
 
-// FallthroughTotal returns the cumulative count of apiserver
+// diagnosticCounters / diagnosticTotal are the 1.12.4 second family
+// (design §5.4). Structurally identical to the pair above — a separate
+// sync.Map keyed by the SAME fallthroughKey struct plus its own
+// grand-total — so a diagnostic reason's cell is absent from
+// fallthroughCounters entirely rather than merely subtracted from a
+// shared scalar.
+var (
+	diagnosticCounters sync.Map
+	diagnosticTotal    atomic.Uint64
+)
+
+// diagnosticReasons is the closed set of reasons that are NOT apiserver
+// fall-throughs. Membership here is the ONLY thing that decides which
+// counter AND WHICH CELL MAP a Record* call lands on, so a new reason
+// cannot be mis-routed by a call site.
+//
+// Each entry is justified in design §5.2 by the reason's OWN
+// doc-comment above:
+//
+//   - ReasonResolverPluralsHit — an in-process cache HIT (built-in fast
+//     path or the permanent sync.Map store). Zero apiserver traffic.
+//   - ReasonResolverPluralsMiss — the underlying hop is ALREADY counted
+//     at plurals_resolver.go by ReasonPluralsDiscoveryHop. Counting it
+//     here too double-counts; the 057 corpus proves it (both cells read
+//     exactly 29).
+//   - ReasonWidgetContentHit — the Ship G content layer Get-HIT, served
+//     from L1.
+//   - ReasonWidgetContentMissPerUserFallback — falls through to the
+//     per-user L1 lookup, not to the apiserver.
+//   - ReasonClusterListDispatch — the collapse SUCCEEDED; its own
+//     comment says "NOT a fallthrough (the dispatch SUCCEEDED)".
+//   - ReasonClusterListShapeFallback — a judgement call, stated as such
+//     in design §5.2: the dispatcher reverts to the per-NS iterator
+//     path, which is itself informer-eligible. A degradation, not a
+//     proven apiserver hop. Impact on the 057 corpus is exactly 1 count.
+//
+// ReasonPluralsDiscoveryHop deliberately STAYS on the fallthrough
+// family: it is the actual discovery request.
+var diagnosticReasons = map[FallthroughReason]struct{}{
+	ReasonResolverPluralsHit:               {},
+	ReasonResolverPluralsMiss:              {},
+	ReasonWidgetContentHit:                 {},
+	ReasonWidgetContentMissPerUserFallback: {},
+	ReasonClusterListDispatch:              {},
+	ReasonClusterListShapeFallback:         {},
+}
+
+// IsDiagnosticReason reports whether reason is classified as a cache
+// DIAGNOSTIC (design §5.2) rather than a genuine apiserver
+// fall-through. Exported so the OTLP mirror and the structural
+// attribute-hygiene falsifier read the same single source of truth the
+// router reads, instead of a hand-copied list.
+func IsDiagnosticReason(reason FallthroughReason) bool {
+	_, ok := diagnosticReasons[reason]
+	return ok
+}
+
+// FallthroughTotal returns the cumulative count of GENUINE apiserver
 // fall-throughs observed by `RecordApiserverFallthrough` since process
 // start. Exported for the AC-D.5 test gate.
+//
+// 1.12.4: the six diagnostic reasons (see diagnosticReasons) no longer
+// contribute here; they are counted by DiagnosticTotal. On a corpus
+// comparable to krateo-057 this value drops ~8.7x. That drop is the
+// fix, not a cache regression — see howto/operating.md.
 func FallthroughTotal() uint64 {
 	return fallthroughTotal.Load()
 }
 
+// DiagnosticTotal returns the cumulative count of cache-DIAGNOSTIC
+// observations — the six reasons that reach no apiserver (design §5.2).
+// Mirrors FallthroughTotal for the second family.
+func DiagnosticTotal() uint64 {
+	return diagnosticTotal.Load()
+}
+
 // FallthroughCount returns the per-cell count for a (path, gvr,
-// reason) tuple, or 0 if the cell has never incremented. Used by tests
-// to assert per-label-tuple cardinality (e.g. F-3 ratify: the
-// `secret-get` reason cell is non-zero post-traffic).
+// reason) tuple in the GENUINE fall-through map, or 0 if the cell has
+// never incremented. Used by tests to assert per-label-tuple
+// cardinality (e.g. F-3 ratify: the `secret-get` reason cell is
+// non-zero post-traffic).
+//
+// A diagnostic reason ALWAYS returns 0 here — that absence is the
+// acceptance assertion of design §5.4 / F4.
 func FallthroughCount(path, gvr string, reason FallthroughReason) uint64 {
 	v, ok := fallthroughCounters.Load(fallthroughKey{path, gvr, reason})
+	if !ok {
+		return 0
+	}
+	c := v.(*atomic.Uint64)
+	return c.Load()
+}
+
+// CacheDiagnosticCount returns the per-cell count for a (path, gvr,
+// reason) tuple in the DIAGNOSTIC map, or 0 if the cell has never
+// incremented. Mirrors FallthroughCount for the second family.
+func CacheDiagnosticCount(path, gvr string, reason FallthroughReason) uint64 {
+	v, ok := diagnosticCounters.Load(fallthroughKey{path, gvr, reason})
 	if !ok {
 		return 0
 	}
@@ -302,8 +406,8 @@ var fallthroughWarnSampleCounter atomic.Uint64
 // 100 fall-throughs. Constant for the deterministic-sampling property.
 const fallthroughWarnSampleEvery = 100
 
-// RecordApiserverFallthrough is invoked by every Layer B wrapper (see
-// fallthrough_wrappers.go) BEFORE the wrapper delegates to the
+// RecordApiserverFallthrough is invoked at each construction site
+// (design §5.2) BEFORE the site delegates to the
 // upstream apiserver-client construction. The "before" ordering is
 // load-bearing (PM tightening): if the upstream call panics, the
 // counter must still record the fall-through occurred. A deferred
@@ -327,6 +431,25 @@ const fallthroughWarnSampleEvery = 100
 // fixed per user, not per resolver target). Use `""` to keep label
 // cardinality bounded; do NOT synthesize a placeholder string.
 func RecordApiserverFallthrough(ctx context.Context, reason FallthroughReason, gvr string) {
+	// 1.12.4 (design §5.4) — the ONLY routing decision. Everything
+	// below recordCell is the pre-1.12.4 body verbatim; only the pair
+	// of destinations differs. Call sites are unchanged and cannot
+	// influence the choice.
+	if _, diag := diagnosticReasons[reason]; diag {
+		recordCell(ctx, reason, gvr, &diagnosticCounters, &diagnosticTotal)
+		return
+	}
+	recordCell(ctx, reason, gvr, &fallthroughCounters, &fallthroughTotal)
+}
+
+// recordCell is the pre-1.12.4 body of RecordApiserverFallthrough,
+// extracted verbatim and parameterised by its destination map + total.
+// Same Disabled() + scope short-circuit, same LoadOrStore cell-init,
+// same 1%-sampled DEBUG echo — so the split changes routing only, and
+// both branches remain an atomic add over a sync.Map cell.
+func recordCell(ctx context.Context, reason FallthroughReason, gvr string,
+	cells *sync.Map, total *atomic.Uint64) {
+
 	if Disabled() {
 		return
 	}
@@ -336,7 +459,7 @@ func RecordApiserverFallthrough(ctx context.Context, reason FallthroughReason, g
 	}
 
 	key := fallthroughKey{path: scope.Path, gvr: gvr, reason: reason}
-	c, ok := fallthroughCounters.Load(key)
+	c, ok := cells.Load(key)
 	if !ok {
 		// LoadOrStore is the standard race-free init pattern for
 		// sync.Map — if two goroutines race to create the cell, the
@@ -344,10 +467,10 @@ func RecordApiserverFallthrough(ctx context.Context, reason FallthroughReason, g
 		// loser drops its fresh atomic. Per-cell counter alloc is
 		// then a one-time cost per (path, gvr, reason) tuple — the
 		// hot-path increment is purely an atomic.Add.
-		c, _ = fallthroughCounters.LoadOrStore(key, new(atomic.Uint64))
+		c, _ = cells.LoadOrStore(key, new(atomic.Uint64))
 	}
 	c.(*atomic.Uint64).Add(1)
-	fallthroughTotal.Add(1)
+	total.Add(1)
 
 	// 1%-sampled DEBUG echo — deterministic via mod 100 on a monotonic
 	// counter. Allocation-free: the counter is package-level atomic.
@@ -376,14 +499,24 @@ func RecordApiserverFallthrough(ctx context.Context, reason FallthroughReason, g
 }
 
 // ResetFallthroughCountersForTest zeros every per-cell counter and the
-// grand-total. TEST-ONLY — production code MUST NOT call it.
-// Mirrors the established ResetEvaluateRBACCallCount pattern at
-// internal/rbac/evaluate.go:48.
+// grand-total, in BOTH families. TEST-ONLY — production code MUST NOT
+// call it. Mirrors the established ResetEvaluateRBACCallCount pattern
+// at internal/rbac/evaluate.go:48.
+//
+// 1.12.4 (design §5.4, gate condition C5): the diagnostic map and total
+// MUST be zeroed here too. Without it, F5's exact-conservation arm
+// (FallthroughTotal()+DiagnosticTotal() == N) inherits counts from an
+// earlier arm in the same test binary and flakes.
 func ResetFallthroughCountersForTest() {
 	fallthroughCounters.Range(func(k, v any) bool {
 		v.(*atomic.Uint64).Store(0)
 		return true
 	})
 	fallthroughTotal.Store(0)
+	diagnosticCounters.Range(func(k, v any) bool {
+		v.(*atomic.Uint64).Store(0)
+		return true
+	})
+	diagnosticTotal.Store(0)
 	fallthroughWarnSampleCounter.Store(0)
 }
