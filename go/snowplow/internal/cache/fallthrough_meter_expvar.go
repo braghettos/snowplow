@@ -11,6 +11,15 @@
 //   - snowplow_apiserver_fallthrough_total — grand-total uint64.
 //   - snowplow_apiserver_fallthrough_cells  — per-cell breakdown
 //     as a map[string]uint64, key `"path|gvr|reason"`.
+//   - snowplow_cache_diagnostic_total       — 1.12.4 companion
+//     grand-total for the six reasons that reach no apiserver.
+//   - snowplow_cache_diagnostic_cells       — its per-cell breakdown,
+//     same `"path|gvr|reason"` key shape.
+//
+// The two families are published inside the SAME sync.Once, so a
+// process either has all four keys or none — an operator never sees a
+// half-migrated surface where the fallthrough number has dropped but
+// the companion that explains the drop is missing.
 //
 // expvar is the existing pattern. No new dependency.
 //
@@ -68,16 +77,42 @@ func registerFallthroughExpvar() {
 			}
 		}))
 		expvar.Publish("snowplow_apiserver_fallthrough_cells", expvar.Func(func() any {
-			out := map[string]uint64{}
-			fallthroughCounters.Range(func(k, v any) bool {
-				key := k.(fallthroughKey)
-				// Pipe-separated label tuple — none of the three label
-				// values contains a pipe (path is a closed enum; gvr
-				// uses `/`; reason is a closed enum).
-				out[key.path+"|"+key.gvr+"|"+string(key.reason)] = v.(*atomic.Uint64).Load()
-				return true
-			})
-			return out
+			// Pipe-separated label tuple — none of the three label
+			// values contains a pipe (path is a closed enum; gvr
+			// uses `/`; reason is a closed enum).
+			//
+			// 1.12.4: this reads the same snapshot helper the OTLP
+			// mirror reads, so the two surfaces cannot drift. expvar
+			// gets the UNCAPPED map (the bench harness and /debug
+			// diagnostics need every cell); the OTLP path applies the
+			// cardinality cap on its own side.
+			return flatFallthroughCells(&fallthroughCounters)
+		}))
+		// 1.12.4 (design §5.4) — the companion family. The six reasons in
+		// diagnosticReasons reach no apiserver; on the krateo-057 corpus they
+		// were 828,525 of the 936,320 that used to be reported as
+		// fall-throughs. Published beside the pair above, in the same
+		// sync.Once, so the number that explains the drop is always present
+		// wherever the dropped number is.
+		expvar.Publish("snowplow_cache_diagnostic_total", expvar.Func(func() any {
+			return diagnosticTotal.Load()
+		}))
+		expvar.Publish("snowplow_cache_diagnostic_cells", expvar.Func(func() any {
+			return flatFallthroughCells(&diagnosticCounters)
 		}))
 	})
+}
+
+// flatFallthroughCells flattens one cell map into the
+// `"path|gvr|reason" -> count` shape both expvar keys publish. Shared by
+// the two families so their serialisation cannot diverge, and reused by
+// the OTLP snapshot accessors in otel_accessors.go.
+func flatFallthroughCells(cells *sync.Map) map[string]uint64 {
+	out := map[string]uint64{}
+	cells.Range(func(k, v any) bool {
+		key := k.(fallthroughKey)
+		out[key.path+"|"+key.gvr+"|"+string(key.reason)] = v.(*atomic.Uint64).Load()
+		return true
+	})
+	return out
 }

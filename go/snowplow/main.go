@@ -10,6 +10,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -204,18 +205,17 @@ func main() {
 	os.Setenv("AUTHN_NAMESPACE", *authnNS)
 	os.Setenv(jqsupport.EnvModulesPath, *jqModPath)
 
-	var lh slog.Handler
+	// 1.12.4: the handler chain lives in buildLogHandler (log_handler.go)
+	// — base text/JSON handler + the OTel trace-correlation decorator that
+	// stamps trace_id/span_id on EVERY *Context record when a span is
+	// active. Pretty logs keep stderr, JSON keeps stdout, exactly as
+	// before. F10 asserts structurally that this assignment goes through
+	// buildLogHandler; do not reconstruct the handler inline here.
+	var logStream io.Writer = os.Stdout
 	if *prettyLog {
-		lh = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-			Level:     logLevel,
-			AddSource: false,
-		})
-	} else {
-		lh = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-			Level:     logLevel,
-			AddSource: false,
-		})
+		logStream = os.Stderr
 	}
+	lh := buildLogHandler(*prettyLog, logLevel, logStream)
 
 	log := slog.New(lh)
 	// 0.30.172: route package-level slog calls (slog.InfoContext / .Info /
@@ -1119,6 +1119,24 @@ func main() {
 	// can read hit-rate + entry count over /debug/vars. Cache mode-agnostic
 	// registration; the memo itself is only populated on the cache=on path.
 	rbac.RegisterAuthzMemoExpvar()
+
+	// 1.12.4 §7a — publish the build stamp as an observable. `build` is
+	// stamped correctly as of 1.12.3 (the Dockerfile's -X main.build= fix),
+	// but it still reaches nothing an operator can read: HealthCheck takes
+	// and discards it, and the only other consumers are the three
+	// default-OFF OTel Setup calls. So on a cache-on, OTel-off pod there is
+	// no way to ask a running snowplow which commit it is.
+	//
+	// snowplow_build_info is the standard build-info idiom — a constant 1
+	// carrying the identity as a label — so a dashboard can pin every other
+	// panel to a commit. Registered UNCONDITIONALLY (cache mode-agnostic,
+	// like the two publishers above): the build identity is not a cache
+	// concept and must be readable under CACHE_ENABLED=false too.
+	//
+	// Do NOT re-populate /health with this instead: that handler is a
+	// deliberate 17-byte static write with zero allocation, hit by the
+	// kubelet every 10s.
+	registerBuildInfoExpvar(build)
 
 	// O-D3 (1.12.3) — the WHOLE /debug/* surface (pprof, vars, servable,
 	// apistage, refreshes) is mounted here, every route behind

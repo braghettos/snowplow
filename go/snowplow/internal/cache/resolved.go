@@ -584,6 +584,20 @@ var (
 	resolvedCacheInstance *ResolvedCacheStore
 	resolvedCacheOnce     sync.Once
 	resolvedCacheStarted  atomic.Bool
+
+	// resolvedCachePublished mirrors resolvedCacheInstance as a
+	// race-free, NON-CONSTRUCTING handle (1.12.4 §7b). Observability
+	// readers — the expvar closure and the OTLP observable callback —
+	// must not be able to bring the singleton into existence, because
+	// ResolvedCache() also wires the dep tracker and starts the summary
+	// goroutine. A metrics scrape creating a cache is a side effect no
+	// telemetry surface should have.
+	//
+	// Written exactly once, inside resolvedCacheOnce.Do, immediately
+	// after the instance is fully configured; read with Load() from any
+	// goroutine. Reading resolvedCacheInstance directly instead would be
+	// a data race against that same Do.
+	resolvedCachePublished atomic.Pointer[ResolvedCacheStore]
 )
 
 // ResolvedCacheEnabled reports whether the L1 resolved-output cache is
@@ -683,6 +697,10 @@ func ResolvedCache() *ResolvedCacheStore {
 		// in lock-step.
 		Deps().SetStore(resolvedCacheInstance)
 		startResolvedCacheSummary(resolvedCacheInstance)
+		// 1.12.4 §7b — publish the non-constructing observability handle
+		// LAST, so a reader that sees it also sees a fully-configured
+		// store (maxResidentBytes set, dep tracker wired).
+		resolvedCachePublished.Store(resolvedCacheInstance)
 	})
 	return resolvedCacheInstance
 }
@@ -1599,6 +1617,10 @@ func resetResolvedCacheForTest() {
 	resolvedCacheInstance = nil
 	resolvedCacheOnce = sync.Once{}
 	resolvedCacheStarted.Store(false)
+	// 1.12.4 §7b — drop the observability handle too, else a test that
+	// tears the singleton down still reports the previous store's stats
+	// through /debug/vars and OTLP.
+	resolvedCachePublished.Store(nil)
 }
 
 // ResetResolvedCacheForTest is the exported variant for cross-package

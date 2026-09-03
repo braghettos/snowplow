@@ -533,8 +533,21 @@ func TestFallthroughScope_E2E_HTTPChain(t *testing.T) {
 //   - "snowplow_apiserver_fallthrough_total" → uint64 grand total
 //   - "snowplow_apiserver_fallthrough_cells" → map[string]uint64
 //     keyed "path|gvr|reason"
+//   - "snowplow_cache_diagnostic_total" → uint64 grand total (1.12.4)
+//   - "snowplow_cache_diagnostic_cells" → map[string]uint64 (1.12.4)
 //   - "snowplow_assertion_violations_total" → map[string]uint64
 //     keyed "check"
+//
+// 1.12.4 RECLASSIFICATION. The two reasons this test drives —
+// resolver-plurals-hit and resolver-plurals-miss — are BOTH in design
+// §5.2's diagnostic set (an in-process cache hit, and a double-count of
+// a hop already recorded as plurals-discovery-hop). Before 1.12.4 they
+// landed on the fall-through family, and this test asserted that. It now
+// asserts the corrected routing end-to-end through the real
+// expvar.Handler surface: the two cells appear under
+// snowplow_cache_diagnostic_cells and the fall-through family reads 0
+// with the keys ABSENT. Driving a genuine reason as well keeps the
+// original assertion — that the fall-through surface still works — alive.
 func TestFallthroughScope_E2E_ExpvarHandler(t *testing.T) {
 	t.Setenv("CACHE_ENABLED", "true")
 	// CFG-1 (Ship 0.30.163): expvar gauges are registered only when
@@ -550,6 +563,9 @@ func TestFallthroughScope_E2E_ExpvarHandler(t *testing.T) {
 	ctx := WithFallthroughScope(context.Background(), ScopeCallWidgets)
 	RecordApiserverFallthrough(ctx, ReasonResolverPluralsHit, "apiextensions.k8s.io/v1/customresourcedefinitions")
 	RecordApiserverFallthrough(ctx, ReasonResolverPluralsMiss, "v1/pods")
+	// A GENUINE apiserver hop, so the fall-through half of the surface is
+	// still exercised rather than merely asserted empty.
+	RecordApiserverFallthrough(ctx, ReasonClientBuild, "v1/pods")
 
 	// Mount expvar.Handler on a test server (the same one-line mount
 	// main.go now does at /debug/vars).
@@ -576,13 +592,24 @@ func TestFallthroughScope_E2E_ExpvarHandler(t *testing.T) {
 		t.Fatalf("unmarshal /debug/vars JSON: %v\nbody: %s", err, string(body))
 	}
 
-	// (1) grand total — JSON numbers unmarshal as float64.
+	// (1) grand totals — JSON numbers unmarshal as float64. Only the
+	// client-build call is a genuine apiserver hop; the two
+	// resolver-plurals calls are diagnostics (1.12.4 design §5.2).
 	total, ok := doc["snowplow_apiserver_fallthrough_total"].(float64)
 	if !ok {
 		t.Fatalf("snowplow_apiserver_fallthrough_total missing or wrong type: %#v", doc["snowplow_apiserver_fallthrough_total"])
 	}
-	if uint64(total) != 2 {
-		t.Errorf("expvar total = %d; want 2", uint64(total))
+	if uint64(total) != 1 {
+		t.Errorf("expvar fallthrough total = %d; want 1 (only client-build is a genuine hop)", uint64(total))
+	}
+	diagTotal, ok := doc["snowplow_cache_diagnostic_total"].(float64)
+	if !ok {
+		t.Fatalf("snowplow_cache_diagnostic_total missing or wrong type: %#v — the 1.12.4 companion "+
+			"family must be published beside the fall-through family, in the same sync.Once",
+			doc["snowplow_cache_diagnostic_total"])
+	}
+	if uint64(diagTotal) != 2 {
+		t.Errorf("expvar diagnostic total = %d; want 2", uint64(diagTotal))
 	}
 
 	// (2) per-cell breakdown — map[string]float64 (JSON-decoded).
@@ -590,13 +617,30 @@ func TestFallthroughScope_E2E_ExpvarHandler(t *testing.T) {
 	if !ok {
 		t.Fatalf("snowplow_apiserver_fallthrough_cells missing or wrong type: %#v", doc["snowplow_apiserver_fallthrough_cells"])
 	}
+	diagCellsRaw, ok := doc["snowplow_cache_diagnostic_cells"].(map[string]any)
+	if !ok {
+		t.Fatalf("snowplow_cache_diagnostic_cells missing or wrong type: %#v", doc["snowplow_cache_diagnostic_cells"])
+	}
 	const crdKey = "call-widgets|apiextensions.k8s.io/v1/customresourcedefinitions|resolver-plurals-hit"
 	const kindKey = "call-widgets|v1/pods|resolver-plurals-miss"
-	if v, ok := cellsRaw[crdKey].(float64); !ok || uint64(v) != 1 {
-		t.Errorf("expvar cell %q = %#v; want 1", crdKey, cellsRaw[crdKey])
+	const hopKey = "call-widgets|v1/pods|client-build"
+	if v, ok := diagCellsRaw[crdKey].(float64); !ok || uint64(v) != 1 {
+		t.Errorf("diagnostic cell %q = %#v; want 1", crdKey, diagCellsRaw[crdKey])
 	}
-	if v, ok := cellsRaw[kindKey].(float64); !ok || uint64(v) != 1 {
-		t.Errorf("expvar cell %q = %#v; want 1", kindKey, cellsRaw[kindKey])
+	if v, ok := diagCellsRaw[kindKey].(float64); !ok || uint64(v) != 1 {
+		t.Errorf("diagnostic cell %q = %#v; want 1", kindKey, diagCellsRaw[kindKey])
+	}
+	if v, ok := cellsRaw[hopKey].(float64); !ok || uint64(v) != 1 {
+		t.Errorf("fallthrough cell %q = %#v; want 1", hopKey, cellsRaw[hopKey])
+	}
+	// The acceptance observation of design §5 read straight off the
+	// operator surface: the reclassified keys are ABSENT from the
+	// fall-through cells map, not merely netted out of its scalar.
+	for _, k := range []string{crdKey, kindKey} {
+		if _, present := cellsRaw[k]; present {
+			t.Errorf("key %q is still present in snowplow_apiserver_fallthrough_cells — "+
+				"design §5.4 requires two separate maps so the key disappears from this one", k)
+		}
 	}
 
 	// (3) assertion-violations map — must exist (zero is the

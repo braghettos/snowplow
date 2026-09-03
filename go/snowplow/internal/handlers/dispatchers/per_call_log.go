@@ -6,7 +6,6 @@ import (
 	"time"
 
 	xcontext "github.com/krateo-platformops/plumbing/context"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // perCallState carries the per-/call timing + observability state that
@@ -22,13 +21,13 @@ import (
 // the 8-cycle parallelism diagnostic (slowest_call_ms ~470ms, chain
 // ~3.65 => par=2.0 vs anchor par=4.3).
 type perCallState struct {
-	start    time.Time
-	path     string
-	method   string
-	handler  string // "restactions" | "widgets"
-	l1Hit    string // "hit" | "miss" | "content-hit" | "n/a"
-	gvr      string // group/version/resource — set once fetchObject succeeds
-	user     string // captured at emit() from xcontext.UserInfo(ctx)
+	start   time.Time
+	path    string
+	method  string
+	handler string // "restactions" | "widgets"
+	l1Hit   string // "hit" | "miss" | "content-hit" | "n/a"
+	gvr     string // group/version/resource — set once fetchObject succeeds
+	user    string // captured at emit() from xcontext.UserInfo(ctx)
 }
 
 // beginPerCall is called as the FIRST line of each ServeHTTP body. It
@@ -60,21 +59,14 @@ func beginPerCall(r *http.Request, handler string) (*perCallState, func()) {
 			slog.String("gvr", st.gvr),
 			slog.Int64("total_ms", time.Since(st.start).Milliseconds()),
 		}
-		// OTel log-correlation (ADDITIVE + default-OFF). When tracing is
-		// enabled, an OTel server span is active on ctx (otelhttp wrap in
-		// main.go), so attach its W3C trace_id/span_id to this
-		// otel_logs-bound record for trace<->log correlation in ClickHouse.
-		// When tracing is disabled SpanContextFromContext returns an invalid
-		// span context, so these fields are simply omitted and the record is
-		// byte-identical to the pre-OTel emission. This does NOT touch the
-		// shortid X-Krateo-TraceId correlation id, which lives on a separate
-		// header/status field and is unaffected here.
-		if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
-			attrs = append(attrs,
-				slog.String("trace_id", sc.TraceID().String()),
-				slog.String("span_id", sc.SpanID().String()),
-			)
-		}
+		// OTel log-correlation: since 1.12.4 the trace_id/span_id pair is
+		// attached to EVERY *Context record by the trace-correlation
+		// handler installed in main (log_handler.go), so this record gets
+		// it for free through slog.InfoContext(ctx, ...). The per-site
+		// injection that used to live here was the ONLY correlated record
+		// in the process — and INFO, which LOG_LEVEL=warn suppresses — so
+		// production correlation coverage was effectively zero. One site
+		// became all sites; do not re-add it here.
 		slog.InfoContext(ctx, "dispatcher.call.complete", attrs...)
 	}
 }

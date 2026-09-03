@@ -38,14 +38,14 @@ import (
 	"time"
 
 	"github.com/krateo-platformops/plumbing/env"
+	"github.com/krateo-platformops/plumbing/kubeutil"
+	"github.com/krateo-platformops/snowplow/internal/otelresource"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
 const (
@@ -64,9 +64,27 @@ const (
 	// standard OTEL_EXPORTER_OTLP_ENDPOINT env contract via
 	// otlptracehttp's WithEndpointURL/env auto-config.
 	EnvOTLPEndpoint = "OTEL_EXPORTER_OTLP_ENDPOINT"
+)
 
-	// serviceName is the resource service.name reported for every span.
-	serviceName = "snowplow"
+// SAMPLING (1.12.4). This package installs NO sampler: NewTracerProvider
+// below passes no WithSampler, so the SDK's samplerFromEnv reads
+// OTEL_TRACES_SAMPLER / OTEL_TRACES_SAMPLER_ARG and those env vars are
+// the live knob. The chart ships "traceidratio" at 0.05 — the ROOT-
+// deciding family, deliberately NOT parentbased_traceidratio. On the
+// 057 topology snowplow sits behind the agent gateway, whose tracing
+// policy is attached with randomSampling "100", so it creates a SAMPLED
+// span for every forwarded request and propagates sampled=1 upstream. A
+// parent-based sampler would honour that flag and span 100% of customer
+// /call traffic — precisely the traffic the ratio was meant to bound.
+// traceidratio makes snowplow's own 5% decision regardless of any
+// parent, which is also correct on the LoadBalancer topology where there
+// is no parent at all. The documented trade is that snowplow's decision
+// DIVERGES from the gateway's: 5% complete end-to-end traces plus 95%
+// gateway-only traces, partial by design and bounded.
+const (
+	// serviceName is the span-scope name passed to otelhttp.NewHandler
+	// in main. The resource service.name lives in internal/otelresource.
+	serviceName = otelresource.ServiceName
 )
 
 // ShutdownFunc flushes and stops the trace pipeline. Always non-nil so the
@@ -114,18 +132,17 @@ func Setup(ctx context.Context, build string) (ShutdownFunc, error) {
 		return noop, err
 	}
 
-	res, err := resource.New(ctx,
-		resource.WithAttributes(
-			semconv.ServiceName(serviceName),
-			semconv.ServiceVersion(build),
-		),
-	)
+	// 1.12.4 — ONE shared resource across traces/metrics/logs
+	// (internal/otelresource). It carries service.name/.version plus the
+	// downward-API pod identity that makes the collector's k8sattributes
+	// pod_association deterministic instead of falling through to
+	// source-IP matching over a SNAT-able hostPort hop. Partial-resource
+	// handling moved into the helper unchanged. logging.go's own
+	// doc-comment relies on the three resources being identical; that is
+	// now structural rather than three copies of one literal.
+	res, err := otelresource.Build(ctx, build, kubeutil.ServiceAccountNamespace)
 	if err != nil {
-		// resource.New can return a partial resource + a non-fatal merge
-		// error (e.g. schema-url skew); use whatever resource we got.
-		if res == nil {
-			res = resource.Default()
-		}
+		return noop, err
 	}
 
 	tp := sdktrace.NewTracerProvider(

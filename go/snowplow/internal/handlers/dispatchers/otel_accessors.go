@@ -15,6 +15,8 @@
 
 package dispatchers
 
+import "strings"
+
 // PrewarmEngineSnapshot returns the prewarm-engine worker counters,
 // mirroring snowplow_prewarm_engine_{enqueued,processed,yield}_total and
 // snowplow_prewarm_engine_pending_depth. pendingDepth is the workqueue's own
@@ -79,4 +81,87 @@ func DispatchL1LookupTotals() (hit, miss uint64) {
 		return true
 	})
 	return hit, miss
+}
+
+// L1LookupCell is one (class, gvr) row of the dispatch-L1 lookup
+// breakdown, as consumed by the OTLP mirror (1.12.4 §3.3).
+//
+// `Class` is the handlerKind half of the expvar key — one of
+// restactions / widgets / widgetContent. It is called Class here because
+// that is the attribute name the dashboard and the design's mapping
+// table use, and because it lines up with the CacheEntryClass vocabulary
+// the rest of the cache speaks.
+type L1LookupCell struct {
+	Class   string
+	GVR     string
+	Hit     uint64
+	Miss    uint64
+	SeedHit uint64
+}
+
+// DispatchL1LookupCells returns the per-(class, gvr) breakdown that
+// DispatchL1LookupTotals collapses (1.12.4 §3.3, "widen").
+//
+// WHY THE AGGREGATE WAS NOT ENOUGH. Two process-wide numbers cannot
+// answer the question the panel is for: "is the cache serving THIS
+// class?" A widgets hit-rate of 99% and a widgetContent hit-rate of 0%
+// average to a healthy-looking aggregate while the portal experience is
+// broken. The per-cell data has existed at /debug/vars since Ship OBS-1;
+// only the OTLP mirror was collapsing it.
+//
+// Cardinality is bounded by (3 classes x registered GVRs) — 169 GVRs on
+// krateo-057, so ~507 worst case, and the GVR set does not grow with
+// composition count. The observation path applies no cap here: unlike
+// the fall-through cells this family cannot reach the 46K worst case.
+//
+// Returns cells in sync.Map iteration order; callers that need
+// determinism must sort. A malformed key (no "|" separator) is skipped
+// rather than emitted with an empty class, so a future key-shape change
+// degrades to missing series instead of a mis-attributed one.
+func DispatchL1LookupCells() []L1LookupCell {
+	var out []L1LookupCell
+	l1LookupCells.Range(func(k, v any) bool {
+		ks, _ := k.(string)
+		cell, _ := v.(*l1LookupCell)
+		if cell == nil {
+			return true
+		}
+		i := strings.Index(ks, "|")
+		if i < 0 {
+			return true
+		}
+		out = append(out, L1LookupCell{
+			Class:   ks[:i],
+			GVR:     ks[i+1:],
+			Hit:     cell.hit.Load(),
+			Miss:    cell.miss.Load(),
+			SeedHit: cell.seedHit.Load(),
+		})
+		return true
+	})
+	return out
+}
+
+// HitsSeedAttributable returns the process-wide count of resolved-cache
+// hits served from a boot-seeded cell, mirroring the
+// snowplow_resolved_cache_hits_seed_attributable expvar (#130 F3). It is
+// the one-number answer to "did the boot seed warm anything a browser
+// actually hit".
+func HitsSeedAttributable() uint64 {
+	return hitsSeedAttributable.Load()
+}
+
+// ReadinessBackstopFired returns the number of boots whose /readyz
+// flipped Ready via the C2 backstop rather than the firstNav-complete
+// happy path — i.e. FAILED-but-serving boots (#131).
+//
+// [C11] This is the top boot SLI and it is LOG-ONLY today: the counter
+// is an unexported expvar.Int in this package with no accessor, and the
+// single ERROR log line that accompanies it is the only other trace. A
+// healthy boot leaves it 0, so any non-zero value is alert-worthy — and
+// nothing could alert on it, because nothing outside this package could
+// read it. Note the counter lives under internal/handlers/dispatchers/,
+// NOT internal/cache/ as the design's §3.3 table said.
+func ReadinessBackstopFired() int64 {
+	return readinessBackstopFired.Value()
 }
