@@ -313,6 +313,18 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// widget→apiref→RA ctx inheritance (context.WithValue is preserved down
 	// the resolve chain). Additive to the stage-error sink.
 	ctx, extTouchedSink := cache.WithExternalTouchedSink(ctx)
+	// 1.12.3 A-1 / R-1 (SECURITY, cross-tenant) — install the UAF-touched sink,
+	// third sibling of the two above. THIS IS THE HOT CARRIER. A widget's apiRef
+	// RESTAction is resolved transitively under THIS ctx (widgets.Resolve →
+	// resolveApiRef → apiref.Resolve → restactions.Resolve); when that RA
+	// declares a userAccessFilter, the refilter narrows the rows PER REQUESTER
+	// and they are folded into this widget's status.widgetData — which is then
+	// Put under the widgets-class per-BINDING key, where two co-bound users
+	// collide. The declaring CR is several resolver frames below the widget this
+	// handler holds, so a declaration predicate here sees nothing; the sink is
+	// the only signal that survives the distance. Measured live: 66 widgets
+	// apiRef a UAF RA, and this cell served 298,064 hits vs 365 misses over 5d7h.
+	ctx, uafTouchedSink := cache.WithUAFTouchedSink(ctx)
 
 	res, err := widgetsResolveFn(ctx, widgets.ResolveOptions{
 		In:      got.Unstructured,
@@ -378,7 +390,30 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 	// partial-with-errors widget body is SERVED below; it is just not
 	// PERSISTED, so a transient apiRef-item failure self-heals on the next
 	// resolve instead of pinning a partial cell for the TTL.
-	if stageErrSink.Count() > 0 {
+	// 1.12.3 A-1 / R-1 (SECURITY, cross-tenant) — THE UAF DECLINE IS FIRST IN THE
+	// CHAIN, and the position is load-bearing. TWO branches below this point also
+	// WRITE: the stage-error branch Puts a bounded partial via putPartialWithTTL
+	// (when PARTIAL_RESULT_TTL_SECONDS is set), and the external-TTL branch Puts
+	// under the opt-in `krateo.io/external-cache-ttl-seconds` annotation. Gating
+	// only in front of the "genuine Put" branch would leave a refilter-narrowed
+	// widget body reachable through either of them, under the same shared
+	// per-binding key. A per-requester-narrowed body must not be persisted by ANY
+	// branch, so the gate sits ahead of all of them.
+	//
+	// The envelope is still SERVED — the 200 with this requester's own narrowed
+	// widgetData is written below either way; only the shared-cell write, its dep
+	// Record and its /refreshes publish are skipped. Reverts in 1.13.0 when the
+	// UAF-scope digest (v7) separates co-bound requesters in the key.
+	if declineWidgetUAFPut(cacheInputs, uafTouchedSink) {
+		// DEBUG, not WARN: on a portal rendering UAF-backed widgets this fires on
+		// essentially every /call, and LOG_LEVEL=warn is the production floor.
+		// snowplow_widgets_uaf_put_declined_total carries the rate.
+		log.Debug("Widget resolve ran a userAccessFilter refilter; declining to cache (per-requester narrowing is not folded into the key)",
+			slog.Int64("uaf_touches", uafTouchedSink.Count()),
+			slog.String("uaf_reason", uafDeclineObserved),
+			slog.String("effect", "envelope served (200) narrowed for THIS requester; not persisted — the widgets cell is keyed per BINDING, so a co-bound user would be served these rows verbatim (1.12.3 A-1/R-1; 1.13.0 folds the UAF scope into the key)"),
+		)
+	} else if stageErrSink.Count() > 0 {
 		// D (bounded partial-cache backstop, default-off) — twin of restactions.go;
 		// Put the partial under the SAME per-user widgets cacheKey with a bounded
 		// PARTIAL_RESULT_TTL_SECONDS window. No-op when the env is 0 (default). With
@@ -486,7 +521,7 @@ func (r *widgetsHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request) {
 			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 			perPage, page, keyExtras)
-		// scope-waiver:TTLOverride: widgets-class cell — UAF refilter output only ever lands in a restactions-class cell (a widget's apiRef resolves the UAF RA via the seedOneRestaction/dispatch path, which IS capped); a widgets Put is never the UAF-stale cell (uaf_shortttl.go R-d-4 SITE MAP).
+		// scope-waiver:TTLOverride: widgets-class cell. 1.12.3 A-1/R-1 CORRECTED WAIVER: the pre-1.12.3 text claimed "UAF refilter output only ever lands in a restactions-class cell ... a widgets Put is never the UAF-stale cell". That was WRONG, and it was the R-1 blocker — widgets/resolve.go folds the apiRef'd RA's UAF-refiltered rows into status.widgetData, i.e. into THIS cell, which live measurement showed is the hot carrier (298,064 hits / 365 misses in 5d7h across 66 UAF-backed widgets). A refilter-touched envelope can no longer REACH this Put: the UAFTouchedSink gate at the HEAD of this chain declines it, so every cell written here is refilter-free and needs no UAF cap (uaf_shortttl.go R-d-4 SITE MAP).
 		cacheHandle.Put(cacheKey, &cache.ResolvedEntry{
 			RawJSON: encoded,
 			Inputs:  cacheInputs,

@@ -780,6 +780,64 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 		return nil
 	}
 
+	// 1.12.3 A-1 (SECURITY, cross-tenant) — the SEED leg of the shared three-site
+	// UAF Put-decline gate, placed BEFORE the resolve. The boot seed warms a
+	// restactions cell under a cohort REPRESENTATIVE identity; for a UAF-bearing
+	// RA that cell holds the representative's OWN per-object narrowing, and every
+	// other cohort member who derives the same BindingUID + RBACSubGen would be
+	// served it verbatim on their first /call — the leak at its widest (a whole
+	// cohort reading one member's rows, warm from boot).
+	//
+	// SKIP-BEFORE-RESOLVE, not resolve-and-decline: the Put is the seed's ONLY
+	// product (the tail's dep Record + informer wiring exist to service that
+	// cell), so resolving first would buy nothing and cost a full fan-out per
+	// cohort per UAF RA at boot. Non-lossy by the same argument as the #113
+	// templated-endpointRef skip above: the seed was never going to leave a
+	// servable cell behind.
+	//
+	// KNOWN, ACCEPTED SIDE EFFECT (arch-cache point (b), ruled a LATENCY TRANSFER
+	// and not a correctness issue): skipping the resolve also skips
+	// EnsureResourceType for any GVR touched ONLY inside this RA's inner calls —
+	// the seed would otherwise have registered those informers as a side effect
+	// of resolving. So the FIRST customer request for such a GVR pays the
+	// registration plus a not-yet-synced fallthrough that boot used to absorb.
+	// It is safe because registration is IDEMPOTENT and LAZILY REACHABLE on the
+	// request path (watcher.go EnsureResourceType), so nothing is permanently
+	// unregistered and no result is wrong — the cost simply moves from boot to
+	// the first request. Accepted deliberately: the alternative is resolving a
+	// UAF RA per cohort at boot purely to warm informers for output that can
+	// never be cached.
+	//
+	// HasUAF is stamped here (not only in the tail) so the
+	// ONE shared helper decides, and so the flag is already correct if a future
+	// path carries these inputs onward. The tail keeps its own defensive decline
+	// for a caller that drives the seam directly.
+	if inputs != nil {
+		inputs.HasUAF = restactionHasUAFStage(&cr)
+	}
+	// nil sink: this gate runs BEFORE the resolve, so no refilter can have been
+	// observed yet — the DECLARATION is the only signal available here, and that
+	// is exactly the point (it is what lets the seed skip the fan-out instead of
+	// paying for a resolve whose output it would then discard). The post-resolve
+	// tail below consults the sink as well.
+	if declineUAFPut(inputs, nil) {
+		// INFO, not WARN: this is a per-boot, per-(cohort × UAF RA) event — a
+		// handful of lines, not hot-path noise — and it is the greppable
+		// counterpart of the other phase1.seed.skip.* lines around it, which the
+		// boot-seed post-mortems read. The hot-path decline sites log at DEBUG.
+		slog.Default().Info("phase1.seed.skip.user_access_filter",
+			slog.String("subsystem", "cache"),
+			slog.String("class", "restactions"),
+			slog.String("restaction", ref.Namespace+"/"+ref.Name),
+			slog.String("cohort", cohortLabel),
+			slog.String("effect", "RESTAction declares a userAccessFilter: its resolved body is narrowed per requester, "+
+				"but the seed cell is keyed per BINDING — a co-bound cohort member would be served the representative's "+
+				"rows. Skipping resolve+Put entirely (1.12.3 A-1); these RAs resolve per request until 1.13.0 folds the "+
+				"UAF scope into the key."),
+		)
+		return nil
+	}
+
 	// Ship 0.30.192 — pure-additive per-stage timing sink for cost
 	// attribution. The 0.30.179 cluster-list-deny / per-NS iterator
 	// fallback at iter_serial=1 is the architect's TRACED hypothesis
@@ -826,6 +884,13 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	// → still Put). Uniform across boot + sweep (feedback_no_special_cases).
 	resCtx, stageErrSink := cache.WithStageErrorSink(resCtx)
 	resCtx, extTouchedSink := cache.WithExternalTouchedSink(resCtx)
+	// 1.12.3 A-1 / R-1 — install the UAF-touched sink, third sibling of the two
+	// above, so the tail's Put-gate sees a refilter that ran ANYWHERE under this
+	// resolve. The pre-resolve declaration skip above already caught an RA that
+	// declares a UAF stage itself; this catches the one it cannot see — a seeded
+	// RA that NESTS a UAF RA. Threaded into the tail through resCtx (the seam
+	// signature is unchanged; the tail reads it back off the context).
+	resCtx, _ = cache.WithUAFTouchedSink(resCtx)
 
 	// Resolve + encode + GTTL-gate + Put TAIL (via the seedRestactionResolveAndPutFn
 	// seam — prod default is seedRestactionResolveAndPutProd). The #113 templated-
@@ -894,6 +959,31 @@ func seedRestactionResolveAndPutProd(
 	// to today for a non-UAF seed cell and when disabled.
 	if inputs != nil {
 		inputs.HasUAF = restactionHasUAFStage(cr)
+	}
+	// 1.12.3 A-1 / R-1 — the POST-RESOLVE decline, and NOT merely defensive.
+	// Two distinct cases reach it:
+	//   - the DECLARATION case, which seedOneRestaction already short-circuited
+	//     before the resolve, so in production it arrives here only when a caller
+	//     drives this REASSIGNABLE SEAM (seedRestactionResolveAndPutFn) directly;
+	//   - the OBSERVED case, which the pre-resolve skip structurally cannot
+	//     catch: a seeded RA that declares no userAccessFilter of its own but
+	//     NESTS one. That is only knowable after resolving, and this is the only
+	//     gate standing between it and a per-binding cell holding one cohort
+	//     member's narrowing.
+	// The sink is read back off resCtx (installed by seedOneRestaction), so the
+	// seam signature is unchanged and a direct caller that supplies its own resCtx
+	// is gated by whatever it installed.
+	if reason := uafDeclineReason(inputs, cache.UAFTouchedSinkFromContext(resCtx)); reason != "" {
+		declineUAFPut(inputs, cache.UAFTouchedSinkFromContext(resCtx))
+		slog.Default().Info("phase1.seed.skip.user_access_filter",
+			slog.String("subsystem", "cache"),
+			slog.String("class", "restactions"),
+			slog.String("restaction", ref.Namespace+"/"+ref.Name),
+			slog.String("site", "resolve_and_put_tail"),
+			slog.String("uaf_reason", reason),
+			slog.String("effect", "declining the seed Put: this resolve is userAccessFilter-narrowed (1.12.3 A-1). A declared UAF RA normally skips before the resolve; an RA that only NESTS a UAF RA can be caught nowhere but here."),
+		)
+		return nil
 	}
 	// Put under the per-user key — exactly the shape restactions.go
 	// :212-216 puts under at serve time.
@@ -1087,8 +1177,40 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// so the keepwarm sweep never blind-re-Puts degraded bytes over a warm cell.
 	resCtx, stageErrSink := cache.WithStageErrorSink(resCtx)
 	resCtx, extTouchedSink := cache.WithExternalTouchedSink(resCtx)
+	// 1.12.3 A-1 / R-1 — install the UAF-touched sink around the WIDGET resolve.
+	// This is the seed leg of the hot carrier: widgets.Resolve → resolveApiRef →
+	// apiref.Resolve → restactions.Resolve folds the apiRef'd RA's refiltered
+	// rows into status.widgetData, and the boot seed writes that under a
+	// per-BINDING widgets key held by a cohort REPRESENTATIVE — so every co-bound
+	// cohort member would read the representative's narrowing on their first
+	// paint.
+	//
+	// WHY THERE IS NO PRE-RESOLVE SKIP HERE, unlike seedOneRestaction: the widget
+	// CR declares no userAccessFilter of its own, and the apiRef chain is not
+	// statically enumerable (nested and template-expanded), so "does this widget
+	// reach a UAF RA?" is not answerable before resolving. The seed therefore
+	// resolves and then declines. That costs the resolve; it is the price of the
+	// carrier being transitive.
+	resCtx, uafTouchedSink := cache.WithUAFTouchedSink(resCtx)
 
-	res, err := widgets.Resolve(resCtx, widgets.ResolveOptions{
+	// 1.12.3 R-1 (adv-cache-isolation) — route through the SAME widgetsResolveFn
+	// seam the dispatcher uses (dispatch_seams.go) instead of calling
+	// widgets.Resolve directly. Two reasons, both about this file's UAF gate:
+	//
+	//  1. CONSISTENCY. The seed and the dispatcher fill the SAME per-binding
+	//     widgets cell and now run the SAME decline gate over it. Having one of
+	//     them bypass the seam meant the seed leg could only ever be tested at
+	//     helper granularity, which is how it ended up as this package's one weak
+	//     RED.
+	//  2. CTX PROPAGATION IS THE FAILURE MODE THE AST GUARD CANNOT SEE. The
+	//     structural enumeration guard proves seedOneWidget CONSULTS the gate; it
+	//     cannot prove the resolve actually ran under the ctx carrying the sink
+	//     the gate reads. Threading resCtx through the seam lets a falsifier
+	//     assert the resolver received a ctx whose UAFTouchedSink is the SAME
+	//     POINTER the gate below holds — bump it there, watch the Put decline.
+	//
+	// Behaviour is unchanged: the seam's production value IS widgets.Resolve.
+	res, err := widgetsResolveFn(resCtx, widgets.ResolveOptions{
 		In: in,
 		// Ship 0.30.230 fix-at-root: RC is the SA *rest.Config carried
 		// on ctx by withCohortSeedContext upstream. Threading it here
@@ -1114,7 +1236,27 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 		return nil
 	}
 
-	// scope-waiver:TTLOverride: seedOneWidget — widgets-class boot seed; UAF is a restactions-STAGE contract, so a widget's apiRef-resolved UAF RA warms the restactions cell via seedOneRestaction (capped), never this widgets cell (uaf_shortttl.go R-d-4 SITE MAP).
+	// 1.12.3 A-1 / R-1 (SECURITY, cross-tenant) — decline the widget seed Put when
+	// the resolve ran a userAccessFilter refilter. Placed with the other two
+	// decline gates, before the Put and therefore before the dep Record, the
+	// seeded-set Mark and the 4a full-list pin below — none of which should fire
+	// for a cell that is not being written.
+	if declineWidgetUAFPut(inputs, uafTouchedSink) {
+		slog.Default().Info("phase1.seed.skip.user_access_filter",
+			slog.String("subsystem", "cache"),
+			slog.String("class", "widgets"),
+			slog.String("widget", e.W.GetNamespace()+"/"+e.W.GetName()),
+			slog.Int64("uaf_touches", uafTouchedSink.Count()),
+			slog.String("uaf_reason", uafDeclineObserved),
+			slog.String("effect", "widget resolve ran a userAccessFilter refilter via its apiRef RESTAction: the body is "+
+				"narrowed for the cohort REPRESENTATIVE, but the widgets cell is keyed per BINDING, so a co-bound member "+
+				"would be served the representative's rows. Skipping the Put, the dep Record and the 4a full-list pin "+
+				"(1.12.3 A-1/R-1); these widgets resolve per request until 1.13.0 folds the UAF scope into the key."),
+		)
+		return nil
+	}
+
+	// scope-waiver:TTLOverride: seedOneWidget — widgets-class boot seed. 1.12.3 A-1/R-1 CORRECTED WAIVER: the pre-1.12.3 text claimed "UAF is a restactions-STAGE contract, so a widget's apiRef-resolved UAF RA warms the restactions cell, never this widgets cell". That was WRONG and it was the R-1 blocker — widgets/resolve.go folds the apiRef'd RA's UAF-refiltered output into status.widgetData, which IS this cell. A refilter-touched widget can no longer REACH this Put (the UAFTouchedSink gate immediately above declines it), so every cell written here is refilter-free and needs no UAF cap.
 	handle.Put(key, &cache.ResolvedEntry{
 		RawJSON:      encoded,
 		Inputs:       inputs,

@@ -317,6 +317,18 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// (no informer/dep edge can invalidate it). Additive to the stage-error
 	// sink — both gate the Put independently. nil-receiver-safe.
 	ctx, extTouchedSink := cache.WithExternalTouchedSink(ctx)
+	// 1.12.3 A-1 / R-1 — install the UAF-touched sink, third sibling of the two
+	// above. Whatever bumps it, wherever that happens and however many resolver
+	// frames down, the Put-gate below reads Count()>0 and declines.
+	//
+	// It is the mechanism INTENDED to cover a NON-UAF RESTAction that NESTS a UAF
+	// one — its own spec declares no userAccessFilter, so the declaration limb is
+	// blind to it, while its resolved body still carries per-requester-narrowed
+	// rows. That case is NOT closed on this branch: the only bump today is
+	// declaration-based (apiref.Resolve) and inspects the parent. It closes with
+	// the refilter bump on fix/1.12.3-authz-hardening; until then
+	// TestM1_NestedUAFChild_NoCellPut_RequiresRefilterBump is RED by design.
+	ctx, uafTouchedSink := cache.WithUAFTouchedSink(ctx)
 	res, err := restactionsResolveFn(ctx, restactions.ResolveOptions{
 		In:      &cr,
 		SArc:    r.saRC,
@@ -354,7 +366,47 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// (resolve_populate.go:242) and the 0.30.254 "never cache an under-served
 	// result" posture. sink==nil is nil-receiver-safe (Count()==0). A clean
 	// resolve (Count()==0) caches exactly as before.
-	if stageErrSink.Count() > 0 {
+	// 1.12.3 A-1 (SECURITY, cross-tenant) — record whether THIS RESTAction
+	// declares a userAccessFilter stage on the carried Inputs, BEFORE the Put
+	// chain. Two consumers read it: the decline gate at the head of the chain,
+	// and (for a non-declined entry) the short UAF TTLOverride, which the
+	// refresher re-Put re-derives from the SAME carried flag (C-118-6). HasUAF is
+	// deliberately NOT key-folded — folding a bare boolean would not separate two
+	// users' divergent narrowings anyway; the per-requester UAF SCOPE digest is
+	// the 1.13.0/v7 key change.
+	if cacheInputs != nil {
+		cacheInputs.HasUAF = restactionHasUAFStage(&cr)
+	}
+	// THE UAF DECLINE IS FIRST IN THE CHAIN, and the position is load-bearing.
+	// TWO branches below this point also WRITE: the stage-error branch Puts a
+	// bounded partial via putPartialWithTTL (when PARTIAL_RESULT_TTL_SECONDS is
+	// set), and — in the widgets twin of this chain — the external-TTL branch
+	// Puts under an opt-in annotation. Placing the UAF gate only in front of the
+	// "genuine Put" branch would leave a UAF body reachable through either of
+	// those, under the same shared per-binding key. A per-requester-narrowed body
+	// must not be persisted by ANY branch, so the gate sits ahead of all of them.
+	//
+	// The key this body would be stored under folds only BindingUID + RBACSubGen,
+	// so a co-bound user with a DIFFERENT per-object narrowing derives the SAME
+	// key and the hit path (above) would hand them these bytes verbatim. Serving
+	// is unaffected — the 200 with this requester's own body is written below
+	// either way; only the shared-cell write is skipped, so no other identity can
+	// ever read it. Reverts in 1.13.0 when the UAF-scope digest (v7) separates
+	// them in the key.
+	if reason := uafDeclineReason(cacheInputs, uafTouchedSink); reason != "" {
+		declineUAFPut(cacheInputs, uafTouchedSink) // bumps the class counter
+		// DEBUG, not WARN: this fires on EVERY /call of a UAF RA and
+		// LOG_LEVEL=warn is the production floor — a WARN here would flood.
+		// snowplow_restactions_uaf_put_declined_total carries the rate.
+		log.Debug("RESTAction resolve is userAccessFilter-narrowed; declining to cache (per-requester narrowing is not folded into the key)",
+			slog.String("name", cr.Name),
+			slog.String("namespace", cr.Namespace),
+			slog.String("key_hash", cacheKey),
+			slog.String("uaf_reason", reason),
+			slog.Int64("uaf_touches", uafTouchedSink.Count()),
+			slog.String("effect", "body served (200) narrowed for THIS requester; not persisted — a co-bound user would key onto the same cell and be served these rows (1.12.3 A-1; 1.13.0 folds the UAF scope into the key)"),
+		)
+	} else if stageErrSink.Count() > 0 {
 		// D (bounded partial-cache backstop, default-off) — instead of a bare
 		// decline, Put the partial under the SAME per-user cacheKey with a
 		// bounded PARTIAL_RESULT_TTL_SECONDS window so a residual un-cacheable RA
@@ -403,45 +455,45 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 			perPage, page, extras)
-		// #118 (d) interim — if THIS RESTAction declares a userAccessFilter stage,
-		// record it on the carried Inputs (so the refresher re-Put re-stamps the
-		// same short TTL — C-118-6) and stamp the short UAF TTLOverride on the
-		// entry, capping the RBAC-staleness window (the resolved key is blind to
-		// the per-object refilter RBAC dependency; #118 (c) is the durable key
-		// fix). uafTTLOverrideForEntry returns 0 (no override) when the knob is
-		// unset OR the RA has no UAF stage → byte-identical to today for every
-		// non-UAF cell and when disabled. HasUAF is NOT key-folded (ComputeKey
-		// skips it), so the cell keeps its existing key — only its TTL tightens.
-		if cacheInputs != nil {
-			cacheInputs.HasUAF = restactionHasUAFStage(&cr)
-		}
-		cacheHandle.Put(cacheKey, &cache.ResolvedEntry{
-			RawJSON:     encoded,
-			Inputs:      cacheInputs,
-			TTLOverride: uafTTLOverrideForEntry(cacheInputs),
-		})
-		// 0.30.8: record the self-dep so a DELETE on this RestAction
-		// CR evicts the cached entry, and an UPDATE re-resolves it.
-		// Inner-K8s-call deps (edge type 3) are NOT recorded at this
-		// tag — that would require a *RecordingDeps context threaded
-		// through resolve.go, which is deferred to a future sub-ship.
-		// TTL remains the outer safety net for changes the dep
-		// tracker cannot see.
-		//
-		// 0.30.9 Sub-scope B: ensure the informer for got.GVR is
-		// registered BEFORE recording the dep. Without this, a
-		// previously-unseen RestAction GVR would record a forward
-		// edge whose DELETE/UPDATE events the watcher never wires.
-		ensureWatcherInformerForGVR(got.GVR)
-		cache.Deps().Record(cacheKey, got.GVR, got.Unstructured.GetNamespace(), got.Unstructured.GetName())
+		// The UAF gate already ran at the HEAD of this chain — it must precede the
+		// stage-error branch's bounded partial Put, not merely this branch — so
+		// reaching here means the body is NOT per-requester-narrowed. HasUAF was
+		// stamped on cacheInputs there; it is read here only for the TTL override.
+		{
+			cacheHandle.Put(cacheKey, &cache.ResolvedEntry{
+				RawJSON:     encoded,
+				Inputs:      cacheInputs,
+				TTLOverride: uafTTLOverrideForEntry(cacheInputs),
+			})
+			// 0.30.8: record the self-dep so a DELETE on this RestAction
+			// CR evicts the cached entry, and an UPDATE re-resolves it.
+			// Inner-K8s-call deps (edge type 3) are NOT recorded at this
+			// tag — that would require a *RecordingDeps context threaded
+			// through resolve.go, which is deferred to a future sub-ship.
+			// TTL remains the outer safety net for changes the dep
+			// tracker cannot see.
+			//
+			// 0.30.9 Sub-scope B: ensure the informer for got.GVR is
+			// registered BEFORE recording the dep. Without this, a
+			// previously-unseen RestAction GVR would record a forward
+			// edge whose DELETE/UPDATE events the watcher never wires.
+			//
+			// 1.12.3 A-1: the dep Record + the /refreshes publish are INSIDE the
+			// non-declined branch on purpose — a declined entry has no cell, so
+			// there is nothing for a dep edge to invalidate and nothing for a
+			// subscriber to be told about (the same shape as the external-skip
+			// decline above, which also declines its Record).
+			ensureWatcherInformerForGVR(got.GVR)
+			cache.Deps().Record(cacheKey, got.GVR, got.Unstructured.GetNamespace(), got.Unstructured.GetName())
 
-		// #62: GENUINE cold-dispatch Put (this else-if guarantees a real
-		// Put + dep-Record — never the stage-error / external-skip declines
-		// above). If a /refreshes connection is already armed for this key
-		// (it re-armed after a TTL-eviction, and this cold-fill replaces the
-		// evicted entry), announce the fill so the viewer's frame goes fresh
-		// now instead of waiting for the next churn. No-op when unarmed.
-		publishIfSubscribed(cacheKey)
+			// #62: GENUINE cold-dispatch Put (this else-if guarantees a real
+			// Put + dep-Record — never the stage-error / external-skip declines
+			// above). If a /refreshes connection is already armed for this key
+			// (it re-armed after a TTL-eviction, and this cold-fill replaces the
+			// evicted entry), announce the fill so the viewer's frame goes fresh
+			// now instead of waiting for the next churn. No-op when unarmed.
+			publishIfSubscribed(cacheKey)
+		}
 	}
 
 	log.Info("RESTAction successfully resolved",

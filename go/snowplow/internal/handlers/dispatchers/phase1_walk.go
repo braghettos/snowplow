@@ -1494,6 +1494,21 @@ func (w *phase1Walker) walk(ctx context.Context, in *unstructured.Unstructured, 
 	// external endpoint — exactly as it declines on a stage error. Additive to
 	// the stage-error sink; both gate the Put independently.
 	resolveCtx, _ = cache.WithExternalTouchedSink(resolveCtx)
+	// 1.12.3 A-1 / R-1 — install the UAF-touched sink on the SAME resolveCtx,
+	// third sibling of the two above. populateWidgetContentL1 (below) reads it
+	// via UAFTouchedSinkFromContext and declines to seed the identity-free
+	// content cell when the widget's resolve ran a userAccessFilter refilter —
+	// exactly as it declines on a stage error or an external touch.
+	//
+	// The widgetContent cell is SHARED (no identity fold) and its serve-time gate
+	// (gateWidgetEnvelope) re-derives only status.resourcesRefs.items[].allowed —
+	// it NEVER narrows status.widgetData. isRBACSensitiveApiRefWidget is supposed
+	// to route apiRef+template widgets away from this cell for exactly that
+	// reason, but that predicate is a DECLARATION-shaped heuristic over the widget
+	// CR and it de-classifies on accessor error. Gating on the observed refilter
+	// closes the question empirically instead of by argument: whatever the
+	// predicate decides, a refilter-narrowed body cannot enter the shared cell.
+	resolveCtx, _ = cache.WithUAFTouchedSink(resolveCtx)
 
 	// Resolve this widget. The resolver recursively reaches this widget's
 	// apiRef RESTAction (firing lazyRegisterInnerCallPaths on any

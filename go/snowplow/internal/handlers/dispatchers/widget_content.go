@@ -300,7 +300,35 @@ func populateWidgetContentL1(
 		return
 	}
 
-	// scope-waiver:TTLOverride: widgetContent-class cell — identity-free shared envelope, per-user serve-time filter (gateWidgetEnvelope); it holds no per-user UAF refilter output, so an out-of-band RBAC change never makes IT stale (uaf_shortttl.go R-d-4 SITE MAP).
+	// 1.12.3 A-1 / R-1 (SECURITY, cross-tenant) — decline to seed the identity-free
+	// content cell when the widget's resolve ran a userAccessFilter refilter. Third
+	// sibling of the stage-error and external-touched gates above, same shape, same
+	// early return (which also skips recordWidgetDeps — there is no entry to
+	// dep-track).
+	//
+	// THIS CELL IS THE WORST PLACE A NARROWED BODY COULD LAND: it carries NO
+	// identity fold at all, so it is shared across every user, and the serve-time
+	// gate re-derives only status.resourcesRefs.items[].allowed — it never narrows
+	// status.widgetData. isRBACSensitiveApiRefWidget is meant to route apiRef+
+	// template widgets to the per-cohort layer before they ever get here, but it
+	// is a declaration-shaped heuristic that de-classifies on accessor error. This
+	// gate makes the property hold by OBSERVATION rather than by that argument.
+	if uafSink := cache.UAFTouchedSinkFromContext(ctx); uafSink.Count() > 0 {
+		cache.BumpWidgetsUAFPutDeclined()
+		log.Debug("widget_content.populate.skip_user_access_filter",
+			slog.String("subsystem", "cache"),
+			slog.String("gvr", gvr.String()),
+			slog.String("ns", in.GetNamespace()),
+			slog.String("name", in.GetName()),
+			slog.Int("perPage", perPage),
+			slog.Int("page", page),
+			slog.Int64("uaf_touches", uafSink.Count()),
+			slog.String("reason", "apiRef RESTAction ran a userAccessFilter refilter — the envelope is narrowed for the resolving identity, and this cell is identity-FREE and shared; not seeding it (1.12.3 A-1/R-1)"),
+		)
+		return
+	}
+
+	// scope-waiver:TTLOverride: widgetContent-class cell — identity-free shared envelope, per-user serve-time filter (gateWidgetEnvelope). 1.12.3 A-1/R-1: it holds no per-user UAF refilter output because a refilter-touched resolve can no longer REACH this Put (the UAFTouchedSink gate immediately above declines it) — previously this rested on isRBACSensitiveApiRefWidget's routing argument alone, which the R-1 finding showed is not a safe basis for a UAF claim (uaf_shortttl.go R-d-4 SITE MAP).
 	c.Put(key, &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  inputs,
@@ -332,9 +360,28 @@ func populateWidgetContentL1(
 // `status.widgetData` (series.total, data=${.list}) computed by an apiRef
 // RA that aggregates cross-namespace would serve EVERY user the SA-maximal
 // full aggregate → cross-user leak. The fix routes these widgets to the
-// per-cohort `widgets` L1, which is RBAC-correct by construction (each
-// cohort resolves the apiRef RA under its OWN identity → narrowed at
-// resolve; no shared cell, no serve-gate, no leak).
+// per-cohort `widgets` L1.
+//
+// CORRECTED 1.12.3 (A-1/R-1) — the destination is NOT unconditionally safe.
+// This comment used to end "...the per-cohort `widgets` L1, which is
+// RBAC-correct by construction (each cohort resolves the apiRef RA under its
+// OWN identity → narrowed at resolve; no shared cell, no serve-gate, no
+// leak)". The premise is wrong in one specific and now-confirmed case. The
+// `widgets` cell is keyed per BINDING, not per USER (BindingUID + RBACSubGen;
+// username/groups are excluded from the key by design — resolved.go). "Each
+// cohort resolves under its own identity" is true, but a COHORT IS NOT A USER:
+// when the apiRef'd RA carries a userAccessFilter, two users who share the
+// first-match binding but have different per-object grants are one cohort with
+// two different correct bodies, and the first one to arrive writes the cell the
+// second reads. That is A-1, and this routing decision is what makes the
+// `widgets` cell its highest-volume carrier.
+//
+// The routing itself is still RIGHT — the shared identity-free cell would be
+// strictly worse. What changed is that the destination now carries its own
+// guard: a refilter-touched resolve declines its Put at every widgets-class
+// site (the UAFTouchedSink gate; uaf_shortttl.go R-d-4 SITE MAP). Until 1.13.0
+// folds the UAF scope into the key (v7), such widgets are simply not cached —
+// so "no leak" holds again, by a decline rather than by construction.
 //
 // SHAPE-BASED, no widget-name/GVR literal (feedback_no_special_cases).
 // True IFF the widget DECLARES a non-empty spec.apiRef AND declares at
