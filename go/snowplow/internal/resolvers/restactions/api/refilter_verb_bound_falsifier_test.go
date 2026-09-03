@@ -44,6 +44,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -131,15 +132,42 @@ func a4Envelope(t *testing.T) []byte {
 // namespaces of the kept items plus everything the stage logged.
 func a4RunStage(t *testing.T, uaf *templates.UserAccessFilterSpec) (keptNamespaces []string, logs string) {
 	t.Helper()
-	kept, logs, _ := a4RunStageWithSink(t, uaf)
+	kept, logs, _ := a4RunStageCore(t, uaf, true)
 	return kept, logs
 }
 
-// a4RunStageWithSink is a4RunStage plus the A-1 UAFTouchedSink installed on the
-// request ctx, returning how many times the refilter bumped it. Every L1 Put
-// site reads Count()>0 to decline caching a UAF-narrowed body, so a missing bump
-// here is a cross-requester cache leak, not a metrics gap.
+// a4RunStageWithSink drives the stage WITH an A-1 UAFTouchedSink installed on
+// the request ctx and reports how many times the refilter bumped it. Every L1
+// Put site reads Count()>0 to decline caching a UAF-narrowed body, so a missing
+// bump is a cross-requester cache leak, not a metrics gap.
 func a4RunStageWithSink(t *testing.T, uaf *templates.UserAccessFilterSpec) (keptNamespaces []string, logs string, uafBumps int64) {
+	t.Helper()
+	return a4RunStageCore(t, uaf, true)
+}
+
+// a4RunStageNoSink drives the SAME stage with NO sink on the ctx — the shape
+// every caller that does not Put an L1 entry presents. cache.BumpUAFTouched is
+// nil-receiver-safe, so this must neither panic nor change the result.
+//
+// This exists because the obvious way to write the inertness arm is wrong: if it
+// goes through a helper that installs a sink, it asserts nothing about the
+// no-sink path while its name promises it does. That is the same
+// assert-on-your-own-simulation shape that made the M1 chain arm a dud, so the
+// helper takes the flag explicitly rather than leaving it implicit.
+func a4RunStageNoSink(t *testing.T, uaf *templates.UserAccessFilterSpec) (keptNamespaces []string, logs string) {
+	t.Helper()
+	kept, logs, bumps := a4RunStageCore(t, uaf, false)
+	if bumps != -1 {
+		t.Fatalf("a4RunStageNoSink must report -1 bumps (no sink to count); got %d — the helper installed a sink and this arm is not testing the no-sink path", bumps)
+	}
+	return kept, logs
+}
+
+// a4RunStageCore drives the LIVE refilter path. installSink chooses whether the
+// request ctx carries a UAFTouchedSink; with it false the returned bump count is
+// -1, which is not a possible real count, so a caller that forgets which mode it
+// asked for fails loudly instead of reading 0 as "no bump observed".
+func a4RunStageCore(t *testing.T, uaf *templates.UserAccessFilterSpec, installSink bool) (keptNamespaces []string, logs string, uafBumps int64) {
 	t.Helper()
 
 	apiCall := &templates.API{
@@ -154,7 +182,10 @@ func a4RunStageWithSink(t *testing.T, uaf *templates.UserAccessFilterSpec) (kept
 		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "user1"}),
 		xcontext.WithLogger(logger),
 	)
-	ctx, uafSink := cache.WithUAFTouchedSink(ctx)
+	var uafSink *cache.UAFTouchedSink
+	if installSink {
+		ctx, uafSink = cache.WithUAFTouchedSink(ctx)
+	}
 
 	dict := make(map[string]any)
 	handler := jsonHandlerBytes(ctx, jsonHandlerOptions{
@@ -183,6 +214,9 @@ func a4RunStageWithSink(t *testing.T, uaf *templates.UserAccessFilterSpec) (kept
 		if items, ok := v["items"].([]any); ok && len(items) > 0 {
 			t.Fatalf("verb=%q: unexpected wrapped items shape: %v", uaf.Verb, items)
 		}
+	}
+	if !installSink {
+		return out, logBuf.String(), -1
 	}
 	return out, logBuf.String(), uafSink.Count()
 }
@@ -405,13 +439,37 @@ func TestA4_RefilterBumpsUAFTouchedSink(t *testing.T) {
 	}
 }
 
-// TestA4_SinkBumpIsNoOpWithoutSink — the inertness arm. Every path that installs
-// no sink (tests, non-Put callers) must be byte-identical: the bump is
-// nil-receiver-safe, so it must not panic and must not change the result.
+// TestA4_SinkBumpIsNoOpWithoutSink — the inertness arm. Every caller that
+// installs no sink (the resolve paths that never Put an L1 entry, and every
+// test) must be byte-identical to pre-1.12.3: cache.BumpUAFTouched is
+// nil-receiver-safe, so it must neither panic nor change what the refilter
+// returns.
+//
+// It drives the NO-SINK helper deliberately. An earlier version of this arm went
+// through a4RunStage, which installs one — so it ran the with-sink path while its
+// name promised the opposite, and would have stayed green with the no-sink path
+// completely broken.
 func TestA4_SinkBumpIsNoOpWithoutSink(t *testing.T) {
 	a4SplitScopeRBAC(t)
-	kept, logs := a4RunStage(t, a4UAF("list")) // a4RunStage installs no sink of its own beyond the wrapper
-	if len(kept) != 2 || kept[0] != "ns-a" {
-		t.Fatalf("the sink bump must not change refilter behaviour; got %v logs=%s", kept, logs)
+
+	// No sink on ctx: must not panic, and must keep exactly what RBAC permits.
+	kept, logs := a4RunStageNoSink(t, a4UAF("list"))
+	if len(kept) != 2 || kept[0] != "ns-a" || kept[1] != "ns-a" {
+		t.Fatalf("A-1 inertness: with NO sink installed the refilter must behave exactly as before the bump (the two ns-a items); got %v logs=%s", kept, logs)
+	}
+
+	// And identical to the with-sink run — the bump observes, it does not filter.
+	keptWith, _, bumps := a4RunStageWithSink(t, a4UAF("list"))
+	if bumps == 0 {
+		t.Fatal("setup: the with-sink run must actually bump, otherwise this comparison proves nothing")
+	}
+	if !reflect.DeepEqual(kept, keptWith) {
+		t.Fatalf("A-1 inertness: installing a sink changed the refilter result; no-sink=%v with-sink=%v — the bump must be observation-only", kept, keptWith)
+	}
+
+	// A non-read verb with no sink must also be inert: the A-4 warn path and the
+	// A-1 bump are independent, and neither may panic without a sink.
+	if keptWrite, _ := a4RunStageNoSink(t, a4UAF("create")); len(keptWrite) != 2 {
+		t.Fatalf("A-1 inertness: a non-read verb with no sink must still serve the items RBAC permits (the two ns-b items); got %v", keptWrite)
 	}
 }
