@@ -25,7 +25,9 @@ it composes content on demand from Kubernetes CRs and serves it to whatever clie
 PATCH/DELETE /call`, `GET /list`, `GET /export`, `GET /api-info/names`, `POST /jq`, `GET /rbac`),
 the per-subject live-refresh SSE stream (`GET /refreshes`), the probes (`/health`, `/readyz`), and
 the debug surface (`/debug/vars`, `/debug/pprof/*`, `/debug/servable`, `/debug/apistage`,
-`/debug/refreshes`, `/swagger/`).
+`/debug/refreshes`, `/swagger/`). The `/debug/*` block is registered by
+`registerDebugRoutes` (`debug_routes.go`), and since 1.12.3 every route in it requires a JWT;
+the probes stay anonymous.
 
 ## The request path (→ [request-lifecycle.md](docs/architecture/request-lifecycle.md))
 

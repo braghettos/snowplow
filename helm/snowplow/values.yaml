@@ -289,6 +289,27 @@ env:
   # 300s = a degraded catalog entry is corrected within ~5 min worst case.
   # Set to "0" to disable (entries then use the standard TTL exactly as before).
   CATALOG_UNSERVABLE_TTL_SECONDS: "300"
+  # #118 (d) bounded-staleness backstop for UAF-bearing cells (C-A2, 1.12.3).
+  # A restactions cell whose RESTAction carries a UserAuthorizationFilter is
+  # RBAC-sensitive, but the resolved-cache key does NOT fold the user's RBAC
+  # generation — so an authorization change inside the entry's TTL is served
+  # stale. When > 0, such an entry is stamped with this SHORT per-entry TTL
+  # instead of the standard RESOLVED_CACHE_TTL_SECONDS (3600), capping the
+  # staleness window; the accessor is internal/cache/resolved.go
+  # UAFResolvedTTL(), and effectiveTTLLocked only ever takes the SHORTER of
+  # the override and the store TTL, so this can only tighten the bound.
+  # Default in the binary is "0" = DISABLED — and the knob was absent from
+  # this chart entirely until 1.12.3, so no chart-deployed pod has ever had
+  # it on. 300s = an authz change is reflected within ~5 min worst case.
+  #
+  # BELT AND BRACES: 1.12.3 also DECLINES the Put for UAF-bearing cells
+  # (the A-1 mitigation), so on 1.12.3 this TTL should have nothing to cap.
+  # It stays declared and on because it bounds any cell a decline path misses,
+  # and because it is the only bound available if the decline is backed out.
+  # Both are INTERIM: the durable fix is the #118 (c) per-user RBAC sub-gen
+  # cache key landing in 1.13.0, after which this can go back to "0".
+  # Set to "0" to disable (UAF cells then use the standard TTL).
+  UAF_RESOLVED_TTL_SECONDS: "300"
   # #57 — prewarm seed loopback auth. The seed exchanges its projected
   # (audience=authn) ServiceAccount token at URL_AUTHN for an authn-issued JWT
   # and appends it on a /call api-step whose resolved endpoint host EXACTLY

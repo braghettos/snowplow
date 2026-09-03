@@ -531,10 +531,15 @@
       "type": "object",
       "additionalProperties": true,
       "properties": {
+        "LOG_LEVEL": {
+          "type": "string",
+          "description": "Log verbosity floor: debug, info, warn or error (case-insensitive; an unrecognised value falls back to info). Binary default is info; this chart sets warn. The single verbosity knob as of #163.",
+          "title": "Log Level"
+        },
         "DEBUG": {
           "type": "string",
-          "description": "Enable debug logging.",
-          "title": "DEBUG"
+          "description": "DEPRECATED (#163) — a thin alias for LOG_LEVEL=debug, kept only for back-compat. This chart no longer sets it; use LOG_LEVEL instead.",
+          "title": "DEBUG (deprecated)"
         },
         "BLIZZARD": {
           "type": "string",
@@ -570,6 +575,11 @@
           "type": "string",
           "description": "Bounded-staleness backstop (seconds) for apistage catalog entries stored while their GVR informer is not servable. When > 0, such an entry self-evicts within this short TTL instead of the standard resolved-cache TTL. 0 disables (entries use the standard TTL).",
           "title": "Catalog Unservable TTL Seconds"
+        },
+        "UAF_RESOLVED_TTL_SECONDS": {
+          "type": "string",
+          "description": "Bounded-staleness backstop (seconds) for resolved-cache entries whose RESTAction carries a UserAuthorizationFilter. When > 0, such an entry gets this short per-entry TTL instead of the standard resolved-cache TTL, capping how long an authorization change can be served stale. 0 disables (entries use the standard TTL).",
+          "title": "UAF Resolved TTL Seconds"
         },
         "OTEL_ENABLED": {
           "type": "string",
