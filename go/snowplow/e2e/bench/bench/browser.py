@@ -96,6 +96,8 @@ __all__ = [
     # Task #217 — per-stage L1 hit/miss delta (report-only)
     "read_snowplow_expvar_map",
     "compute_l1_lookup_delta",
+    # O-D3 (snowplow 1.12.3) — /debug/* is JWT-gated; park the bearer.
+    "set_debug_token",
 ]
 
 
@@ -261,9 +263,11 @@ def read_snowplow_expvar_int(key, *, base_url=None, timeout=10):
 
     Mechanism-independent probe used by the Phase 6 S8/S9 inner gate
     (Probe A — RBAC publish-seq delta). Mirrors the pattern of
-    http_get_json (single GET, gzip-decompress) but reads /debug/vars
-    UNAUTHENTICATED (the expvar mux at main.go:788 is mounted before any
-    auth middleware so /debug/vars is server-only-reachable).
+    http_get_json (single GET, gzip-decompress).
+
+    As of snowplow 1.12.3 (O-D3) /debug/vars is JWT-gated like every other
+    /debug/* route, so the GET carries the bearer _debug_auth_headers
+    resolves. An anonymous read of a 1.12.3 pod returns 401 → None.
 
     Args:
         key:      JSON top-level key in /debug/vars (e.g.
@@ -280,7 +284,10 @@ def read_snowplow_expvar_int(key, *, base_url=None, timeout=10):
     base = base_url if base_url is not None else SNOWPLOW
     url = f"{base.rstrip('/')}/debug/vars"
     try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        req = urllib.request.Request(
+            url,
+            headers=_debug_auth_headers({"Accept": "application/json"}),
+        )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status != 200:
                 return None
@@ -335,7 +342,10 @@ def read_snowplow_expvar_map(key, *, base_url=None, timeout=10):
     base = base_url if base_url is not None else SNOWPLOW
     url = f"{base.rstrip('/')}/debug/vars"
     try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        req = urllib.request.Request(
+            url,
+            headers=_debug_auth_headers({"Accept": "application/json"}),
+        )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status != 200:
                 return None
@@ -783,7 +793,57 @@ def login_all():
                     time.sleep(3)
                 else:
                     _log(f"{username}: login FAILED — {e}")
+    # O-D3 (snowplow 1.12.3): /debug/vars is no longer anonymous. Park the
+    # first token we obtained so the expvar readers below have credentials
+    # without every caller having to thread one through (see
+    # _debug_auth_headers).
+    if tokens:
+        set_debug_token(next(iter(tokens.values())))
     return tokens
+
+
+# ─── /debug/* credentials (snowplow O-D3, 1.12.3) ───────────────────────────
+#
+# As of snowplow 1.12.3 the whole /debug/* surface (pprof, vars, servable,
+# apistage, refreshes) is behind the same JWT gate /debug/refreshes has had
+# since #69 — an anonymous GET now returns 401, so the readers below MUST send
+# a bearer. Resolution order:
+#
+#   1. SNOWPLOW_DEBUG_TOKEN in the environment (an operator-supplied JWT, or a
+#      CI-injected one) — wins, so a run can probe with a specific identity;
+#   2. whatever login_all() parked — the normal bench path, since the harness
+#      logs every USER in before any stage runs.
+#
+# There is deliberately NO lazy login here: _debug_auth_headers sits on the
+# probe path and must stay I/O-free and side-effect-free (the unit tests drive
+# it with urlopen mocked and no cluster). A probe-only invocation that never
+# called login_all sets SNOWPLOW_DEBUG_TOKEN, or calls set_debug_token().
+#
+# Any authenticated identity works: the gate validates the JWT signature and
+# does not authorize per-key, so the counters an operator sees are the ones the
+# bench reads. With no token the readers issue an anonymous GET — against a
+# pre-1.12.3 pod that still succeeds, and against a 1.12.3 pod it 401s and the
+# reader returns None, which every caller already fails closed on.
+
+DEBUG_TOKEN: str | None = os.environ.get("SNOWPLOW_DEBUG_TOKEN") or None
+
+
+def set_debug_token(token):
+    """Park the JWT the /debug/* readers should present."""
+    global DEBUG_TOKEN
+    if token:
+        DEBUG_TOKEN = token
+
+
+def _debug_auth_headers(extra=None):
+    """Return request headers for a /debug/* GET, incl. Authorization.
+
+    Pure + I/O-free: merges the parked bearer (if any) on top of `extra`.
+    """
+    headers = dict(extra or {})
+    if DEBUG_TOKEN:
+        headers["Authorization"] = "Bearer " + DEBUG_TOKEN
+    return headers
 
 
 def http_get(path, token, base_url=None, timeout=120, retries=3,

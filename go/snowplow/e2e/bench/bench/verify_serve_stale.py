@@ -293,9 +293,15 @@ def _snapshot_debug_vars(base_url: str | None = None,
 
     Used as the PRIMARY hit/miss source per design Q5-A — atomic
     counters bumped in emitResolvedCacheLookup (helpers.go:241-250).
+
+    As of snowplow 1.12.3 (O-D3) /debug/vars is JWT-gated, so the GET
+    carries the bearer browser._debug_auth_headers resolves; an anonymous
+    read of a 1.12.3 pod is a 401 and raises _VerifyError, which the
+    caller already maps to INDETERMINATE_DEBUG_VARS_UNREACHABLE.
     """
     url = (base_url or browser.SNOWPLOW) + "/debug/vars"
-    req = urllib.request.Request(url)
+    req = urllib.request.Request(
+        url, headers=browser._debug_auth_headers())
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             if r.status != 200:

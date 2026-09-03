@@ -8,12 +8,10 @@ package main
 
 import (
 	"context"
-	"expvar"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
-	"net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime"
@@ -1107,26 +1105,6 @@ func main() {
 
 	mux.Handle("POST /jq", chain.Append(middleware.UserConfig(jwtKeys, *authnNS)).Then(handlers.JQ()))
 
-	// /debug/pprof/* — registered on the custom mux (server does NOT use http.DefaultServeMux).
-	// Exposes goroutine, heap, profile, allocs, mutex, block, cmdline, symbol, threadcreate, trace.
-	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
-	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
-	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
-
-	// Ship D.1 (0.30.142) — mount expvar.Handler on the snowplow mux so
-	// Ship D's counters (snowplow_apiserver_fallthrough_total,
-	// snowplow_apiserver_fallthrough_cells,
-	// snowplow_assertion_violations_total) are reachable over HTTP.
-	// Without this mount the counters published in
-	// internal/cache/fallthrough_meter_expvar.go are visible only via
-	// the process expvar registry — not on the production pod's HTTP
-	// surface — which is why Ship D's tester gate appeared to fail
-	// observability (the architect's audit confirmed the wrappers WERE
-	// firing; the counter simply wasn't reachable). One-liner alongside
-	// the existing pprof registrations.
-	//
 	// Ship 0.30.249 / Task #250 Block 2a — register
 	// snowplow_rbac_publish_seq (RBAC snapshot publish-sequence counter)
 	// here BEFORE the mux mount accepts scrapes. Unconditionally wired
@@ -1141,44 +1119,19 @@ func main() {
 	// can read hit-rate + entry count over /debug/vars. Cache mode-agnostic
 	// registration; the memo itself is only populated on the cache=on path.
 	rbac.RegisterAuthzMemoExpvar()
-	mux.Handle("GET /debug/vars", expvar.Handler())
 
-	// Fix #1 / stale-delete diagnostic — read-only per-GVR servability
-	// snapshot {HasSynced, watchBroken, confirmed, servable}
-	// (docs/rca-stale-delete-compositiondefinitions-informer-2026-06-25.md).
-	// Mutates no state; available in both cache-on and cache-off so the
-	// stale-delete latch (registered-but-unconfirmed / watch-broken GVR) is
-	// diagnosable without a kubectl exec. Mounted next to /debug/vars.
-	mux.HandleFunc("GET /debug/servable", handlers.DebugServable())
-
-	// R1 diagnostic — read-only METADATA-ONLY snapshot of resolved-output
-	// cache entries (class/path/gvr/age/ttl/items_count), for diagnosing a
-	// degraded apistage entry (stale getComposition / cluster-scoped
-	// allCompositionResources) without a kubectl exec. NEVER returns
-	// resolved bodies (per-identity RBAC-sensitive) — the structural leak
-	// guard is cache.ResolvedEntryMeta's type shape. Mounted next to
-	// /debug/servable (docs/design-r1-allcompositionresources-invalidation-2026-06-26.md §6).
-	mux.HandleFunc("GET /debug/apistage", handlers.DebugApistage())
-
-	// #61 diagnostic — read-only AGGREGATE-ONLY refresh-broadcaster counters
-	// (published/delivered/dropped/coalesced + subscriber count), the
-	// on-cluster instrument for verifying live-refresh delivery
-	// (refreshDeliveredTotal>0 for an armed key under churn) without a kubectl
-	// exec. NO per-subscription-key/identity enumeration — totals only (a
-	// per-key dump would be a cross-user signal). Mounted next to
-	// /debug/servable + /debug/apistage (docs/rca-refreshes-zero-delivery-2026-06-26.md §5).
+	// O-D3 (1.12.3) — the WHOLE /debug/* surface (pprof, vars, servable,
+	// apistage, refreshes) is mounted here, every route behind
+	// middleware.RefreshAuth(jwtKeys) — the same JWT gate #69 put on
+	// /debug/refreshes. Before 1.12.3 only /debug/refreshes was gated and the
+	// other four were world-readable on the chart's LoadBalancer Service.
+	// Extracted into a named registrar (debug_routes.go) so the gating is
+	// testable against production wiring — the same shape snowplowCORSOptions
+	// uses for the CORS contract. /health + /readyz above stay ANONYMOUS (the
+	// kubelet presents no JWT); /swagger/ is unchanged.
 	//
-	// #69 — AUTH-GATED for prod. Wrapped in middleware.RefreshAuth (the SAME
-	// cookie-or-header JWT gate /refreshes uses), so a bare unauthenticated GET
-	// now 401s instead of returning the counters. The body stays aggregate-only
-	// (uint64 totals + int subscriber count + bool — structurally cannot carry
-	// per-key/per-user data), so even past the gate it is leak-safe; the gate
-	// is defence-in-depth so the diagnostic is not world-readable in prod. Uses
-	// the same RefreshAuth chain form as /refreshes (no apiserver read, no
-	// UserConfig Secret lookup).
-	mux.Handle("GET /debug/refreshes", chain.Append(
-		middleware.RefreshAuth(jwtKeys)).
-		Then(handlers.DebugRefreshes()))
+	// MUST come after the expvar publishers registered just above.
+	registerDebugRoutes(mux, chain, jwtKeys)
 
 	ctx, stop := signal.NotifyContext(context.Background(), []os.Signal{
 		os.Interrupt,

@@ -18,10 +18,27 @@ port the server listens on (`main.go` `server.Addr = :<port>`):
 4. **OTel export** — traces, metrics and logs to an OTLP collector,
    **default-off** behind the `OTEL_ENABLED` master switch (see below).
 
-Plus the diagnostic endpoints `GET /debug/servable`, `GET /debug/apistage`
-and the auth-gated `GET /debug/refreshes` (the live-refresh subscription
-registry, wrapped in the same `RefreshAuth` as `/refreshes`), and two probe
-endpoints used by the chart:
+Plus the diagnostic endpoints `GET /debug/servable`, `GET /debug/apistage` and
+`GET /debug/refreshes` (the live-refresh subscription registry), and two probe
+endpoints used by the chart.
+
+> **Every `/debug/*` route needs a JWT (since 1.12.3).** The whole surface —
+> pprof, vars, servable, apistage, refreshes — is registered by
+> `registerDebugRoutes` (`debug_routes.go`) behind `middleware.RefreshAuth`,
+> the stateless header-or-cookie RS256 gate `/refreshes` uses. Before 1.12.3
+> only `/debug/refreshes` was gated (#69) and the rest were world-readable on
+> the chart's LoadBalancer Service. Pass the token explicitly:
+>
+> ```bash
+> curl -H "Authorization: Bearer $TOKEN" http://pod:8081/debug/vars
+> ```
+>
+> No token, an expired token, or a token supplied only in the query string →
+> `401`. A JWKS the pod cannot fetch → `503`. `/health` and `/readyz` stay
+> anonymous — the kubelet presents no credentials. Operator recipes are in
+> [operating.md](../../howto/operating.md).
+
+The probe endpoints:
 
 | Path | Handler | Returns | Meaning |
 |---|---|---|---|
@@ -212,7 +229,7 @@ operator-notable ones:
 | `phase1.seed.cohort.operational_failure` | Warn+ | dispatchers phase1 seed | a cohort hit an UNEXPECTED seed failure — pairs with `snowplow_phase1_seed_operational_fail_total`; actionable |
 | `phase1.seed.cohort.expected_deny` | Info | dispatchers phase1 seed | EXPECTED narrow-RBAC deny — normal, pairs with `snowplow_phase1_seed_rbac_deny_total` |
 | `phase1.walk.apiref_pagination.backstop_hit` | Warn | `dispatchers/phase1_walk_pagination.go` | a widget's apiRef pagination hit the anti-runaway page ceiling — coverage may be capped |
-| `apiserver_fallthrough` | Warn | `internal/cache/fallthrough_meter.go` | a read punted to the apiserver — the log companion to `snowplow_apiserver_fallthrough_total`; includes path/gvr/reason |
+| `apiserver_fallthrough` | Debug | `internal/cache/fallthrough_meter.go` | a read punted to the apiserver — the log companion to `snowplow_apiserver_fallthrough_total`; includes path/gvr/reason. **Demoted Warn→Debug in 1.12.2** (commit `52eb46d`): a warm pod still punts routinely, so at Warn it drowned the log. Track the counter, not the line; raise `LOG_LEVEL=debug` to see it. |
 | `cache.read_paths_scoped.violation` | Error | `internal/cache/fallthrough_assert.go` | architectural invariant breach — a `/call` route is not scope-wrapped |
 | `cache.serve_requires_servable.violation` | Error | `internal/cache/serve_assert.go` | **P1** invariant breach — a cache HIT was about to be served from a not-servable informer (names the gvr + serve_path) |
 | `cache.bindings_by_gvr.delta_skipped_non_typed` | Warn | `internal/cache/bindings_by_gvr_delta.go` | an index delta event was dropped — index is drifting; pairs with the same-named expvar |
