@@ -101,8 +101,14 @@ spec:
             # container. This entry OVERRIDES the same key from the ConfigMap and
             # only performs the expansion; values.env.OTEL_EXPORTER_OTLP_ENDPOINT
             # stays the installer-editable source of truth.
+            # Guarded: if an operator REMOVES the key from values.env, no entry
+            # is rendered (an unguarded entry would render value: "" and
+            # override the ConfigMap with an empty endpoint — a dead exporter
+            # pointed at the SDK default localhost:4318).
+            {{- with .Values.env.OTEL_EXPORTER_OTLP_ENDPOINT }}
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: {{ .Values.env.OTEL_EXPORTER_OTLP_ENDPOINT | quote }}
+              value: {{ . | quote }}
+            {{- end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: {{ include "krateo.image" (dict "img" .Values.image "global" .Values.global "defaultTag" .Chart.AppVersion) | quote }}
