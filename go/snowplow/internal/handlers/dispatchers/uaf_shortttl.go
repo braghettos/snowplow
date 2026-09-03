@@ -205,11 +205,24 @@ const (
 	// stage (inputs.HasUAF, stamped from RESTAction.HasUserAccessFilterStage).
 	// Available PRE-resolve, which is what lets the boot seed skip the fan-out.
 	uafDeclineDeclared = "declared"
-	// uafDeclineObserved — a userAccessFilter refilter actually RAN under this
-	// resolve's context (UAFTouchedSink). Necessarily post-resolve, but
-	// TRANSITIVE and declaration-blind: it fires for a widget whose apiRef'd RA
-	// declares the UAF several resolver frames down (the R-1 hot carrier) and for
-	// a non-UAF RA that NESTS a UAF one — both invisible to the declaration.
+	// uafDeclineObserved — the resolve under this context was MARKED as
+	// userAccessFilter-narrowed (UAFTouchedSink). Necessarily post-resolve, but
+	// TRANSITIVE and declaration-blind, so it reaches shapes the declaration
+	// cannot see from the Put site's own frame.
+	//
+	// WHAT IT ACTUALLY REACHES depends on where the bumps are, and that differs
+	// between this branch and the assembled tree:
+	//   - a widget whose apiRef'd RA declares the UAF several resolver frames
+	//     down (the R-1 hot carrier) — COVERED HERE, by apiref.Resolve's
+	//     declaration bump;
+	//   - a non-UAF RA that NESTS a UAF one — NOT covered here. No bump fires on
+	//     that path, because the only bump inspects the RA the apiRef names and
+	//     that one declares nothing (asserted by
+	//     TestM1_DeclarationLimbIsBlindToNestedUAFChild, apiref package). It
+	//     closes with the refilter bump on fix/1.12.3-authz-hardening, whose arm
+	//     is TestA4_RefilterBumpsUAFTouchedSink.
+	// Read this constant as "something marked the resolve", never as "every
+	// narrowed shape is marked".
 	uafDeclineObserved = "observed_refilter"
 )
 

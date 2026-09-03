@@ -172,8 +172,13 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	// WHY THE DECLARATION AND NOT THE REFILTER ITSELF: the refilter's own bump
 	// (cache.BumpUAFTouched at the top of applyUserAccessFilterOnPig,
 	// internal/resolvers/restactions/api/refilter.go) is owned by another dev and
-	// lands separately. The two are COMPLEMENTARY, not duplicates, and both are
-	// wanted:
+	// DOES NOT EXIST YET ON THIS BRANCH — it lands on fix/1.12.3-authz-hardening
+	// and is a HARD TAG CONDITION for 1.12.3. Until it merges, the bump below is
+	// the ONLY one, which leaves the nested-chain case open — the blindness is
+	// asserted by TestM1_DeclarationLimbIsBlindToNestedUAFChild in this package,
+	// and the refilter's own marking by TestA4_RefilterBumpsUAFTouchedSink in
+	// internal/resolvers/restactions/api. The two bumps are COMPLEMENTARY, not
+	// duplicates, and both are wanted:
 	//   - THIS bump is declaration-based and fires whenever an apiRef'd RA
 	//     DECLARES a UAF stage — even if the refilter then narrows nothing (an
 	//     empty result set still means the body is requester-dependent), and even
