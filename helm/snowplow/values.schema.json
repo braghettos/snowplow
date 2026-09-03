@@ -546,11 +546,6 @@
           "description": "Blizzard feature toggle.",
           "title": "BLIZZARD"
         },
-        "SKIP": {
-          "type": "string",
-          "description": "Skip feature toggle.",
-          "title": "SKIP"
-        },
         "JQ_MODULES_PATH": {
           "type": "string",
           "description": "Path where jq custom modules are mounted.",
@@ -583,18 +578,28 @@
         },
         "OTEL_ENABLED": {
           "type": "string",
-          "description": "Enable OpenTelemetry instrumentation.",
+          "description": "Master switch for OpenTelemetry export to ClickStack (traces + metrics over OTLP/HTTP). \"false\" restores a byte-identical pre-1.12.4 process. Per-signal overrides: OTEL_TRACING_ENABLED, OTEL_METRICS_ENABLED, OTEL_LOGS_ENABLED.",
           "title": "OTEL Enabled"
         },
         "OTEL_EXPORTER_OTLP_ENDPOINT": {
           "type": "string",
-          "description": "OTLP collector endpoint.",
+          "description": "OTLP/HTTP collector endpoint. Default http://$(HOST_IP):4318 targets the node-local OTel collector daemonset agent (hostPort 4318), the only OTLP ingest on the platform; $(HOST_IP) is expanded by the Deployment. The collector *deployment* Service has no OTLP receiver — do not point here.",
           "title": "OTEL Exporter OTLP Endpoint"
         },
-        "OTEL_SERVICE_NAME": {
+        "OTEL_TRACES_SAMPLER": {
           "type": "string",
-          "description": "Service name reported to OpenTelemetry.",
-          "title": "OTEL Service Name"
+          "description": "OTel SDK sampler family. Ship \"traceidratio\" (snowplow's own root decision). NOT \"parentbased_traceidratio\": the agent gateway samples 100% and propagates sampled=1, so a parent-based sampler would span 100% of customer /call.",
+          "title": "OTEL Traces Sampler"
+        },
+        "OTEL_TRACES_SAMPLER_ARG": {
+          "type": "string",
+          "description": "Sampling ratio for OTEL_TRACES_SAMPLER (\"0.05\" = 5% of root traces). The SDK default with no sampler is 100% — always set together with OTEL_ENABLED.",
+          "title": "OTEL Traces Sampler Arg"
+        },
+        "OTEL_LOGS_ENABLED": {
+          "type": "string",
+          "description": "OTLP log export (audit events). Ship \"false\": the collector agent's logs pipeline accepts filelog only, so an OTLP log export has no consumer. Logs stay stdout → filelog.",
+          "title": "OTEL Logs Enabled"
         },
         "PRETTY_LOG": {
           "type": "string",

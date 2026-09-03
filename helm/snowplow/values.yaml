@@ -246,6 +246,37 @@ env:
   # unaffected. Set to "info" (or DEBUG=true) to restore verbose logs for
   # debugging. snowplow's binary default is "info"; this chart overrides to warn.
   LOG_LEVEL: "warn"
+  # ---------------------------------------------------------------------
+  # OpenTelemetry → ClickStack (1.12.4). Platform observability is entirely
+  # ClickStack (HyperDX + ClickHouse + OTel collector); snowplow exports
+  # traces + metrics over OTLP/HTTP to the NODE-LOCAL collector daemonset
+  # agent (hostPort 4318) — the only OTLP ingest on the platform. The
+  # collector *deployment* exposes 4317/4318 too but has no otlp receiver:
+  # do not point this at it. All five knobs are STRINGS (installer plumbing
+  # is string-only). OTEL_ENABLED "false" restores a byte-identical 1.12.3
+  # process; OTEL_METRICS_ENABLED / OTEL_TRACING_ENABLED gate each signal.
+  OTEL_ENABLED: "true"
+  # $(HOST_IP) is expanded by the Deployment's container env: entry (the
+  # ConfigMap/envFrom path performs no expansion). To use the headless
+  # Service instead set
+  # http://otel-collector-daemonset-opentelemetry-collector.<ns>.svc.cluster.local:4318
+  # and $(HOST_IP) simply goes unused.
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://$(HOST_IP):4318"
+  # SAMPLER FAMILY — read before changing. "traceidratio" makes snowplow's
+  # OWN root decision. NOT "parentbased_traceidratio": snowplow sits behind
+  # the agent gateway whose tracing policy samples 100% and propagates
+  # sampled=1, so a parent-based sampler would span 100% of customer
+  # /call — exactly the traffic the ratio is meant to bound. Trade: 5%
+  # complete end-to-end traces + 95% gateway-only traces, partial BY
+  # DESIGN. The SDK default with no sampler is 100%, so these two ship
+  # together with OTEL_ENABLED — never flip one without the other.
+  OTEL_TRACES_SAMPLER: "traceidratio"
+  OTEL_TRACES_SAMPLER_ARG: "0.05"
+  # Explicit override DOWN from the master: the collector agent's logs
+  # pipeline accepts filelog only (no OTLP logs receiver), so an OTLP log
+  # export has no consumer. Logs stay stdout → filelog as for every other
+  # Krateo component; since 1.12.4 every *Context record carries trace_id.
+  OTEL_LOGS_ENABLED: "false"
   # Phase 1 informer-sync barrier bounds (snowplow Fix 1b).
   #   PHASE1_TIMEOUT_SECONDS  — absolute outer backstop for the whole
   #     Phase 1 warmup. #130 F3: RAISED 180->900 (the seed companion, TRACED).
