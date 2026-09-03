@@ -22,6 +22,13 @@ import pytest
 # Bypass the GKE context guard — tests should never contact a real cluster.
 os.environ.setdefault("BENCH_ALLOW_NON_GKE", "1")
 
+# BENCH_GKE_CONTEXT retargets the pinned context (cluster.canonical_gke_context).
+# An operator who exports it in their shell to drive a real bench run would
+# otherwise change what the context-pinning tests assert. Clear it so the suite
+# is hermetic against the operator's environment; the tests that exercise the
+# override set it explicitly via monkeypatch.
+os.environ.pop("BENCH_GKE_CONTEXT", None)
+
 # Add e2e/bench/ to sys.path so `import bench.cluster` works without install.
 _E2E_BENCH_DIR = Path(__file__).resolve().parent.parent
 if str(_E2E_BENCH_DIR) not in sys.path:

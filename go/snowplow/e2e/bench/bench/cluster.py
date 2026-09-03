@@ -41,6 +41,36 @@ import time
 
 CANONICAL_GKE_CONTEXT = "gke_neon-481711_us-central1-a_cluster-1"
 
+# Env override for the pinned context. The hard-coded CANONICAL_GKE_CONTEXT
+# above is the historical bench cluster, and it is GONE (the neon-481711
+# project 403s and no longer lists) — so as shipped the harness pins a
+# context that resolves to nothing on every live cluster.
+#
+# BENCH_GKE_CONTEXT retargets the pin. It does NOT weaken it: the resolved
+# context is still injected into every kubectl(), every `helm --kube-context`,
+# every direct-Popen `--context=`, and the in-process kubernetes client, and
+# gke_context_guard still refuses to run when current-context does not match
+# it. That is the whole point of the override — BENCH_ALLOW_NON_GKE=1 is the
+# only other way to reach a non-neon cluster today and it REMOVES all pinning,
+# which lets a `helm upgrade` land on whatever cluster current-context happens
+# to name (gcloud rewrites it; a teammate's kind run flips it). An operator
+# who needs a different GKE cluster must be able to say so without giving up
+# the safety rail.
+#
+# Resolved at CALL time, not import time, mirroring
+# expected.py:_resolve_overlay_path — so a test (or a caller that sets the
+# variable after importing bench.cluster) sees the change.
+ENV_GKE_CONTEXT = "BENCH_GKE_CONTEXT"
+
+
+def canonical_gke_context() -> str:
+    """The GKE context every bench kubectl/helm/client call pins.
+
+    Returns $BENCH_GKE_CONTEXT when set and non-empty, else the
+    CANONICAL_GKE_CONTEXT fallback.
+    """
+    return os.environ.get(ENV_GKE_CONTEXT, "").strip() or CANONICAL_GKE_CONTEXT
+
 
 def gke_context_guard(allow_non_gke: bool | None = None) -> None:
     """Exit non-zero if kubectl current-context is not the canonical GKE.
@@ -82,11 +112,13 @@ def gke_context_guard(allow_non_gke: bool | None = None) -> None:
         # the caller; we do not want module import to die on a transient.
         return
     ctx = (proc.stdout.decode() or "").strip()
-    if ctx != CANONICAL_GKE_CONTEXT:
+    want = canonical_gke_context()
+    if ctx != want:
         sys.stderr.write(
             f"bench: GKE context guard FAIL — current-context={ctx!r} "
-            f"(want {CANONICAL_GKE_CONTEXT!r}). Set BENCH_ALLOW_NON_GKE=1 "
-            f"to bypass (kind/minikube only).\n"
+            f"(want {want!r}). Set {ENV_GKE_CONTEXT} to pin a different GKE "
+            f"cluster, or BENCH_ALLOW_NON_GKE=1 to bypass pinning entirely "
+            f"(kind/minikube only).\n"
         )
         sys.exit(3)
 
@@ -96,7 +128,7 @@ def gke_context_guard(allow_non_gke: bool | None = None) -> None:
 def kubectl(*args, input_data=None, timeout_secs=120):
     """Run a kubectl invocation. Returns (returncode, stdout, stderr).
 
-    Injects `--context=CANONICAL_GKE_CONTEXT` UNLESS the caller already
+    Injects `--context=canonical_gke_context()` UNLESS the caller already
     passed an explicit `--context=...` flag OR `BENCH_ALLOW_NON_GKE=1` is
     set in the environment. This makes the bench hermetic against the
     user's kubectl current-context drifting between Bash invocations
@@ -111,7 +143,7 @@ def kubectl(*args, input_data=None, timeout_secs=120):
     caller_pinned_context = any(
         isinstance(a, str) and a.startswith("--context") for a in arg_list)
     if not allow_non_gke and not caller_pinned_context:
-        arg_list = [f"--context={CANONICAL_GKE_CONTEXT}"] + arg_list
+        arg_list = [f"--context={canonical_gke_context()}"] + arg_list
     try:
         proc = subprocess.run(
             ["kubectl"] + arg_list,
@@ -141,7 +173,7 @@ def helm_context_args():
     """
     if _allow_non_gke_env():
         return []
-    return ["--kube-context", CANONICAL_GKE_CONTEXT]
+    return ["--kube-context", canonical_gke_context()]
 
 
 def kubectl_context_args():
@@ -151,7 +183,7 @@ def kubectl_context_args():
     """
     if _allow_non_gke_env():
         return []
-    return [f"--context={CANONICAL_GKE_CONTEXT}"]
+    return [f"--context={canonical_gke_context()}"]
 
 
 # ─── Kubernetes-client helper layer (k8s_* prefix) ───────────────────────────
@@ -205,7 +237,7 @@ def _k8s_init():
                 env_flag = os.environ.get(
                     "BENCH_ALLOW_NON_GKE", "0").strip().lower()
                 pin = (None if env_flag in ("1", "true", "yes")
-                       else CANONICAL_GKE_CONTEXT)
+                       else canonical_gke_context())
                 _k8s_config_mod.load_kube_config(context=pin)
             except Exception:
                 # Fall back to in-cluster config (when running in a pod)
@@ -1315,6 +1347,8 @@ gke_context_guard()
 __all__ = [
     # Constants
     "CANONICAL_GKE_CONTEXT",
+    "ENV_GKE_CONTEXT",
+    "canonical_gke_context",
     "NS",
     "COMPDEF_NAME",
     "COMP_GVR",

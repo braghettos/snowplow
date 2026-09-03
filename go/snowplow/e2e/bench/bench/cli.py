@@ -28,7 +28,6 @@ from pathlib import Path
 
 from bench import cluster
 from bench.cluster import (
-    CANONICAL_GKE_CONTEXT,
     NS,
     kubectl,
 )
@@ -473,8 +472,8 @@ def _gate_k8s_client() -> tuple[bool, str]:
                        "'kubernetes>=28.0.0' per requirements.txt)")
     if not cluster._k8s_init():
         return False, ("k8s_client: FAIL (lib present but client init "
-                       "failed — kubeconfig/context problem; canonical "
-                       f"context is {cluster.CANONICAL_GKE_CONTEXT!r})")
+                       "failed — kubeconfig/context problem; pinned "
+                       f"context is {cluster.canonical_gke_context()!r})")
     return True, "k8s_client: PASS (in-process client initialized)"
 
 
