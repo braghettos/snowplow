@@ -260,6 +260,33 @@ func raFullListServe(
 		return nil, false, nil // cache off — fall back
 	}
 
+	// 1.12.3 A-1 (SECURITY, cross-tenant) — BYPASS the whole RAFullList layer for
+	// a RESTAction that declares a userAccessFilter stage. The cell this path
+	// serves AND populates holds the RA's full resolve output, UAF refilter
+	// INCLUDED, under a key that folds the RA-CR's first-match BindingUID ALONE
+	// (seedFullListRAKey → RAFullListKeyInputs — no RBACSubGen, strictly weaker
+	// separation than the restactions cell). So two co-bound users with divergent
+	// per-object narrowings key onto ONE cell and the second is served the first
+	// one's rows — the same defect the three restactions Put sites now decline,
+	// with fewer defences in front of it.
+	//
+	// Returning served=false is the ESTABLISHED fall-back contract of this
+	// function (identical to the not-sliceable and no-identity exits above and
+	// below): apiref.Resolve falls straight through to the page-keyed
+	// resolveRA(ctx, PerPage, Page) under the REQUEST'S OWN identity, so the
+	// caller still gets a correct, freshly-narrowed page. Placed FIRST, before
+	// the key derivation and the sliceability memo, so a UAF RA touches neither
+	// the cell nor the verdict store on either the serve or the populate side —
+	// there is nothing left to leak from. The predicate is the one shared
+	// RESTAction.HasUserAccessFilterStage (nil-receiver-safe), the same call the
+	// dispatchers' declineUAFPut gate stamps HasUAF from.
+	//
+	// 1.13.0 removes this bypass when the UAF-scope digest lands in the key (v7).
+	if ra.HasUserAccessFilterStage() {
+		cache.BumpRAFullListUAFBypass()
+		return nil, false, nil
+	}
+
 	// Ship 0.30.242 H.c-layered Phase 2b (§3.3 raFullList row) + #42 G2-A: the
 	// RAFullList cell keys on the RA-CR's GET-permit first-match BindingUID,
 	// derived via seedFullListRAKey — the SINGLE SOURCE OF TRUTH shared with the

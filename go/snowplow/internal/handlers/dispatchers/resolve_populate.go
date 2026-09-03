@@ -288,6 +288,30 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 		return nil
 	}
 
+	// 1.12.3 A-1 (SECURITY, cross-tenant) — DECLINE the re-Put for a UAF-bearing
+	// cell, the refresher leg of the shared three-site gate. The refresher has no
+	// RESTAction CR, so it consults the CARRIED inputs.HasUAF the original Put
+	// recorded — the same single-source shape C-118-6 established for the TTL
+	// override. DEFENSIVE SYMMETRY: since 1.12.3 no UAF cell can be created (all
+	// three Put sites decline), so the refresher should never be handed one; but
+	// a residual cell — an entry written by a pre-1.12.3 process image, or a
+	// future path that starts caching UAF output again — must not be REFRESHED
+	// into a longer life. Structurally identical to the external-touched re-Put
+	// gate above: keep whatever entry exists, decline the write, TTL is the outer
+	// net. Byte-identical to 1.12.2 for every non-UAF cell (HasUAF false).
+	if declineUAFPut(&inputs) {
+		// DEBUG for the same reason as the dispatch site: expected, designed, and
+		// potentially per-refresh-cycle frequent. The counter carries the rate.
+		log.Debug("resolveAndPopulateL1: entry is userAccessFilter-bearing; declining to re-Put",
+			slog.String("subsystem", "cache"),
+			slog.String("key_hash", key),
+			slog.String("handler", inputs.CacheEntryClass),
+			slog.String("user", refreshUser),
+			slog.String("effect", "prior entry kept, not refreshed; a UAF body is per-requester-narrowed and the key does not separate co-bound users (1.12.3 A-1)"),
+		)
+		return nil
+	}
+
 	entry := &cache.ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  &inputs,

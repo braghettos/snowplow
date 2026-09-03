@@ -780,6 +780,44 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 		return nil
 	}
 
+	// 1.12.3 A-1 (SECURITY, cross-tenant) — the SEED leg of the shared three-site
+	// UAF Put-decline gate, placed BEFORE the resolve. The boot seed warms a
+	// restactions cell under a cohort REPRESENTATIVE identity; for a UAF-bearing
+	// RA that cell holds the representative's OWN per-object narrowing, and every
+	// other cohort member who derives the same BindingUID + RBACSubGen would be
+	// served it verbatim on their first /call — the leak at its widest (a whole
+	// cohort reading one member's rows, warm from boot).
+	//
+	// SKIP-BEFORE-RESOLVE, not resolve-and-decline: the Put is the seed's ONLY
+	// product (the tail's dep Record + informer wiring exist to service that
+	// cell), so resolving first would buy nothing and cost a full fan-out per
+	// cohort per UAF RA at boot. Non-lossy by the same argument as the #113
+	// templated-endpointRef skip above: the seed was never going to leave a
+	// servable cell behind. HasUAF is stamped here (not only in the tail) so the
+	// ONE shared helper decides, and so the flag is already correct if a future
+	// path carries these inputs onward. The tail keeps its own defensive decline
+	// for a caller that drives the seam directly.
+	if inputs != nil {
+		inputs.HasUAF = restactionHasUAFStage(&cr)
+	}
+	if declineUAFPut(inputs) {
+		// INFO, not WARN: this is a per-boot, per-(cohort × UAF RA) event — a
+		// handful of lines, not hot-path noise — and it is the greppable
+		// counterpart of the other phase1.seed.skip.* lines around it, which the
+		// boot-seed post-mortems read. The hot-path decline sites log at DEBUG.
+		slog.Default().Info("phase1.seed.skip.user_access_filter",
+			slog.String("subsystem", "cache"),
+			slog.String("class", "restactions"),
+			slog.String("restaction", ref.Namespace+"/"+ref.Name),
+			slog.String("cohort", cohortLabel),
+			slog.String("effect", "RESTAction declares a userAccessFilter: its resolved body is narrowed per requester, "+
+				"but the seed cell is keyed per BINDING — a co-bound cohort member would be served the representative's "+
+				"rows. Skipping resolve+Put entirely (1.12.3 A-1); these RAs resolve per request until 1.13.0 folds the "+
+				"UAF scope into the key."),
+		)
+		return nil
+	}
+
 	// Ship 0.30.192 — pure-additive per-stage timing sink for cost
 	// attribution. The 0.30.179 cluster-list-deny / per-NS iterator
 	// fallback at iter_serial=1 is the architect's TRACED hypothesis
@@ -894,6 +932,22 @@ func seedRestactionResolveAndPutProd(
 	// to today for a non-UAF seed cell and when disabled.
 	if inputs != nil {
 		inputs.HasUAF = restactionHasUAFStage(cr)
+	}
+	// 1.12.3 A-1 — DEFENSIVE decline at the Put itself. seedOneRestaction already
+	// short-circuits a UAF RA before this tail is ever called, so in production
+	// this is unreachable; it exists because the tail is a REASSIGNABLE SEAM
+	// (seedRestactionResolveAndPutFn) and a caller that enters it directly must
+	// still be unable to write a per-binding cell holding one cohort member's
+	// per-requester narrowing. Same shared helper as the other two sites.
+	if declineUAFPut(inputs) {
+		slog.Default().Info("phase1.seed.skip.user_access_filter",
+			slog.String("subsystem", "cache"),
+			slog.String("class", "restactions"),
+			slog.String("restaction", ref.Namespace+"/"+ref.Name),
+			slog.String("site", "resolve_and_put_tail"),
+			slog.String("effect", "declining the seed Put for a userAccessFilter-bearing RESTAction (1.12.3 A-1 defensive leg; the pre-resolve skip normally fires first)"),
+		)
+		return nil
 	}
 	// Put under the per-user key — exactly the shape restactions.go
 	// :212-216 puts under at serve time.
