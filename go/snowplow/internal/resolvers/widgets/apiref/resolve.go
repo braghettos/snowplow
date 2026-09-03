@@ -82,6 +82,19 @@ func IsPaginatedResolve(perPage, page int) bool {
 	return perPage > 0 && page > 0
 }
 
+// bumpUAFSinkIfDeclared marks the enclosing resolve as userAccessFilter-narrowed
+// when the apiRef'd RESTAction declares a UAF stage. Extracted as a named
+// function (rather than inlined at the one call site) so the A-1/R-1 falsifier
+// can drive the REAL predicate-to-bump wiring with a real sink on ctx, without
+// standing up objects.Get and a live RA fetch just to observe one bump.
+//
+// nil ra and a ctx with no sink are both no-ops.
+func bumpUAFSinkIfDeclared(ctx context.Context, ra *templatesv1.RESTAction) {
+	if ra.HasUserAccessFilterStage() {
+		cache.BumpUAFTouched(ctx)
+	}
+}
+
 func shouldServeRAFullList(ctx context.Context, perPage, page int) bool {
 	if !IsPaginatedResolve(perPage, page) || !cache.ResolvedCacheEnabled() {
 		return false
@@ -144,6 +157,40 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	if res.Err != nil {
 		return map[string]any{}, err
 	}
+
+	// 1.12.3 A-1 / R-1 (SECURITY, cross-tenant) — THE PRODUCTION BUMP FOR THE
+	// WIDGET CARRIER, and this is the frame where it has to happen.
+	//
+	// The widgets/widgetContent Put sites gate on cache.UAFTouchedSink, but they
+	// cannot detect a userAccessFilter themselves: a widget CR declares none, and
+	// the RA that does sits several resolver frames below them. THIS function is
+	// the apiRef chokepoint — every widget→RESTAction read funnels through it, and
+	// it is the FIRST frame holding the typed RA, so it is the first place the
+	// declaration is visible at all. Bumping here makes the sink non-empty for the
+	// whole enclosing widget resolve, so the widget's Put declines.
+	//
+	// WHY THE DECLARATION AND NOT THE REFILTER ITSELF: the refilter's own bump
+	// (cache.BumpUAFTouched at the top of applyUserAccessFilterOnPig,
+	// internal/resolvers/restactions/api/refilter.go) is owned by another dev and
+	// DOES NOT EXIST YET ON THIS BRANCH — it lands on fix/1.12.3-authz-hardening
+	// and is a HARD TAG CONDITION for 1.12.3. Until it merges, the bump below is
+	// the ONLY one, which leaves the nested-chain case open — the blindness is
+	// asserted by TestM1_DeclarationLimbIsBlindToNestedUAFChild in this package,
+	// and the refilter's own marking by TestA4_RefilterBumpsUAFTouchedSink in
+	// internal/resolvers/restactions/api. The two bumps are COMPLEMENTARY, not
+	// duplicates, and both are wanted:
+	//   - THIS bump is declaration-based and fires whenever an apiRef'd RA
+	//     DECLARES a UAF stage — even if the refilter then narrows nothing (an
+	//     empty result set still means the body is requester-dependent), and even
+	//     if a future short-circuit skips the refilter for some input.
+	//   - THEIR bump is execution-based and fires wherever a refilter actually
+	//     runs, including chains this frame never sees (a nested RA→RA hop that
+	//     does not pass through apiref).
+	// Double-bumping is harmless: the gate reads Count()>0, never an exact count.
+	//
+	// No-op when no sink is installed on ctx (BumpUAFTouched is nil-safe), so
+	// every path that does not cache is byte-unchanged.
+	bumpUAFSinkIfDeclared(ctx, &ra)
 
 	// resolveRA is the page-keyed resolve seam: it runs the SAME
 	// restactions.Resolve pipeline at the given pagination and returns the RA

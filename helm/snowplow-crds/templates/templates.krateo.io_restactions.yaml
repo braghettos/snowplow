@@ -63,6 +63,31 @@ spec:
                     rule reads sibling stage fields (self.verb / self.exportJwt) alongside
                     self.userAccessFilter — placement the UserAccessFilterSpec-level XOR
                     rule cannot reach.
+
+                    A-4 (1.12.3) — THERE IS DELIBERATELY NO FOURTH RULE BOUNDING
+                    userAccessFilter.verb. Do not add one; it was tried and reverted.
+
+                    The temptation is obvious: uaf.Verb is threaded verbatim into
+                    rbac.EvaluateRBAC (refilter.go evalSingle), so `verb: create` on a stage that
+                    returns objects of the SAME resource keeps the objects the caller may WRITE
+                    rather than the ones they may read — a scope inversion. But a blanket
+                    `verb in ['get','list','watch']` rule is too coarse: three LIVE portal
+                    RESTActions (testdata/portal_uaf_corpus.yaml, portal @ b2a558d) use
+                    `verb: create` legitimately. Their api-step returns NAMESPACES and the filter
+                    checks create on a DIFFERENT resource, so it answers "which namespaces may I
+                    create X in" — a form picker that discloses nothing the caller cannot
+                    already determine about their own grants. The rule would have failed the
+                    portal upgrade and silently emptied three namespace pickers.
+
+                    The real invariant is narrower — SAME-RESOURCE — and it needs the resource
+                    the api-step RETURNS, which CEL on this struct cannot derive (the path may be
+                    jq-templated). So it lives at runtime: refilter.go carries uafVerbIsRead as a
+                    WARN-ONLY signal in 1.12.3, and 1.13.0 flips it to enforce the same-resource
+                    rule, failing OPEN on templated paths. See the 1.13.0 note there.
+
+                    TestA4_PortalCorpus_CreateVerbUAFs_Admitted and
+                    TestA4_UAFVerbBound_NotReintroduced (uaf_verb_cel_test.go) fail if the rule
+                    comes back, and name the three portal files it would break.
                   properties:
                     continueOnError:
                       type: boolean

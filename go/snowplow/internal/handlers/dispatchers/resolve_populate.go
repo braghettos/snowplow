@@ -213,6 +213,13 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 	// reached this path it would still decline the re-Put rather than persist
 	// stale external data. Additive to the stage-error sink.
 	rctx, extTouchedSink := cache.WithExternalTouchedSink(rctx)
+	// 1.12.3 A-1 / R-1 — install the UAF-touched sink, third sibling of the two
+	// above. The refresher has no CR, so the declaration limb of the gate can
+	// only read the HasUAF the original Put carried; the sink gives it a SECOND,
+	// derivation-independent signal that works for a cell of ANY class whose
+	// re-resolve runs a refilter — including a widgets-class cell, whose stored
+	// Inputs never carry HasUAF because the declaration lives on the apiRef'd RA.
+	rctx, uafTouchedSink := cache.WithUAFTouchedSink(rctx)
 
 	encoded, err := resolveOnceFn(rctx, inputs)
 	if err != nil {
@@ -284,6 +291,39 @@ func resolveAndPopulateL1(ctx context.Context, inputs cache.ResolvedKeyInputs, s
 			slog.String("user", refreshUser),
 			slog.Int64("external_touches", extTouchedSink.Count()),
 			slog.String("effect", "prior entry kept; external data has no dep edge — TTL is the outer net"),
+		)
+		return nil
+	}
+
+	// 1.12.3 A-1 (SECURITY, cross-tenant) — DECLINE the re-Put for a UAF-bearing
+	// cell, the refresher leg of the shared three-site gate. The refresher has no
+	// RESTAction CR, so it consults the CARRIED inputs.HasUAF the original Put
+	// recorded — the same single-source shape C-118-6 established for the TTL
+	// override. DEFENSIVE SYMMETRY: since 1.12.3 no UAF cell can be created (all
+	// three Put sites decline), so the refresher should never be handed one; but
+	// a residual cell — an entry written by a pre-1.12.3 process image, or a
+	// future path that starts caching UAF output again — must not be REFRESHED
+	// into a longer life. Structurally identical to the external-touched re-Put
+	// gate above: keep whatever entry exists, decline the write, TTL is the outer
+	// net. Byte-identical to 1.12.2 for every non-UAF cell (HasUAF false).
+	if reason := uafDeclineReason(&inputs, uafTouchedSink); reason != "" {
+		// Count under the class the cell actually belongs to, so the widgets
+		// carrier's refresh declines do not get buried in the restactions number.
+		if isWidgetClass(inputs.CacheEntryClass) {
+			declineWidgetUAFPut(&inputs, uafTouchedSink)
+		} else {
+			declineUAFPut(&inputs, uafTouchedSink)
+		}
+		// DEBUG for the same reason as the dispatch site: expected, designed, and
+		// potentially per-refresh-cycle frequent. The counter carries the rate.
+		log.Debug("resolveAndPopulateL1: re-resolve is userAccessFilter-narrowed; declining to re-Put",
+			slog.String("subsystem", "cache"),
+			slog.String("key_hash", key),
+			slog.String("handler", inputs.CacheEntryClass),
+			slog.String("user", refreshUser),
+			slog.String("uaf_reason", reason),
+			slog.Int64("uaf_touches", uafTouchedSink.Count()),
+			slog.String("effect", "prior entry kept, not refreshed; a UAF body is per-requester-narrowed and the key does not separate co-bound users (1.12.3 A-1)"),
 		)
 		return nil
 	}

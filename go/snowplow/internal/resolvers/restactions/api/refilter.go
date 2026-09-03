@@ -40,13 +40,104 @@ import (
 	"github.com/itchyny/gojq"
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 )
 
+// uafReadVerbs is the set of Kubernetes RBAC verbs that unambiguously express
+// a READ intent — A-4 (1.12.3).
+//
+// Lower-case only, and that is a correctness point rather than a style one.
+// rbac/evaluate.go stringSliceMatches tests the rule's "*" wildcard FIRST, so an
+// upper-case "GET" checked against a wildcard grant is silently ALLOWED, and
+// against every non-wildcard grant is silently DENIED. Either way the operator
+// sees a filter that quietly does the wrong thing. Treating a non-lower-case
+// verb as "not a read verb" is what surfaces the typo.
+//
+// Not a resource/path/user special-case (feedback_no_special_cases): a fixed,
+// mechanism-level verb vocabulary, uniform across every userAccessFilter.
+var uafReadVerbs = map[string]struct{}{
+	"get":   {},
+	"list":  {},
+	"watch": {},
+}
+
+// uafVerbIsRead reports whether verb unambiguously expresses a read intent.
+// Anything else — a write verb, a typo, an upper-case "GET", the empty string —
+// is not read.
+//
+// WHAT THIS IS FOR, AND WHAT IT IS DELIBERATELY NOT. uaf.Verb is threaded
+// verbatim into rbac.EvaluateRBAC (evalSingle below). The dangerous shape is a
+// stage that returns objects of resource R filtered by a WRITE verb on R: it
+// keeps the objects the caller may mutate rather than the ones they may read,
+// so a user with a broad create grant and a narrow get grant is SHOWN objects
+// they cannot read. That is a genuine scope inversion.
+//
+// But "non-read verb" alone does NOT identify it. Three LIVE portal RESTActions
+// (testdata/portal_uaf_corpus.yaml, portal @ b2a558d) use `verb: create`
+// legitimately: the api-step returns NAMESPACES and the filter checks create on
+// a DIFFERENT resource, so it answers "which namespaces may I create X in" — a
+// form picker that discloses nothing about objects the caller cannot read.
+// A-4's first cut rejected exactly these at admission and dropped their items
+// here; it would have failed the portal upgrade and silently emptied three
+// namespace pickers. See core.go for why the CRD rule was removed too.
+//
+// So in 1.12.3 this predicate is WARN-ONLY. It never drops an item.
+//
+// THE 1.13.0 RULE, written down so the flip is mechanical and does not
+// re-litigate this. Drop the items only when BOTH hold:
+//
+//	(a) !uafVerbIsRead(uaf.Verb), and
+//	(b) the UAF's resource set intersects the resource the api-step RETURNS.
+//
+// (b) is the part that separates the portal's pickers (namespaces filtered by
+// create on compositiondefinitions/alerts — disjoint, allowed) from the
+// inversion (compositions filtered by create on compositions — equal, dropped).
+// Deriving the returned resource means parsing apiCall.Path, and that path may
+// be jq-templated ("${...}"): when it is, or when it cannot be parsed to a
+// plural, (b) MUST evaluate FALSE — fail OPEN, serve the items. A fail-closed
+// default on an underivable path recreates the very outage this warn-only
+// stage exists to avoid. Resolve the UAF side with resolveUAFResources, which
+// already handles the resourcesFrom jq fan-out.
+func uafVerbIsRead(verb string) bool {
+	_, ok := uafReadVerbs[verb]
+	return ok
+}
+
+// warnUAFVerbNonRead emits the A-4 operator signal from BOTH refilter entry
+// points (applyUserAccessFilterOnPig — the live jsonHandlerCore callsite — and
+// its applyUserAccessFilter twin, kept symmetric so the twin cannot become a
+// silent bypass if it is ever re-wired).
+//
+// It returns nothing and changes no items: 1.12.3 is observation only. It fires
+// exactly ONCE per (RA stage) evaluation, never per item — a non-read verb is a
+// single authoring choice in one CR, so per-item logging would flood the
+// operator on a 500-item list and tell them nothing extra.
+func warnUAFVerbNonRead(log *slog.Logger, stageName string, uaf *templates.UserAccessFilterSpec) {
+	if log == nil || uafVerbIsRead(uaf.Verb) {
+		return
+	}
+	resource := uaf.Resource
+	if resource == "" {
+		resource = uaf.ResourcesFrom
+	}
+	log.Warn("userAccessFilter: verb is not a read verb",
+		slog.String("subsystem", "uaf"),
+		slog.String("api", stageName),
+		slog.String("verb", uaf.Verb),
+		slog.String("uaf_resource", resource),
+		slog.String("group", uaf.Group),
+		slog.String("effect", "none in 1.12.3 — items are served unchanged; this is an observation-only signal"),
+		slog.String("risk", "a non-read verb is only a scope inversion when it is checked against the SAME resource the stage returns; then the filter keeps what the caller may MUTATE, not what they may read"),
+		slog.String("next", "1.13.0 drops items only for the same-resource case (failing open on jq-templated paths); a cross-resource picker stays served"),
+	)
+}
+
 // refilterResult is the (kept, dropped, total) summary the resolver
 // logs as the per-call falsifier per plan §"Code-path falsifier":
-//   userAccessFilter.dispatch=service_account ... refilter_dropped=N refilter_kept=M evaluate_rbac_calls=K
+//
+//	userAccessFilter.dispatch=service_account ... refilter_dropped=N refilter_kept=M evaluate_rbac_calls=K
 type refilterResult struct {
 	Kept              int
 	Dropped           int
@@ -59,8 +150,9 @@ type refilterResult struct {
 // subset.
 //
 // Shape detection: dict[apiCall.Name] is either:
-//   * map[string]any with an "items" slice (typical K8s list response);
-//   * []any (rare; some endpoints flatten the list).
+//   - map[string]any with an "items" slice (typical K8s list response);
+//   - []any (rare; some endpoints flatten the list).
+//
 // Other shapes are passed through unchanged with a WARN (we cannot
 // safely refilter what we don't understand — the user sees the full
 // SA-dispatched response, which is the conservative-deny choice for
@@ -77,6 +169,37 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 		return res
 	}
 	uaf := apiCall.UserAccessFilter
+
+	// A-1 (1.12.3) — EXECUTION-BASED UAF signal for the L1 Put-gate. Record that
+	// the resolve under this ctx produced a userAccessFilter-NARROWED body, so
+	// every Put site downstream declines to cache it: the cache key folds
+	// BindingUID and RBACSubGen, neither of which separates requesters by their
+	// per-object narrowing scope, so caching a refiltered body serves one
+	// requester's rows to another.
+	//
+	// This is the second of the two bump sites cache/uaf_touched_sink.go
+	// describes, and the one that is not declaration-blind. The apiref
+	// chokepoint bump fires when the apiRef'd RESTAction DECLARES a UAF; it
+	// cannot see a CHAIN (a parent RA declaring nothing whose inner step consumes
+	// a UAF child). Only bumping at the refilter itself observes execution. No
+	// live RA forms such a chain today, which closes it by corpus accident rather
+	// than by code — one customer CR away from being false.
+	//
+	// Placed BEFORE any item is evaluated so the signal does not depend on the
+	// filter keeping anything: a refilter that drops every item still narrowed
+	// the body. No-op when no sink is installed on ctx (nil-receiver-safe), so
+	// every non-Put path is byte-identical.
+	//
+	// Symmetric with the live entry deliberately (architect ruling): this twin is
+	// currently dead, but if it is ever re-wired an unbumped path would silently
+	// cache narrowed bytes.
+	cache.BumpUAFTouched(ctx)
+
+	// A-4 (1.12.3) — WARN-ONLY, once per stage, before any per-item work. Kept
+	// symmetric with the live applyUserAccessFilterOnPig entry so this twin
+	// cannot silently become a bypass if it is ever re-wired. Drops nothing;
+	// 1.13.0 flips it to the same-resource rule (see uafVerbIsRead).
+	warnUAFVerbNonRead(log, apiCall.Name, uaf)
 
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
@@ -603,6 +726,36 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 		return res
 	}
 
+	// A-1 (1.12.3) — EXECUTION-BASED UAF signal for the L1 Put-gate. Record that
+	// the resolve under this ctx produced a userAccessFilter-NARROWED body, so
+	// every Put site downstream declines to cache it: the cache key folds
+	// BindingUID and RBACSubGen, neither of which separates requesters by their
+	// per-object narrowing scope, so caching a refiltered body serves one
+	// requester's rows to another.
+	//
+	// This is the second of the two bump sites cache/uaf_touched_sink.go
+	// describes, and the one that is not declaration-blind. The apiref
+	// chokepoint bump fires when the apiRef'd RESTAction DECLARES a UAF; it
+	// cannot see a CHAIN (a parent RA declaring nothing whose inner step consumes
+	// a UAF child). Only bumping at the refilter itself observes execution. No
+	// live RA forms such a chain today, which closes it by corpus accident rather
+	// than by code — one customer CR away from being false.
+	//
+	// Placed BEFORE any item is evaluated so the signal does not depend on the
+	// filter keeping anything: a refilter that drops every item still narrowed
+	// the body. No-op when no sink is installed on ctx (nil-receiver-safe), so
+	// every non-Put path is byte-identical.
+	//
+	// THIS IS THE LIVE SITE (jsonHandlerCore) and a hard tag condition for
+	// 1.12.3 per cache/uaf_touched_sink.go.
+	cache.BumpUAFTouched(ctx)
+
+	// A-4 (1.12.3) — WARN-ONLY, once per stage, before any per-item work. This
+	// is the LIVE production callsite; the applyUserAccessFilter twin above
+	// carries the identical call so neither entry point can drift. Drops
+	// nothing; 1.13.0 flips it to the same-resource rule (see uafVerbIsRead).
+	warnUAFVerbNonRead(log, stageName, uaf)
+
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
 		log.Error("userAccessFilter: cannot extract UserInfo; dropping all items (fail-closed)",
@@ -709,8 +862,8 @@ func emitRefilterFalsifierFromHandler(ctx context.Context, log *slog.Logger, api
 // emitRefilterFalsifier emits the per-call falsifier per plan
 // §"Code-path falsifier" line:
 //
-//   userAccessFilter.dispatch=service_account user=X resource_type=...
-//   refilter_dropped=N refilter_kept=M evaluate_rbac_calls=K
+//	userAccessFilter.dispatch=service_account user=X resource_type=...
+//	refilter_dropped=N refilter_kept=M evaluate_rbac_calls=K
 //
 // Called by the resolver right after applyUserAccessFilter completes.
 func emitRefilterFalsifier(log *slog.Logger, apiCall *templates.API, username string, res refilterResult) {

@@ -289,6 +289,50 @@ env:
   # 300s = a degraded catalog entry is corrected within ~5 min worst case.
   # Set to "0" to disable (entries then use the standard TTL exactly as before).
   CATALOG_UNSERVABLE_TTL_SECONDS: "300"
+  # #118 (d) STALENESS bound for userAccessFilter-bearing cells (C-A2, 1.12.3).
+  # Reachability fix: the binary has read this since #118 (d) but the knob was
+  # absent from this chart entirely, so no chart-deployed pod could ever set it.
+  #
+  # WHAT IT DOES. When > 0, a restactions-class entry whose RESTAction declares
+  # a userAccessFilter stage is stamped with this SHORT per-entry TTL instead of
+  # the standard RESOLVED_CACHE_TTL_SECONDS (3600). Accessor is
+  # internal/cache/resolved.go UAFResolvedTTL(); effectiveTTLLocked only ever
+  # takes the SHORTER of the override and the store TTL, so this can only
+  # tighten the bound. 300s mirrors CATALOG_UNSERVABLE_TTL_SECONDS above.
+  #
+  # WHAT IT DOES NOT DO — read this before reaching for it in an incident.
+  #   * It is NOT a mitigation for the A-1 cross-tenant key collision. A TTL
+  #     bounds staleness over TIME, not identity: when two tenants derive the
+  #     same key, a shorter TTL just forces more refills and every refill
+  #     re-establishes the same collision.
+  #   * It covers ONLY the restactions class. HasUAF is set at exactly two
+  #     sites (dispatchers/restactions.go:393 and phase1_pip_seed.go:896), both
+  #     restactions; restactionHasUAFStage takes a *RESTAction, so the widgets
+  #     and widgetContent classes are never stamped and are NOT capped by this.
+  #
+  # IS IT INERT? CONDITIONAL — check before blaming or excusing this knob.
+  #   * WITH the A-1 mitigation (fix/1.12.3-uaf-put-decline, a SIBLING branch —
+  #     NOT this one): every userAccessFilter-bearing Put is declined, so no UAF
+  #     cell exists and this TTL caps nothing. Inert. That is the intended
+  #     1.12.3 shape, and it is why the value is safe to ship at "300".
+  #   * WITHOUT it (this branch tagged alone): the TTL is LIVE and shortens
+  #     every UAF-bearing restactions cell from 3600s to 300s — a 12x refill
+  #     rate for that class, on the boot seed path too, since
+  #     phase1_pip_seed.go:896 stamps HasUAF. Not a correctness problem, but a
+  #     real load change: set this to "0" for such a tag and back to "300" when
+  #     the decline lands.
+  # Either way it becomes load-bearing again in 1.13.0, when those Puts are
+  # re-enabled under the v7 key.
+  #
+  # THE RESIDUAL THIS BOUNDS. #118 (c) already shipped: resolvedKeyVersion is
+  # "v6" (internal/cache/resolved.go:498) and ComputeKey folds RBACSubGen for
+  # every identity-bound class (:765-782). What remains is that HasUAF is
+  # EXPLICITLY EXCLUDED from ComputeKey (:410-421) and RBACSubGen is a change
+  # COUNTER, not a per-object scope discriminator — 1.13.0 adds a UAF-scope
+  # digest (the v7 bump).
+  #
+  # Set to "0" to disable (UAF cells then use the standard TTL).
+  UAF_RESOLVED_TTL_SECONDS: "300"
   # #57 — prewarm seed loopback auth. The seed exchanges its projected
   # (audience=authn) ServiceAccount token at URL_AUTHN for an authn-issued JWT
   # and appends it on a /call api-step whose resolved endpoint host EXACTLY

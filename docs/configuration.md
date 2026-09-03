@@ -65,12 +65,14 @@ A `checksum/configmap` pod annotation rolls the Deployment when the ConfigMap ch
 | `CACHE_ENABLED` | `"true"` | The single master cache gate. `false` = transparent fallback to the direct apiserver — same data, same RBAC, slower ([ADR 0004](../go/snowplow/docs/adr/0004-cache-is-provisional-and-removable.md)). |
 | `GOMEMLIMIT` | `7GiB` | **Must stay strictly below the container memory limit** (default 8Gi) so Go GC back-pressures before Linux OOM-kills. Move it with `resources.limits.memory`. |
 | `GOGC` | `"50"` | Tighter heap for ~1% CPU. |
-| `DEBUG` | `"false"` | Verbose logging. |
+| `LOG_LEVEL` | `"warn"` (chart) / `info` (binary) | The single verbosity knob (`--log-level`, #163): `debug`, `info`, `warn` or `error`, case-insensitive; an unrecognised value falls back to `info` so a typo never silences logs. |
+| `DEBUG` | unset (binary default `"false"`) | **Deprecated** — `main.go` labels `--debug` / `DEBUG` a thin alias for `--log-level=debug`. The chart dropped it in #163; set `LOG_LEVEL` instead. |
 | `PRETTY_LOG` | `"false"` | `false` = single-line JSON logs (the pretty handler is a measured CPU/I/O drag in prod). |
 | `PHASE1_TIMEOUT_SECONDS` | `"900"` | Outer backstop for the whole boot warmup (informer sync + prewarm walk + cohort seed). |
 | `PHASE1_SYNC_PASS_GRACE_SECONDS` | `"45"` | Per-pass grace for one `WaitForCacheSync` pass. |
 | `PHASE1_SYNC_QUIESCENCE_SECONDS` | `"10"` | Registered-set stability window before the sync barrier returns. |
 | `CATALOG_UNSERVABLE_TTL_SECONDS` | `"300"` | Short TTL for entries cached while their informer wasn't servable (self-correcting safety net); `0` disables. |
+| `UAF_RESOLVED_TTL_SECONDS` | `"300"` | Staleness bound for **restactions-class** entries whose RESTAction declares a `userAccessFilter` stage (#118 (d)); `0` disables. It bounds staleness over *time*, not identity, so it is not a mitigation for a cross-tenant key collision, and it does not stamp the widgets or widgetContent classes. Inert **only while** the A-1 mitigation declines every `userAccessFilter`-bearing cache write; without it this value is live and cuts those cells from 3600s to 300s (a 12x refill rate for the class, boot seed included), so set it to `"0"` for a release that ships without the mitigation. Load-bearing again in 1.13.0 when those writes return under the v7 key. |
 | `URL_AUTHN` / `URL_SELF` | authn / snowplow in-cluster service URLs | The prewarm-seed loopback-auth pair: exchange the projected SA token at authn, append the JWT only on exact-`URL_SELF` loopback calls. |
 | `SERVICEACCOUNT_TOKEN_PATH` | `/var/run/secrets/krateo.io/serviceaccount/token` | Where the projected (audience=`authn`) token is mounted. |
 | `JQ_MODULES_PATH` | `/jq-modules` | Custom jq modules, mounted from the chart's `jq-custom-modules` ConfigMap. |

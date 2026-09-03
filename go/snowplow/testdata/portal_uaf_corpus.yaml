@@ -1,0 +1,61 @@
+# portal_uaf_corpus.yaml — the LIVE portal userAccessFilter stanzas that use a
+# WRITE verb legitimately. Vendored verbatim (field-for-field) from
+# krateo-platformops/portal @ b2a558d, helm/portal/templates/.
+#
+# WHY THIS FILE EXISTS. A-4's first cut bounded userAccessFilter.verb to
+# get/list/watch at the CRD, on the reasoning that a read path must not filter by
+# a write grant. That reasoning is right about the DANGEROUS shape and wrong
+# about this one, and these three stanzas are the counter-example: the CRD rule
+# would have failed the portal upgrade, and the fail-closed runtime guard would
+# have silently emptied three namespace pickers.
+#
+# THE PATTERN THEY SHARE, and why it is safe. The api-step returns NAMESPACES.
+# The userAccessFilter checks `create` on a DIFFERENT resource
+# (composition.krateo.io/<blueprint>, observability.krateo.io/alerts,
+# core.krateo.io/compositiondefinitions) with namespaceFrom `.metadata.name`.
+# So the filter answers "which namespaces may I create X in", and the stage's
+# own output — a list of namespace NAMES the caller is being offered as a form
+# picker — is not the resource the verb is checked against. Nothing the caller
+# cannot read is disclosed: they learn only where their own create grant holds.
+#
+# The scope inversion A-4 set out to stop is the SAME-RESOURCE case: an api-step
+# that returns objects of resource R filtered by `create` on R, which keeps the
+# objects the caller may write rather than the ones they may read. That is the
+# 1.13.0 enforcement rule (see uafVerbIsRead / the 1.13.0 note in refilter.go).
+#
+# Keep this file in sync with the portal only when a stanza actually changes;
+# it is a regression corpus, not a mirror.
+
+cases:
+  - name: blueprint-formdef
+    source: helm/portal/templates/restaction.blueprint-formdef.yaml (api step "namespaces")
+    apiStepName: namespaces
+    apiStepPath: /api/v1/namespaces
+    apiStepVerb: GET
+    userAccessFilter:
+      verb: create
+      group: composition.krateo.io
+      resourcesFrom: "[.compdef.status.resource]"
+      namespaceFrom: .metadata.name
+
+  - name: blueprint-install-formdef
+    source: helm/portal/templates/restaction.blueprint-install-formdef.yaml (api step "namespaces")
+    apiStepName: namespaces
+    apiStepPath: /api/v1/namespaces
+    apiStepVerb: GET
+    userAccessFilter:
+      verb: create
+      group: core.krateo.io
+      resource: compositiondefinitions
+      namespaceFrom: .metadata.name
+
+  - name: alert-formdef
+    source: helm/portal/templates/restaction.alert-formdef.yaml (api step "namespaces")
+    apiStepName: namespaces
+    apiStepPath: /api/v1/namespaces
+    apiStepVerb: GET
+    userAccessFilter:
+      verb: create
+      group: observability.krateo.io
+      resourcesFrom: '["alerts"]'
+      namespaceFrom: .metadata.name
