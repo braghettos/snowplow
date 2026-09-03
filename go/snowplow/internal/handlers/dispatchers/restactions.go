@@ -294,6 +294,13 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// (no informer/dep edge can invalidate it). Additive to the stage-error
 	// sink — both gate the Put independently. nil-receiver-safe.
 	ctx, extTouchedSink := cache.WithExternalTouchedSink(ctx)
+	// 1.12.3 A-1 / R-1 — install the UAF-touched sink, third sibling of the two
+	// above. The refilter bumps it wherever it actually runs, however many
+	// resolver frames down; the Put-gate below reads Count()>0 and declines. This
+	// is what covers a NON-UAF RESTAction that NESTS a UAF one — its own spec
+	// declares no userAccessFilter, so the declaration limb of the gate is blind
+	// to it, but its resolved body still carries per-requester-narrowed rows.
+	ctx, uafTouchedSink := cache.WithUAFTouchedSink(ctx)
 	res, err := restactionsResolveFn(ctx, restactions.ResolveOptions{
 		In:      &cr,
 		SArc:    r.saRC,
@@ -331,7 +338,47 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// (resolve_populate.go:242) and the 0.30.254 "never cache an under-served
 	// result" posture. sink==nil is nil-receiver-safe (Count()==0). A clean
 	// resolve (Count()==0) caches exactly as before.
-	if stageErrSink.Count() > 0 {
+	// 1.12.3 A-1 (SECURITY, cross-tenant) — record whether THIS RESTAction
+	// declares a userAccessFilter stage on the carried Inputs, BEFORE the Put
+	// chain. Two consumers read it: the decline gate at the head of the chain,
+	// and (for a non-declined entry) the short UAF TTLOverride, which the
+	// refresher re-Put re-derives from the SAME carried flag (C-118-6). HasUAF is
+	// deliberately NOT key-folded — folding a bare boolean would not separate two
+	// users' divergent narrowings anyway; the per-requester UAF SCOPE digest is
+	// the 1.13.0/v7 key change.
+	if cacheInputs != nil {
+		cacheInputs.HasUAF = restactionHasUAFStage(&cr)
+	}
+	// THE UAF DECLINE IS FIRST IN THE CHAIN, and the position is load-bearing.
+	// TWO branches below this point also WRITE: the stage-error branch Puts a
+	// bounded partial via putPartialWithTTL (when PARTIAL_RESULT_TTL_SECONDS is
+	// set), and — in the widgets twin of this chain — the external-TTL branch
+	// Puts under an opt-in annotation. Placing the UAF gate only in front of the
+	// "genuine Put" branch would leave a UAF body reachable through either of
+	// those, under the same shared per-binding key. A per-requester-narrowed body
+	// must not be persisted by ANY branch, so the gate sits ahead of all of them.
+	//
+	// The key this body would be stored under folds only BindingUID + RBACSubGen,
+	// so a co-bound user with a DIFFERENT per-object narrowing derives the SAME
+	// key and the hit path (above) would hand them these bytes verbatim. Serving
+	// is unaffected — the 200 with this requester's own body is written below
+	// either way; only the shared-cell write is skipped, so no other identity can
+	// ever read it. Reverts in 1.13.0 when the UAF-scope digest (v7) separates
+	// them in the key.
+	if reason := uafDeclineReason(cacheInputs, uafTouchedSink); reason != "" {
+		declineUAFPut(cacheInputs, uafTouchedSink) // bumps the class counter
+		// DEBUG, not WARN: this fires on EVERY /call of a UAF RA and
+		// LOG_LEVEL=warn is the production floor — a WARN here would flood.
+		// snowplow_restactions_uaf_put_declined_total carries the rate.
+		log.Debug("RESTAction resolve is userAccessFilter-narrowed; declining to cache (per-requester narrowing is not folded into the key)",
+			slog.String("name", cr.Name),
+			slog.String("namespace", cr.Namespace),
+			slog.String("key_hash", cacheKey),
+			slog.String("uaf_reason", reason),
+			slog.Int64("uaf_touches", uafTouchedSink.Count()),
+			slog.String("effect", "body served (200) narrowed for THIS requester; not persisted — a co-bound user would key onto the same cell and be served these rows (1.12.3 A-1; 1.13.0 folds the UAF scope into the key)"),
+		)
+	} else if stageErrSink.Count() > 0 {
 		// D (bounded partial-cache backstop, default-off) — instead of a bare
 		// decline, Put the partial under the SAME per-user cacheKey with a
 		// bounded PARTIAL_RESULT_TTL_SECONDS window so a residual un-cacheable RA
@@ -380,36 +427,11 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 			got.GVR.Group, got.GVR.Version, got.GVR.Resource,
 			got.Unstructured.GetNamespace(), got.Unstructured.GetName(),
 			perPage, page, extras)
-		// #118 (d) — record whether THIS RESTAction declares a userAccessFilter
-		// stage on the carried Inputs. Two consumers read it: the 1.12.3 A-1
-		// decline immediately below, and (for a non-declined entry) the short UAF
-		// TTLOverride, which the refresher re-Put re-derives from the SAME carried
-		// flag (C-118-6). HasUAF is deliberately NOT key-folded — folding a bare
-		// boolean would not separate two users' divergent narrowings anyway; the
-		// per-requester UAF SCOPE digest is the 1.13.0/v7 key change.
-		if cacheInputs != nil {
-			cacheInputs.HasUAF = restactionHasUAFStage(&cr)
-		}
-		// 1.12.3 A-1 (SECURITY, cross-tenant) — DECLINE the Put for a UAF-bearing
-		// RESTAction. `encoded` below was narrowed by the UAF refilter for THIS
-		// requester; the key it would be stored under folds only BindingUID +
-		// RBACSubGen, so a co-bound user with a DIFFERENT per-object narrowing
-		// derives the SAME key and the hit path (above) would hand them these
-		// bytes verbatim. Serving is unaffected — the 200 with this requester's
-		// own body is written below either way; only the shared-cell write is
-		// skipped, so no other identity can ever read it. Reverts in 1.13.0 when
-		// the UAF-scope digest (v7) makes the key separate them.
-		if declineUAFPut(cacheInputs) {
-			// DEBUG, not WARN: this fires on EVERY /call of a UAF RA and
-			// LOG_LEVEL=warn is the production floor — a WARN here would flood.
-			// snowplow_restactions_uaf_put_declined_total carries the rate.
-			log.Debug("RESTAction declares a userAccessFilter; declining to cache (per-requester narrowing is not folded into the key)",
-				slog.String("name", cr.Name),
-				slog.String("namespace", cr.Namespace),
-				slog.String("key_hash", cacheKey),
-				slog.String("effect", "body served (200) narrowed for THIS requester; not persisted — a co-bound user would key onto the same cell and be served these rows (1.12.3 A-1; 1.13.0 folds the UAF scope into the key)"),
-			)
-		} else {
+		// The UAF gate already ran at the HEAD of this chain — it must precede the
+		// stage-error branch's bounded partial Put, not merely this branch — so
+		// reaching here means the body is NOT per-requester-narrowed. HasUAF was
+		// stamped on cacheInputs there; it is read here only for the TTL override.
+		{
 			cacheHandle.Put(cacheKey, &cache.ResolvedEntry{
 				RawJSON:     encoded,
 				Inputs:      cacheInputs,

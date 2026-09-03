@@ -414,6 +414,7 @@ func populateClusterListCellSync(
 		return false
 	}
 
+	// uaf-scope-waiver: PRE-refilter substrate, structurally incapable of carrying narrowed rows. This cell holds the RAW apiserver LIST envelope keyed by contentKeyInputs(gvr, ns, name) with NO identity fold; the userAccessFilter runs LATER, on the way out, and its output lands in the identity-bound restactions/widgets cells (all gated). Caching the un-narrowed substrate is what makes the per-request refilter cheap — gating it here would be wrong-cell and would defeat the layer for zero isolation gain.
 	// scope-waiver:TTLOverride: cluster-list identity-free content substrate — sets its OWN data-plane CATALOG_UNSERVABLE TTLOverride CONDITIONALLY on newEntry below (not a keyed literal element); NOT the UAF-cap class (no BindingUID / no per-user refilter output) — uaf_shortttl.go R-d-4 SITE MAP.
 	newEntry := &cache.ResolvedEntry{
 		RawJSON:         rawEnvelope,

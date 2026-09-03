@@ -2,11 +2,29 @@
 // PUT-DECLINE (current) and the #118 (d) interim short-TTL it supersedes.
 //
 // ============================ 1.12.3 — A-1 ==============================
-// SUPERSEDING POSTURE (read this first): as of 1.12.3 a UAF-bearing RESTAction
-// is NOT CACHED AT ALL. declineUAFPut below returns true for it and all THREE
-// restactions Put sites skip the write; the sibling raFullList cell is bypassed
-// at ra_full_list.go. The request is still served normally — 200 with the
-// requester's own correctly-narrowed body; only the cache write is skipped.
+// SUPERSEDING POSTURE (read this first): as of 1.12.3, NOTHING WHOSE BODY WAS
+// NARROWED BY A userAccessFilter IS CACHED — in any class. Every L1 Put site
+// consults uafDeclineReason below and skips the write; the raFullList cell is
+// bypassed outright at ra_full_list.go. The request is still served normally —
+// 200 with the requester's own correctly-narrowed body; only the cache write is
+// skipped.
+//
+// TWO SIGNALS, because one was not enough (R-1). The first cut gated on the
+// DECLARATION — "does the RESTAction being dispatched declare a UAF stage?" —
+// and that closed the direct /call on the RA while leaving open the path the
+// portal actually renders. Widgets fold the apiRef'd RA's refiltered rows into
+// their OWN status.widgetData (widgets/resolve.go), and the declaring CR sits
+// several resolver frames below the widget the dispatcher holds, so the
+// declaration predicate saw nothing there. Live measurement settled it: 66
+// widgets apiRef a UAF RA, and the widgets cell served 298,064 hits against 365
+// misses over 5d7h — the cold path was gated and the hot one was not. So the
+// gate now also consults an OBSERVED signal, cache.UAFTouchedSink, bumped where
+// the refilter actually runs and therefore blind to how far away the declaration
+// is. Both are kept: only the declaration exists BEFORE a resolve, which is what
+// lets the boot seed skip a UAF RA's whole fan-out.
+//
+// THE CARRIERS, all now gated: restactions (dispatch, refresher, seed), widgets
+// (dispatch, seed), widgetContent (walker populate), raFullList (bypass).
 //
 // WHY the (d) TTL cap was not enough. (d) assumed the exposure was TIME (a
 // user's own view going stale after an out-of-band RBAC change) and capped the
@@ -114,14 +132,47 @@
 //     gain. (Traced + agreed with arch/PM; no disagreement to flag.)
 //   - partial_result_ttl.go:85 — self-stamps its OWN bounded TTLOverride for a
 //     partial-with-errors body; independent bounded-staleness mechanism. Untouched.
-//   - phase1_pip_seed.go seedOneWidget (~:1046) + widgets.go / widget_content.go
-//     / ra_full_list_store.go — widgets / widgetContent / RAFullList classes.
-//     UAF is a restactions-STAGE contract (API.UserAccessFilter). A widget whose
-//     apiRef resolves a UAF RA warms the RESTACTIONS cell via the apiref resolve
-//     path — which IS the seedOneRestaction / dispatch path now capped above — so
-//     the widget path is NOT a hole: the UAF refilter output only ever lands in a
-//     restactions-class cell, never a widget-class one. widgetContent is
-//     additionally identity-free (shared envelope, per-user serve-time filter).
+//   - RETRACTED — THIS PARAGRAPH WAS THE R-1 BLOCKER. It previously read: "UAF is
+//     a restactions-STAGE contract ... the UAF refilter output only ever lands in
+//     a restactions-class cell, never a widget-class one", and on that basis put
+//     seedOneWidget, widgets.go and widget_content.go OUT of scope. It is FALSE,
+//     by the identical mechanism that invalidated the raFullList waiver above.
+//
+//     What actually happens: widgets.Resolve → resolveApiRef → apiref.Resolve →
+//     restactions.Resolve, and the apiRef'd RA's UAF-REFILTERED ROWS ARE FOLDED
+//     INTO THE WIDGET'S OWN status.widgetData (widgets/resolve.go:154). That body
+//     is Put under the widgets-class per-BINDING key at widgets.go (both the
+//     external-TTL and the genuine-Put branches) and by seedOneWidget, and the
+//     widgets hit path serves entry.RawJSON verbatim. It is not merely A hole —
+//     live measurement makes it THE hole: 66 widgets apiRef a UAF RA, and that
+//     cell served 298,064 hits against 365 misses over 5d7h, against the
+//     restactions cell's near-zero traffic. The declaration-only gate shipped
+//     first closed the cold path and left the hot one open.
+//
+//     Worse, isRBACSensitiveApiRefWidget (widget_content.go) DELIBERATELY routes
+//     apiRef+template widgets INTO that per-cohort cell, in the belief that it is
+//     "RBAC-correct by construction". That belief is what A-1 disproves: the cell
+//     is per-BINDING, and per-binding is not per-user once a userAccessFilter is
+//     in play.
+//
+//     NOW IN SCOPE, gated on the OBSERVED refilter (cache.UAFTouchedSink) rather
+//     than on any declaration, because the declaring CR sits several resolver
+//     frames below the object each of these Put sites holds:
+//       - widgets.go            — customer dispatch, gate at the HEAD of the Put
+//                                 chain (ahead of the partial and external-TTL
+//                                 branches, which also write).
+//       - phase1_pip_seed.go seedOneWidget — boot seed; no pre-resolve skip is
+//                                 possible here (the apiRef chain is nested and
+//                                 template-expanded, so it is not statically
+//                                 enumerable), so it resolves and then declines.
+//       - widget_content.go populateWidgetContentL1 — the identity-FREE shared
+//                                 envelope, third sibling of its stage-error and
+//                                 external-touched gates.
+//     THE LESSON, recorded so the next reader does not repeat it: a leak with N
+//     carriers needs an acceptance arm PER CARRIER. The restactions-only arm went
+//     green over an open hot carrier. Any comment of the form "UAF output only
+//     ever lands in class X" is a stale-waiver smell — check it against
+//     widgets/resolve.go before trusting it.
 
 package dispatchers
 
@@ -146,39 +197,110 @@ func restactionHasUAFStage(cr *templatesv1.RESTAction) bool {
 	return cr.HasUserAccessFilterStage()
 }
 
-// declineUAFPut is the 1.12.3 A-1 gate: report whether the L1 Put for this
-// resolved entry must be SKIPPED because the entry's RESTAction declares a
-// userAccessFilter stage, i.e. its body is narrowed PER REQUESTER by a
-// dependency the cache key does not fold.
+// UAF decline reasons — the two INDEPENDENT signals that a resolved body is
+// narrowed per requester. Either one is sufficient to decline; they are kept
+// distinct so a log line and a test can say WHICH fired.
+const (
+	// uafDeclineDeclared — the entry's own RESTAction declares a userAccessFilter
+	// stage (inputs.HasUAF, stamped from RESTAction.HasUserAccessFilterStage).
+	// Available PRE-resolve, which is what lets the boot seed skip the fan-out.
+	uafDeclineDeclared = "declared"
+	// uafDeclineObserved — a userAccessFilter refilter actually RAN under this
+	// resolve's context (UAFTouchedSink). Necessarily post-resolve, but
+	// TRANSITIVE and declaration-blind: it fires for a widget whose apiRef'd RA
+	// declares the UAF several resolver frames down (the R-1 hot carrier) and for
+	// a non-UAF RA that NESTS a UAF one — both invisible to the declaration.
+	uafDeclineObserved = "observed_refilter"
+)
+
+// uafDeclineReason is the SINGLE derivation of "must this Put be skipped?",
+// shared by every class. It returns "" when the Put may proceed, else the
+// reason constant.
 //
-// ONE HELPER, THREE SITES (#64 anti-shadow-drift). The customer dispatch Put
+// TWO SIGNALS, BOTH LOAD-BEARING, NEITHER REDUNDANT (R-1). The declaration is
+// the only signal available BEFORE a resolve, so it is what lets the seed skip
+// work; the sink is the only signal that survives resolver-frame distance, so it
+// is what catches the widgets class the portal actually renders from. Dropping
+// either re-opens a carrier: dropping the sink re-opens R-1, dropping the
+// declaration turns the seed's cheap skip into a full fan-out it then discards.
+//
+// Pure — no side effects. The counter bump lives in the thin per-class wrappers
+// below so each class counts its own declines while the RULE stays single-source
+// (#64 anti-shadow-drift).
+func uafDeclineReason(inputs *cache.ResolvedKeyInputs, sink *cache.UAFTouchedSink) string {
+	if inputs != nil && inputs.HasUAF {
+		return uafDeclineDeclared
+	}
+	if sink.Count() > 0 { // nil-receiver-safe: no sink installed reads as 0
+		return uafDeclineObserved
+	}
+	return ""
+}
+
+// declineUAFPut is the RESTACTIONS-class gate: report whether the L1 Put for
+// this resolved entry must be SKIPPED because its body is narrowed PER
+// REQUESTER by a dependency the cache key does not fold.
+//
+// ONE RULE, THREE SITES (#64 anti-shadow-drift). The customer dispatch Put
 // (restactions.go), the refresher re-Put (resolve_populate.go) and the boot seed
 // (phase1_pip_seed.go) all route their decision through THIS function, exactly
-// as they all route their TTL override through uafTTLOverrideForEntry. The two
-// CR-bearing sites stamp inputs.HasUAF from restactionHasUAFStage first; the
-// refresher — which has no CR — reads the HasUAF the original Put carried. So
-// the three sites cannot diverge on what "UAF-bearing" means, and a future edit
-// that changes the rule changes it everywhere.
+// as they all route their TTL override through uafTTLOverrideForEntry. The
+// CR-bearing sites stamp inputs.HasUAF from restactionHasUAFStage; the refresher
+// — which has no CR — reads the HasUAF the original Put carried; and all of them
+// additionally consult the sink, which is what covers a non-UAF RA that NESTS a
+// UAF one. So the sites cannot diverge on what "UAF-bearing" means.
 //
-// THE COUNTER IS BUMPED HERE, not at the call sites: bumping inside the single
-// predicate makes "the counter ticked" and "a Put was skipped" the same event,
-// so snowplow_restactions_uaf_put_declined_total cannot drift from the gate.
-// The helper is therefore NOT side-effect-free — call it exactly once per
-// candidate Put, at the decision point.
+// THE COUNTER IS BUMPED HERE, not at the call sites: bumping inside the gate
+// makes "the counter ticked" and "a Put was skipped" the same event, so
+// snowplow_restactions_uaf_put_declined_total cannot drift from it. The helper
+// is therefore NOT side-effect-free — call it exactly once per candidate Put, at
+// the decision point.
 //
 // NO TOGGLE, by design. This is a confirmed cross-tenant correctness defect, so
 // there is no env flag to switch the leak back on (no flag-parking); the
-// mechanism is instead cleanly REMOVABLE — 1.13.0 deletes this helper and its
-// three call sites when the UAF-scope digest lands in the key (v7).
+// mechanism is instead cleanly REMOVABLE — 1.13.0 deletes these helpers and
+// their call sites when the UAF-scope digest lands in the key (v7).
 //
-// inputs nil / HasUAF false → false: byte-identical to 1.12.2 for every non-UAF
-// entry, which is every entry in a deployment that declares no UAF stage.
-func declineUAFPut(inputs *cache.ResolvedKeyInputs) bool {
-	if inputs == nil || !inputs.HasUAF {
+// No declaration and no observed refilter → false: byte-identical to 1.12.2 for
+// every non-UAF entry, which is every entry in a deployment with no UAF RA.
+func declineUAFPut(inputs *cache.ResolvedKeyInputs, sink *cache.UAFTouchedSink) bool {
+	if uafDeclineReason(inputs, sink) == "" {
 		return false
 	}
 	cache.BumpRestactionsUAFPutDeclined()
 	return true
+}
+
+// declineWidgetUAFPut is the WIDGETS/WIDGETCONTENT-class gate — the R-1 carrier.
+// Same rule (uafDeclineReason), separate counter.
+//
+// WHY A SEPARATE COUNTER AND NOT A SHARED ONE: this is the cell the portal
+// actually renders from (66 live widgets apiRef a UAF RA; 298,064 hits vs 365
+// misses over 5d7h), so its decline rate is the number an operator watches to
+// see the real cost of the mitigation. Summing it into the restactions counter
+// would bury a 300K-hit class under a 365-miss one.
+//
+// In practice this class declines on uafDeclineObserved: a widget CR declares no
+// userAccessFilter of its own — the declaration lives on the apiRef'd RESTAction
+// several resolver frames below — so the sink is the signal that fires. The
+// declaration limb is still consulted for uniformity and for any future path
+// that stamps HasUAF on a widgets-class ResolvedKeyInputs.
+func declineWidgetUAFPut(inputs *cache.ResolvedKeyInputs, sink *cache.UAFTouchedSink) bool {
+	if uafDeclineReason(inputs, sink) == "" {
+		return false
+	}
+	cache.BumpWidgetsUAFPutDeclined()
+	return true
+}
+
+// isWidgetClass reports whether a CacheEntryClass belongs to the widget family,
+// so a CLASS-AGNOSTIC caller (the refresher, which refreshes every class through
+// one function) can pick the matching decline counter. Mirrors the shape of
+// isIdentityFreeClass (resolve_populate.go). "widgets" has no exported constant
+// — it is a bare CacheEntryClass literal throughout (see resolved.go's class
+// list) — so it is spelled out here once rather than in each caller.
+func isWidgetClass(class string) bool {
+	return class == "widgets" || class == cache.CacheEntryClassWidgetContent
 }
 
 // uafTTLOverrideForEntry returns the short UAF TTLOverride to stamp on a

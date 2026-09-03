@@ -109,20 +109,28 @@ func a1BuildTwoTenantWatcher(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = rbacv1.AddToScheme(scheme)
 	listKinds := map[schema.GroupVersionResource]string{
-		h1RAGVR: "RESTActionList",
-		crbGVR:  "ClusterRoleBindingList",
-		crGVR:   "ClusterRoleList",
-		rbGVR:   "RoleBindingList",
-		rGVR:    "RoleList",
+		h1RAGVR:     "RESTActionList",
+		h1WidgetGVR: "PanelList",
+		crbGVR:      "ClusterRoleBindingList",
+		crGVR:       "ClusterRoleList",
+		rbGVR:       "RoleBindingList",
+		rGVR:        "RoleList",
 	}
 
 	cmRule := []rbacv1.PolicyRule{{Verbs: []string{"get", "list"}, APIGroups: []string{""}, Resources: []string{"configmaps"}}}
 	seed := []runtime.Object{
 		// The SHARED dispatch grant — one CRB, via the group both users present.
+		// It covers BOTH the RESTAction and the widget GVR, which is the real
+		// portal shape (one portal-wide read grant) and is what makes the two
+		// users co-bound on the widgets cell as well as the restactions one. The
+		// widgets carrier (R-2) needs that second resource to derive a non-empty,
+		// SHARED widgets BindingUID.
 		&rbacv1.ClusterRole{
 			ObjectMeta: metav1.ObjectMeta{Name: "ra-reader"},
 			Rules: []rbacv1.PolicyRule{{
-				Verbs: []string{"get", "list"}, APIGroups: []string{h1RAGVR.Group}, Resources: []string{h1RAGVR.Resource},
+				Verbs:     []string{"get", "list"},
+				APIGroups: []string{h1RAGVR.Group, h1WidgetGVR.Group},
+				Resources: []string{h1RAGVR.Resource, h1WidgetGVR.Resource},
 			}},
 		},
 		&rbacv1.ClusterRoleBinding{

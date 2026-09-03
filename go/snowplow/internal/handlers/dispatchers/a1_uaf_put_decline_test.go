@@ -26,8 +26,6 @@ import (
 	"bytes"
 	"context"
 	"net/http/httptest"
-	"os"
-	"strings"
 	"testing"
 
 	templatesv1 "github.com/krateo-platformops/snowplow/apis/templates/v1"
@@ -341,43 +339,17 @@ func TestA1_Refresher_DeclinesCarriedHasUAF_ControlRefreshes(t *testing.T) {
 // Anti-shadow-drift: all three sites route through the ONE shared gate
 // ---------------------------------------------------------------------------
 
-// TestA1_AllThreePutSitesRouteThroughSharedGate is the source-level guard that
-// the decline is expressed ONCE and consulted at every restactions Put site —
-// the #64 anti-shadow-drift principle, and the same shape as the pre-existing
-// TestUAF_C118_6_AllThreePutSitesWired guard for the TTL override.
+// SUPERSEDED: the hand-listed three-file wiring guard that used to live here has
+// been replaced by TestA1_EveryResolvedEntryPutSiteIsUAFGatedOrWaived
+// (a1_uaf_site_enumeration_test.go), which enumerates ResolvedEntry Put sites
+// STRUCTURALLY from the AST instead of from a list.
 //
-// It catches the failure the behavioural arms cannot: a future edit that adds a
-// FOURTH restactions Put path, or that re-implements the predicate inline at one
-// site so the three can diverge on what "UAF-bearing" means. It also pins the
-// seed's DEFENSIVE tail leg, which the behavioural arm (b) deliberately never
-// reaches (the pre-resolve skip fires first) and which cannot be driven
-// hermetically because the prod tail dials the apiserver.
-func TestA1_AllThreePutSitesRouteThroughSharedGate(t *testing.T) {
-	for _, f := range []string{"restactions.go", "resolve_populate.go", "phase1_pip_seed.go"} {
-		src, err := os.ReadFile(f)
-		if err != nil {
-			t.Fatalf("read %s: %v", f, err)
-		}
-		if !strings.Contains(string(src), "declineUAFPut(") {
-			t.Fatalf("A-1 wiring: %s must consult the SHARED declineUAFPut(...) gate before writing a restactions "+
-				"ResolvedEntry. All THREE Put sites (customer dispatch restactions.go, refresher re-Put "+
-				"resolve_populate.go, boot seed phase1_pip_seed.go) decline for a UAF-bearing RA; a site that "+
-				"re-derives the rule inline can drift from the other two.", f)
-		}
-	}
-	// The seed carries BOTH legs: the pre-resolve skip (so a UAF RA never pays
-	// for a resolve whose output could not be Put) AND the defensive decline in
-	// the reassignable resolve+Put tail seam.
-	src, err := os.ReadFile("phase1_pip_seed.go")
-	if err != nil {
-		t.Fatalf("read phase1_pip_seed.go: %v", err)
-	}
-	if n := strings.Count(string(src), "declineUAFPut("); n < 2 {
-		t.Fatalf("A-1 wiring: phase1_pip_seed.go must gate BOTH the pre-resolve seed skip AND the resolve+Put tail "+
-			"(the tail is a reassignable seam, so a direct caller must still be unable to write a UAF cell); "+
-			"found %d declineUAFPut call(s), want >= 2", n)
-	}
-}
+// The hand-list is worth remembering as a lesson rather than as code: it named
+// restactions.go, resolve_populate.go and phase1_pip_seed.go, it passed, and it
+// was guarding an open hot carrier the whole time. It could not have found the
+// widgets class, because it was written from the same mistaken belief as the
+// comment it was guarding. A guard built from the author's own enumeration can
+// only confirm what the author already believed.
 
 // TestA1_DeclineUAFPut_PredicateAndCounter pins the gate's own contract: it
 // declines exactly when the entry is UAF-bearing, is nil-safe, and bumps the
@@ -388,20 +360,60 @@ func TestA1_DeclineUAFPut_PredicateAndCounter(t *testing.T) {
 	cache.ResetUAFPutDeclineCountersForTest()
 	t.Cleanup(cache.ResetUAFPutDeclineCountersForTest)
 
-	if declineUAFPut(nil) {
-		t.Fatal("declineUAFPut(nil) must be false — no inputs, no decline")
+	if declineUAFPut(nil, nil) {
+		t.Fatal("declineUAFPut(nil, nil) must be false — no inputs, no sink, no decline")
 	}
-	if declineUAFPut(&cache.ResolvedKeyInputs{CacheEntryClass: "restactions"}) {
+	if declineUAFPut(&cache.ResolvedKeyInputs{CacheEntryClass: "restactions"}, nil) {
 		t.Fatal("a non-UAF entry must NOT be declined — every non-UAF cell caches byte-identically to 1.12.2")
 	}
 	if got := cache.RestactionsUAFPutDeclined(); got != 0 {
 		t.Fatalf("no decline happened yet; counter must still be 0, got %d", got)
 	}
-	if !declineUAFPut(&cache.ResolvedKeyInputs{CacheEntryClass: "restactions", HasUAF: true}) {
-		t.Fatal("a UAF-bearing entry MUST be declined")
+
+	// LIMB 1 — the DECLARATION. Available pre-resolve; what lets the seed skip.
+	if !declineUAFPut(&cache.ResolvedKeyInputs{CacheEntryClass: "restactions", HasUAF: true}, nil) {
+		t.Fatal("a UAF-DECLARING entry MUST be declined even with no sink installed")
 	}
 	if got := cache.RestactionsUAFPutDeclined(); got != 1 {
 		t.Fatalf("the counter must tick on the decline itself (one tick per skipped Put); got %d", got)
+	}
+
+	// LIMB 2 — the OBSERVED refilter (R-1). This is the limb that covers the
+	// widgets carrier and the nested-RA case, where the entry's own Inputs carry
+	// NO HasUAF because the declaration lives frames below. A gate that only read
+	// HasUAF would pass this and leave the hot carrier open.
+	_, sink := cache.WithUAFTouchedSink(context.Background())
+	sink.Bump()
+	if !declineUAFPut(&cache.ResolvedKeyInputs{CacheEntryClass: "restactions" /* HasUAF false */}, sink) {
+		t.Fatal("R-1: an entry whose resolve OBSERVED a refilter MUST be declined even though its own Inputs declare no UAF — " +
+			"this is the limb that covers the widget carrier and a non-UAF RA that nests a UAF one")
+	}
+	if got := cache.RestactionsUAFPutDeclined(); got != 2 {
+		t.Fatalf("the observed-refilter decline must tick the counter too; got %d", got)
+	}
+
+	// The two limbs are reported distinctly, and neither firing means proceed.
+	if r := uafDeclineReason(&cache.ResolvedKeyInputs{HasUAF: true}, nil); r != uafDeclineDeclared {
+		t.Fatalf("declaration limb must report %q; got %q", uafDeclineDeclared, r)
+	}
+	if r := uafDeclineReason(nil, sink); r != uafDeclineObserved {
+		t.Fatalf("sink limb must report %q; got %q", uafDeclineObserved, r)
+	}
+	if r := uafDeclineReason(nil, nil); r != "" {
+		t.Fatalf("neither limb firing must report \"\" (proceed); got %q", r)
+	}
+
+	// The widgets class routes through the SAME rule but its OWN counter — the
+	// R-1 carrier must be countable separately from the restactions cold path.
+	before := cache.WidgetsUAFPutDeclined()
+	if !declineWidgetUAFPut(nil, sink) {
+		t.Fatal("declineWidgetUAFPut must apply the same rule as declineUAFPut")
+	}
+	if got := cache.WidgetsUAFPutDeclined(); got != before+1 {
+		t.Fatalf("the widgets decline must tick the WIDGETS counter; got %d want %d", got, before+1)
+	}
+	if got := cache.RestactionsUAFPutDeclined(); got != 2 {
+		t.Fatalf("a widgets decline must NOT tick the restactions counter (they are separate classes); got %d", got)
 	}
 
 	// The gate reads HasUAF, which the CR-bearing sites stamp from the ONE
