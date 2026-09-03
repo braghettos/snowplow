@@ -50,6 +50,7 @@ import (
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	"github.com/krateo-platformops/plumbing/jwtutil"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -130,6 +131,16 @@ func a4Envelope(t *testing.T) []byte {
 // namespaces of the kept items plus everything the stage logged.
 func a4RunStage(t *testing.T, uaf *templates.UserAccessFilterSpec) (keptNamespaces []string, logs string) {
 	t.Helper()
+	kept, logs, _ := a4RunStageWithSink(t, uaf)
+	return kept, logs
+}
+
+// a4RunStageWithSink is a4RunStage plus the A-1 UAFTouchedSink installed on the
+// request ctx, returning how many times the refilter bumped it. Every L1 Put
+// site reads Count()>0 to decline caching a UAF-narrowed body, so a missing bump
+// here is a cross-requester cache leak, not a metrics gap.
+func a4RunStageWithSink(t *testing.T, uaf *templates.UserAccessFilterSpec) (keptNamespaces []string, logs string, uafBumps int64) {
+	t.Helper()
 
 	apiCall := &templates.API{
 		Name:             "anyplurals",
@@ -143,6 +154,7 @@ func a4RunStage(t *testing.T, uaf *templates.UserAccessFilterSpec) (keptNamespac
 		xcontext.WithUserInfo(jwtutil.UserInfo{Username: "user1"}),
 		xcontext.WithLogger(logger),
 	)
+	ctx, uafSink := cache.WithUAFTouchedSink(ctx)
 
 	dict := make(map[string]any)
 	handler := jsonHandlerBytes(ctx, jsonHandlerOptions{
@@ -172,7 +184,7 @@ func a4RunStage(t *testing.T, uaf *templates.UserAccessFilterSpec) (keptNamespac
 			t.Fatalf("verb=%q: unexpected wrapped items shape: %v", uaf.Verb, items)
 		}
 	}
-	return out, logBuf.String()
+	return out, logBuf.String(), uafSink.Count()
 }
 
 func a4UAF(verb string) *templates.UserAccessFilterSpec {
@@ -342,3 +354,64 @@ func TestA4_SameResourceIsTheRealInversion(t *testing.T) {
 
 // ptrToString is a local helper (the package's ptr import is not in scope here).
 func ptrToString(s string) *string { return &s }
+
+// TestA4_RefilterBumpsUAFTouchedSink — the A-1 hard tag condition, asserted from
+// the file that owns the bump site.
+//
+// The L1 Put-gate declines to cache a userAccessFilter-narrowed body by reading
+// UAFTouchedSink.Count()>0. The apiref chokepoint bump
+// (internal/resolvers/widgets/apiref) is DECLARATION-based and therefore blind
+// to a chain — a parent RA declaring no UAF whose inner step consumes a UAF
+// child. Only the bump at the refilter itself observes execution. Without it the
+// chain is closed by corpus accident (0 of 49 live RAs form one), which is one
+// customer CR away from being false.
+//
+// RED without the bump: the sink reads 0 while the refilter demonstrably ran and
+// narrowed the body, so a downstream Put site would cache requester-specific
+// rows under a key that does not separate requesters.
+func TestA4_RefilterBumpsUAFTouchedSink(t *testing.T) {
+	a4SplitScopeRBAC(t)
+
+	// A read verb: the ordinary, overwhelmingly common shape.
+	kept, _, bumps := a4RunStageWithSink(t, a4UAF("list"))
+	if len(kept) == 0 {
+		t.Fatal("setup: expected the list filter to keep the ns-a items")
+	}
+	if bumps == 0 {
+		t.Fatal("A-1: the live refilter must bump the UAFTouchedSink — every L1 Put site reads Count()>0 to decline caching a UAF-narrowed body. With no bump, a resolve whose rows were narrowed for THIS requester is cached under a key that folds only BindingUID/RBACSubGen and is served to a co-binding requester with different per-object grants")
+	}
+
+	// A non-read verb still narrows the body, so it must bump too — the signal
+	// must not depend on the A-4 warn path's verdict.
+	if _, _, wbumps := a4RunStageWithSink(t, a4UAF("create")); wbumps == 0 {
+		t.Fatal("A-1: a non-read-verb UAF still runs the refilter and still narrows the body; the sink must bump regardless of the A-4 verb signal")
+	}
+
+	// The bump must be placed BEFORE per-item evaluation, so a filter that keeps
+	// NOTHING still records that narrowing happened. A drop-everything result is
+	// still a per-requester result and must not be cached.
+	emptyUAF := &templates.UserAccessFilterSpec{
+		Verb:          "list",
+		Group:         "example.test",
+		Resource:      "no-such-resource",
+		NamespaceFrom: ".metadata.namespace",
+	}
+	keptNone, _, nbumps := a4RunStageWithSink(t, emptyUAF)
+	if len(keptNone) != 0 {
+		t.Fatalf("setup: a grant-less resource must keep nothing; got %v", keptNone)
+	}
+	if nbumps == 0 {
+		t.Fatal("A-1: the bump must precede per-item evaluation — a refilter that drops EVERY item still narrowed the body for this requester, and an empty result cached under a shared key is still wrong")
+	}
+}
+
+// TestA4_SinkBumpIsNoOpWithoutSink — the inertness arm. Every path that installs
+// no sink (tests, non-Put callers) must be byte-identical: the bump is
+// nil-receiver-safe, so it must not panic and must not change the result.
+func TestA4_SinkBumpIsNoOpWithoutSink(t *testing.T) {
+	a4SplitScopeRBAC(t)
+	kept, logs := a4RunStage(t, a4UAF("list")) // a4RunStage installs no sink of its own beyond the wrapper
+	if len(kept) != 2 || kept[0] != "ns-a" {
+		t.Fatalf("the sink bump must not change refilter behaviour; got %v logs=%s", kept, logs)
+	}
+}

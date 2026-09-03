@@ -40,6 +40,7 @@ import (
 	"github.com/itchyny/gojq"
 	xcontext "github.com/krateo-platformops/plumbing/context"
 	templates "github.com/krateo-platformops/snowplow/apis/templates/v1"
+	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 )
@@ -135,7 +136,8 @@ func warnUAFVerbNonRead(log *slog.Logger, stageName string, uaf *templates.UserA
 
 // refilterResult is the (kept, dropped, total) summary the resolver
 // logs as the per-call falsifier per plan §"Code-path falsifier":
-//   userAccessFilter.dispatch=service_account ... refilter_dropped=N refilter_kept=M evaluate_rbac_calls=K
+//
+//	userAccessFilter.dispatch=service_account ... refilter_dropped=N refilter_kept=M evaluate_rbac_calls=K
 type refilterResult struct {
 	Kept              int
 	Dropped           int
@@ -148,8 +150,9 @@ type refilterResult struct {
 // subset.
 //
 // Shape detection: dict[apiCall.Name] is either:
-//   * map[string]any with an "items" slice (typical K8s list response);
-//   * []any (rare; some endpoints flatten the list).
+//   - map[string]any with an "items" slice (typical K8s list response);
+//   - []any (rare; some endpoints flatten the list).
+//
 // Other shapes are passed through unchanged with a WARN (we cannot
 // safely refilter what we don't understand — the user sees the full
 // SA-dispatched response, which is the conservative-deny choice for
@@ -166,6 +169,31 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 		return res
 	}
 	uaf := apiCall.UserAccessFilter
+
+	// A-1 (1.12.3) — EXECUTION-BASED UAF signal for the L1 Put-gate. Record that
+	// the resolve under this ctx produced a userAccessFilter-NARROWED body, so
+	// every Put site downstream declines to cache it: the cache key folds
+	// BindingUID and RBACSubGen, neither of which separates requesters by their
+	// per-object narrowing scope, so caching a refiltered body serves one
+	// requester's rows to another.
+	//
+	// This is the second of the two bump sites cache/uaf_touched_sink.go
+	// describes, and the one that is not declaration-blind. The apiref
+	// chokepoint bump fires when the apiRef'd RESTAction DECLARES a UAF; it
+	// cannot see a CHAIN (a parent RA declaring nothing whose inner step consumes
+	// a UAF child). Only bumping at the refilter itself observes execution. No
+	// live RA forms such a chain today, which closes it by corpus accident rather
+	// than by code — one customer CR away from being false.
+	//
+	// Placed BEFORE any item is evaluated so the signal does not depend on the
+	// filter keeping anything: a refilter that drops every item still narrowed
+	// the body. No-op when no sink is installed on ctx (nil-receiver-safe), so
+	// every non-Put path is byte-identical.
+	//
+	// Symmetric with the live entry deliberately (architect ruling): this twin is
+	// currently dead, but if it is ever re-wired an unbumped path would silently
+	// cache narrowed bytes.
+	cache.BumpUAFTouched(ctx)
 
 	// A-4 (1.12.3) — WARN-ONLY, once per stage, before any per-item work. Kept
 	// symmetric with the live applyUserAccessFilterOnPig entry so this twin
@@ -698,6 +726,30 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 		return res
 	}
 
+	// A-1 (1.12.3) — EXECUTION-BASED UAF signal for the L1 Put-gate. Record that
+	// the resolve under this ctx produced a userAccessFilter-NARROWED body, so
+	// every Put site downstream declines to cache it: the cache key folds
+	// BindingUID and RBACSubGen, neither of which separates requesters by their
+	// per-object narrowing scope, so caching a refiltered body serves one
+	// requester's rows to another.
+	//
+	// This is the second of the two bump sites cache/uaf_touched_sink.go
+	// describes, and the one that is not declaration-blind. The apiref
+	// chokepoint bump fires when the apiRef'd RESTAction DECLARES a UAF; it
+	// cannot see a CHAIN (a parent RA declaring nothing whose inner step consumes
+	// a UAF child). Only bumping at the refilter itself observes execution. No
+	// live RA forms such a chain today, which closes it by corpus accident rather
+	// than by code — one customer CR away from being false.
+	//
+	// Placed BEFORE any item is evaluated so the signal does not depend on the
+	// filter keeping anything: a refilter that drops every item still narrowed
+	// the body. No-op when no sink is installed on ctx (nil-receiver-safe), so
+	// every non-Put path is byte-identical.
+	//
+	// THIS IS THE LIVE SITE (jsonHandlerCore) and a hard tag condition for
+	// 1.12.3 per cache/uaf_touched_sink.go.
+	cache.BumpUAFTouched(ctx)
+
 	// A-4 (1.12.3) — WARN-ONLY, once per stage, before any per-item work. This
 	// is the LIVE production callsite; the applyUserAccessFilter twin above
 	// carries the identical call so neither entry point can drift. Drops
@@ -810,8 +862,8 @@ func emitRefilterFalsifierFromHandler(ctx context.Context, log *slog.Logger, api
 // emitRefilterFalsifier emits the per-call falsifier per plan
 // §"Code-path falsifier" line:
 //
-//   userAccessFilter.dispatch=service_account user=X resource_type=...
-//   refilter_dropped=N refilter_kept=M evaluate_rbac_calls=K
+//	userAccessFilter.dispatch=service_account user=X resource_type=...
+//	refilter_dropped=N refilter_kept=M evaluate_rbac_calls=K
 //
 // Called by the resolver right after applyUserAccessFilter completes.
 func emitRefilterFalsifier(log *slog.Logger, apiCall *templates.API, username string, res refilterResult) {
