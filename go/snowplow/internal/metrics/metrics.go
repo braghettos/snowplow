@@ -21,20 +21,51 @@
 //	OTEL_METRICS_ENABLED    gate metrics  (default: value of OTEL_ENABLED)
 //	OTEL_EXPORTER_OTLP_ENDPOINT   collector OTLP/HTTP endpoint
 //
-// All instruments are OBSERVABLE (async): a single registered callback
-// reads the live counter snapshots at collection time. This matches the
-// expvar.Func "computed-on-read" semantics exactly and adds zero cost to
+// Every instrument DECLARED HERE is OBSERVABLE (async): a single registered
+// callback reads the live counter snapshots at collection time. This matches
+// the expvar.Func "computed-on-read" semantics exactly and adds zero cost to
 // the hot path — the callback only runs when the collector reads, and only
 // when metrics are enabled.
+//
+// # THE PROCESS IS NOT FREE, EVEN THOUGH THESE INSTRUMENTS ARE (1.12.4)
+//
+// The sentence above is about snowplow's OWN instruments and is true of
+// them. It is NOT true of the process, and the difference is what the
+// serving path experiences. Enabling metrics costs three SYNCHRONOUS,
+// UNSAMPLED histogram Records on EVERY non-filtered request:
+//
+//   - otelhttp captures the GLOBAL MeterProvider at handler-construction
+//     time (its newConfig defaults MeterProvider to otel.GetMeterProvider()).
+//   - Setup below calls otel.SetMeterProvider BEFORE main constructs the
+//     otelhttp handler, so the REAL provider is what gets captured — not
+//     the no-op.
+//   - Each request then performs http.server.request.body.size,
+//     .response.body.size and .request.duration Records, each with a
+//     freshly built attribute set.
+//
+// Metrics do NOT honour the trace sampler, so every request pays this even
+// at 5% trace sampling. OTEL_METRICS_ENABLED="false" is the rollback and
+// needs no binary change. F11 pins the contract; the real acceptance is the
+// Phase-6 bench at SCALE=50000.
+//
+// The compensation is worth claiming: those three histograms include
+// http.server.request.duration, a per-route server-side latency
+// distribution for /call — unsampled, complete, and the FIRST server-side
+// latency distribution snowplow has ever exported.
+//
+// Not a 1.12.4 delta: otelhttp already built its metric attribute set per
+// request in 1.12.3 under the no-op meter. That cost is already shipped.
 package metrics
 
 import (
 	"context"
 
 	"github.com/krateo-platformops/plumbing/env"
+	"github.com/krateo-platformops/plumbing/kubeutil"
 	"github.com/krateo-platformops/snowplow/internal/cache"
 	"github.com/krateo-platformops/snowplow/internal/dynamic"
 	"github.com/krateo-platformops/snowplow/internal/handlers/dispatchers"
+	"github.com/krateo-platformops/snowplow/internal/otelresource"
 	"github.com/krateo-platformops/snowplow/internal/rbac"
 	"github.com/krateo-platformops/snowplow/internal/resolvers/crds/schema"
 
@@ -43,8 +74,6 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
-	"go.opentelemetry.io/otel/sdk/resource"
-	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
 const (
@@ -62,8 +91,7 @@ const (
 	// trace pipeline via the standard OTEL_EXPORTER_OTLP_ENDPOINT contract.
 	EnvOTLPEndpoint = "OTEL_EXPORTER_OTLP_ENDPOINT"
 
-	serviceName = "snowplow"
-	meterName   = "github.com/krateo-platformops/snowplow"
+	meterName = "github.com/krateo-platformops/snowplow"
 )
 
 // ShutdownFunc flushes and stops the metrics pipeline. Always non-nil; a
@@ -102,14 +130,13 @@ func Setup(ctx context.Context, build string) (ShutdownFunc, error) {
 		return noop, err
 	}
 
-	res, err := resource.New(ctx,
-		resource.WithAttributes(
-			semconv.ServiceName(serviceName),
-			semconv.ServiceVersion(build),
-		),
-	)
-	if err != nil && res == nil {
-		res = resource.Default()
+	// 1.12.4 — the shared resource (internal/otelresource). Identical by
+	// construction to the trace and log pipelines' resource, including
+	// the downward-API pod identity that keeps the collector's
+	// k8sattributes association deterministic.
+	res, err := otelresource.Build(ctx, build, kubeutil.ServiceAccountNamespace)
+	if err != nil {
+		return noop, err
 	}
 
 	mp := sdkmetric.NewMeterProvider(
@@ -118,7 +145,7 @@ func Setup(ctx context.Context, build string) (ShutdownFunc, error) {
 	)
 	otel.SetMeterProvider(mp)
 
-	if err := registerInstruments(mp.Meter(meterName)); err != nil {
+	if err := registerInstruments(mp.Meter(meterName), build); err != nil {
 		// Best-effort: shut the provider down so we don't leak the reader
 		// goroutine, then surface the error.
 		_ = mp.Shutdown(ctx)
@@ -132,7 +159,7 @@ func Setup(ctx context.Context, build string) (ShutdownFunc, error) {
 // callback that reads the live counter snapshots. Instrument names mirror
 // the expvar keys (with the conventional `_total` suffix on monotonic
 // counters) so dashboards can correlate the two surfaces.
-func registerInstruments(m metric.Meter) error {
+func registerInstruments(m metric.Meter, build string) error {
 	// --- cache: apiserver fallthrough + assertion violations ---
 	fallthroughTotal, err := m.Int64ObservableCounter(
 		"snowplow_apiserver_fallthrough_total",
@@ -367,12 +394,13 @@ func registerInstruments(m metric.Meter) error {
 		return err
 	}
 
-	// --- dispatch: L1 resolved-output lookup aggregate hit/miss ---
-	dispatchL1, err := m.Int64ObservableCounter("snowplow_dispatch_l1_lookups_total",
-		metric.WithDescription("Cluster-wide dispatch-L1 resolved-output lookups, labelled by outcome (hit/miss)."))
-	if err != nil {
-		return err
-	}
+	// --- dispatch: L1 resolved-output lookups.
+	//
+	// 1.12.4 WIDENED IN PLACE. This instrument kept its name but gained
+	// the `class` and `gvr` attributes and the `seed_hit` outcome; the
+	// aggregate-only declaration it replaces observed a single
+	// process-wide hit/miss pair. Declared below with the other 1.12.4
+	// instruments as dispatchL1Cells.
 
 	// --- RAFullList: cheap Go-slice serve outcomes + index drift canary ---
 	raFullListServe, err := m.Int64ObservableCounter("snowplow_ra_full_list_serve",
@@ -382,6 +410,121 @@ func registerInstruments(m metric.Meter) error {
 	}
 	bindingsDeltaSkipped, err := m.Int64ObservableCounter("snowplow_bindings_by_gvr_delta_skipped_non_typed",
 		metric.WithDescription("Delta-event objects neither typed nor convertible, DROPPED (index drift canary); should be 0."))
+	if err != nil {
+		return err
+	}
+
+	// ===== 1.12.4 (design §3.3) — the instrument gap =====
+	//
+	// Everything below already existed as a live counter inside the
+	// process, reachable only through expvar at the JWT-gated
+	// /debug/vars, or (worse) only through an INFO log line the chart's
+	// LOG_LEVEL=warn suppresses. None of it is a new measurement; all of
+	// it is an existing measurement finally leaving the pod.
+
+	// --- A-1 UAF Put declines (1.12.3). Non-zero is CORRECT in 1.12.x:
+	// the A-1 cross-tenant mitigation is active and declining the Puts.
+	// They return to 0 in 1.13.0 when the v7 key re-enables them. The
+	// dashboard panel MUST carry that annotation or the series reads as
+	// an error.
+	uafRestactionsDeclined, err := m.Int64ObservableCounter(
+		"snowplow_restactions_uaf_put_declined_total",
+		metric.WithDescription("restactions-class L1 Puts declined because the RESTAction declares a userAccessFilter (A-1 mitigation). Non-zero is CORRECT in 1.12.x."))
+	if err != nil {
+		return err
+	}
+	uafWidgetsDeclined, err := m.Int64ObservableCounter(
+		"snowplow_widgets_uaf_put_declined_total",
+		metric.WithDescription("widgets-class L1 Puts declined under the A-1 UAF mitigation. Non-zero is CORRECT in 1.12.x."))
+	if err != nil {
+		return err
+	}
+	uafRAFullListBypass, err := m.Int64ObservableCounter(
+		"snowplow_ra_full_list_uaf_bypass_total",
+		metric.WithDescription("raFullList serves that bypassed the UAF-narrowed cache path (A-1 mitigation)."))
+	if err != nil {
+		return err
+	}
+
+	// --- dispatch L1, WIDENED. The aggregate above collapses every
+	// class and GVR into one hit/miss pair, in which a widgets hit-rate
+	// of 99% and a widgetContent hit-rate of 0% average to a
+	// healthy-looking number while the portal is broken.
+	dispatchL1Cells, err := m.Int64ObservableCounter(
+		"snowplow_dispatch_l1_lookups_total",
+		metric.WithDescription("Dispatch-L1 resolved-output lookups by class, gvr and outcome (hit/miss/seed_hit)."))
+	if err != nil {
+		return err
+	}
+	seedAttributableHits, err := m.Int64ObservableCounter(
+		"snowplow_resolved_cache_hits_seed_attributable_total",
+		metric.WithDescription("Resolved-cache hits served from a boot-seeded cell — did the boot seed warm anything a browser actually hit."))
+	if err != nil {
+		return err
+	}
+
+	// --- the fall-through family, per cell. The grand total was already
+	// instrument #1; what was missing is the path|gvr|reason breakdown,
+	// which is the half that carries the diagnostic value. Capped on the
+	// observation path (see cache.FallthroughCellsSnapshot).
+	fallthroughCells, err := m.Int64ObservableCounter(
+		"snowplow_apiserver_fallthrough_cells_total",
+		metric.WithDescription("GENUINE apiserver fall-throughs by path, gvr and reason."))
+	if err != nil {
+		return err
+	}
+	diagnosticTotal, err := m.Int64ObservableCounter(
+		"snowplow_cache_diagnostic_total",
+		metric.WithDescription("Cache-diagnostic observations that reach NO apiserver (1.12.4 reclassification). Expect this to dwarf the fall-through total ~8:1."))
+	if err != nil {
+		return err
+	}
+	diagnosticCells, err := m.Int64ObservableCounter(
+		"snowplow_cache_diagnostic_cells_total",
+		metric.WithDescription("Cache-diagnostic observations by path, gvr and reason."))
+	if err != nil {
+		return err
+	}
+	seriesTruncated, err := m.Int64ObservableCounter(
+		"snowplow_metrics_series_truncated_total",
+		metric.WithDescription("Cell series folded into gvr=__other__ by the OTLP cardinality cap, by family. Non-zero means a cardinality regression — alert."))
+	if err != nil {
+		return err
+	}
+
+	// --- boot SLI. Log-only before 1.12.4: an unexported expvar.Int
+	// with no accessor, so nothing could alert on it. A healthy boot
+	// leaves it 0.
+	readyzBackstop, err := m.Int64ObservableCounter(
+		"snowplow_readyz_backstop_fired_total",
+		metric.WithDescription("Boots whose /readyz flipped Ready via the C2 backstop instead of firstNav-complete — a FAILED-but-serving boot. Alert on > 0."))
+	if err != nil {
+		return err
+	}
+
+	// --- L1 store occupancy + lifetime, keyed by stat. Computed by
+	// Stats() every N seconds since forever and emitted only into an
+	// INFO line the production LOG_LEVEL=warn discards.
+	resolvedCache, err := m.Int64ObservableGauge(
+		"snowplow_resolved_cache",
+		metric.WithDescription("Resolved-output L1 store occupancy, ceilings, hit/miss/store and evict counters, labelled by stat."))
+	if err != nil {
+		return err
+	}
+
+	// --- informer servability, the leading indicator for the
+	// informer-fallthrough-not-synced cell.
+	informerServable, err := m.Int64ObservableGauge(
+		"snowplow_informer_servable",
+		metric.WithDescription("Informer counts by state (registered/synced/servable/watch_broken/confirmed). watch_broken > 0 is the stale-delete latch."))
+	if err != nil {
+		return err
+	}
+
+	// --- build identity, so every other panel can be pinned to a commit.
+	buildInfo, err := m.Int64ObservableGauge(
+		"snowplow_build_info",
+		metric.WithDescription("Constant 1, labelled with the snowplow build (git short commit)."))
 	if err != nil {
 		return err
 	}
@@ -513,12 +656,89 @@ func registerInstruments(m metric.Meter) error {
 		o.ObserveInt64(upstreamWebhooks, whFail,
 			metric.WithAttributes(attribute.String("policy", "fail")))
 
-		// --- dispatch L1 aggregate ---
-		l1Hit, l1Miss := dispatchers.DispatchL1LookupTotals()
-		o.ObserveInt64(dispatchL1, int64(l1Hit),
-			metric.WithAttributes(attribute.String("outcome", "hit")))
-		o.ObserveInt64(dispatchL1, int64(l1Miss),
-			metric.WithAttributes(attribute.String("outcome", "miss")))
+		// --- dispatch L1, per (class, gvr, outcome) ---
+		//
+		// 1.12.4: emit one point per cell instead of one process-wide
+		// hit/miss pair. seed_hit is a SUBSET of hit, not a third
+		// disjoint outcome — a ratio panel must divide seed_hit by hit,
+		// and hit by (hit+miss). Cardinality is 3 classes x registered
+		// GVRs; the GVR set does not grow with composition count.
+		for _, c := range dispatchers.DispatchL1LookupCells() {
+			base := []attribute.KeyValue{
+				attribute.String("class", c.Class),
+				attribute.String("gvr", c.GVR),
+			}
+			for outcome, v := range map[string]uint64{
+				"hit":      c.Hit,
+				"miss":     c.Miss,
+				"seed_hit": c.SeedHit,
+			} {
+				o.ObserveInt64(dispatchL1Cells, int64(v),
+					metric.WithAttributes(append(append([]attribute.KeyValue{}, base...),
+						attribute.String("outcome", outcome))...))
+			}
+		}
+		o.ObserveInt64(seedAttributableHits, int64(dispatchers.HitsSeedAttributable()))
+
+		// --- 1.12.4: A-1 UAF Put declines ---
+		o.ObserveInt64(uafRestactionsDeclined, int64(cache.RestactionsUAFPutDeclined()))
+		o.ObserveInt64(uafWidgetsDeclined, int64(cache.WidgetsUAFPutDeclined()))
+		o.ObserveInt64(uafRAFullListBypass, int64(cache.RAFullListUAFBypass()))
+
+		// --- 1.12.4: the two cell families, capped ---
+		//
+		// The cap is applied inside the snapshot accessors, on THIS path
+		// only: /debug/vars keeps the full uncapped maps so the bench
+		// harness is unaffected. Overflow lands on gvr="__other__" and
+		// is counted by snowplow_metrics_series_truncated_total below,
+		// so a cardinality regression is visible rather than silent.
+		ftCells, _ := cache.FallthroughCellsSnapshot()
+		for _, c := range ftCells {
+			o.ObserveInt64(fallthroughCells, int64(c.Count),
+				metric.WithAttributes(
+					attribute.String("path", c.Path),
+					attribute.String("gvr", c.GVR),
+					attribute.String("reason", c.Reason)))
+		}
+		o.ObserveInt64(diagnosticTotal, int64(cache.DiagnosticTotal()))
+		diagCells, _ := cache.CacheDiagnosticCellsSnapshot()
+		for _, c := range diagCells {
+			o.ObserveInt64(diagnosticCells, int64(c.Count),
+				metric.WithAttributes(
+					attribute.String("path", c.Path),
+					attribute.String("gvr", c.GVR),
+					attribute.String("reason", c.Reason)))
+		}
+		for family, n := range cache.SeriesTruncatedSnapshot() {
+			o.ObserveInt64(seriesTruncated, int64(n),
+				metric.WithAttributes(attribute.String("family", family)))
+		}
+
+		// --- 1.12.4: boot SLI ---
+		o.ObserveInt64(readyzBackstop, dispatchers.ReadinessBackstopFired())
+
+		// --- 1.12.4: L1 store occupancy + lifetime ---
+		for stat, v := range cache.ResolvedCacheStatsByStat() {
+			o.ObserveInt64(resolvedCache, v,
+				metric.WithAttributes(attribute.String("stat", stat)))
+		}
+
+		// --- 1.12.4: informer servability ---
+		reg, syncedN, servableN, brokenN, confirmedN := cache.ServableCountsSnapshot()
+		for state, v := range map[string]int{
+			"registered":   reg,
+			"synced":       syncedN,
+			"servable":     servableN,
+			"watch_broken": brokenN,
+			"confirmed":    confirmedN,
+		} {
+			o.ObserveInt64(informerServable, int64(v),
+				metric.WithAttributes(attribute.String("state", state)))
+		}
+
+		// --- 1.12.4: build identity, constant 1 ---
+		o.ObserveInt64(buildInfo, 1,
+			metric.WithAttributes(attribute.String("version", buildLabel(build))))
 
 		// --- RAFullList serve outcomes + index drift canary ---
 		ra := cache.RAFullListServeSnapshot()
@@ -545,9 +765,27 @@ func registerInstruments(m metric.Meter) error {
 		refresher, refresherQueueDepth,
 		saDiscovery, crdSchemaMemo,
 		upstreamControllers, upstreamWebhooks,
-		dispatchL1, raFullListServe, bindingsDeltaSkipped,
+		raFullListServe, bindingsDeltaSkipped,
+		// --- 1.12.4 ---
+		uafRestactionsDeclined, uafWidgetsDeclined, uafRAFullListBypass,
+		dispatchL1Cells, seedAttributableHits,
+		fallthroughCells, diagnosticTotal, diagnosticCells, seriesTruncated,
+		readyzBackstop, resolvedCache, informerServable, buildInfo,
 	)
 	return err
+}
+
+// buildLabel normalises the build string for the snowplow_build_info
+// version attribute. An empty build — a local `go build` without the
+// linker flag — becomes "unknown" rather than "", so a dashboard panel
+// never renders a blank label that reads as a scrape failure. Matches
+// the expvar route's normalisation in build_info_expvar.go, so the two
+// surfaces report the same thing for the same binary.
+func buildLabel(build string) string {
+	if build == "" {
+		return "unknown"
+	}
+	return build
 }
 
 // registeredGVRCount returns the number of GVRs with a registered informer,

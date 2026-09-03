@@ -5,9 +5,27 @@
 // SEPARATE signal from the existing stdout -> otel-daemonset filelog ->
 // ClickHouse `otel_logs` per-call diagnostic log. That stdout pipeline is
 // UNTOUCHED. The audit event is a FIRST-CLASS OTLP LogRecord emitted
-// directly by the Logs SDK on the shared OTel Collector -> ClickHouse
-// `otel_logs` plane, stamped with trace_id/span_id from the active span so
-// it joins the traces/logs it caused (otel_logs.idx_trace_id).
+// directly by the Logs SDK, stamped with trace_id/span_id from the active
+// span so it joins the traces/logs it caused (otel_logs.idx_trace_id).
+//
+// PREREQUISITE — READ BEFORE ENABLING (corrected in 1.12.4). This package
+// doc used to assert that the audit LogRecord "reaches otel_logs directly
+// on the shared OTel Collector -> ClickHouse otel_logs plane". On the
+// deployed Krateo topology it does NOT, and the gap is entirely
+// collector-side: the node-local daemonset agent's `logs` pipeline lists
+// `receivers: [filelog]`. `otlp` feeds only its `metrics` and `traces`
+// pipelines. An OTLP log export therefore has NO CONSUMER — the records
+// leave this process and are dropped at the agent.
+//
+// That is why the chart ships OTEL_LOGS_ENABLED="false" EXPLICITLY, even
+// with the OTEL_ENABLED master on: without the explicit override the
+// per-signal gate would default to the master, and the pipeline would
+// silently export into a void. Enabling it requires an `otlp` receiver on
+// the agent's logs pipeline first — a change in the krateo-observability
+// composition, tracked as a separate issue, not a snowplow change.
+//
+// The stdout -> filelog path remains the whole platform's log route and
+// is where snowplow's diagnostics actually land.
 //
 // GATING: Setup mirrors tracing.Setup exactly. It is a no-op unless the
 // pipeline resolves to enabled. Logs are gated by OTEL_LOGS_ENABLED, which
@@ -27,11 +45,11 @@ import (
 	"context"
 
 	"github.com/krateo-platformops/plumbing/env"
+	"github.com/krateo-platformops/plumbing/kubeutil"
+	"github.com/krateo-platformops/snowplow/internal/otelresource"
 
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
-	"go.opentelemetry.io/otel/sdk/resource"
-	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
 const (
@@ -46,11 +64,6 @@ const (
 	// EnvOTLPEndpoint is the OTLP/HTTP collector endpoint, consumed via the
 	// standard OTEL_EXPORTER_OTLP_ENDPOINT env contract.
 	EnvOTLPEndpoint = "OTEL_EXPORTER_OTLP_ENDPOINT"
-
-	// serviceName is the resource service.name reported on every audit
-	// LogRecord — the otel_logs.ServiceName primary key. Must match the
-	// tracing package's service.name so audit logs and spans agree.
-	serviceName = "snowplow"
 )
 
 // ShutdownFunc flushes and stops the logs pipeline. Always non-nil so the
@@ -97,16 +110,13 @@ func Setup(ctx context.Context, build string) (*sdklog.LoggerProvider, ShutdownF
 		return nil, noop, err
 	}
 
-	res, err := resource.New(ctx,
-		resource.WithAttributes(
-			semconv.ServiceName(serviceName),
-			semconv.ServiceVersion(build),
-		),
-	)
+	// 1.12.4 — the shared resource (internal/otelresource), so the audit
+	// LogRecord and the spans it correlates to carry byte-identical
+	// resource attributes rather than two copies of one literal that
+	// happen to agree.
+	res, err := otelresource.Build(ctx, build, kubeutil.ServiceAccountNamespace)
 	if err != nil {
-		if res == nil {
-			res = resource.Default()
-		}
+		return nil, noop, err
 	}
 
 	lp := sdklog.NewLoggerProvider(

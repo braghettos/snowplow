@@ -9,17 +9,11 @@ import (
 	"testing"
 )
 
-// resetL1LookupCellsForTest clears the package-level cell map so an arm
-// sees only its own observations. The map is keyed by
-// "<handlerKind>|<gvrString>" and grows monotonically in production; a
-// test that inherited another arm's cells would assert on a moving set.
-func resetL1LookupCellsForTest() {
-	l1LookupCells.Range(func(k, _ any) bool {
-		l1LookupCells.Delete(k)
-		return true
-	})
-	hitsSeedAttributable.Store(0)
-}
+// resetL1LookupCellsForTest is the local alias for the cross-package
+// seam in l1_lookup_test_seam.go. The map grows monotonically in
+// production; an arm that inherited another arm's cells would assert on
+// a moving set.
+func resetL1LookupCellsForTest() { ResetL1LookupCellsForTest() }
 
 // TestDispatchL1LookupCells_PerClassPerGVR is the shape the aggregate
 // could not express.

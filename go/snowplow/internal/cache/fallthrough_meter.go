@@ -504,17 +504,26 @@ func recordCell(ctx context.Context, reason FallthroughReason, gvr string,
 // at internal/rbac/evaluate.go:48.
 //
 // 1.12.4 (design §5.4, gate condition C5): the diagnostic map and total
-// MUST be zeroed here too. Without it, F5's exact-conservation arm
+// MUST be reset here too. Without it, F5's exact-conservation arm
 // (FallthroughTotal()+DiagnosticTotal() == N) inherits counts from an
 // earlier arm in the same test binary and flakes.
+//
+// 1.12.4 also changes this from ZEROING cells to DELETING them. The old
+// behaviour left every key resident with a 0 count, which is invisible
+// to FallthroughCount (0 either way) but NOT to anything that counts
+// CELLS — and the cardinality-cap falsifier does exactly that. An arm
+// that pushes the map past the cap and asserts "cap + 1 overflow series"
+// was off by however many keys earlier arms had left behind. Deleting is
+// the honest meaning of "reset" and is what makes a cell-count assertion
+// deterministic across arms in one binary.
 func ResetFallthroughCountersForTest() {
-	fallthroughCounters.Range(func(k, v any) bool {
-		v.(*atomic.Uint64).Store(0)
+	fallthroughCounters.Range(func(k, _ any) bool {
+		fallthroughCounters.Delete(k)
 		return true
 	})
 	fallthroughTotal.Store(0)
-	diagnosticCounters.Range(func(k, v any) bool {
-		v.(*atomic.Uint64).Store(0)
+	diagnosticCounters.Range(func(k, _ any) bool {
+		diagnosticCounters.Delete(k)
 		return true
 	})
 	diagnosticTotal.Store(0)
