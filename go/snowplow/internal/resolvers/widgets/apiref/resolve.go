@@ -95,6 +95,19 @@ func bumpUAFSinkIfDeclared(ctx context.Context, ra *templatesv1.RESTAction) {
 	}
 }
 
+// BumpUAFSinkIfDeclaredForTest exposes the production declaration-bump so a
+// cross-package falsifier (the M1 nested-UAF-chain arm, which lives in the
+// dispatchers package and cannot reach an unexported apiref symbol) can drive
+// the REAL derivation instead of re-deciding "does this RA declare a UAF?" for
+// itself. That matters for M1 specifically: the whole claim under test is that
+// the declaration limb does NOT fire for a parent RA whose CHILD declares the
+// filter, so the verdict has to come from production code, not from the test's
+// own opinion of it. Mirrors the established RecordSeedFullListShapeNegativeForTest
+// convention in this package. TEST-ONLY; production calls bumpUAFSinkIfDeclared.
+func BumpUAFSinkIfDeclaredForTest(ctx context.Context, ra *templatesv1.RESTAction) {
+	bumpUAFSinkIfDeclared(ctx, ra)
+}
+
 func shouldServeRAFullList(ctx context.Context, perPage, page int) bool {
 	if !IsPaginatedResolve(perPage, page) || !cache.ResolvedCacheEnabled() {
 		return false
@@ -172,7 +185,11 @@ func Resolve(ctx context.Context, opts ResolveOptions) (map[string]any, error) {
 	// WHY THE DECLARATION AND NOT THE REFILTER ITSELF: the refilter's own bump
 	// (cache.BumpUAFTouched at the top of applyUserAccessFilterOnPig,
 	// internal/resolvers/restactions/api/refilter.go) is owned by another dev and
-	// lands separately. The two are COMPLEMENTARY, not duplicates, and both are
+	// DOES NOT EXIST YET ON THIS BRANCH — it lands on fix/1.12.3-authz-hardening
+	// and is a HARD TAG CONDITION for 1.12.3. Until it merges, the bump below is
+	// the ONLY one, which leaves the nested-chain case open (see
+	// TestM1_NestedUAFChild_NoCellPut_RequiresRefilterBump, deliberately RED on
+	// this branch). The two are COMPLEMENTARY, not duplicates, and both are
 	// wanted:
 	//   - THIS bump is declaration-based and fires whenever an apiRef'd RA
 	//     DECLARES a UAF stage — even if the refilter then narrows nothing (an

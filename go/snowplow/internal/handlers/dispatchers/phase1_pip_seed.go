@@ -1193,7 +1193,24 @@ func seedOneWidget(ctx context.Context, e navWidgetEntry, authnNS string, mode s
 	// carrier being transitive.
 	resCtx, uafTouchedSink := cache.WithUAFTouchedSink(resCtx)
 
-	res, err := widgets.Resolve(resCtx, widgets.ResolveOptions{
+	// 1.12.3 R-1 (adv-cache-isolation) — route through the SAME widgetsResolveFn
+	// seam the dispatcher uses (dispatch_seams.go) instead of calling
+	// widgets.Resolve directly. Two reasons, both about this file's UAF gate:
+	//
+	//  1. CONSISTENCY. The seed and the dispatcher fill the SAME per-binding
+	//     widgets cell and now run the SAME decline gate over it. Having one of
+	//     them bypass the seam meant the seed leg could only ever be tested at
+	//     helper granularity, which is how it ended up as this package's one weak
+	//     RED.
+	//  2. CTX PROPAGATION IS THE FAILURE MODE THE AST GUARD CANNOT SEE. The
+	//     structural enumeration guard proves seedOneWidget CONSULTS the gate; it
+	//     cannot prove the resolve actually ran under the ctx carrying the sink
+	//     the gate reads. Threading resCtx through the seam lets a falsifier
+	//     assert the resolver received a ctx whose UAFTouchedSink is the SAME
+	//     POINTER the gate below holds — bump it there, watch the Put decline.
+	//
+	// Behaviour is unchanged: the seam's production value IS widgets.Resolve.
+	res, err := widgetsResolveFn(resCtx, widgets.ResolveOptions{
 		In: in,
 		// Ship 0.30.230 fix-at-root: RC is the SA *rest.Config carried
 		// on ctx by withCohortSeedContext upstream. Threading it here

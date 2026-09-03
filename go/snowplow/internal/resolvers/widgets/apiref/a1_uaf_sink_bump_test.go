@@ -15,8 +15,9 @@
 //
 // SCOPE NOTE. A second, complementary bump belongs at the top of the live
 // refilter entry point (applyUserAccessFilterOnPig,
-// internal/resolvers/restactions/api/refilter.go) and is owned by another dev.
-// The two are not duplicates:
+// internal/resolvers/restactions/api/refilter.go), is owned by another dev, and
+// IS NOT ON THIS BRANCH — it lands on fix/1.12.3-authz-hardening and is a hard
+// tag condition. The two are not duplicates:
 //   - THIS one is DECLARATION-based and fires whenever an apiRef'd RA declares a
 //     UAF stage, including when the refilter then narrows nothing (an empty
 //     result is still requester-dependent);
