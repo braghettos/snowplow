@@ -793,7 +793,22 @@ func seedOneRestaction(ctx context.Context, cohortLabel string, ref templatesv1.
 	// cell), so resolving first would buy nothing and cost a full fan-out per
 	// cohort per UAF RA at boot. Non-lossy by the same argument as the #113
 	// templated-endpointRef skip above: the seed was never going to leave a
-	// servable cell behind. HasUAF is stamped here (not only in the tail) so the
+	// servable cell behind.
+	//
+	// KNOWN, ACCEPTED SIDE EFFECT (arch-cache point (b), ruled a LATENCY TRANSFER
+	// and not a correctness issue): skipping the resolve also skips
+	// EnsureResourceType for any GVR touched ONLY inside this RA's inner calls —
+	// the seed would otherwise have registered those informers as a side effect
+	// of resolving. So the FIRST customer request for such a GVR pays the
+	// registration plus a not-yet-synced fallthrough that boot used to absorb.
+	// It is safe because registration is IDEMPOTENT and LAZILY REACHABLE on the
+	// request path (watcher.go EnsureResourceType), so nothing is permanently
+	// unregistered and no result is wrong — the cost simply moves from boot to
+	// the first request. Accepted deliberately: the alternative is resolving a
+	// UAF RA per cohort at boot purely to warm informers for output that can
+	// never be cached.
+	//
+	// HasUAF is stamped here (not only in the tail) so the
 	// ONE shared helper decides, and so the flag is already correct if a future
 	// path carries these inputs onward. The tail keeps its own defensive decline
 	// for a caller that drives the seam directly.
