@@ -302,9 +302,10 @@ func (r *restActionHandler) ServeHTTP(wri http.ResponseWriter, req *http.Request
 	// one — its own spec declares no userAccessFilter, so the declaration limb is
 	// blind to it, while its resolved body still carries per-requester-narrowed
 	// rows. That case is NOT closed on this branch: the only bump today is
-	// declaration-based (apiref.Resolve) and inspects the parent. It closes with
-	// the refilter bump on fix/1.12.3-authz-hardening; until then
-	// TestM1_NestedUAFChild_NoCellPut_RequiresRefilterBump is RED by design.
+	// declaration-based (apiref.Resolve) and inspects the parent — the blindness
+	// is asserted by TestM1_DeclarationLimbIsBlindToNestedUAFChild (apiref). It
+	// closes with the refilter bump on fix/1.12.3-authz-hardening, whose own arm
+	// is TestA4_RefilterBumpsUAFTouchedSink.
 	ctx, uafTouchedSink := cache.WithUAFTouchedSink(ctx)
 	res, err := restactionsResolveFn(ctx, restactions.ResolveOptions{
 		In:      &cr,

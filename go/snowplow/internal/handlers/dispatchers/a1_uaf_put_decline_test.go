@@ -396,10 +396,12 @@ func TestA1_DeclineUAFPut_PredicateAndCounter(t *testing.T) {
 	//     TestR2_UAFCrossUser_WidgetNoSharedCellServe.
 	//   - NESTED-RA CHAIN (a non-UAF parent whose inner step consumes a UAF
 	//     child): NOT covered on this branch. No production bump fires — the
-	//     declaration bump inspects the PARENT, which declares nothing. Producer
-	//     coverage arrives with the refilter bump on fix/1.12.3-authz-hardening.
-	//     TestM1_NestedUAFChild_NoCellPut_RequiresRefilterBump is that arm; it is
-	//     RED here BY DESIGN and green on the assembled tree.
+	//     declaration bump inspects the PARENT, which declares nothing
+	//     (TestM1_DeclarationLimbIsBlindToNestedUAFChild, apiref package).
+	//     Producer coverage arrives with the refilter bump on
+	//     fix/1.12.3-authz-hardening, whose arm is
+	//     TestA4_RefilterBumpsUAFTouchedSink — it drives the real refilter, so
+	//     unlike a seamed dispatch it is actually sensitive to that bump.
 	//
 	// So: this asserts the gate consumes the sink. It does not assert the nested
 	// chain is closed, and must not be cited as if it did.

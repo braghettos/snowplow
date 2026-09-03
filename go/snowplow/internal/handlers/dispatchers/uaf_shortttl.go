@@ -217,11 +217,12 @@ const (
 	//     declaration bump;
 	//   - a non-UAF RA that NESTS a UAF one — NOT covered here. No bump fires on
 	//     that path, because the only bump inspects the RA the apiRef names and
-	//     that one declares nothing. It closes with the refilter bump on
-	//     fix/1.12.3-authz-hardening.
+	//     that one declares nothing (asserted by
+	//     TestM1_DeclarationLimbIsBlindToNestedUAFChild, apiref package). It
+	//     closes with the refilter bump on fix/1.12.3-authz-hardening, whose arm
+	//     is TestA4_RefilterBumpsUAFTouchedSink.
 	// Read this constant as "something marked the resolve", never as "every
-	// narrowed shape is marked" — that gap is the whole subject of
-	// TestM1_NestedUAFChild_NoCellPut_RequiresRefilterBump, RED here by design.
+	// narrowed shape is marked".
 	uafDeclineObserved = "observed_refilter"
 )
 

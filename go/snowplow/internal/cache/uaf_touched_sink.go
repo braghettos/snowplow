@@ -19,8 +19,10 @@
 // rows. The sink is the right MECHANISM for it — but only once something bumps
 // it on that path, and the declaration bump present here inspects the PARENT,
 // which declares nothing. That case is closed by the refilter bump described
-// below, and is RED until it merges
-// (TestM1_NestedUAFChild_NoCellPut_RequiresRefilterBump).
+// below. The blindness itself is asserted by
+// TestM1_DeclarationLimbIsBlindToNestedUAFChild (apiref package); that the
+// refilter DOES mark a resolve is asserted by TestA4_RefilterBumpsUAFTouchedSink
+// (internal/resolvers/restactions/api), which drives the real refilter.
 //
 // THE MECHANISM (mirrors StageErrorSink / ExternalTouchedSink exactly — the
 // established idiom for "something happened DOWN the resolve that the Put site
@@ -59,8 +61,16 @@
 // Today no live RA forms such a chain (0 of 49 consume the restactions endpoint),
 // so on this branch alone the chain is closed by CORPUS ACCIDENT rather than by
 // the code — one customer CR away from being false, with no admission rule
-// preventing it. TestM1_NestedUAFChild_NoCellPut_RequiresRefilterBump is RED here
-// and green once (2) merges; that RED is the evidence the two are not redundant.
+// preventing it.
+//
+// NO SINGLE HERMETIC ARM SPANS THE WHOLE CHAIN, and an earlier attempt to write
+// one was wrong (it seamed away the resolver and asserted on its own simulation,
+// so it stayed RED even after (2) landed). Coverage is compositional, each link
+// driven at a real boundary: TestA4_RefilterBumpsUAFTouchedSink (a refilter run
+// marks the ctx), TestR1_SeedOneWidget_ResolveCtxCarriesTheGatesSink plus the
+// identity-agreement arms (the mark rides the ctx the gate reads), and
+// TestR2_UAFCrossUser_WidgetNoSharedCellServe (a marked resolve declines its
+// Put, asserted on served bytes).
 //
 // Double-bumping is harmless: every gate reads Count()>0, never an exact count.
 // BumpUAFTouched exists so each site is a single line with no sink plumbing of
