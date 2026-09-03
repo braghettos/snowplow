@@ -1,31 +1,29 @@
-// uaf_verb_cel_test.go — A-4 (1.12.3) ADMISSION falsifier for the read-verb
-// bound on userAccessFilter.verb.
+// uaf_verb_cel_test.go — A-4 (1.12.3) ADMISSION arm for userAccessFilter.verb.
 //
-// WHY A REAL CEL DRIVE, NOT A STRING GREP. Asserting that the generated YAML
-// CONTAINS the rule text proves only that a marker was typed; it cannot tell a
-// correct rule from one that parses but never rejects anything (a mis-scoped
-// `self`, a `has()` short-circuit that always yields true, a typo'd field
-// path). Per feedback_falsifier_must_drive_real_boundary_not_install_crossed_state
-// this arm drives the REAL admission boundary: it loads the COMMITTED generated
-// CRD, builds the same structural schema the apiserver builds, and runs the
-// apiserver's own CEL validator over whole RESTAction objects. A rule that does
-// not actually reject `verb: create` fails here.
+// HISTORY, because the assertion here is the OPPOSITE of the one this file
+// shipped with a few hours ago. A-4's first cut added a fourth XValidation
+// bounding userAccessFilter.verb to get/list/watch. Review found three LIVE
+// portal RESTActions that use `verb: create` legitimately (testdata/
+// portal_uaf_corpus.yaml, portal @ b2a558d): the api-step returns NAMESPACES
+// and the filter checks `create` on a DIFFERENT resource, so it answers "which
+// namespaces may I create X in" — a form picker, not a scope inversion. The CRD
+// rule would have failed the portal upgrade outright. It was DROPPED for
+// 1.12.3; the read-verb check survives at runtime as a WARN-ONLY signal
+// (refilter.go uafVerbIsRead), and 1.13.0 will enforce the narrower
+// SAME-RESOURCE rule.
 //
-// The arms:
+// So this arm now pins the ABSENCE of a verb bound: the committed CRD must
+// ADMIT the live portal corpus. It is a regression gate on a real outage — if
+// someone re-adds the blanket rule, the portal upgrade breaks and this fails
+// first, naming the three files.
 //
-//	(i)  verb: create  → REJECTED, and the rejection cites the A-4 rule (not one
-//	     of the three pre-existing userAccessFilter rules, which would mean the
-//	     arm is passing for the wrong reason).
-//	(ii) verb: list    → ACCEPTED (no CEL error at all) — proves the rule is not
-//	     an indiscriminate deny.
-//	(iii) the full write-verb corpus + an upper-case "GET" → all REJECTED.
-//	(iv) the full read-verb corpus (get/list/watch) → all ACCEPTED.
-//	(v)  a stage with NO userAccessFilter → ACCEPTED, proving the rule's
-//	     !has() guard does not leak onto the ~99% of api-steps that have no
-//	     filter at all.
-//
-// RED on origin/main: without the fourth XValidation marker, arm (i) admits
-// `verb: create` and fails with "want REJECTED, got ACCEPTED".
+// WHY A REAL CEL DRIVE, NOT A STRING GREP. Grepping the YAML for a rule that is
+// absent proves nothing about whether some OTHER rule rejects these objects.
+// Per feedback_falsifier_must_drive_real_boundary_not_install_crossed_state this
+// loads the COMMITTED generated CRD, builds the structural schema the apiserver
+// builds, and runs the apiserver's own CEL validator over whole RESTAction
+// objects. The kind-backed twin, against a genuine apiserver, is
+// TestInspect_RealAdmission_UAFFreeFormVerb in internal/resolvers/restactions/api.
 
 package v1
 
@@ -44,18 +42,52 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-// celPerCallLimit / celCostBudget mirror the apiserver's own defaults closely
-// enough for a handful of rules over a two-stage object; they only bound
-// runtime cost, never which rules run.
+// celPerCallLimit / celCostBudget only bound runtime cost, never which rules run.
 const (
 	celPerCallLimit = uint64(1_000_000)
 	celCostBudget   = int64(10_000_000)
 )
 
+// portalUAFCase mirrors one entry of testdata/portal_uaf_corpus.yaml.
+type portalUAFCase struct {
+	Name             string `json:"name"`
+	Source           string `json:"source"`
+	APIStepName      string `json:"apiStepName"`
+	APIStepPath      string `json:"apiStepPath"`
+	APIStepVerb      string `json:"apiStepVerb"`
+	UserAccessFilter struct {
+		Verb          string `json:"verb"`
+		Group         string `json:"group"`
+		Resource      string `json:"resource"`
+		ResourcesFrom string `json:"resourcesFrom"`
+		NamespaceFrom string `json:"namespaceFrom"`
+	} `json:"userAccessFilter"`
+}
+
+// loadPortalUAFCorpus reads the vendored live-portal stanzas. Shared with the
+// refilter-side arm in internal/resolvers/restactions/api, which reads the same
+// file, so the two halves of the corpus gate can never drift apart.
+func loadPortalUAFCorpus(t *testing.T, relToTestdata string) []portalUAFCase {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(relToTestdata, "portal_uaf_corpus.yaml"))
+	if err != nil {
+		t.Fatalf("read portal UAF corpus: %v", err)
+	}
+	var doc struct {
+		Cases []portalUAFCase `json:"cases"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal portal UAF corpus: %v", err)
+	}
+	if len(doc.Cases) != 3 {
+		t.Fatalf("portal UAF corpus must carry the 3 live stanzas; got %d", len(doc.Cases))
+	}
+	return doc.Cases
+}
+
 // loadRESTActionCELValidator builds the apiserver's CEL validator from the
-// COMMITTED generated CRD — the same artifact the snowplow-crds chart ships,
-// so this arm fails if the marker is present in core.go but the YAML was never
-// regenerated (the CI drift guard's twin, from the admission side).
+// COMMITTED generated CRD — the same artifact the snowplow-crds chart ships, so
+// this arm fails if core.go and the YAML ever disagree.
 func loadRESTActionCELValidator(t *testing.T) (*schemacel.Validator, *structuralschema.Structural) {
 	t.Helper()
 
@@ -87,29 +119,32 @@ func loadRESTActionCELValidator(t *testing.T) (*schemacel.Validator, *structural
 	return schemacel.NewValidator(structural, true, celPerCallLimit), structural
 }
 
-// restActionWithUAFVerb builds a complete, otherwise-VALID RESTAction carrying a
-// single api-step whose userAccessFilter checks `verb`. Everything else is
-// deliberately well-formed (GET stage, no exportJwt, a non-empty resource) so
-// the ONLY rule that can possibly fire is the A-4 verb bound — if any other
-// userAccessFilter rule fires, the arm's message-matching catches it rather
-// than silently passing.
-func restActionWithUAFVerb(verb string) map[string]any {
+// restActionFromCase builds a complete RESTAction around one vendored stanza.
+func restActionFromCase(c portalUAFCase) map[string]any {
+	uaf := map[string]any{
+		"verb":          c.UserAccessFilter.Verb,
+		"group":         c.UserAccessFilter.Group,
+		"namespaceFrom": c.UserAccessFilter.NamespaceFrom,
+	}
+	// resource / resourcesFrom are XOR'd by an existing rule — set exactly the
+	// one the live stanza sets.
+	if c.UserAccessFilter.Resource != "" {
+		uaf["resource"] = c.UserAccessFilter.Resource
+	}
+	if c.UserAccessFilter.ResourcesFrom != "" {
+		uaf["resourcesFrom"] = c.UserAccessFilter.ResourcesFrom
+	}
 	return map[string]any{
 		"apiVersion": "templates.krateo.io/v1",
 		"kind":       "RESTAction",
-		"metadata":   map[string]any{"name": "a4-probe", "namespace": "demo-system"},
+		"metadata":   map[string]any{"name": "a4-portal-" + c.Name, "namespace": "krateo-system"},
 		"spec": map[string]any{
 			"api": []any{
 				map[string]any{
-					"name": "compositions",
-					"path": "/apis/composition.krateo.io/v1alpha1/compositions",
-					"verb": "GET",
-					"userAccessFilter": map[string]any{
-						"group":         "composition.krateo.io",
-						"resource":      "compositions",
-						"verb":          verb,
-						"namespaceFrom": ".metadata.namespace",
-					},
+					"name":             c.APIStepName,
+					"path":             c.APIStepPath,
+					"verb":             c.APIStepVerb,
+					"userAccessFilter": uaf,
 				},
 			},
 		},
@@ -121,7 +156,7 @@ func restActionNoUAF() map[string]any {
 	return map[string]any{
 		"apiVersion": "templates.krateo.io/v1",
 		"kind":       "RESTAction",
-		"metadata":   map[string]any{"name": "a4-probe", "namespace": "demo-system"},
+		"metadata":   map[string]any{"name": "a4-probe", "namespace": "krateo-system"},
 		"spec": map[string]any{
 			"api": []any{
 				map[string]any{"name": "plain", "path": "/healthz", "verb": "GET"},
@@ -136,7 +171,7 @@ func validateCEL(t *testing.T, obj map[string]any) string {
 	t.Helper()
 	validator, structural := loadRESTActionCELValidator(t)
 	if validator == nil {
-		t.Fatal("A-4 setup: the generated CRD carries NO CEL rules at all — the validator is nil, so no admission bound exists")
+		t.Fatal("A-4 setup: the generated CRD carries NO CEL rules at all — the three pre-existing userAccessFilter guards have gone missing, so this harness is not exercising admission")
 	}
 	errs, _ := validator.Validate(context.Background(), field.NewPath(""), structural, obj, nil, celCostBudget)
 	msgs := make([]string, 0, len(errs))
@@ -146,62 +181,90 @@ func validateCEL(t *testing.T, obj map[string]any) string {
 	return strings.Join(msgs, "\n")
 }
 
-// a4RuleFingerprint is a distinctive fragment of the A-4 message. Matching it
-// (rather than merely "some error occurred") is what stops the arm passing
-// because one of the three PRE-EXISTING userAccessFilter rules fired instead.
-const a4RuleFingerprint = "must be a READ verb"
-
-// TestA4_UAFVerbNonRead_RejectedByCRDSchema — the make-or-break admission arm.
-func TestA4_UAFVerbNonRead_RejectedByCRDSchema(t *testing.T) {
-	// (i) create → REJECTED, by the A-4 rule specifically.
-	got := validateCEL(t, restActionWithUAFVerb("create"))
-	if got == "" {
-		t.Fatalf("A-4 (i): an api-step with userAccessFilter.verb=create must be REJECTED by the CRD schema; the CEL validator ADMITTED it. Without the read-verb XValidation the refilter checks a WRITE grant on a read path — every object the requester may create is admitted into the filtered response (scope inversion)")
-	}
-	if !strings.Contains(got, a4RuleFingerprint) {
-		t.Fatalf("A-4 (i): verb=create was rejected, but NOT by the A-4 read-verb rule — the arm would pass for the wrong reason. Rejection text:\n%s", got)
-	}
-
-	// (ii) list → ACCEPTED. Discriminates an indiscriminate deny.
-	if got := validateCEL(t, restActionWithUAFVerb("list")); got != "" {
-		t.Fatalf("A-4 (ii): userAccessFilter.verb=list is a legitimate read filter and must be ACCEPTED; the schema rejected it:\n%s", got)
-	}
-}
-
-// TestA4_UAFVerbCorpus_ReadAcceptedWriteRejected — the corpus arm. Every write
-// verb the CRD previously admitted must now be rejected, and every read verb
-// must still be accepted. "GET" (upper-case) is in the REJECT set on purpose:
-// the RBAC evaluator matches verbs by exact lower-case equality, so an
-// upper-case verb matches no PolicyRule and silently denies every item —
-// rejecting it at admission surfaces the typo instead of shipping a filter that
-// returns an empty list forever.
-func TestA4_UAFVerbCorpus_ReadAcceptedWriteRejected(t *testing.T) {
-	rejected := []string{
-		"create", "update", "patch", "delete", "deletecollection",
-		"*", "GET", "List", "impersonate", "escalate", "bind",
-	}
-	for _, verb := range rejected {
-		got := validateCEL(t, restActionWithUAFVerb(verb))
-		if got == "" {
-			t.Errorf("A-4 corpus: userAccessFilter.verb=%q must be REJECTED (not a lower-case read verb); the schema ADMITTED it", verb)
-			continue
-		}
-		if !strings.Contains(got, a4RuleFingerprint) {
-			t.Errorf("A-4 corpus: verb=%q was rejected by some OTHER rule, not the A-4 read-verb bound:\n%s", verb, got)
-		}
-	}
-
-	for _, verb := range []string{"get", "list", "watch"} {
-		if got := validateCEL(t, restActionWithUAFVerb(verb)); got != "" {
-			t.Errorf("A-4 corpus: userAccessFilter.verb=%q is a read verb and must be ACCEPTED; got:\n%s", verb, got)
+// TestA4_PortalCorpus_CreateVerbUAFs_Admitted — the regression gate on the real
+// outage. Each live portal stanza must be ADMITTED by the committed CRD.
+func TestA4_PortalCorpus_CreateVerbUAFs_Admitted(t *testing.T) {
+	for _, c := range loadPortalUAFCorpus(t, filepath.Join("..", "..", "..", "testdata")) {
+		if got := validateCEL(t, restActionFromCase(c)); got != "" {
+			t.Errorf("A-4 PORTAL CORPUS: the LIVE portal RESTAction %q (%s) was REJECTED by the "+
+				"committed CRD schema. Its userAccessFilter uses verb %q to answer \"which "+
+				"namespaces may I create this in\" — the api-step returns NAMESPACES and the "+
+				"filter checks a DIFFERENT resource, so it is not the scope inversion A-4 "+
+				"targets. A blanket read-verb bound on userAccessFilter.verb fails the portal "+
+				"upgrade and empties three namespace pickers. Rejection:\n%s",
+				c.Name, c.Source, c.UserAccessFilter.Verb, got)
 		}
 	}
 }
 
-// TestA4_NoUserAccessFilter_Unaffected — the !has() boundary. An api-step with
-// no userAccessFilter at all (the overwhelming majority of the corpus) must be
-// admitted unchanged; a rule missing its !has() guard would reject every one of
-// them and take the whole product down.
+// TestA4_UAFVerbBound_NotReintroduced states the same invariant at the schema
+// level, so the failure names the cause rather than only the symptom: no rule on
+// the API stage may constrain userAccessFilter.verb by value.
+func TestA4_UAFVerbBound_NotReintroduced(t *testing.T) {
+	for _, verb := range []string{"create", "update", "patch", "delete", "deletecollection"} {
+		obj := restActionFromCase(portalUAFCase{
+			Name: "synthetic", APIStepName: "ns", APIStepPath: "/api/v1/namespaces", APIStepVerb: "GET",
+			UserAccessFilter: struct {
+				Verb          string `json:"verb"`
+				Group         string `json:"group"`
+				Resource      string `json:"resource"`
+				ResourcesFrom string `json:"resourcesFrom"`
+				NamespaceFrom string `json:"namespaceFrom"`
+			}{Verb: verb, Group: "core.krateo.io", Resource: "compositiondefinitions", NamespaceFrom: ".metadata.name"},
+		})
+		if got := validateCEL(t, obj); got != "" {
+			t.Errorf("A-4: userAccessFilter.verb=%q must still be ADMITTED in 1.12.3 — the blanket "+
+				"read-verb XValidation was DROPPED because it breaks the live portal. Non-read "+
+				"verbs are handled at RUNTIME as a warn-only signal (refilter.go), and 1.13.0 "+
+				"enforces the narrower SAME-RESOURCE rule. Rejection:\n%s", verb, got)
+		}
+	}
+}
+
+// TestA4_PreExistingUAFRulesStillFire — the paired arm proving this file is not
+// vacuous. The THREE pre-existing userAccessFilter guards must still reject what
+// they always rejected; dropping the fourth rule must not have loosened them.
+func TestA4_PreExistingUAFRulesStillFire(t *testing.T) {
+	base := func() map[string]any {
+		return restActionFromCase(portalUAFCase{
+			Name: "synthetic", APIStepName: "ns", APIStepPath: "/api/v1/namespaces", APIStepVerb: "GET",
+			UserAccessFilter: struct {
+				Verb          string `json:"verb"`
+				Group         string `json:"group"`
+				Resource      string `json:"resource"`
+				ResourcesFrom string `json:"resourcesFrom"`
+				NamespaceFrom string `json:"namespaceFrom"`
+			}{Verb: "list", Group: "core.krateo.io", Resource: "compositiondefinitions", NamespaceFrom: ".metadata.name"},
+		})
+	}
+	step := func(o map[string]any) map[string]any {
+		return o["spec"].(map[string]any)["api"].([]any)[0].(map[string]any)
+	}
+
+	// Rule 1 — a UAF on a WRITE HTTP stage.
+	o := base()
+	step(o)["verb"] = "POST"
+	if got := validateCEL(t, o); got == "" {
+		t.Error("A-4: rule 1 stopped firing — a userAccessFilter on a POST HTTP stage must still be rejected")
+	}
+
+	// Rule 2 — exportJwt alongside a UAF.
+	o = base()
+	step(o)["exportJwt"] = true
+	if got := validateCEL(t, o); got == "" {
+		t.Error("A-4: rule 2 stopped firing — exportJwt alongside a userAccessFilter must still be rejected")
+	}
+
+	// Rule 3 — an empty verb.
+	o = base()
+	step(o)["userAccessFilter"].(map[string]any)["verb"] = ""
+	if got := validateCEL(t, o); got == "" {
+		t.Error("A-4: rule 3 stopped firing — an empty userAccessFilter.verb must still be rejected")
+	}
+}
+
+// TestA4_NoUserAccessFilter_Unaffected — the !has() boundary for the three
+// surviving rules: an api-step with no userAccessFilter must be admitted.
 func TestA4_NoUserAccessFilter_Unaffected(t *testing.T) {
 	if got := validateCEL(t, restActionNoUAF()); got != "" {
 		t.Fatalf("A-4 boundary: an api-step with NO userAccessFilter must be ACCEPTED unchanged; the schema rejected it:\n%s", got)

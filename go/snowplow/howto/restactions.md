@@ -156,7 +156,7 @@ CEL also forbids `exportJwt: true` on such a stage. Type `UserAccessFilterSpec`
 
 | Field | Type | Description | Required |
 |--------|------|-------------|-----------|
-| `verb` | `string` | Kubernetes RBAC verb checked per item. **Must be `get`, `list` or `watch`, lower-case** — a CEL rule on the CRD rejects anything else, and the refilter drops every item (fail-closed, one warning) if a pre-existing CR carries one. A write verb would keep the items the caller may *mutate*, inverting the filter's scope on a read path. | ✅ |
+| `verb` | `string` | Kubernetes RBAC verb checked per item (e.g. `get`, lower-case). | ✅ |
 | `group` | `string` | API group of the checked resource (`""` = core group). | ✅ |
 | `resource` | `string` | Static plural resource name. Exactly one of `resource` / `resourcesFrom`. | conditional |
 | `resourcesFrom` | `string` | jq over the resolve dict yielding a `[]string` of plurals; an item is kept if the user may act on **any** of them (OR). | conditional |

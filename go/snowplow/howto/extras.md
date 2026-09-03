@@ -143,8 +143,10 @@ a deterministic `fmt.Sprintf("%v", …)` so the key still varies with content.
 
   Identity keys (`username`, `groups`, `displayName`) are handled one step
   earlier and never reach the resolve dict unless the widget declares them.
-  A client-supplied identity extra is **stripped** at the dispatcher
-  (`sanitizeUndeclaredIdentityExtras`) unless the widget names that key in
+  A client-supplied identity extra is **stripped** inside `widgets.Resolve`
+  (`sanitizeUndeclaredIdentityExtras`), so every caller — the `/call` dispatcher,
+  the refresher, the boot seed and nested resolves — gets the same contract.
+  It survives only when the widget names that key in
   `spec.identityContext` — where the server overwrites it with the JWT's own
   value — or in `spec.keyExtras`, where it partitions the key. So a widget
   whose output depends on the caller's identity **must declare it in

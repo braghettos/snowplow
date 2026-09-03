@@ -44,25 +44,16 @@ import (
 	jqsupport "github.com/krateo-platformops/snowplow/internal/support/jq"
 )
 
-// uafReadVerbs is the closed set of Kubernetes RBAC verbs a userAccessFilter
-// may CHECK per object — A-4 (1.12.3). It is the runtime twin of the
-// XValidation bound on apis/templates/v1/core.go's API struct, and exists
-// because the CRD rule only guards CRs written THROUGH the apiserver after
-// 1.12.3: a CR admitted by an older schema, or written straight to etcd,
-// still reaches this code.
+// uafReadVerbs is the set of Kubernetes RBAC verbs that unambiguously express
+// a READ intent — A-4 (1.12.3).
 //
-// WHY IT MUST BE BOUNDED. uaf.Verb is threaded verbatim into
-// rbac.EvaluateRBAC (evalSingle below). A userAccessFilter is by construction
-// a READ-path narrowing — it decides which items of a ServiceAccount-dispatched
-// list the requester is allowed to SEE. Checking a write verb inverts that
-// scope: `verb: create` keeps exactly the items the requester may CREATE, which
-// on a read path is neither a subset of nor a superset of what they may read.
-// A user holding a broad create grant and a narrow get grant would be SHOWN
-// objects they cannot read. Bounding the verb is the only way to keep the
-// filter's meaning ("what you may see") stable.
+// Lower-case only, and that is a correctness point rather than a style one.
+// rbac/evaluate.go stringSliceMatches tests the rule's "*" wildcard FIRST, so an
+// upper-case "GET" checked against a wildcard grant is silently ALLOWED, and
+// against every non-wildcard grant is silently DENIED. Either way the operator
+// sees a filter that quietly does the wrong thing. Treating a non-lower-case
+// verb as "not a read verb" is what surfaces the typo.
 //
-// Lower-case only, matching the RBAC evaluator's exact-match verb tables
-// (rbac/evaluate.go stringSliceMatches / nameSpecificVerbs) and the CEL rule.
 // Not a resource/path/user special-case (feedback_no_special_cases): a fixed,
 // mechanism-level verb vocabulary, uniform across every userAccessFilter.
 var uafReadVerbs = map[string]struct{}{
@@ -71,44 +62,75 @@ var uafReadVerbs = map[string]struct{}{
 	"watch": {},
 }
 
-// uafVerbIsRead reports whether verb is one of the read verbs a
-// userAccessFilter is allowed to check. Anything else (a write verb, a typo,
-// an upper-case "GET", the empty string) is NOT read and fails closed.
+// uafVerbIsRead reports whether verb unambiguously expresses a read intent.
+// Anything else — a write verb, a typo, an upper-case "GET", the empty string —
+// is not read.
+//
+// WHAT THIS IS FOR, AND WHAT IT IS DELIBERATELY NOT. uaf.Verb is threaded
+// verbatim into rbac.EvaluateRBAC (evalSingle below). The dangerous shape is a
+// stage that returns objects of resource R filtered by a WRITE verb on R: it
+// keeps the objects the caller may mutate rather than the ones they may read,
+// so a user with a broad create grant and a narrow get grant is SHOWN objects
+// they cannot read. That is a genuine scope inversion.
+//
+// But "non-read verb" alone does NOT identify it. Three LIVE portal RESTActions
+// (testdata/portal_uaf_corpus.yaml, portal @ b2a558d) use `verb: create`
+// legitimately: the api-step returns NAMESPACES and the filter checks create on
+// a DIFFERENT resource, so it answers "which namespaces may I create X in" — a
+// form picker that discloses nothing about objects the caller cannot read.
+// A-4's first cut rejected exactly these at admission and dropped their items
+// here; it would have failed the portal upgrade and silently emptied three
+// namespace pickers. See core.go for why the CRD rule was removed too.
+//
+// So in 1.12.3 this predicate is WARN-ONLY. It never drops an item.
+//
+// THE 1.13.0 RULE, written down so the flip is mechanical and does not
+// re-litigate this. Drop the items only when BOTH hold:
+//
+//	(a) !uafVerbIsRead(uaf.Verb), and
+//	(b) the UAF's resource set intersects the resource the api-step RETURNS.
+//
+// (b) is the part that separates the portal's pickers (namespaces filtered by
+// create on compositiondefinitions/alerts — disjoint, allowed) from the
+// inversion (compositions filtered by create on compositions — equal, dropped).
+// Deriving the returned resource means parsing apiCall.Path, and that path may
+// be jq-templated ("${...}"): when it is, or when it cannot be parsed to a
+// plural, (b) MUST evaluate FALSE — fail OPEN, serve the items. A fail-closed
+// default on an underivable path recreates the very outage this warn-only
+// stage exists to avoid. Resolve the UAF side with resolveUAFResources, which
+// already handles the resourcesFrom jq fan-out.
 func uafVerbIsRead(verb string) bool {
 	_, ok := uafReadVerbs[verb]
 	return ok
 }
 
-// uafVerbGuardFailsClosed is the shared A-4 runtime gate for BOTH refilter
-// entry points (applyUserAccessFilterOnPig — the live jsonHandlerCore callsite
-// — and its applyUserAccessFilter twin). It reports whether the caller must
-// drop every item, and emits the operator Warn exactly ONCE per RA/stage
-// evaluation, never per item: a non-read verb is a single authoring mistake in
-// one CR, so per-item logging would be pure noise on a 500-item list.
+// warnUAFVerbNonRead emits the A-4 operator signal from BOTH refilter entry
+// points (applyUserAccessFilterOnPig — the live jsonHandlerCore callsite — and
+// its applyUserAccessFilter twin, kept symmetric so the twin cannot become a
+// silent bypass if it is ever re-wired).
 //
-// Fail CLOSED rather than fall back to a read verb: silently rewriting
-// `create` to `get` would serve a filtered list the author never described,
-// and an operator would never learn the CR is wrong. An empty list plus a Warn
-// naming the offending verb is the diagnosable failure.
-func uafVerbGuardFailsClosed(log *slog.Logger, stageName string, uaf *templates.UserAccessFilterSpec) bool {
-	if uafVerbIsRead(uaf.Verb) {
-		return false
+// It returns nothing and changes no items: 1.12.3 is observation only. It fires
+// exactly ONCE per (RA stage) evaluation, never per item — a non-read verb is a
+// single authoring choice in one CR, so per-item logging would flood the
+// operator on a 500-item list and tell them nothing extra.
+func warnUAFVerbNonRead(log *slog.Logger, stageName string, uaf *templates.UserAccessFilterSpec) {
+	if log == nil || uafVerbIsRead(uaf.Verb) {
+		return
 	}
-	if log == nil {
-		// A missing logger must never turn the gate OFF — the drop decision is
-		// the security property, the Warn is only the operator's diagnostic.
-		// emitRefilterFalsifierFromHandler guards the same way.
-		return true
+	resource := uaf.Resource
+	if resource == "" {
+		resource = uaf.ResourcesFrom
 	}
-	log.Warn("userAccessFilter: verb is not a read verb; dropping all items (fail-closed)",
+	log.Warn("userAccessFilter: verb is not a read verb",
 		slog.String("subsystem", "uaf"),
 		slog.String("api", stageName),
 		slog.String("verb", uaf.Verb),
-		slog.String("allowed", "get, list, watch (lower-case)"),
-		slog.String("effect", "every item dropped for this stage; a userAccessFilter narrows a READ path, so checking a write verb would keep the objects the requester may MUTATE — a scope inversion"),
-		slog.String("fix", "set userAccessFilter.verb to get, list or watch; CRs admitted from 1.12.3 onward are rejected by the CRD schema"),
+		slog.String("uaf_resource", resource),
+		slog.String("group", uaf.Group),
+		slog.String("effect", "none in 1.12.3 — items are served unchanged; this is an observation-only signal"),
+		slog.String("risk", "a non-read verb is only a scope inversion when it is checked against the SAME resource the stage returns; then the filter keeps what the caller may MUTATE, not what they may read"),
+		slog.String("next", "1.13.0 drops items only for the same-resource case (failing open on jq-templated paths); a cross-resource picker stays served"),
 	)
-	return true
 }
 
 // refilterResult is the (kept, dropped, total) summary the resolver
@@ -145,11 +167,11 @@ func applyUserAccessFilter(ctx context.Context, dict map[string]any, apiCall *te
 	}
 	uaf := apiCall.UserAccessFilter
 
-	// A-4 runtime bound (1.12.3) — ONCE per stage, before any per-item work.
-	if uafVerbGuardFailsClosed(log, apiCall.Name, uaf) {
-		_ = setRefilteredEmpty(dict, apiCall.Name)
-		return res
-	}
+	// A-4 (1.12.3) — WARN-ONLY, once per stage, before any per-item work. Kept
+	// symmetric with the live applyUserAccessFilterOnPig entry so this twin
+	// cannot silently become a bypass if it is ever re-wired. Drops nothing;
+	// 1.13.0 flips it to the same-resource rule (see uafVerbIsRead).
+	warnUAFVerbNonRead(log, apiCall.Name, uaf)
 
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {
@@ -676,13 +698,11 @@ func applyUserAccessFilterOnPig(ctx context.Context, pig map[string]any, dict ma
 		return res
 	}
 
-	// A-4 runtime bound (1.12.3) — ONCE per stage, before any per-item work.
-	// This is the LIVE production callsite (the applyUserAccessFilter twin above
-	// carries the identical guard so neither entry point can drift).
-	if uafVerbGuardFailsClosed(log, stageName, uaf) {
-		_ = setRefilteredEmpty(pig, stageName)
-		return res
-	}
+	// A-4 (1.12.3) — WARN-ONLY, once per stage, before any per-item work. This
+	// is the LIVE production callsite; the applyUserAccessFilter twin above
+	// carries the identical call so neither entry point can drift. Drops
+	// nothing; 1.13.0 flips it to the same-resource rule (see uafVerbIsRead).
+	warnUAFVerbNonRead(log, stageName, uaf)
 
 	user, err := xcontext.UserInfo(ctx)
 	if err != nil {

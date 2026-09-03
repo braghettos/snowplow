@@ -31,29 +31,30 @@ type Dependency struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.userAccessFilter) || !has(self.exportJwt) || !self.exportJwt",message="userAccessFilter stages MUST NOT have exportJwt: true; would leak the raw JWT through the user-facing filtered response."
 // +kubebuilder:validation:XValidation:rule="!has(self.userAccessFilter) || ((has(self.userAccessFilter.resource) && size(self.userAccessFilter.resource) > 0) || (has(self.userAccessFilter.resourcesFrom) && size(self.userAccessFilter.resourcesFrom) > 0)) && self.userAccessFilter.verb != ''",message="userAccessFilter must specify a non-empty verb and exactly one of resource or resourcesFrom; a degenerate filter would collapse the SubjectAccessReview check to a wildcard."
 //
-// A-4 (1.12.3) — READ-VERB BOUND on userAccessFilter.verb. Rule 1 above bounds
-// the enclosing HTTP STAGE verb; nothing bounded the RBAC verb the refilter
-// CHECKS per object. userAccessFilter.verb is threaded verbatim into
-// rbac.EvaluateRBAC (refilter.go evalSingle), so an author writing
-// `verb: create` makes the read path admit every object the requester may
-// CREATE — a scope inversion: the filter stops meaning "what you may see" and
-// starts meaning "what you may write". Author-controlled, hence defence in
-// depth, but the CRD is the right place to make it unwritable.
+// A-4 (1.12.3) — THERE IS DELIBERATELY NO FOURTH RULE BOUNDING
+// userAccessFilter.verb. Do not add one; it was tried and reverted.
 //
-// LOWER-CASE ONLY, deliberately asymmetric with rule 1's case-insensitive
-// GET/HEAD. Rule 1 bounds an HTTP METHOD (conventionally upper-case on the
-// wire); this bounds a KUBERNETES RBAC VERB, and the evaluator matches it by
-// exact lower-case string equality against rule.Verbs (rbac/evaluate.go
-// stringSliceMatches / nameSpecificVerbs, both lower-case tables). An
-// upper-case "GET" would therefore match NO PolicyRule and silently deny every
-// item; rejecting it at admission surfaces the typo instead of shipping a
-// filter that returns an empty list forever. The CRD field doc already states
-// lower-case; this makes it enforceable.
+// The temptation is obvious: uaf.Verb is threaded verbatim into
+// rbac.EvaluateRBAC (refilter.go evalSingle), so `verb: create` on a stage that
+// returns objects of the SAME resource keeps the objects the caller may WRITE
+// rather than the ones they may read — a scope inversion. But a blanket
+// `verb in ['get','list','watch']` rule is too coarse: three LIVE portal
+// RESTActions (testdata/portal_uaf_corpus.yaml, portal @ b2a558d) use
+// `verb: create` legitimately. Their api-step returns NAMESPACES and the filter
+// checks create on a DIFFERENT resource, so it answers "which namespaces may I
+// create X in" — a form picker that discloses nothing the caller cannot
+// already determine about their own grants. The rule would have failed the
+// portal upgrade and silently emptied three namespace pickers.
 //
-// The runtime twin is uafVerbIsRead (refilter.go), which fails CLOSED on the
-// same set for any CR that predates this rule or was written directly to etcd.
+// The real invariant is narrower — SAME-RESOURCE — and it needs the resource
+// the api-step RETURNS, which CEL on this struct cannot derive (the path may be
+// jq-templated). So it lives at runtime: refilter.go carries uafVerbIsRead as a
+// WARN-ONLY signal in 1.12.3, and 1.13.0 flips it to enforce the same-resource
+// rule, failing OPEN on templated paths. See the 1.13.0 note there.
 //
-// +kubebuilder:validation:XValidation:rule="!has(self.userAccessFilter) || self.userAccessFilter.verb in ['get', 'list', 'watch']",message="userAccessFilter.verb must be a READ verb (get, list or watch — lower-case, as the RBAC evaluator compares verbs by exact lower-case match); a write verb would admit every object the requester may MUTATE, inverting the filter's scope on a read path."
+// TestA4_PortalCorpus_CreateVerbUAFs_Admitted and
+// TestA4_UAFVerbBound_NotReintroduced (uaf_verb_cel_test.go) fail if the rule
+// comes back, and name the three portal files it would break.
 type API struct {
 	// Name is a (unique) identifier
 	Name string `json:"name"`

@@ -537,29 +537,9 @@ func TestFARCH_F6_6_DeclaredCounterpart_GuardInert(t *testing.T) {
 // widget's content was never cached → revisit always MISS (the exact 14/14-same-key /
 // 0/14-hit west4 failure).
 //
-// GREEN (the fix): the Put is ALLOWED → a second identical request HITs the
-// extras_len>0 key. RED = make the guard decline on the identity keys →
-// revisit MISS returns.
-//
-// A-3 UPDATE (1.12.3). The BEHAVIOUR this arm pins — a declared widget carrying
-// the legacy identity wire still caches, at the extras_len=2 key — is unchanged
-// and still load-bearing. What changed is WHERE the identity keys stop being a
-// problem. 1.7.11 let them reach the resolver and exempted them at the Put;
-// A-3 proved that lets a client-chosen extras.username shape a body written
-// into the shared per-BindingUID cell, so the dispatcher now STRIPS undeclared
-// identity keys before anything else sees them
-// (sanitizeUndeclaredIdentityExtras, widgets.go, right after the CR is
-// fetched). The guard therefore never sees them, and it no longer needs a
-// blanket identity exemption — it refuses to exempt an UNDECLARED identity key,
-// so an unsanitised caller falls closed instead of open.
-//
-// This arm consequently evaluates the guard on the SANITISED extras, which is
-// what the production callsite passes it. Feeding it the raw wire would assert
-// a call shape the dispatcher no longer makes. The end-to-end property (same
-// key, revisit HIT) is asserted exactly as before, and
-// TestA3_LegacyIdentityWire_StillCaches drives the SAME wire shape through the
-// real Widgets().ServeHTTP as the whole-path guard against this arm drifting
-// into a unit-level tautology.
+// GREEN (the fix): the guard exempts identity-dimension keys → the Put is ALLOWED → a
+// second identical request HITs the extras_len>0 key. RED = remove the identity
+// exemption (re-introduce the divergence) → the guard declines → revisit MISS returns.
 func TestFARCH_F6_7_RevisitHit_IdentityExtrasExempt(t *testing.T) {
 	enableWidgetContentL1(t)
 	ctx := ctxWithIdentity() // cyberjoker / [devs]
@@ -579,30 +559,16 @@ func TestFARCH_F6_7_RevisitHit_IdentityExtrasExempt(t *testing.T) {
 		"displayName": "Cyber Joker",
 	}
 
-	// A-3: the dispatcher sanitises the wire before ANY consumer sees it. This is
-	// the map the folder, the resolver and the guard all receive in production.
-	sanitized := sanitizeUndeclaredIdentityExtras(cr, req)
-	if _, present := sanitized["username"]; present {
-		t.Fatalf("F6-7/A-3: an identity key this widget does not declare must be stripped before the resolver sees it; got %#v", sanitized)
-	}
-	if sanitized["name"] != "demo-1" || sanitized["namespace"] != "team-a" {
-		t.Fatalf("F6-7/A-3: the DECLARED route params must survive sanitisation untouched; got %#v", sanitized)
-	}
-
 	// FOLDER: keeps only the declared keyExtras subset → extras_len=2 (identity dropped).
-	// Asserted on the RAW wire too, because sanitisation must be key-inert.
-	keyExtras := effectiveKeyExtras(ctx, cr, sanitized)
+	keyExtras := effectiveKeyExtras(ctx, cr, req)
 	if len(keyExtras) != 2 || keyExtras["name"] != "demo-1" || keyExtras["namespace"] != "team-a" {
 		t.Fatalf("F6-7: the folder must keep ONLY the declared [name,namespace] (identity dropped); got %#v", keyExtras)
 	}
-	if rawKeyExtras := effectiveKeyExtras(ctx, cr, req); !reflect.DeepEqual(rawKeyExtras, keyExtras) {
-		t.Fatalf("F6-7/A-3: sanitisation must be KEY-INERT — the same key material from the raw wire and the sanitised map; raw=%#v sanitised=%#v", rawKeyExtras, keyExtras)
-	}
 
-	// GUARD: must NOT decline. name/namespace are declared; the identity keys are
-	// already gone. This is the fix's core assertion — the widget stays cacheable.
-	if !requestExtrasFullyDeclared(cr, sanitized) {
-		t.Fatal("F6-7 REGRESSION: the guard declined a declared widget carrying the legacy identity wire — it must still cache; this is the west4 revisit-miss bug (0/14 hit)")
+	// GUARD: must NOT decline — name/namespace are declared, username/displayName are
+	// identity-dimension keys (exempt). This is the fix's core assertion.
+	if !requestExtrasFullyDeclared(cr, req) {
+		t.Fatal("F6-7 REGRESSION: the guard declined a declared widget carrying identity extras (username/displayName) — identity keys must be EXEMPT (they never pollute a shared cell); this is the west4 revisit-miss bug")
 	}
 
 	// End-to-end: first request Puts at the extras_len>0 key; second identical request HITs.
@@ -613,12 +579,12 @@ func TestFARCH_F6_7_RevisitHit_IdentityExtrasExempt(t *testing.T) {
 	body := []byte(`{"status":{"widgetData":{"detail":"header"}}}`)
 	// The Put only happens because the guard allowed it (mirrors widgets.go's
 	// genuine-Put gate: the F6 decline branch is skipped when requestExtrasFullyDeclared).
-	if requestExtrasFullyDeclared(cr, sanitized) {
+	if requestExtrasFullyDeclared(cr, req) {
 		handle1.Put(key1, &cache.ResolvedEntry{RawJSON: body, Inputs: inputs1})
 	}
 
 	// REVISIT: same widget, same request → same key → HIT (was 0/14 on west4).
-	keyExtras2 := effectiveKeyExtras(ctx, cr, sanitizeUndeclaredIdentityExtras(cr, req))
+	keyExtras2 := effectiveKeyExtras(ctx, cr, req)
 	key2, handle2, _ := dispatchCacheLookupKey(ctx, "widgets", g, v, r, ns, name, perPage, page, keyExtras2)
 	if key2 != key1 {
 		t.Fatalf("F6-7: revisit must derive the SAME extras_len>0 key; key1=%q key2=%q", key1, key2)
@@ -637,33 +603,17 @@ func TestFARCH_F6_7_RevisitHit_IdentityExtrasExempt(t *testing.T) {
 // BODY-affecting request key. A declared[name,namespace] widget receiving a NON-identity
 // undeclared key (foo) must STILL decline — otherwise the F6-6 self-quarantine leak
 // reopens. Discriminates the exemption from an over-broad "allow everything".
-//
-// A-3 UPDATE (1.12.3): evaluated on the SANITISED extras, the shape the
-// production callsite passes (see F6-7 above). A non-identity key like foo is
-// NOT sanitised away — it still reaches the resolve input, which is exactly why
-// it must still be quarantined at the Put.
 func TestFARCH_F6_7b_GenuinelyUndeclaredStillDeclines(t *testing.T) {
 	cr := declaredKeyExtrasCR("name", "namespace")
-	// Declared keys fine, identity key stripped — but foo is a genuinely-undeclared
+	// Identity keys exempt, declared keys fine — but foo is a genuinely-undeclared
 	// non-identity body-affecting key → MUST still decline.
 	req := map[string]any{"name": "demo-1", "namespace": "team-a", "username": "cyberjoker", "foo": "evil"}
-	sanitized := sanitizeUndeclaredIdentityExtras(cr, req)
-	if sanitized["foo"] != "evil" {
-		t.Fatalf("F6-7b: sanitisation must NOT touch a non-identity extra — it still reaches the resolve input and must still be quarantined; got %#v", sanitized)
+	if requestExtrasFullyDeclared(cr, req) {
+		t.Fatal("F6-7b OVER-FIX GUARD: a genuinely-undeclared non-identity key (foo) must STILL be quarantined even alongside declared+identity keys — the exemption must not allow body-affecting undeclared extras (F6-6 leak would reopen)")
 	}
-	if requestExtrasFullyDeclared(cr, sanitized) {
-		t.Fatal("F6-7b OVER-FIX GUARD: a genuinely-undeclared non-identity key (foo) must STILL be quarantined even alongside declared keys — the F6-6 shared-cell leak would reopen")
-	}
-	// Sanity: without foo, the same request is fully-declared once sanitised.
+	// Sanity: without foo, the same request is fully-declared (identity exempt).
 	req2 := map[string]any{"name": "demo-1", "namespace": "team-a", "username": "cyberjoker"}
-	if !requestExtrasFullyDeclared(cr, sanitizeUndeclaredIdentityExtras(cr, req2)) {
-		t.Fatal("F6-7b: declared keys plus a stripped identity key must be fully-declared")
-	}
-	// A-3 DEFENCE IN DEPTH: an UNSANITISED caller must fall CLOSED, not open. The
-	// guard refuses to exempt an identity key this widget never declared, so a
-	// future callsite that forgets to sanitise declines the Put instead of
-	// persisting a client-shaped body into the shared cell.
-	if requestExtrasFullyDeclared(cr, req2) {
-		t.Fatal("F6-7b/A-3: the guard must NOT exempt an UNDECLARED identity key when handed the raw wire — an unsanitised caller has to fail closed")
+	if !requestExtrasFullyDeclared(cr, req2) {
+		t.Fatal("F6-7b: declared keys + identity keys only must be fully-declared")
 	}
 }

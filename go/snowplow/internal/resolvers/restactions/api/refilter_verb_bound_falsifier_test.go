@@ -1,40 +1,39 @@
-// refilter_verb_bound_falsifier_test.go — A-4 (1.12.3) RUNTIME falsifier for
-// the read-verb bound on userAccessFilter.verb.
+// refilter_verb_bound_falsifier_test.go — A-4 (1.12.3) RUNTIME arms for the
+// userAccessFilter non-read-verb signal.
 //
-// THE DEFECT. uaf.Verb was unbounded and threaded verbatim into
-// rbac.EvaluateRBAC (refilter.go evalSingle). A userAccessFilter narrows a READ
-// path — it decides which items of a ServiceAccount-dispatched list the caller
-// may SEE — so checking a WRITE verb inverts its scope: the filter starts
-// keeping the items the caller may MUTATE. Those two sets are unrelated, so a
-// user with a broad create grant and a narrow get grant is SHOWN objects they
-// cannot read.
+// WHAT A-4 SET OUT TO STOP. uaf.Verb is threaded verbatim into
+// rbac.EvaluateRBAC (refilter.go evalSingle). A stage that returns objects of
+// resource R filtered by a WRITE verb on R keeps the objects the caller may
+// MUTATE rather than the ones they may read, so a user with a broad create
+// grant and a narrow get grant is shown objects they cannot read.
 //
-// WHY THESE ARMS DISCRIMINATE. A fail-closed guard is trivially satisfiable by
-// a broken filter that drops everything always, so "verb=create drops all
-// items" alone proves nothing. The fixture therefore splits the RBAC grants
-// across TWO namespaces:
+// WHY 1.12.3 ONLY WARNS. "Non-read verb" does not identify that shape. Three
+// LIVE portal RESTActions use `verb: create` legitimately, with the filter
+// checking a DIFFERENT resource than the stage returns
+// (testdata/portal_uaf_corpus.yaml, portal @ b2a558d). The first cut of A-4
+// dropped their items and rejected them at admission, which would have failed
+// the portal upgrade and silently emptied three namespace pickers. So the
+// runtime check is observation-only here, and 1.13.0 enforces the narrower
+// SAME-RESOURCE rule (spelled out at uafVerbIsRead).
 //
-//	ns-a — user1 may LIST (and get/watch) anyplural. Readable.
-//	ns-b — user1 may CREATE anyplural, and NOTHING else. Not readable.
+// The arms, all driving the LIVE path jsonHandlerBytes → jsonHandlerCore →
+// applyUserAccessFilterOnPig:
 //
-// so the three arms pin three DIFFERENT outcomes on the SAME envelope:
+//	(1) SERVED, NOT DROPPED. A `create` UAF still returns the items ordinary
+//	    RBAC permits, and emits exactly ONE warn naming the verb.
+//	(2) ONE WARN PER STAGE, not per item. The envelope carries four items on
+//	    purpose, so a per-item guard would emit four.
+//	(3) READ VERBS SILENT. get/list/watch emit no warn and behave exactly as
+//	    before A-4.
+//	(4) PORTAL CORPUS SERVED. The three vendored live stanzas each keep their
+//	    permitted items — the regression gate on the outage the first cut
+//	    would have caused.
 //
-//	(i)   verb "create" post-fix → 0 items + exactly one Warn (fail closed).
-//	(ii)  verb "create" pre-fix  → the ns-B item, the one user1 may CREATE but
-//	      MUST NOT SEE. TestA4_RED_UnboundedVerb_ServesWriteScopedItem asserts
-//	      that inversion directly against rbac.EvaluateRBAC, so the leak arm (i)
-//	      prevents is demonstrated, not merely asserted.
-//	(iii) verb "list" → the ns-A item, unchanged. Proves the guard is scoped to
-//	      non-read verbs and has not broken the production corpus.
-//
-// The Warn arm counts occurrences: the guard must log ONCE PER STAGE, never per
-// item (the envelope carries several items on purpose), because a non-read verb
-// is a single authoring mistake in one CR and per-item logging would flood the
-// operator on a 500-item list.
-//
-// All arms drive the LIVE path — jsonHandlerBytes → jsonHandlerCore →
-// applyUserAccessFilterOnPig (refilter.go), the sole production callsite — not
-// the guard helper in isolation.
+// Arms (1) and (4) are RED on the FIRST A-4 cut (the fail-closed guard), which
+// is the version they exist to prevent coming back; they pass on origin/main
+// (no guard at all) because origin/main also serves the items. The behaviour
+// they pin is therefore "1.12.3 == origin/main for the corpus, plus a signal" —
+// which is exactly the intent of a warn-only stage.
 
 package api
 
@@ -43,6 +42,8 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -53,12 +54,16 @@ import (
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/yaml"
 )
 
+// a4WarnMsg is the exact Warn message warnUAFVerbNonRead emits.
+const a4WarnMsg = "verb is not a read verb"
+
 // a4SplitScopeRBAC seeds the split-scope fixture: user1 may READ in ns-a and
-// may only CREATE in ns-b. The asymmetry is the whole point — it makes
-// "filtered by a read verb" and "filtered by a write verb" produce DIFFERENT,
-// observable item sets.
+// may only CREATE in ns-b. The asymmetry is what makes "served, not dropped"
+// meaningful: under a `create` filter the ns-b items are the ones RBAC permits,
+// so a fail-closed guard is instantly visible as an empty result.
 func a4SplitScopeRBAC(t *testing.T) {
 	t.Helper()
 
@@ -78,7 +83,7 @@ func a4SplitScopeRBAC(t *testing.T) {
 		RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "anyplural-reader"},
 	}
 
-	// ns-b: CREATE ONLY. user1 can write here but must never SEE these objects.
+	// ns-b: CREATE ONLY.
 	writeRole := &rbacv1.Role{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
 		ObjectMeta: metav1.ObjectMeta{Name: "anyplural-creator", Namespace: "ns-b"},
@@ -99,8 +104,8 @@ func a4SplitScopeRBAC(t *testing.T) {
 }
 
 // a4Envelope is the SA-dispatched cluster-scope LIST: two items in ns-a
-// (readable) and two in ns-b (create-only). Several items per namespace so the
-// once-per-stage Warn assertion is meaningful — a per-item log would emit 4.
+// (readable) and two in ns-b (create-only). Four items so the once-per-stage
+// warn assertion is meaningful.
 func a4Envelope(t *testing.T) []byte {
 	t.Helper()
 	item := func(name, ns string) any {
@@ -121,20 +126,15 @@ func a4Envelope(t *testing.T) []byte {
 	return raw
 }
 
-// a4RunStage drives the LIVE refilter path for one uaf.Verb and returns the
+// a4RunStage drives the LIVE refilter path for one UAF spec and returns the
 // namespaces of the kept items plus everything the stage logged.
-func a4RunStage(t *testing.T, verb string) (keptNamespaces []string, logs string) {
+func a4RunStage(t *testing.T, uaf *templates.UserAccessFilterSpec) (keptNamespaces []string, logs string) {
 	t.Helper()
 
 	apiCall := &templates.API{
-		Name:   "anyplurals",
-		Filter: ptrToString("[.anyplurals.items[]? | {name: .metadata.name, ns: .metadata.namespace}]"),
-		UserAccessFilter: &templates.UserAccessFilterSpec{
-			Verb:          verb,
-			Group:         "example.test",
-			Resource:      "anyplural",
-			NamespaceFrom: ".metadata.namespace",
-		},
+		Name:             "anyplurals",
+		Filter:           ptrToString("[.anyplurals.items[]? | {name: .metadata.name, ns: .metadata.namespace}]"),
+		UserAccessFilter: uaf,
 	}
 
 	var logBuf bytes.Buffer
@@ -154,7 +154,7 @@ func a4RunStage(t *testing.T, verb string) (keptNamespaces []string, logs string
 		dict:        dict,
 	})
 	if err := handler(a4Envelope(t)); err != nil {
-		t.Fatalf("jsonHandlerBytes(verb=%q): %v", verb, err)
+		t.Fatalf("jsonHandlerBytes(verb=%q): %v", uaf.Verb, err)
 	}
 
 	out := []string{}
@@ -168,66 +168,149 @@ func a4RunStage(t *testing.T, verb string) (keptNamespaces []string, logs string
 			}
 		}
 	case map[string]any:
-		// The fail-closed shape setRefilteredEmpty writes: {"items": []}.
 		if items, ok := v["items"].([]any); ok && len(items) > 0 {
-			t.Fatalf("verb=%q: unexpected non-empty items in the fail-closed shape: %v", verb, items)
+			t.Fatalf("verb=%q: unexpected wrapped items shape: %v", uaf.Verb, items)
 		}
 	}
 	return out, logBuf.String()
 }
 
-// TestA4_UAFVerbNonRead_FailsClosed — the make-or-break runtime arm.
-func TestA4_UAFVerbNonRead_FailsClosed(t *testing.T) {
+func a4UAF(verb string) *templates.UserAccessFilterSpec {
+	return &templates.UserAccessFilterSpec{
+		Verb:          verb,
+		Group:         "example.test",
+		Resource:      "anyplural",
+		NamespaceFrom: ".metadata.namespace",
+	}
+}
+
+// TestA4_UAFVerbNonRead_WarnsButServes — the make-or-break runtime arm.
+func TestA4_UAFVerbNonRead_WarnsButServes(t *testing.T) {
 	a4SplitScopeRBAC(t)
 
-	// (i) A WRITE verb must drop EVERY item. Pre-fix this returns the two ns-b
-	// items — the ones user1 may CREATE but must never SEE.
-	kept, logs := a4RunStage(t, "create")
-	if len(kept) != 0 {
-		t.Fatalf("A-4 (i) FAIL-CLOSED: userAccessFilter.verb=create must drop every item; the refilter KEPT %v. Those are the items user1 may CREATE, not read — the filter's scope inverted from \"what you may see\" to \"what you may write\"", kept)
+	// (1) A write verb must STILL SERVE the items ordinary RBAC permits. Under
+	// `create`, user1's grant is in ns-b, so the ns-b items are kept and the
+	// ns-a items are dropped by RBAC — not by A-4.
+	kept, logs := a4RunStage(t, a4UAF("create"))
+	if len(kept) != 2 || kept[0] != "ns-b" || kept[1] != "ns-b" {
+		t.Fatalf("A-4 (1) SERVED-NOT-DROPPED: verb=create must serve the items RBAC permits (the two ns-b items); got %v. A fail-closed guard here is the regression that would have emptied the three live portal namespace pickers (testdata/portal_uaf_corpus.yaml)", kept)
 	}
 
-	// The operator must be told, exactly ONCE for the stage — not once per item.
-	const warnMsg = "verb is not a read verb"
-	if n := strings.Count(logs, warnMsg); n != 1 {
-		t.Fatalf("A-4 (i) WARN: expected exactly ONE %q warning per stage (4 items in the envelope, so a per-item guard would emit 4); got %d. logs:\n%s", warnMsg, n, logs)
+	// (2) Exactly ONE warn for the stage, naming the verb — not one per item.
+	if n := strings.Count(logs, a4WarnMsg); n != 1 {
+		t.Fatalf("A-4 (2) WARN: expected exactly ONE %q warning per stage (4 items in the envelope, so a per-item signal would emit 4); got %d. logs:\n%s", a4WarnMsg, n, logs)
 	}
 	if !strings.Contains(logs, `"verb":"create"`) {
-		t.Fatalf("A-4 (i) WARN: the warning must name the offending verb so the operator can find the CR; logs:\n%s", logs)
+		t.Fatalf("A-4 (2) WARN: the warning must name the offending verb so the operator can find the CR; logs:\n%s", logs)
+	}
+	if !strings.Contains(logs, `"uaf_resource":"anyplural"`) {
+		t.Fatalf("A-4 (2) WARN: the warning must name the UAF resource — it is what 1.13.0 compares against the returned resource; logs:\n%s", logs)
+	}
+	// The warn must not overstate what 1.12.3 does.
+	if strings.Contains(logs, "dropping all items") {
+		t.Fatalf("A-4 (2) WARN: the 1.12.3 signal must NOT claim it dropped anything — it serves the items; logs:\n%s", logs)
 	}
 
-	// (iii) A READ verb is UNCHANGED: the ns-a items survive, the ns-b items are
-	// dropped by ordinary RBAC. This is what makes (i) a bound and not a break.
-	keptRead, readLogs := a4RunStage(t, "list")
+	// (3) Read verbs are silent and behave exactly as before A-4: under `list`
+	// user1's grant is in ns-a, so the ns-a items survive.
+	keptRead, readLogs := a4RunStage(t, a4UAF("list"))
 	if len(keptRead) != 2 || keptRead[0] != "ns-a" || keptRead[1] != "ns-a" {
-		t.Fatalf("A-4 (iii) NO-REGRESSION: verb=list must keep exactly the two ns-a items user1 can read; got %v", keptRead)
+		t.Fatalf("A-4 (3) NO-REGRESSION: verb=list must keep exactly the two ns-a items user1 can read; got %v", keptRead)
 	}
-	if strings.Contains(readLogs, warnMsg) {
-		t.Fatalf("A-4 (iii): the read-verb guard must be SILENT for a legitimate verb; logs:\n%s", readLogs)
+	if strings.Contains(readLogs, a4WarnMsg) {
+		t.Fatalf("A-4 (3): the signal must be SILENT for a legitimate read verb; logs:\n%s", readLogs)
 	}
-
-	// get and watch are the other two admitted verbs — neither may warn.
 	for _, verb := range []string{"get", "watch"} {
-		_, l := a4RunStage(t, verb)
-		if strings.Contains(l, warnMsg) {
-			t.Errorf("A-4 (iii): verb=%q is a read verb and must not trip the guard; logs:\n%s", verb, l)
+		if _, l := a4RunStage(t, a4UAF(verb)); strings.Contains(l, a4WarnMsg) {
+			t.Errorf("A-4 (3): verb=%q is a read verb and must not warn; logs:\n%s", verb, l)
 		}
 	}
 }
 
-// TestA4_RED_UnboundedVerb_ServesWriteScopedItem is the RED companion. It does
-// NOT go through the refilter (the guard now stops that); it asks
-// rbac.EvaluateRBAC the exact question the UNBOUNDED refilter asked, and asserts
-// that the answer for the ns-b item is ALLOW under "create" and DENY under
-// "list". That is the scope inversion in one assertion: with an unbounded verb
-// the refilter's keep-decision for ns-b flips from deny to allow purely because
-// the author typed a write verb, and user1 is served an object they cannot read.
+// portalUAFCase mirrors one entry of testdata/portal_uaf_corpus.yaml. Kept in
+// sync with the twin in apis/templates/v1/uaf_verb_cel_test.go, which asserts
+// the admission half over the same file.
+type portalUAFCase struct {
+	Name             string `json:"name"`
+	Source           string `json:"source"`
+	APIStepName      string `json:"apiStepName"`
+	APIStepPath      string `json:"apiStepPath"`
+	APIStepVerb      string `json:"apiStepVerb"`
+	UserAccessFilter struct {
+		Verb          string `json:"verb"`
+		Group         string `json:"group"`
+		Resource      string `json:"resource"`
+		ResourcesFrom string `json:"resourcesFrom"`
+		NamespaceFrom string `json:"namespaceFrom"`
+	} `json:"userAccessFilter"`
+}
+
+// TestA4_PortalCorpus_CreateVerbUAFs_AdmittedAndServed — the served half of the
+// corpus gate (the admitted half is
+// TestA4_PortalCorpus_CreateVerbUAFs_Admitted, apis/templates/v1). Each live
+// portal stanza's `create` filter must still return the caller's permitted
+// namespaces.
 //
-// This arm is GREEN because it asserts the PROPERTY OF THE RBAC FIXTURE that
-// makes the leak real. If it ever fails, the main arm's fail-closed assertion
-// has become vacuous (the fixture no longer distinguishes read from write) and
-// the whole file needs revisiting.
-func TestA4_RED_UnboundedVerb_ServesWriteScopedItem(t *testing.T) {
+// The fixture mirrors the portal's real shape: a NAMESPACES list filtered by a
+// create grant on a DIFFERENT resource. user1 may create example.test/anyplural
+// in ns-b only, so the picker must offer exactly ns-b — which is the whole
+// point of these RAs, and precisely what a fail-closed guard destroyed.
+func TestA4_PortalCorpus_CreateVerbUAFs_AdmittedAndServed(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "testdata", "portal_uaf_corpus.yaml"))
+	if err != nil {
+		t.Fatalf("read portal UAF corpus: %v", err)
+	}
+	var doc struct {
+		Cases []portalUAFCase `json:"cases"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal portal UAF corpus: %v", err)
+	}
+	if len(doc.Cases) != 3 {
+		t.Fatalf("portal UAF corpus must carry the 3 live stanzas; got %d", len(doc.Cases))
+	}
+
+	a4SplitScopeRBAC(t)
+
+	for _, c := range doc.Cases {
+		if c.UserAccessFilter.Verb == "" {
+			t.Errorf("corpus case %q has no verb", c.Name)
+			continue
+		}
+		// Re-point the vendored stanza at the fixture's own group/resource so it
+		// runs against real RBAC; the VERB and the cross-resource SHAPE — the
+		// only things A-4 reasons about — are the live ones.
+		uaf := &templates.UserAccessFilterSpec{
+			Verb:          c.UserAccessFilter.Verb,
+			Group:         "example.test",
+			Resource:      "anyplural",
+			NamespaceFrom: ".metadata.namespace",
+		}
+		kept, logs := a4RunStage(t, uaf)
+		if len(kept) == 0 {
+			t.Errorf("A-4 PORTAL CORPUS (served): the live portal stanza %q (%s) uses verb %q and its "+
+				"items were ALL DROPPED. In production this stage feeds a form's Namespace picker; "+
+				"an empty result is a silent outage — the user gets an empty enum and cannot create "+
+				"anything. 1.12.3 must WARN, never drop. logs:\n%s", c.Name, c.Source, c.UserAccessFilter.Verb, logs)
+			continue
+		}
+		if n := strings.Count(logs, a4WarnMsg); n != 1 {
+			t.Errorf("A-4 PORTAL CORPUS (%s): expected exactly one warn for the stage; got %d", c.Name, n)
+		}
+	}
+}
+
+// TestA4_SameResourceIsTheRealInversion documents, as an executable note, the
+// distinction 1.13.0 will enforce — and proves the fixture can actually tell the
+// two apart, so the 1.13.0 rule is implementable against it rather than
+// aspirational.
+//
+// Under `create`, RBAC's answer for ns-b is ALLOW and for ns-a is DENY; under
+// `list` it is the exact opposite. That divergence is what makes a same-resource
+// write filter a scope inversion. The portal's cross-resource pickers are not
+// affected by it, because there the verb is checked against a resource the stage
+// never returns.
+func TestA4_SameResourceIsTheRealInversion(t *testing.T) {
 	a4SplitScopeRBAC(t)
 	ctx := ctxWithUser("user1")
 
@@ -247,16 +330,13 @@ func TestA4_RED_UnboundedVerb_ServesWriteScopedItem(t *testing.T) {
 	}
 
 	if ask("list", "ns-b") {
-		t.Fatal("A-4 RED setup: user1 must NOT be able to list in ns-b — the fixture no longer separates read from write scope")
+		t.Fatal("A-4 fixture: user1 must NOT be able to list in ns-b — the fixture no longer separates read from write scope, so the arms above are vacuous")
 	}
 	if !ask("create", "ns-b") {
-		t.Fatal("A-4 RED setup: user1 must be able to create in ns-b — the fixture no longer separates read from write scope")
+		t.Fatal("A-4 fixture: user1 must be able to create in ns-b — the fixture no longer separates read from write scope")
 	}
-	// The inversion: the SAME item, the SAME user, opposite keep-decisions
-	// depending only on the author-chosen verb. Pre-fix the refilter propagated
-	// the create answer straight into the served response.
 	if ask("create", "ns-b") == ask("list", "ns-b") {
-		t.Fatal("A-4 RED: the create and list decisions for ns-b must DIFFER; without that difference an unbounded verb could not invert the filter's scope and the guard would be unfalsifiable")
+		t.Fatal("A-4: the create and list decisions for ns-b must DIFFER; without that a same-resource write filter could not invert the scope and the 1.13.0 rule would be pointless")
 	}
 }
 
