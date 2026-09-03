@@ -10,6 +10,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -204,18 +205,17 @@ func main() {
 	os.Setenv("AUTHN_NAMESPACE", *authnNS)
 	os.Setenv(jqsupport.EnvModulesPath, *jqModPath)
 
-	var lh slog.Handler
+	// 1.12.4: the handler chain lives in buildLogHandler (log_handler.go)
+	// — base text/JSON handler + the OTel trace-correlation decorator that
+	// stamps trace_id/span_id on EVERY *Context record when a span is
+	// active. Pretty logs keep stderr, JSON keeps stdout, exactly as
+	// before. F10 asserts structurally that this assignment goes through
+	// buildLogHandler; do not reconstruct the handler inline here.
+	var logStream io.Writer = os.Stdout
 	if *prettyLog {
-		lh = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-			Level:     logLevel,
-			AddSource: false,
-		})
-	} else {
-		lh = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-			Level:     logLevel,
-			AddSource: false,
-		})
+		logStream = os.Stderr
 	}
+	lh := buildLogHandler(*prettyLog, logLevel, logStream)
 
 	log := slog.New(lh)
 	// 0.30.172: route package-level slog calls (slog.InfoContext / .Info /
