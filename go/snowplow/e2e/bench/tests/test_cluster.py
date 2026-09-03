@@ -194,6 +194,164 @@ def test_kubectl_no_inject_when_env_bypass_set(monkeypatch, with_env):
     assert contexts == []
 
 
+# ─── BENCH_GKE_CONTEXT override (H-1) ───────────────────────────────────────
+#
+# The shipped CANONICAL_GKE_CONTEXT names a cluster whose GCP project no
+# longer exists, so the harness as written pins a dead context on every live
+# cluster. BENCH_GKE_CONTEXT retargets that pin. These arms exist to prove the
+# override RETARGETS the pin rather than WEAKENING it — the distinction that
+# matters, because the only pre-existing way to reach a non-neon cluster was
+# BENCH_ALLOW_NON_GKE=1, which removes pinning entirely and would let a
+# `helm upgrade` land on whatever current-context happens to name.
+
+_OVERRIDE_CTX = "gke_operations-dev-krateo-io_europe-west3-a_krateo-057"
+
+
+def _fake_run_factory(seen, stdout=b""):
+    """subprocess.run stub that records argv and returns a success result."""
+
+    class _Fake:
+        returncode = 0
+        stderr = b""
+
+    def _run(argv, **kwargs):
+        seen["argv"] = list(argv)
+        result = _Fake()
+        result.stdout = stdout
+        return result
+
+    return _run
+
+
+def test_canonical_gke_context_falls_back_to_constant(with_env):
+    """Unset (or blank) BENCH_GKE_CONTEXT → the hard-coded constant."""
+    with_env(BENCH_GKE_CONTEXT=None)
+    assert cluster_mod.canonical_gke_context() == CANONICAL_GKE_CONTEXT
+    # Whitespace-only is treated as unset, not as a context named "  ".
+    with_env(BENCH_GKE_CONTEXT="   ")
+    assert cluster_mod.canonical_gke_context() == CANONICAL_GKE_CONTEXT
+
+
+def test_canonical_gke_context_env_override(with_env):
+    """BENCH_GKE_CONTEXT wins, and is read at CALL time (not import time)."""
+    with_env(BENCH_GKE_CONTEXT=_OVERRIDE_CTX)
+    assert cluster_mod.canonical_gke_context() == _OVERRIDE_CTX
+    assert cluster_mod.canonical_gke_context() != CANONICAL_GKE_CONTEXT
+
+
+def test_kubectl_injects_overridden_context(monkeypatch, with_env):
+    """kubectl() pins the OVERRIDE — still position 1, still exactly one."""
+    with_env(BENCH_ALLOW_NON_GKE=None, BENCH_GKE_CONTEXT=_OVERRIDE_CTX)
+
+    seen = {}
+    monkeypatch.setattr(subprocess, "run", _fake_run_factory(seen))
+    kubectl("get", "ns")
+
+    assert seen["argv"][1] == f"--context={_OVERRIDE_CTX}"
+    contexts = [a for a in seen["argv"]
+                if isinstance(a, str) and a.startswith("--context")]
+    assert contexts == [f"--context={_OVERRIDE_CTX}"]
+    # The dead constant must NOT survive anywhere in the invocation.
+    assert CANONICAL_GKE_CONTEXT not in " ".join(seen["argv"])
+
+
+def test_helm_context_args_use_override(with_env):
+    """helm pins the override too — an unpinned `helm upgrade` is the
+    scenario that would mutate the wrong cluster."""
+    with_env(BENCH_ALLOW_NON_GKE=None, BENCH_GKE_CONTEXT=_OVERRIDE_CTX)
+    assert cluster_mod.helm_context_args() == ["--kube-context", _OVERRIDE_CTX]
+
+
+def test_kubectl_context_args_use_override(with_env):
+    """The direct-Popen streamers (port-forward, logs -f) pin the override."""
+    with_env(BENCH_ALLOW_NON_GKE=None, BENCH_GKE_CONTEXT=_OVERRIDE_CTX)
+    assert cluster_mod.kubectl_context_args() == [f"--context={_OVERRIDE_CTX}"]
+
+
+def test_gke_context_guard_passes_on_overridden_context(monkeypatch, with_env):
+    """current-context == the override → guard returns silently."""
+    with_env(BENCH_ALLOW_NON_GKE=None, BENCH_GKE_CONTEXT=_OVERRIDE_CTX)
+
+    seen = {}
+    monkeypatch.setattr(
+        subprocess, "run",
+        _fake_run_factory(seen, stdout=(_OVERRIDE_CTX + "\n").encode()))
+    gke_context_guard()  # must not raise
+
+
+def test_gke_context_guard_still_exits_on_stale_constant(monkeypatch, with_env):
+    """THE safety arm: with the override set, sitting on the OLD canonical
+    context must still exit 3.
+
+    A "fix" that merely widened the guard into an allow-anything check would
+    pass every other arm here and fail this one.
+    """
+    with_env(BENCH_ALLOW_NON_GKE=None, BENCH_GKE_CONTEXT=_OVERRIDE_CTX)
+
+    seen = {}
+    monkeypatch.setattr(
+        subprocess, "run",
+        _fake_run_factory(seen, stdout=(CANONICAL_GKE_CONTEXT + "\n").encode()))
+
+    with pytest.raises(SystemExit) as exc_info:
+        gke_context_guard()
+    assert exc_info.value.code == 3
+
+
+def test_allow_non_gke_still_bypasses_with_override_set(monkeypatch, with_env):
+    """The kind/minikube escape hatch is unchanged: BENCH_ALLOW_NON_GKE=1
+    removes pinning even when BENCH_GKE_CONTEXT names a cluster."""
+    with_env(BENCH_ALLOW_NON_GKE="1", BENCH_GKE_CONTEXT=_OVERRIDE_CTX)
+
+    seen = {}
+    monkeypatch.setattr(subprocess, "run", _fake_run_factory(seen))
+    kubectl("get", "ns")
+
+    contexts = [a for a in seen["argv"]
+                if isinstance(a, str) and a.startswith("--context")]
+    assert contexts == []
+    assert cluster_mod.helm_context_args() == []
+    assert cluster_mod.kubectl_context_args() == []
+
+
+def test_k8s_client_pins_overridden_context(monkeypatch, with_env,
+                                            reset_k8s_state):
+    """The in-process kubernetes client pins the override, so it and the
+    subprocess kubectl calls cannot diverge onto two different clusters."""
+    with_env(BENCH_ALLOW_NON_GKE=None, BENCH_GKE_CONTEXT=_OVERRIDE_CTX)
+    cluster_mod = reset_k8s_state
+
+    seen = {}
+
+    class _FakeConfigMod:
+        @staticmethod
+        def load_kube_config(context=None):
+            seen["context"] = context
+
+        @staticmethod
+        def load_incluster_config():
+            raise AssertionError("must not fall back to in-cluster config")
+
+    class _FakeApi:
+        def __init__(self, *a, **kw):
+            pass
+
+    class _FakeClientMod:
+        CoreV1Api = _FakeApi
+        RbacAuthorizationV1Api = _FakeApi
+        CustomObjectsApi = _FakeApi
+        ApiextensionsV1Api = _FakeApi
+
+    monkeypatch.setattr(cluster_mod, "_K8S_LIB_AVAILABLE", True)
+    monkeypatch.setattr(cluster_mod, "_k8s_config_mod", _FakeConfigMod)
+    monkeypatch.setattr(cluster_mod, "_k8s_client_mod", _FakeClientMod)
+    monkeypatch.setattr(cluster_mod, "K8S_CLIENT_AVAILABLE", False)
+    monkeypatch.setattr(cluster_mod, "_k8s_init_attempted", False)
+
+    assert cluster_mod._k8s_init() is True
+    assert seen["context"] == _OVERRIDE_CTX
+
+
 # ─── Case 4/5: _k8s_init idempotence + one-shot retry semantics ─────────────
 
 def test_k8s_init_short_circuits_when_lib_missing(reset_k8s_state):
