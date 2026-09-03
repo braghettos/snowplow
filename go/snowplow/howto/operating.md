@@ -168,9 +168,26 @@ go tool pprof -http=: heap.pprof
 ```
 
 Expired or missing token → `401`; a token in the query string is **not**
-accepted (it would leak into logs and referrers). If snowplow cannot fetch
-authn's JWKS the routes return `503`, not `401` — that is a snowplow-side
-failure, not a credential problem.
+accepted (it would leak into logs and referrers).
+
+#### Known limitation — the debug surface is unavailable when authn is down
+
+`RefreshAuth` maps `jwtutil.ErrKeyUnavailable` to **`503`**
+(`internal/handlers/middleware/refreshauth.go:124-127`). So if authn is down or
+its JWKS endpoint is unreachable, snowplow cannot verify any token and the
+**entire** `/debug/*` surface returns `503` — including `/debug/pprof/goroutine`,
+which is exactly what you want during that incident. `/health` and `/readyz` are
+unaffected (still anonymous), so the probes and the pod's lifecycle are fine; you
+simply lose the diagnostics while the outage lasts.
+
+A `503` here means "snowplow could not fetch the verification key", not "your
+credentials are wrong" — do not go hunting for a token problem.
+
+There is no break-glass path today, and a `kubectl exec` into the pod is **not**
+one: the gate sits on the mux, not on the network path, so a loopback `curl` from
+inside the container gets the same `503`. The follow-up under consideration is to
+bind the debug mux to localhost so `kubectl port-forward` always reaches it
+regardless of authn's state, or failing that a static operator token.
 
 The Phase 6 bench harness presents this token automatically: `login_all()`
 parks the first JWT it obtains and the expvar readers send it. For a

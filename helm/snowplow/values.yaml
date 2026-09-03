@@ -289,25 +289,40 @@ env:
   # 300s = a degraded catalog entry is corrected within ~5 min worst case.
   # Set to "0" to disable (entries then use the standard TTL exactly as before).
   CATALOG_UNSERVABLE_TTL_SECONDS: "300"
-  # #118 (d) bounded-staleness backstop for UAF-bearing cells (C-A2, 1.12.3).
-  # A restactions cell whose RESTAction carries a UserAuthorizationFilter is
-  # RBAC-sensitive, but the resolved-cache key does NOT fold the user's RBAC
-  # generation — so an authorization change inside the entry's TTL is served
-  # stale. When > 0, such an entry is stamped with this SHORT per-entry TTL
-  # instead of the standard RESOLVED_CACHE_TTL_SECONDS (3600), capping the
-  # staleness window; the accessor is internal/cache/resolved.go
-  # UAFResolvedTTL(), and effectiveTTLLocked only ever takes the SHORTER of
-  # the override and the store TTL, so this can only tighten the bound.
-  # Default in the binary is "0" = DISABLED — and the knob was absent from
-  # this chart entirely until 1.12.3, so no chart-deployed pod has ever had
-  # it on. 300s = an authz change is reflected within ~5 min worst case.
+  # #118 (d) STALENESS bound for userAccessFilter-bearing cells (C-A2, 1.12.3).
+  # Reachability fix: the binary has read this since #118 (d) but the knob was
+  # absent from this chart entirely, so no chart-deployed pod could ever set it.
   #
-  # BELT AND BRACES: 1.12.3 also DECLINES the Put for UAF-bearing cells
-  # (the A-1 mitigation), so on 1.12.3 this TTL should have nothing to cap.
-  # It stays declared and on because it bounds any cell a decline path misses,
-  # and because it is the only bound available if the decline is backed out.
-  # Both are INTERIM: the durable fix is the #118 (c) per-user RBAC sub-gen
-  # cache key landing in 1.13.0, after which this can go back to "0".
+  # WHAT IT DOES. When > 0, a restactions-class entry whose RESTAction declares
+  # a userAccessFilter stage is stamped with this SHORT per-entry TTL instead of
+  # the standard RESOLVED_CACHE_TTL_SECONDS (3600). Accessor is
+  # internal/cache/resolved.go UAFResolvedTTL(); effectiveTTLLocked only ever
+  # takes the SHORTER of the override and the store TTL, so this can only
+  # tighten the bound. 300s mirrors CATALOG_UNSERVABLE_TTL_SECONDS above.
+  #
+  # WHAT IT DOES NOT DO — read this before reaching for it in an incident.
+  #   * It is NOT a mitigation for the A-1 cross-tenant key collision. A TTL
+  #     bounds staleness over TIME, not identity: when two tenants derive the
+  #     same key, a shorter TTL just forces more refills and every refill
+  #     re-establishes the same collision.
+  #   * It covers ONLY the restactions class. HasUAF is set at exactly two
+  #     sites (dispatchers/restactions.go:393 and phase1_pip_seed.go:896), both
+  #     restactions; restactionHasUAFStage takes a *RESTAction, so the widgets
+  #     and widgetContent classes are never stamped and are NOT capped by this.
+  #
+  # INERT IN 1.12.3. The A-1 mitigation declines every userAccessFilter-bearing
+  # Put (that change lands on the sibling branch fix/1.12.3-uaf-put-decline, NOT
+  # in this commit), so there is no UAF cell left for this TTL to cap. It is
+  # declared and set here so the knob is reachable, and it becomes load-bearing
+  # again in 1.13.0 when those Puts are re-enabled under the v7 key.
+  #
+  # THE RESIDUAL THIS BOUNDS. #118 (c) already shipped: resolvedKeyVersion is
+  # "v6" (internal/cache/resolved.go:498) and ComputeKey folds RBACSubGen for
+  # every identity-bound class (:765-782). What remains is that HasUAF is
+  # EXPLICITLY EXCLUDED from ComputeKey (:410-421) and RBACSubGen is a change
+  # COUNTER, not a per-object scope discriminator — 1.13.0 adds a UAF-scope
+  # digest (the v7 bump).
+  #
   # Set to "0" to disable (UAF cells then use the standard TTL).
   UAF_RESOLVED_TTL_SECONDS: "300"
   # #57 — prewarm seed loopback auth. The seed exchanges its projected

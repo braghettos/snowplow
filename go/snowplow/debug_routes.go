@@ -33,6 +33,17 @@
 // kubelet probe targets (howto/operating.md, "the chart ⇄ binary probe
 // contract") and the kubelet presents no JWT. `/swagger/` is unchanged.
 //
+// KNOWN LIMITATION (accepted here, follow-up ticketed). RefreshAuth maps
+// jwtutil.ErrKeyUnavailable to 503 (refreshauth.go:124-127), so while authn or
+// its JWKS endpoint is unreachable NO token can be verified and this whole
+// surface answers 503 — including /debug/pprof/goroutine, which is exactly the
+// dump an operator wants during that incident. The gate is on the mux, not on
+// the network path, so a loopback curl from inside the container is 503 too:
+// there is no break-glass today. The candidate follow-ups are binding the debug
+// mux to localhost (so `kubectl port-forward` always works regardless of authn)
+// or a static operator token. Documented for operators under "Known limitation"
+// in howto/operating.md; deliberately NOT solved in this change.
+//
 // TESTABILITY: the registration is a function rather than a straight-line block
 // in main() so main_debug_auth_test.go can build the real mux and drive real
 // requests through it — the same "extracted, named constructor" shape
