@@ -525,6 +525,72 @@ func (rw *ResourceWatcher) ServableSnapshot() []ServableGVRStatus {
 	return out
 }
 
+// ServableCounts collapses the per-GVR servability picture into five
+// bounded counts (1.12.4 §7c). It is the aggregate companion to
+// ServableSnapshot: same rw.mu.RLock loop, same servableLocked source of
+// truth, but it allocates NOTHING — no slice, no per-GVR struct — so it
+// is safe to call on the OTLP collection interval over the ~169
+// registered informers of a production cluster.
+//
+// WHY IT EXISTS. The per-GVR truth is already reachable, but only
+// through /debug/servable, which is JWT-gated (1.12.3 O-D3) and
+// per-GVR. There is no aggregate anywhere, so "how many of my informers
+// can actually serve right now" is unanswerable from a dashboard. That
+// number is the LEADING indicator for the informer-fallthrough-not-synced
+// cell, which stood at 27,041 lifetime on krateo-057: it tells an
+// operator a GVR is about to start missing before the misses accumulate.
+//
+// The five counts are deliberately not mutually exclusive — they are the
+// conjuncts, so `registered - servable` is the gap and watchBroken /
+// confirmed / synced say which conjunct is responsible:
+//
+//	registered  — informers built for a GVR
+//	synced      — HasSynced() (conjunct 2)
+//	watchBroken — the stale-delete latch is set (conjunct 3; >0 is an alarm)
+//	confirmed   — resource type confirmed served by the apiserver (conjunct 4)
+//	servable    — all conjuncts hold: this GVR can be served from cache
+//
+// Returns all zeros for a nil receiver or passthrough mode, matching
+// ServableSnapshot's nil return.
+func (rw *ResourceWatcher) ServableCounts() (registered, synced, servable, watchBroken, confirmed int) {
+	if rw == nil || rw.mode == modePassthrough {
+		return 0, 0, 0, 0, 0
+	}
+	rw.mu.RLock()
+	defer rw.mu.RUnlock()
+	for gvr, gi := range rw.informers {
+		registered++
+		if gi.Informer().HasSynced() {
+			synced++
+		}
+		if _, broken := rw.watchBroken[gvr]; broken {
+			watchBroken++
+		}
+		if _, ok := rw.confirmed[gvr]; ok {
+			confirmed++
+		}
+		// servableLocked is the single source of truth for the composite —
+		// reuse it rather than re-deriving the conjunction here, so a
+		// future conjunct change cannot make this gauge disagree with the
+		// gate that decides whether a request is served.
+		if _, ok := rw.servableLocked(gvr); ok {
+			servable++
+		}
+	}
+	return registered, synced, servable, watchBroken, confirmed
+}
+
+// ServableCountsSnapshot is the package-level accessor over the global
+// watcher, for the observability surfaces (expvar + the OTLP mirror in
+// internal/metrics) which have no watcher handle of their own. Returns
+// all zeros when the cache is off or the watcher is not yet built.
+func ServableCountsSnapshot() (registered, synced, servable, watchBroken, confirmed int) {
+	if Disabled() {
+		return 0, 0, 0, 0, 0
+	}
+	return Global().ServableCounts()
+}
+
 // resourceTypeServed reports whether the apiserver currently serves
 // gvr's resource *type*. It asks discovery for the group/version's
 // APIResourceList and checks the Resource name appears. A discovery
