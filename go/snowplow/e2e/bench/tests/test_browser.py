@@ -2105,3 +2105,105 @@ def test_D2_dashboard_final_hold_targets_compositions_not_first_chart(
     assert "top: 0" not in final and "top:0" not in final, (
         "_DASHBOARD_FINAL_HOLD_JS still resets to top:0 (the pre-fix "
         "miss-fallback that framed the Blueprints donut)")
+
+
+# ─── O-D3 (snowplow 1.12.3) — /debug/* bearer plumbing ──────────────────────
+#
+# snowplow 1.12.3 put the whole /debug/* surface behind a JWT. The harness has
+# to present one, but it must ALSO stay usable against a pre-1.12.3 pod, which
+# serves /debug/vars anonymously. So the contract on _debug_auth_headers is:
+# add Authorization when a token is parked, and otherwise be a no-op — never an
+# empty-bearer header, never a raise, never a hidden login on the probe path.
+
+
+def test_debug_auth_headers_is_a_noop_without_a_token(monkeypatch):
+    """No parked token → headers pass through unchanged, no Authorization.
+
+    This is the pre-1.12.3-pod arm: a bench run against an older snowplow must
+    still issue the SAME anonymous GET it always did. An empty or malformed
+    Authorization header would be worse than none — a 1.12.3 pod would 401 it
+    and an older pod might reject it outright.
+    """
+    import bench.browser as browser_mod
+
+    monkeypatch.setattr(browser_mod, "DEBUG_TOKEN", None)
+
+    assert browser_mod._debug_auth_headers() == {}
+    assert browser_mod._debug_auth_headers({"Accept": "application/json"}) == {
+        "Accept": "application/json"}
+
+
+def test_debug_auth_headers_adds_bearer_without_mutating_the_caller(
+        monkeypatch):
+    """Parked token → Authorization added, and `extra` is left alone.
+
+    The readers pass a fresh literal each call today, but mutating the caller's
+    dict would leak the bearer into unrelated request headers the moment one of
+    them hoists that literal.
+    """
+    import bench.browser as browser_mod
+
+    monkeypatch.setattr(browser_mod, "DEBUG_TOKEN", "tok-abc")
+
+    extra = {"Accept": "application/json"}
+    out = browser_mod._debug_auth_headers(extra)
+
+    assert out["Authorization"] == "Bearer tok-abc"
+    assert out["Accept"] == "application/json"
+    assert extra == {"Accept": "application/json"}, (
+        "_debug_auth_headers mutated the caller's dict")
+
+
+def test_set_debug_token_ignores_empty_values(monkeypatch):
+    """set_debug_token(None) / ("") must NOT clobber a good token.
+
+    login_all() forwards whatever it got; a failed login round that yields no
+    token must not disarm the bearer a previous round parked.
+    """
+    import bench.browser as browser_mod
+
+    monkeypatch.setattr(browser_mod, "DEBUG_TOKEN", "tok-good")
+    browser_mod.set_debug_token(None)
+    browser_mod.set_debug_token("")
+    assert browser_mod.DEBUG_TOKEN == "tok-good"
+
+    browser_mod.set_debug_token("tok-new")
+    assert browser_mod.DEBUG_TOKEN == "tok-new"
+
+
+def test_expvar_reader_sends_the_parked_bearer(monkeypatch):
+    """End of the plumbing: the parked token reaches the actual GET.
+
+    Drives read_snowplow_expvar_int with urlopen faked and asserts the
+    Authorization header on the Request object — not merely that the helper
+    returns one. Fails if a future reader builds its own headers and bypasses
+    _debug_auth_headers.
+    """
+    import bench.browser as browser_mod
+
+    captured = {}
+
+    class _FakeResp:
+        status = 200
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"snowplow_rbac_publish_seq": 7}'
+
+    def _fake_urlopen(req, timeout=None):
+        captured["headers"] = dict(req.headers)
+        return _FakeResp()
+
+    monkeypatch.setattr(browser_mod, "DEBUG_TOKEN", "tok-xyz")
+    monkeypatch.setattr(browser_mod.urllib.request, "urlopen", _fake_urlopen)
+
+    assert browser_mod.read_snowplow_expvar_int(
+        "snowplow_rbac_publish_seq", base_url="http://fake:8081") == 7
+    # urllib title-cases header names on the Request object.
+    assert captured["headers"].get("Authorization") == "Bearer tok-xyz"
