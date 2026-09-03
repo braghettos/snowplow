@@ -60,7 +60,8 @@ func (c *ResolvedCacheStore) PutRAFullList(key string, inputs ResolvedKeyInputs,
 	}
 	pin := int64(len(encoded)) >= raFullListPinBytesThreshold()
 	in := inputs // copy onto the heap for the entry
-	// scope-waiver:TTLOverride: raFullList-class cell — the page-independent RA full-list substrate; UAF refilter output lands in the per-page restactions cell (capped), never here (uaf_shortttl.go R-d-4 SITE MAP). Pinned/TTL governed by the 4a resident-budget path.
+	// uaf-scope-waiver: UNREACHABLE for a refilter-narrowed body. The only caller is apiref.raFullListServe, which bypasses this whole layer (returns served=false) for a RESTAction declaring a userAccessFilter BEFORE it derives the key — so no refilter output can arrive here. Falsified by TestA1_RAFullList_UAFBypassesCell_ControlServes (no cell under the derived raKey) and the warm-cell ordering arm.
+	// scope-waiver:TTLOverride: raFullList-class cell — 1.12.3 A-1 CORRECTED WAIVER. The pre-1.12.3 text claimed UAF refilter output "lands in the per-page restactions cell, never here"; that was WRONG (this cell holds the apiRef'd RA's own full resolve output, UAF stage included, keyed on BindingUID ALONE — no RBACSubGen). A UAF-bearing RA can no longer REACH this Put: raFullListServe bypasses the whole layer for it (ra_full_list.go), so every cell written here is non-UAF and needs no UAF cap. Pinned/TTL governed by the 4a resident-budget path. Revisit when 1.13.0 folds the UAF scope into the key (uaf_shortttl.go R-d-4 SITE MAP, "THE FOURTH SITE").
 	c.Put(key, &ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  &in,
@@ -82,7 +83,8 @@ func (c *ResolvedCacheStore) PutRAFullListPinned(key string, inputs ResolvedKeyI
 		return
 	}
 	in := inputs
-	// scope-waiver:TTLOverride: raFullList-class cell (explicit-pin path) — same class as PutRAFullList above; UAF refilter output lands in the per-page restactions cell (capped), never here (uaf_shortttl.go R-d-4 SITE MAP).
+	// uaf-scope-waiver: UNREACHABLE for a refilter-narrowed body, same as PutRAFullList above. This explicit-pin path only ever re-Puts a cell that raFullListServe (gated) or the refresher (gated) already produced; a UAF RA never produces one.
+	// scope-waiver:TTLOverride: raFullList-class cell (explicit-pin path) — same class as PutRAFullList above, same 1.12.3 A-1 CORRECTED reasoning: NOT "UAF output never lands here" (it did), but "a UAF-bearing RA can no longer reach this Put" — raFullListServe bypasses the layer for it, and this explicit-pin path re-Puts only cells that path (or the refresher, over its stored Inputs) already produced (uaf_shortttl.go R-d-4 SITE MAP, "THE FOURTH SITE").
 	c.Put(key, &ResolvedEntry{
 		RawJSON: encoded,
 		Inputs:  &in,

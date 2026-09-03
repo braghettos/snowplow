@@ -27,6 +27,38 @@ type RESTAction struct {
 	Status *runtime.RawExtension `json:"status,omitempty"`
 }
 
+// HasUserAccessFilterStage reports whether ANY api-step of this RESTAction
+// declares a userAccessFilter — i.e. whether the RA's resolved output is
+// PER-REQUESTER NARROWED by the per-object RBAC refilter.
+//
+// SINGLE SOURCE OF TRUTH (#118 / A-1). The resolved-cache key folds only the
+// dispatch-authorizing BindingUID (+ the per-subject RBACSubGen); it does NOT
+// fold the per-object UAF narrowing scope. So two users who share the
+// first-match binding for `get restactions` derive the SAME key while their
+// UAF-narrowed bodies legitimately DIFFER — one user's rows would be served to
+// the other from the shared cell. The 1.12.3 A-1 mitigation declines the L1 Put
+// (and bypasses the raFullList cell) for any RA this predicate reports true for.
+//
+// The predicate lives on the API type — not in a consumer package — because it
+// is consulted from THREE packages (internal/handlers/dispatchers for the three
+// restactions Put sites, internal/resolvers/widgets/apiref for the raFullList
+// bypass, and the tests): one derivation, so the sites cannot drift (#64
+// anti-shadow-drift). It keys on the presence of the UAF CONTRACT itself,
+// uniform across every RA — never on a resource/name/path literal
+// (feedback_no_special_cases). Nil receiver, nil api-step elements and a nil
+// UserAccessFilter are all guarded.
+func (in *RESTAction) HasUserAccessFilterStage() bool {
+	if in == nil {
+		return false
+	}
+	for _, step := range in.Spec.API {
+		if step != nil && step.UserAccessFilter != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // RESTActionList contains a list of RESTAction

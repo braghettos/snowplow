@@ -82,6 +82,23 @@ func putPartialWithTTL(
 	if ttl <= 0 || handle == nil || cacheKey == "" {
 		return false // D off, or nothing to key against — bare decline (pre-D)
 	}
+	// 1.12.3 A-1 — DEFENCE IN DEPTH. This helper is the OTHER writer in the
+	// restactions and widgets Put chains: it persists a partial-with-errors body
+	// under the SAME shared per-binding cacheKey when PARTIAL_RESULT_TTL_SECONDS
+	// is set. Both callers now run the UAF gate at the HEAD of their chain,
+	// ahead of the stage-error branch that calls this — precisely so a
+	// refilter-narrowed body cannot slip through here — so in a correct chain
+	// this check never fires. It exists because "the caller checked first" is an
+	// ordering invariant, and ordering invariants are what the A-1 first cut got
+	// wrong: gating only the genuine-Put branch left this writer open. A future
+	// caller that forgets the ordering is stopped here instead of leaking.
+	//
+	// Declaration limb only — this helper takes no ctx, so it cannot read the
+	// UAFTouchedSink. The observed limb is enforced by the callers' chain-head
+	// gate, which is where the sink is in scope.
+	if declineUAFPut(inputs, nil) {
+		return false
+	}
 	handle.Put(cacheKey, &cache.ResolvedEntry{
 		RawJSON:     encoded,
 		Inputs:      inputs,
